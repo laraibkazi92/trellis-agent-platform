@@ -27,6 +27,7 @@ services:
       - "traefik.http.services.web-ui.loadbalancer.server.port=80"
     environment:
       - PUBLIC_API_URL=http://localhost:8000
+      - PUBLIC_API_KEY=${CONTROL_PLANE_API_KEY:-}
     depends_on:
       - control-plane
     networks:
@@ -36,9 +37,10 @@ services:
     build: ./control-plane
     container_name: control-plane
     environment:
-      - DATABASE_URL=postgresql://user:password@postgres:5432/agent_registry
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-agent_registry}
       - ETCD_ENDPOINT=http://etcd:2379
       - TOOLS_DIR=/app/tools
+      - CONTROL_PLANE_API_KEY=${CONTROL_PLANE_API_KEY:-}
     volumes:
       - ./tools:/app/tools
     ports:
@@ -61,9 +63,9 @@ services:
     image: postgres:15
     container_name: postgres
     environment:
-      - POSTGRES_DB=agent_registry
-      - POSTGRES_USER=user
-      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=${POSTGRES_DB:-agent_registry}
+      - POSTGRES_USER=${POSTGRES_USER:-user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
     ports:
       - "5432:5432"
     networks:
@@ -85,7 +87,7 @@ services:
     environment:
       - ETCD_ENDPOINT=http://etcd:2379
       - TOOLS_DIR=/app/tools
-      - DATABASE_URL=postgresql://user:password@postgres:5432/agent_registry
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-agent_registry}
     volumes:
       - ./tools:/app/tools
     depends_on:
@@ -101,6 +103,7 @@ services:
       - AGENT_NAME=finance-agent
       - REGISTRY_URL=http://control-plane:8000
       - ETCD_ENDPOINT=http://etcd:2379
+      - CONTROL_PLANE_API_KEY=${CONTROL_PLANE_API_KEY:-}
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.finance-agent.rule=PathPrefix(`/mcp/finance-agent`)"

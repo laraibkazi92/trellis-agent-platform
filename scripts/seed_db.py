@@ -10,8 +10,8 @@ sys.path.append(os.path.join(os.getcwd(), 'control-plane'))
 
 from app import models
 
-DATABASE_URL = "postgresql://user:password@localhost:5432/agent_registry"
-ETCD_URL = "http://localhost:2379"
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://user:password@localhost:5432/agent_registry")
+ETCD_URL = os.environ.get("ETCD_ENDPOINT", "http://localhost:2379")
 
 def seed():
     try:

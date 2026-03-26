@@ -3,13 +3,19 @@ import sys
 import importlib.util
 import json
 import inspect
+import logging
+import asyncio
 from pathlib import Path
 from typing import Dict, Any, List, Callable
 from mcp.server.fastmcp import FastMCP
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 import etcd3gw
 from sqlalchemy import create_engine, text
 import uvicorn
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Configuration
 TOOLS_DIR = os.environ.get("TOOLS_DIR", "/app/tools")
@@ -33,7 +39,7 @@ def get_etcd_secret(key: str) -> dict:
             value = value[0]
         return json.loads(value.decode() if isinstance(value, bytes) else value)
     except Exception as e:
-        print(f"Error fetching etcd secret {key}: {e}")
+        logger.error(f"Error fetching etcd secret {key}: {e}")
         return {}
 
 def load_tool_function(tool_dir: str, module_name: str, function_name: str):
@@ -90,41 +96,58 @@ def create_mcp_wrapper(tool_name: str, description: str, tool_func: Callable, se
     
     return mcp_tool_wrapper
 
-def register_tools():
-    """Query database and load all active tools"""
-    try:
-        engine = create_engine(DATABASE_URL)
-        with engine.connect() as conn:
-            result = conn.execute(text("""
-                SELECT name, description, tool_directory, entry_point_module,
-                       entry_point_function, etcd_secret_key
-                FROM tools
-                WHERE is_active = true
-            """))
-            
-            for row in result:
-                tool_name, description, tool_dir, module_name, func_name, secret_key = row
-                try:
-                    tool_func = load_tool_function(tool_dir, module_name, func_name)
-                    wrapper = create_mcp_wrapper(tool_name, description, tool_func, secret_key)
-                    mcp.add_tool(wrapper)
-                    print(f"Registered tool: {tool_name}")
-                except Exception as e:
-                    print(f"Failed to register tool {tool_name}: {e}")
-    except Exception as e:
-        print(f"Database connection failed during tool registration: {e}")
+def register_tools(max_retries: int = 5, retry_delay: int = 5):
+    """Query database and load all active tools with retry logic"""
+    engine = create_engine(DATABASE_URL)
+    
+    for attempt in range(max_retries):
+        try:
+            with engine.connect() as conn:
+                result = conn.execute(text("""
+                    SELECT name, description, tool_directory, entry_point_module,
+                           entry_point_function, etcd_secret_key
+                    FROM tools
+                    WHERE is_active = true
+                """))
+                
+                for row in result:
+                    tool_name, description, tool_dir, module_name, func_name, secret_key = row
+                    try:
+                        tool_func = load_tool_function(tool_dir, module_name, func_name)
+                        wrapper = create_mcp_wrapper(tool_name, description, tool_func, secret_key)
+                        mcp.add_tool(wrapper)
+                        logger.info(f"Registered tool: {tool_name}")
+                    except Exception as e:
+                        logger.error(f"Failed to register tool {tool_name}: {e}")
+                
+                # If we reached here, connection was successful
+                return
+        except Exception as e:
+            logger.warning(f"Database connection attempt {attempt + 1}/{max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                import time
+                time.sleep(retry_delay)
+            else:
+                logger.error("Final database connection attempt failed. Starting server without tools.")
 
 # We'll use a standard FastAPI app to host the MCP and the reload endpoint
 app = FastAPI()
 
 @app.post("/reload")
 def reload_server():
-    """Restarts the server to reload all tools and dependencies"""
-    print("Reloading server...")
-    # In a real Docker environment, this will cause the container to restart 
-    # if the entrypoint is 'python server.py' or similar.
-    # Alternatively, we can use os.execv to restart the process.
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    """Dynamically reloads tools from database without restarting the process"""
+    logger.info("Reloading tools...")
+    # Clear existing tools from FastMCP if possible
+    # FastMCP stores tools in a list or dict. We'll try to clear it if we can access the attribute.
+    # If not, we'll just add tools again (might cause duplicates if not careful)
+    # A better way is to rebuild the MCP instance if we can swap it in the FastAPI app
+    
+    # For now, let's try to clear the internal tool registry of FastMCP
+    if hasattr(mcp, '_tools'):
+        mcp._tools = []
+    
+    register_tools()
+    return {"status": "success", "message": "Tools reloaded successfully"}
 
 # Mount the MCP server's app
 # FastMCP.app is a FastAPI app

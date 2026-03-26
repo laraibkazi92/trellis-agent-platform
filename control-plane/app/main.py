@@ -6,7 +6,26 @@ from datetime import datetime
 import httpx
 import base64
 import os
+import logging
 from pathlib import Path
+
+from fastapi.security import APIKeyHeader
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+API_KEY_NAME = "X-API-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+def verify_api_key(api_key: str = Depends(api_key_header)):
+    expected_api_key = os.environ.get("CONTROL_PLANE_API_KEY")
+    if not expected_api_key:
+        # If no key is configured, allow all requests (for backward compatibility/easy dev)
+        # But log a warning in a production-like environment
+        return
+    if api_key != expected_api_key:
+        raise HTTPException(status_code=403, detail="Invalid or missing API Key")
 
 from . import models, schemas, database, etcd_client
 from .database import engine
@@ -18,7 +37,7 @@ app = FastAPI(title="Control Plane API")
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For dev, allow all. In production, restrict to web-ui origin.
+    allow_origins=os.environ.get("ALLOWED_ORIGINS", "*").split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -36,7 +55,7 @@ def get_db():
 def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
-@app.post("/agents/register")
+@app.post("/agents/register", dependencies=[Depends(verify_api_key)])
 def register_agent(agent_data: schemas.AgentRegister, db: Session = Depends(get_db)):
     agent = db.query(models.Agent).filter(models.Agent.name == agent_data.agent_name).first()
     if not agent:
@@ -63,7 +82,7 @@ def register_agent(agent_data: schemas.AgentRegister, db: Session = Depends(get_
         "config_url": f"/agents/{agent.id}/config"
     }
 
-@app.get("/agents/{agent_id}/config")
+@app.get("/agents/{agent_id}/config", dependencies=[Depends(verify_api_key)])
 def get_agent_config(agent_id: int, db: Session = Depends(get_db)):
     agent = db.query(models.Agent).filter(models.Agent.id == agent_id).first()
     if not agent:
@@ -102,7 +121,7 @@ def get_agent_config(agent_id: int, db: Session = Depends(get_db)):
         }
     }
 
-@app.get("/marketplace/agents")
+@app.get("/marketplace/agents", dependencies=[Depends(verify_api_key)])
 def list_marketplace_agents(db: Session = Depends(get_db)):
     agents = db.query(models.Agent).all()
     result = []
@@ -119,7 +138,7 @@ def list_marketplace_agents(db: Session = Depends(get_db)):
         })
     return {"agents": result}
 
-@app.post("/marketplace/agents", response_model=schemas.Agent)
+@app.post("/marketplace/agents", response_model=schemas.Agent, dependencies=[Depends(verify_api_key)])
 def create_agent(agent_data: schemas.AgentCreate, db: Session = Depends(get_db)):
     db_agent = models.Agent(
         name=agent_data.name,
@@ -152,16 +171,24 @@ def deploy_tool_files(tool_id: int, files: List[schemas.ToolFile], db: Session):
     if base_tool_dir.startswith("tools/"):
         base_tool_dir = base_tool_dir[len("tools/"):]
         
-    full_tool_path = Path(tools_dir) / base_tool_dir
+    full_tool_path = (Path(tools_dir) / base_tool_dir).resolve()
     full_tool_path.mkdir(parents=True, exist_ok=True)
     
     for f in files:
-        file_path = full_tool_path / f.path
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(file_path, "wb") as file:
+        # Prevent path traversal by ensuring the resolved path is within the base tool directory
+        requested_path = (full_tool_path / f.path).resolve()
+        try:
+            requested_path.relative_to(full_tool_path)
+        except ValueError:
+             logger.warning(f"Prevented path traversal attempt: {f.path}")
+             continue
+             
+        requested_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(requested_path, "wb") as file:
             file.write(base64.b64decode(f.content))
+        logger.info(f"Deployed file {f.path} for tool {tool_id}")
 
-@app.post("/marketplace/tools", response_model=schemas.Tool)
+@app.post("/marketplace/tools", response_model=schemas.Tool, dependencies=[Depends(verify_api_key)])
 def create_tool(tool_data: schemas.ToolRegister, db: Session = Depends(get_db)):
     db_tool = models.Tool(
         name=tool_data.name,
@@ -183,7 +210,7 @@ def create_tool(tool_data: schemas.ToolRegister, db: Session = Depends(get_db)):
         
     return db_tool
 
-@app.put("/marketplace/tools/{tool_id}", response_model=schemas.Tool)
+@app.put("/marketplace/tools/{tool_id}", response_model=schemas.Tool, dependencies=[Depends(verify_api_key)])
 def update_tool(tool_id: int, tool_data: schemas.ToolUpdate, db: Session = Depends(get_db)):
     db_tool = db.query(models.Tool).filter(models.Tool.id == tool_id).first()
     if not db_tool:
@@ -196,14 +223,14 @@ def update_tool(tool_id: int, tool_data: schemas.ToolUpdate, db: Session = Depen
     db.refresh(db_tool)
     return db_tool
 
-@app.post("/marketplace/tools/{tool_id}/deploy")
+@app.post("/marketplace/tools/{tool_id}/deploy", dependencies=[Depends(verify_api_key)])
 async def deploy_tool_endpoint(tool_id: int, deploy_data: schemas.ToolDeploy, db: Session = Depends(get_db)):
     deploy_tool_files(tool_id, deploy_data.files, db)
     # Trigger All Tools MCP Server to reload tools
     await reload_mcp()
     return {"status": "deployed", "mcp_reloaded": True}
 
-@app.post("/admin/mcp-reload")
+@app.post("/admin/mcp-reload", dependencies=[Depends(verify_api_key)])
 async def reload_mcp():
     # Trigger All Tools MCP Server to reload tools
     # We'll call its /reload endpoint
@@ -216,7 +243,7 @@ async def reload_mcp():
             # Fallback if MCP server doesn't have /reload yet or is unreachable
             return {"status": "error", "message": f"Failed to reload MCP server: {str(e)}"}
 
-@app.put("/marketplace/agents/{agent_id}/tools")
+@app.put("/marketplace/agents/{agent_id}/tools", dependencies=[Depends(verify_api_key)])
 def assign_agent_tools(agent_id: int, tool_data: List[int], db: Session = Depends(get_db)):
     # Remove existing links
     db.query(models.AgentToolLink).filter(models.AgentToolLink.agent_id == agent_id).delete()
@@ -229,22 +256,22 @@ def assign_agent_tools(agent_id: int, tool_data: List[int], db: Session = Depend
     db.commit()
     return {"status": "success", "agent_id": agent_id, "tool_count": len(tool_data)}
 
-@app.get("/marketplace/tools")
+@app.get("/marketplace/tools", dependencies=[Depends(verify_api_key)])
 def list_marketplace_tools(db: Session = Depends(get_db)):
     tools = db.query(models.Tool).filter(models.Tool.is_active == True).all()
     return {"tools": tools}
 
-@app.post("/marketplace/credentials")
+@app.post("/marketplace/credentials", dependencies=[Depends(verify_api_key)])
 def create_credential(cred: schemas.CredentialCreate):
     etcd_client.set_etcd_secret(cred.path, cred.value)
     return {"status": "created", "path": cred.path}
 
-@app.get("/marketplace/credentials")
+@app.get("/marketplace/credentials", dependencies=[Depends(verify_api_key)])
 def list_credentials(prefix: str = ""):
     keys = etcd_client.list_etcd_secrets(prefix)
     return {"credentials": keys}
 
-@app.get("/agents/{agent_id}/health")
+@app.get("/agents/{agent_id}/health", dependencies=[Depends(verify_api_key)])
 async def check_agent_health(agent_id: int, db: Session = Depends(get_db)):
     agent = db.query(models.Agent).filter(models.Agent.id == agent_id).first()
     if not agent or not agent.docker_container_name:
@@ -271,7 +298,7 @@ async def check_agent_health(agent_id: int, db: Session = Depends(get_db)):
     
     return {"agent_id": agent_id, "status": status, "last_check": deployment.last_health_check}
 
-@app.get("/agents/health")
+@app.get("/agents/health", dependencies=[Depends(verify_api_key)])
 async def check_all_agents_health(db: Session = Depends(get_db)):
     agents = db.query(models.Agent).filter(models.Agent.status == "active").all()
     results = []
@@ -283,7 +310,7 @@ async def check_all_agents_health(db: Session = Depends(get_db)):
             continue
     return {"agents": results}
 
-@app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
 async def chat_completions(request: Request, db: Session = Depends(get_db)):
     request_data = await request.json()
     model_name = request_data.get("model")
