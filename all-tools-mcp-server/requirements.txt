@@ -1,0 +1,7 @@
+mcp[cli]
+fastapi
+uvicorn
+etcd3gw
+sqlalchemy
+psycopg2-binary
+httpx
