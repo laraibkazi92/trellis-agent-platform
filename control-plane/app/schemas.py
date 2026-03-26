@@ -35,6 +35,7 @@ class AgentCreate(AgentBase):
 
 class Agent(AgentBase):
     id: int
+    agent_token: str
     port_openai: int
     port_mcp: int
     port_a2a: int

@@ -8,6 +8,8 @@ import base64
 import os
 import logging
 from pathlib import Path
+import sys
+import subprocess
 
 from fastapi.security import APIKeyHeader
 
@@ -20,10 +22,15 @@ api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 def verify_api_key(api_key: str = Depends(api_key_header)):
     expected_api_key = os.environ.get("CONTROL_PLANE_API_KEY")
+    dev_mode = os.environ.get("DEV_MODE", "false").lower() == "true"
+    
     if not expected_api_key:
-        # If no key is configured, allow all requests (for backward compatibility/easy dev)
-        # But log a warning in a production-like environment
-        return
+        if dev_mode:
+            logger.warning("Running in DEV_MODE without API Key authentication.")
+            return
+        else:
+            raise HTTPException(status_code=500, detail="Server configuration error: API Key not set")
+            
     if api_key != expected_api_key:
         raise HTTPException(status_code=403, detail="Invalid or missing API Key")
 
@@ -78,6 +85,7 @@ def register_agent(agent_data: schemas.AgentRegister, db: Session = Depends(get_
     
     return {
         "agent_id": agent.id,
+        "agent_token": agent.agent_token,
         "status": "registered",
         "config_url": f"/agents/{agent.id}/config"
     }
@@ -106,6 +114,7 @@ def get_agent_config(agent_id: int, db: Session = Depends(get_db)):
     return {
         "agent": {
             "id": agent.id,
+            "agent_token": agent.agent_token,
             "name": agent.name,
             "model_provider": agent.model_provider,
             "model_name": agent.model_name,
@@ -159,6 +168,37 @@ def create_agent(agent_data: schemas.AgentCreate, db: Session = Depends(get_db))
 
     return db_agent
 
+import ast
+
+def analyze_python_file(content: str, filename: str):
+    """Analyze a python file's AST to block dangerous imports unless overridden"""
+    try:
+        tree = ast.parse(content, filename=filename)
+    except SyntaxError as e:
+        raise ValueError(f"Syntax error in {filename}: {e}")
+        
+    blocked_imports = {'subprocess', 'pty'}
+    
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split('.')[0] in blocked_imports:
+                    raise ValueError(f"Dangerous import '{alias.name}' detected in {filename}")
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and node.module.split('.')[0] in blocked_imports:
+                 raise ValueError(f"Dangerous import '{node.module}' detected in {filename}")
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in {'eval', 'exec', '__import__', 'getattr', 'setattr', 'globals', 'locals', 'compile'}:
+                raise ValueError(f"Dangerous function call '{node.func.id}' in {filename}")
+        elif isinstance(node, ast.Attribute):
+            if node.attr in {'__class__', '__subclasses__', '__bases__', '__mro__', '__builtins__'}:
+                raise ValueError(f"Dangerous attribute access '{node.attr}' in {filename}")
+        elif isinstance(node, ast.Name):
+            if node.id in {'__builtins__', 'builtins'}:
+                raise ValueError(f"Dangerous variable access '{node.id}' in {filename}")
+
+MAX_FILE_SIZE = 10 * 1024 * 1024 # 10MB
+
 def deploy_tool_files(tool_id: int, files: List[schemas.ToolFile], db: Session):
     db_tool = db.query(models.Tool).filter(models.Tool.id == tool_id).first()
     if not db_tool:
@@ -172,21 +212,55 @@ def deploy_tool_files(tool_id: int, files: List[schemas.ToolFile], db: Session):
         base_tool_dir = base_tool_dir[len("tools/"):]
         
     full_tool_path = (Path(tools_dir) / base_tool_dir).resolve()
+    base_tools_dir_path = Path(tools_dir).resolve()
+    
+    if not full_tool_path.is_relative_to(base_tools_dir_path):
+        raise HTTPException(status_code=400, detail="Invalid tool directory path")
+        
     full_tool_path.mkdir(parents=True, exist_ok=True)
     
     for f in files:
         # Prevent path traversal by ensuring the resolved path is within the base tool directory
+        if os.path.isabs(f.path) or ".." in f.path:
+            logger.warning(f"Prevented path traversal attempt (absolute or ..): {f.path}")
+            raise HTTPException(status_code=400, detail="Invalid file path structure")
+            
         requested_path = (full_tool_path / f.path).resolve()
         try:
-            requested_path.relative_to(full_tool_path)
+            if not requested_path.is_relative_to(full_tool_path):
+                raise ValueError("Path traversal attempt")
         except ValueError:
              logger.warning(f"Prevented path traversal attempt: {f.path}")
-             continue
+             raise HTTPException(status_code=400, detail="Invalid file path")
              
+        decoded_content = base64.b64decode(f.content)
+        if len(decoded_content) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=413, detail=f"File {f.path} exceeds max size limit of 10MB")
+            
+        if f.path.endswith('.py'):
+            try:
+                analyze_python_file(decoded_content.decode('utf-8'), f.path)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+                
         requested_path.parent.mkdir(parents=True, exist_ok=True)
         with open(requested_path, "wb") as file:
-            file.write(base64.b64decode(f.content))
+            file.write(decoded_content)
         logger.info(f"Deployed file {f.path} for tool {tool_id}")
+        
+    # Phase 3: Create venv and install requirements if present
+    req_file = full_tool_path / "requirements.txt"
+    if req_file.exists():
+        venv_dir = full_tool_path / "venv"
+        logger.info(f"Creating venv and installing requirements for tool {tool_id} at {full_tool_path}")
+        try:
+            subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
+            pip_exe = str(venv_dir / "bin" / "pip")
+            subprocess.run([pip_exe, "install", "-r", str(req_file)], check=True)
+            logger.info(f"Successfully installed requirements for tool {tool_id}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to install requirements for tool {tool_id}: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to install tool dependencies: {e}")
 
 @app.post("/marketplace/tools", response_model=schemas.Tool, dependencies=[Depends(verify_api_key)])
 def create_tool(tool_data: schemas.ToolRegister, db: Session = Depends(get_db)):
@@ -235,9 +309,10 @@ async def reload_mcp():
     # Trigger All Tools MCP Server to reload tools
     # We'll call its /reload endpoint
     mcp_url = "http://all-tools-mcp-server:8000/reload"
+    headers = {"X-API-Key": os.environ.get("CONTROL_PLANE_API_KEY", "")}
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.post(mcp_url, timeout=10.0)
+            response = await client.post(mcp_url, headers=headers, timeout=10.0)
             return response.json()
         except Exception as e:
             # Fallback if MCP server doesn't have /reload yet or is unreachable
@@ -283,7 +358,7 @@ async def check_agent_health(agent_id: int, db: Session = Depends(get_db)):
         try:
             response = await client.get(health_url, timeout=5.0)
             status = "healthy" if response.status_code == 200 else "unhealthy"
-        except Exception:
+        except httpx.RequestError:
             status = "unhealthy"
 
     # Update or create deployment status
@@ -301,13 +376,17 @@ async def check_agent_health(agent_id: int, db: Session = Depends(get_db)):
 @app.get("/agents/health", dependencies=[Depends(verify_api_key)])
 async def check_all_agents_health(db: Session = Depends(get_db)):
     agents = db.query(models.Agent).filter(models.Agent.status == "active").all()
-    results = []
-    for agent in agents:
+    
+    import asyncio
+    async def fetch_health(agent_id):
         try:
-            health = await check_agent_health(agent.id, db)
-            results.append(health)
+            return await check_agent_health(agent_id, db)
         except HTTPException:
-            continue
+            return None
+
+    health_results = await asyncio.gather(*(fetch_health(agent.id) for agent in agents))
+    results = [r for r in health_results if r is not None]
+
     return {"agents": results}
 
 @app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])

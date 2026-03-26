@@ -1,6 +1,7 @@
 from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, JSON
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from datetime import datetime
+import uuid
 from .database import Base
 
 class Tool(Base):
@@ -26,6 +27,7 @@ class Agent(Base):
     __tablename__ = 'agents'
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    agent_token: Mapped[str] = mapped_column(String(36), default=lambda: str(uuid.uuid4()), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     model_provider: Mapped[str] = mapped_column(String(50), nullable=False)
     model_name: Mapped[str] = mapped_column(String(255), nullable=False)
