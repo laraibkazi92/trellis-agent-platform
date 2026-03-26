@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from typing import List
+from datetime import datetime
 import httpx
 
 from . import models, schemas, database, etcd_client
@@ -18,6 +19,10 @@ def get_db():
     finally:
         db.close()
 
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+
 @app.post("/agents/register")
 def register_agent(agent_data: schemas.AgentRegister, db: Session = Depends(get_db)):
     agent = db.query(models.Agent).filter(models.Agent.name == agent_data.agent_name).first()
@@ -27,6 +32,16 @@ def register_agent(agent_data: schemas.AgentRegister, db: Session = Depends(get_
     # Update agent info based on registration
     agent.status = "active"
     agent.docker_container_name = agent_data.docker_container_name
+    
+    # Create or update deployment status
+    deployment = db.query(models.Deployment).filter(models.Deployment.agent_id == agent.id).first()
+    if not deployment:
+        deployment = models.Deployment(agent_id=agent.id)
+        db.add(deployment)
+    
+    deployment.container_url = agent_data.container_url
+    deployment.docker_status = "running"
+    
     db.commit()
     
     return {
@@ -126,6 +141,45 @@ def create_credential(cred: schemas.CredentialCreate):
 def list_credentials(prefix: str = ""):
     keys = etcd_client.list_etcd_secrets(prefix)
     return {"credentials": keys}
+
+@app.get("/agents/{agent_id}/health")
+async def check_agent_health(agent_id: int, db: Session = Depends(get_db)):
+    agent = db.query(models.Agent).filter(models.Agent.id == agent_id).first()
+    if not agent or not agent.docker_container_name:
+        raise HTTPException(status_code=404, detail="Agent not found or not registered")
+
+    health_url = f"http://{agent.docker_container_name}:{agent.port_openai}/health"
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(health_url, timeout=5.0)
+            status = "healthy" if response.status_code == 200 else "unhealthy"
+        except Exception:
+            status = "unhealthy"
+
+    # Update or create deployment status
+    deployment = db.query(models.Deployment).filter(models.Deployment.agent_id == agent_id).first()
+    if not deployment:
+        deployment = models.Deployment(agent_id=agent_id)
+        db.add(deployment)
+    
+    deployment.health_status = status
+    deployment.last_health_check = datetime.utcnow()
+    db.commit()
+    
+    return {"agent_id": agent_id, "status": status, "last_check": deployment.last_health_check}
+
+@app.get("/agents/health")
+async def check_all_agents_health(db: Session = Depends(get_db)):
+    agents = db.query(models.Agent).filter(models.Agent.status == "active").all()
+    results = []
+    for agent in agents:
+        try:
+            health = await check_agent_health(agent.id, db)
+            results.append(health)
+        except HTTPException:
+            continue
+    return {"agents": results}
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, db: Session = Depends(get_db)):

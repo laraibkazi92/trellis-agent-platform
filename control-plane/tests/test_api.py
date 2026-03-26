@@ -62,3 +62,12 @@ def test_list_agents():
     assert len(data["agents"]) > 0
     names = [a["name"] for a in data["agents"]]
     assert "test-agent-list" in names
+
+def test_health_check():
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json()["status"] == "healthy"
+
+def test_agent_health_404():
+    response = client.get("/agents/999/health")
+    assert response.status_code == 404
