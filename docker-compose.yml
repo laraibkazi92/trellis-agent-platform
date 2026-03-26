@@ -38,6 +38,9 @@ services:
     environment:
       - DATABASE_URL=postgresql://user:password@postgres:5432/agent_registry
       - ETCD_ENDPOINT=http://etcd:2379
+      - TOOLS_DIR=/app/tools
+    volumes:
+      - ./tools:/app/tools
     ports:
       - "8000:8000"
     labels:

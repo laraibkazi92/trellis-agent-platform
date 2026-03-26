@@ -48,6 +48,23 @@ class AgentRegister(BaseModel):
     container_url: str
     docker_container_name: str
 
+class ToolFile(BaseModel):
+    path: str
+    content: str  # base64 encoded
+    size: int
+
+class ToolRegister(ToolCreate):
+    files: List[ToolFile] = []
+
+class ToolDeploy(BaseModel):
+    files: List[ToolFile]
+
+class ToolUpdate(BaseModel):
+    description: Optional[str] = None
+    etcd_secret_key: Optional[str] = None
+    etcd_secret_key_reference: Optional[bool] = None
+    is_active: Optional[bool] = None
+
 class CredentialCreate(BaseModel):
     path: str
     value: dict

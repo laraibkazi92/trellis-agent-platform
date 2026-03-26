@@ -6,8 +6,10 @@ import inspect
 from pathlib import Path
 from typing import Dict, Any, List, Callable
 from mcp.server.fastmcp import FastMCP
+from fastapi import FastAPI, HTTPException
 import etcd3gw
 from sqlalchemy import create_engine, text
+import uvicorn
 
 # Configuration
 TOOLS_DIR = os.environ.get("TOOLS_DIR", "/app/tools")
@@ -36,10 +38,8 @@ def get_etcd_secret(key: str) -> dict:
 
 def load_tool_function(tool_dir: str, module_name: str, function_name: str):
     """Dynamically load a tool function from its directory"""
-    # Normalize paths
     base_path = Path(TOOLS_DIR)
     
-    # Handle relative paths from DB
     rel_path = tool_dir
     if rel_path.startswith("tools/"):
         rel_path = rel_path[len("tools/"):]
@@ -57,26 +57,24 @@ def load_tool_function(tool_dir: str, module_name: str, function_name: str):
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not load spec for {tool_path}")
     module = importlib.util.module_from_spec(spec)
+    # Important: remove from sys.modules to force reload
+    if module_name in sys.modules:
+        del sys.modules[module_name]
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
 
     return getattr(module, function_name)
 
 def create_mcp_wrapper(tool_name: str, description: str, tool_func: Callable, secret_key: str | None):
-    """
-    Creates a wrapper for the tool function that injects credentials
-    and preserves type hints for the other arguments.
-    """
+    """Creates a wrapper for the tool function that injects credentials"""
     sig = inspect.signature(tool_func)
     params = list(sig.parameters.values())
     
-    # Filter out 'credentials' parameter if it exists
     new_params = [p for p in params if p.name != 'credentials']
     new_sig = sig.replace(parameters=new_params)
     
     async def mcp_tool_wrapper(**kwargs) -> str:
         credentials = get_etcd_secret(secret_key) if secret_key else {}
-        # Inject credentials into kwargs if tool expects it
         if 'credentials' in [p.name for p in params]:
             kwargs['credentials'] = credentials
         
@@ -116,11 +114,22 @@ def register_tools():
     except Exception as e:
         print(f"Database connection failed during tool registration: {e}")
 
+# We'll use a standard FastAPI app to host the MCP and the reload endpoint
+app = FastAPI()
+
+@app.post("/reload")
+def reload_server():
+    """Restarts the server to reload all tools and dependencies"""
+    print("Reloading server...")
+    # In a real Docker environment, this will cause the container to restart 
+    # if the entrypoint is 'python server.py' or similar.
+    # Alternatively, we can use os.execv to restart the process.
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+# Mount the MCP server's app
+# FastMCP.app is a FastAPI app
+app.mount("/mcp", mcp.app)
+
 if __name__ == "__main__":
     register_tools()
-    # Run MCP server on port 8000 (standard for our architecture)
-    import uvicorn
-    # FastMCP uses its own internal server, but we can also use mcp.run()
-    # If transport="http", it uses an internal FastAPI app.
-    mcp.run(transport="http")
-
+    uvicorn.run(app, host="0.0.0.0", port=8000)

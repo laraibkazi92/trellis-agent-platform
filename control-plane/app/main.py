@@ -4,6 +4,9 @@ from sqlalchemy.orm import Session
 from typing import List
 from datetime import datetime
 import httpx
+import base64
+import os
+from pathlib import Path
 
 from . import models, schemas, database, etcd_client
 from .database import engine
@@ -136,6 +139,95 @@ def create_agent(agent_data: schemas.AgentCreate, db: Session = Depends(get_db))
     db.commit()
 
     return db_agent
+
+def deploy_tool_files(tool_id: int, files: List[schemas.ToolFile], db: Session):
+    db_tool = db.query(models.Tool).filter(models.Tool.id == tool_id).first()
+    if not db_tool:
+        raise HTTPException(status_code=404, detail="Tool not found")
+        
+    tools_dir = os.environ.get("TOOLS_DIR", "/app/tools")
+    base_tool_dir = db_tool.tool_directory
+    
+    # Strip tools/ prefix if it exists to avoid nested tools/tools/
+    if base_tool_dir.startswith("tools/"):
+        base_tool_dir = base_tool_dir[len("tools/"):]
+        
+    full_tool_path = Path(tools_dir) / base_tool_dir
+    full_tool_path.mkdir(parents=True, exist_ok=True)
+    
+    for f in files:
+        file_path = full_tool_path / f.path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(file_path, "wb") as file:
+            file.write(base64.b64decode(f.content))
+
+@app.post("/marketplace/tools", response_model=schemas.Tool)
+def create_tool(tool_data: schemas.ToolRegister, db: Session = Depends(get_db)):
+    db_tool = models.Tool(
+        name=tool_data.name,
+        description=tool_data.description,
+        tool_directory=tool_data.tool_directory,
+        entry_point_module=tool_data.entry_point_module,
+        entry_point_function=tool_data.entry_point_function,
+        etcd_secret_key=tool_data.etcd_secret_key,
+        etcd_secret_key_reference=tool_data.etcd_secret_key_reference,
+        is_active=True
+    )
+    db.add(db_tool)
+    db.commit()
+    db.refresh(db_tool)
+    
+    # If files are provided during registration, deploy them
+    if tool_data.files:
+        deploy_tool_files(db_tool.id, tool_data.files, db)
+        
+    return db_tool
+
+@app.put("/marketplace/tools/{tool_id}", response_model=schemas.Tool)
+def update_tool(tool_id: int, tool_data: schemas.ToolUpdate, db: Session = Depends(get_db)):
+    db_tool = db.query(models.Tool).filter(models.Tool.id == tool_id).first()
+    if not db_tool:
+        raise HTTPException(status_code=404, detail="Tool not found")
+    
+    for key, value in tool_data.model_dump(exclude_unset=True).items():
+        setattr(db_tool, key, value)
+    
+    db.commit()
+    db.refresh(db_tool)
+    return db_tool
+
+@app.post("/marketplace/tools/{tool_id}/deploy")
+async def deploy_tool_endpoint(tool_id: int, deploy_data: schemas.ToolDeploy, db: Session = Depends(get_db)):
+    deploy_tool_files(tool_id, deploy_data.files, db)
+    # Trigger All Tools MCP Server to reload tools
+    await reload_mcp()
+    return {"status": "deployed", "mcp_reloaded": True}
+
+@app.post("/admin/mcp-reload")
+async def reload_mcp():
+    # Trigger All Tools MCP Server to reload tools
+    # We'll call its /reload endpoint
+    mcp_url = "http://all-tools-mcp-server:8000/reload"
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(mcp_url, timeout=10.0)
+            return response.json()
+        except Exception as e:
+            # Fallback if MCP server doesn't have /reload yet or is unreachable
+            return {"status": "error", "message": f"Failed to reload MCP server: {str(e)}"}
+
+@app.put("/marketplace/agents/{agent_id}/tools")
+def assign_agent_tools(agent_id: int, tool_data: List[int], db: Session = Depends(get_db)):
+    # Remove existing links
+    db.query(models.AgentToolLink).filter(models.AgentToolLink.agent_id == agent_id).delete()
+    
+    # Add new links
+    for tid in tool_data:
+        link = models.AgentToolLink(agent_id=agent_id, tool_id=tid)
+        db.add(link)
+    
+    db.commit()
+    return {"status": "success", "agent_id": agent_id, "tool_count": len(tool_data)}
 
 @app.get("/marketplace/tools")
 def list_marketplace_tools(db: Session = Depends(get_db)):
