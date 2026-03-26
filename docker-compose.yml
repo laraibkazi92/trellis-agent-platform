@@ -1,6 +1,37 @@
 version: '3.8'
 
 services:
+  traefik:
+    image: traefik:v2.10
+    container_name: traefik
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+    ports:
+      - "80:80"
+      - "8081:8080" # Dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+    networks:
+      - agent-network
+
+  web-ui:
+    build: ./web-ui
+    container_name: web-ui
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.web-ui.rule=PathPrefix(`/`)"
+      - "traefik.http.services.web-ui.loadbalancer.server.port=80"
+    environment:
+      - PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - control-plane
+    networks:
+      - agent-network
+
   control-plane:
     build: ./control-plane
     container_name: control-plane
@@ -9,6 +40,12 @@ services:
       - ETCD_ENDPOINT=http://etcd:2379
     ports:
       - "8000:8000"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.control-plane.rule=PathPrefix(`/api`)"
+      - "traefik.http.routers.control-plane.middlewares=control-plane-strip"
+      - "traefik.http.middlewares.control-plane-strip.stripprefix.prefixes=/api"
+      - "traefik.http.services.control-plane.loadbalancer.server.port=8000"
     depends_on:
       postgres:
         condition: service_started
@@ -38,6 +75,7 @@ services:
       - "2380:2380"
     networks:
       - agent-network
+
   all-tools-mcp-server:
     build: ./all-tools-mcp-server
     container_name: all-tools-mcp-server
@@ -60,6 +98,10 @@ services:
       - AGENT_NAME=finance-agent
       - REGISTRY_URL=http://control-plane:8000
       - ETCD_ENDPOINT=http://etcd:2379
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.finance-agent.rule=PathPrefix(`/mcp/finance-agent`)"
+      - "traefik.http.services.finance-agent.loadbalancer.server.port=8001"
     depends_on:
       - control-plane
       - etcd
@@ -68,6 +110,5 @@ services:
       - agent-network
 
 networks:
-
   agent-network:
     driver: bridge
