@@ -2,7 +2,8 @@ mcp[cli]
 fastapi
 uvicorn
 etcd3gw
-sqlalchemy
+sqlalchemy[asyncio]
+asyncpg
 psycopg2-binary
 httpx
 pydantic-settings

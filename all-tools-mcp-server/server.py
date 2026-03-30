@@ -1,6 +1,5 @@
 import os
 import sys
-import importlib.util
 import json
 import inspect
 import logging
@@ -8,12 +7,14 @@ import asyncio
 from pathlib import Path
 from typing import Dict, Any, List, Callable
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request
 from fastapi.security import APIKeyHeader
 import etcd3gw
-from sqlalchemy import create_engine, text
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy import text
 import uvicorn
+import subprocess
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 class Settings(BaseSettings):
     tools_dir: str = "/app/tools"
     etcd_endpoint: str = "http://etcd:2379"
-    database_url: str = "postgresql://user:password@postgres:5432/agent_registry"
+    database_url: str = "postgresql+asyncpg://user:password@postgres:5432/agent_registry"
     
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
@@ -34,7 +35,7 @@ ETCD_ENDPOINT = settings.etcd_endpoint
 DATABASE_URL = settings.database_url
 
 # Initialize database engine globally with connection pooling settings
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=10)
+engine = create_async_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=10)
 
 # Initialize global MCP server reference
 current_mcp = FastMCP("all-tools-mcp-server")
@@ -42,18 +43,19 @@ current_mcp = FastMCP("all-tools-mcp-server")
 import contextvars
 agent_token_var = contextvars.ContextVar("agent_token", default=None)
 
-def check_tool_assignment(token: str | None, tool_name: str) -> bool:
+async def check_tool_assignment(token: str | None, tool_name: str) -> bool:
     if not token:
         return False
     try:
-        with engine.connect() as conn:
-            result = conn.execute(text("""
+        async with engine.connect() as conn:
+            result = await conn.execute(text("""
                 SELECT 1 FROM agent_tool_links atl
                 JOIN agents a ON a.id = atl.agent_id
                 JOIN tools t ON t.id = atl.tool_id
                 WHERE a.agent_token = :token AND t.name = :tool_name
-            """), {"token": token, "tool_name": tool_name}).fetchone()
-            return bool(result)
+            """), {"token": token, "tool_name": tool_name})
+            row = result.fetchone()
+            return bool(row)
     except Exception as e:
         logger.error(f"Error checking tool assignment: {e}")
         return False
@@ -75,63 +77,82 @@ def get_etcd_secret(key: str) -> dict:
         logger.error(f"Error fetching etcd secret {key}: {e}")
         return {}
 
-def load_tool_function(tool_dir: str, module_name: str, function_name: str):
-    """Dynamically load a tool function from its directory"""
+def get_tool_info(tool_dir: str, module_name: str, function_name: str) -> dict:
+    """Get tool signature and docstring out-of-process to avoid direct imports."""
     base_path = Path(TOOLS_DIR)
-    
     rel_path = tool_dir
     if rel_path.startswith("tools/"):
         rel_path = rel_path[len("tools/"):]
     
     full_tool_path = base_path / rel_path
-    tool_path = full_tool_path / f"{module_name}.py"
     
-    if not tool_path.exists():
+    if not full_tool_path.exists():
         # Fallback for local dev/testing
         root_dir = Path(__file__).parent.parent
         full_tool_path = root_dir / tool_dir
-        tool_path = full_tool_path / f"{module_name}.py"
-        if not tool_path.exists():
-            raise FileNotFoundError(f"Tool file not found: {tool_path}")
+        if not full_tool_path.exists():
+            raise FileNotFoundError(f"Tool directory not found: {full_tool_path}")
 
-    # Add venv site-packages to sys.path to allow inspecting signatures
-    venv_site_packages = list(full_tool_path.glob("venv/lib/python*/site-packages"))
-    if venv_site_packages:
-        sys.path.insert(0, str(venv_site_packages[0]))
+    venv_python = full_tool_path / "venv" / "bin" / "python"
+    if not venv_python.exists():
+        venv_python = Path(sys.executable)
+
+    tool_runner_path = Path(__file__).parent / "tool_runner.py"
+
+    process = subprocess.Popen(
+        [str(venv_python), str(tool_runner_path), "info", str(full_tool_path), module_name, function_name],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(full_tool_path)
+    )
+    stdout, stderr = process.communicate()
     
-    sys.path.insert(0, str(full_tool_path))
+    if process.returncode != 0:
+        raise Exception(f"Failed to get tool info: {stderr}")
+        
+    try:
+        info = json.loads(stdout)
+        if "error" in info:
+            raise Exception(info["error"])
+        return info
+    except json.JSONDecodeError:
+        raise Exception(f"Failed to parse tool info output: {stdout}")
 
-    # If module already exists, try to reload it safely to avoid memory leaks
-    if module_name in sys.modules:
-        module = sys.modules[module_name]
-        # Only reload if the module has a __file__ attribute matching our tool path
-        if getattr(module, '__file__', None) == str(tool_path):
-            importlib.reload(module)
-            sys.path.pop(0)
-            if venv_site_packages:
-                sys.path.pop(0)
-            return getattr(module, function_name)
-            
-    spec = importlib.util.spec_from_file_location(module_name, tool_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Could not load spec for {tool_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-
-    sys.path.pop(0)
-    if venv_site_packages:
-        sys.path.pop(0)
-
-    return getattr(module, function_name)
-
-def create_mcp_wrapper(tool_name: str, description: str, tool_func: Callable, secret_key: str | None, tool_dir: str, module_name: str, function_name: str):
+def create_mcp_wrapper(tool_name: str, description: str, secret_key: str | None, tool_dir: str, module_name: str, function_name: str):
     """Creates a wrapper for the tool function that executes it in a subprocess"""
-    sig = inspect.signature(tool_func)
-    params = list(sig.parameters.values())
+    info = get_tool_info(tool_dir, module_name, function_name)
     
-    new_params = [p for p in params if p.name != 'credentials']
-    new_sig = sig.replace(parameters=new_params)
+    # Reconstruct inspect.Signature
+    parameters = []
+    has_credentials_param = False
+    
+    for p in info["params"]:
+        name = p["name"]
+        
+        # We skip adding credentials to the signature, since the MCP client shouldn't supply it
+        if name == "credentials":
+            has_credentials_param = True
+            continue
+            
+        annotation = p["annotation"]
+        if annotation == "Any":
+            annotation = inspect.Parameter.empty
+            
+        default = inspect.Parameter.empty if p["default"] == "__EMPTY__" else p["default"]
+        
+        # Kind mapping (string to enum)
+        kind_str = p["kind"].split(".")[-1]
+        kind = getattr(inspect.Parameter, kind_str, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        
+        parameters.append(inspect.Parameter(
+            name=name,
+            kind=kind,
+            default=default,
+            annotation=annotation
+        ))
+        
+    new_sig = inspect.Signature(parameters)
     
     base_path = Path(TOOLS_DIR)
     rel_path = tool_dir
@@ -144,43 +165,20 @@ def create_mcp_wrapper(tool_name: str, description: str, tool_func: Callable, se
         # Fallback for local testing or tools without requirements
         venv_python = Path(sys.executable)
         
+    tool_runner_path = Path(__file__).parent / "tool_runner.py"
+        
     async def mcp_tool_wrapper(**kwargs) -> str:
+        # Check authorization using ContextVar
         token = agent_token_var.get()
-        if not check_tool_assignment(token, tool_name):
+        if not await check_tool_assignment(token, tool_name):
             raise Exception(f"Unauthorized: Agent does not have permission to execute tool '{tool_name}'")
             
         credentials = get_etcd_secret(secret_key) if secret_key else {}
-        if 'credentials' in [p.name for p in params]:
+        if has_credentials_param:
             kwargs['credentials'] = credentials
             
-        import subprocess
-        
-        # We write a tiny wrapper script to execute the function and handle sync/async
-        script = f"""
-import sys, json, asyncio
-sys.path.insert(0, '{full_tool_path}')
-try:
-    from {module_name} import {function_name}
-except ImportError as e:
-    print(json.dumps({{"error": f"Import error: {{e}}" }}))
-    sys.exit(1)
-
-kwargs = json.loads(sys.stdin.read())
-
-async def run():
-    try:
-        if asyncio.iscoroutinefunction({function_name}):
-            res = await {function_name}(**kwargs)
-        else:
-            res = {function_name}(**kwargs)
-        print(json.dumps({{"result": res}}))
-    except Exception as e:
-        print(json.dumps({{"error": str(e)}}))
-
-asyncio.run(run())
-"""
         process = await asyncio.create_subprocess_exec(
-            str(venv_python), "-c", script,
+            str(venv_python), str(tool_runner_path), "run", str(full_tool_path), module_name, function_name,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -198,33 +196,33 @@ asyncio.run(run())
                 raise Exception(output["error"])
             return str(output.get("result", ""))
         except json.JSONDecodeError:
-            raise Exception(f"Failed to parse tool output: {stdout}")
+            raise Exception(f"Failed to parse tool output: {stdout.decode()}")
     
     mcp_tool_wrapper.__signature__ = new_sig
     mcp_tool_wrapper.__name__ = tool_name
-    mcp_tool_wrapper.__doc__ = description
+    mcp_tool_wrapper.__doc__ = description or info.get("doc", "")
     
     return mcp_tool_wrapper
 
-def register_tools(max_retries: int = 5, retry_delay: int = 5):
+async def register_tools(max_retries: int = 5, retry_delay: int = 5):
     """Query database and load all active tools with retry logic"""
     new_mcp = FastMCP("all-tools-mcp-server")
     
     for attempt in range(max_retries):
         try:
-            with engine.connect() as conn:
-                result = conn.execute(text("""
+            async with engine.connect() as conn:
+                result = await conn.execute(text("""
                     SELECT name, description, tool_directory, entry_point_module,
                            entry_point_function, etcd_secret_key
                     FROM tools
                     WHERE is_active = true
                 """))
                 
-                for row in result:
+                rows = result.fetchall()
+                for row in rows:
                     tool_name, description, tool_dir, module_name, func_name, secret_key = row
                     try:
-                        tool_func = load_tool_function(tool_dir, module_name, func_name)
-                        wrapper = create_mcp_wrapper(tool_name, description, tool_func, secret_key, tool_dir, module_name, func_name)
+                        wrapper = create_mcp_wrapper(tool_name, description, secret_key, tool_dir, module_name, func_name)
                         new_mcp.add_tool(wrapper)
                         logger.info(f"Registered tool: {tool_name}")
                     except Exception as e:
@@ -236,8 +234,7 @@ def register_tools(max_retries: int = 5, retry_delay: int = 5):
         except Exception as e:
             logger.warning(f"Database connection attempt {attempt + 1}/{max_retries} failed: {e}")
             if attempt < max_retries - 1:
-                import time
-                time.sleep(retry_delay)
+                await asyncio.sleep(retry_delay)
             else:
                 logger.error("Final database connection attempt failed. Starting server without tools.")
 
@@ -253,27 +250,30 @@ def verify_api_key(api_key: str = Depends(api_key_header)):
 app = FastAPI()
 
 @app.post("/reload", dependencies=[Depends(verify_api_key)])
-def reload_server():
+async def reload_server():
     """Dynamically reloads tools from database without restarting the process"""
     logger.info("Reloading tools...")
-    register_tools()
+    await register_tools()
     return {"status": "success", "message": "Tools reloaded successfully"}
 
-async def mcp_proxy(scope, receive, send):
-    if scope['type'] == 'http':
-        headers = dict(scope.get('headers', []))
-        token = headers.get(b'x-agent-token', b'').decode()
-        agent_token_var.set(token)
-    elif scope['type'] == 'websocket':
-        headers = dict(scope.get('headers', []))
-        token = headers.get(b'x-agent-token', b'').decode()
-        agent_token_var.set(token)
-        
-    await current_mcp.app(scope, receive, send)
 
-# Mount the MCP server's app proxy
-app.mount("/mcp", mcp_proxy)
+class AgentTokenMiddleware:
+    def __init__(self, app):
+        self.app = app
+        
+    async def __call__(self, scope, receive, send):
+        if scope['type'] in ('http', 'websocket'):
+            headers = dict(scope.get('headers', []))
+            token = headers.get(b'x-agent-token', b'').decode()
+            if token:
+                # Setting ContextVar in middleware ensures it propagates to all downstream async tasks
+                agent_token_var.set(token)
+        await self.app(scope, receive, send)
+
+# Mount the MCP server's app proxy with the contextvar middleware applied
+app.mount("/mcp", AgentTokenMiddleware(current_mcp.app))
 
 if __name__ == "__main__":
-    register_tools()
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(register_tools())
     uvicorn.run(app, host="0.0.0.0", port=8000)

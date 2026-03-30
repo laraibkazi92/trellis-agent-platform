@@ -1,13 +1,13 @@
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Optional
 from datetime import datetime
 
 class ToolBase(BaseModel):
-    name: str
+    name: str = Field(..., pattern=r"^[a-zA-Z0-9_-]+$")
     description: Optional[str] = None
-    tool_directory: str
-    entry_point_module: str
-    entry_point_function: str
+    tool_directory: str = Field(..., pattern=r"^[a-zA-Z0-9_/-]+$")
+    entry_point_module: str = Field(..., pattern=r"^[a-zA-Z0-9_-]+$")
+    entry_point_function: str = Field(..., pattern=r"^[a-zA-Z0-9_-]+$")
     etcd_secret_key: Optional[str] = None
     etcd_secret_key_reference: bool = False
 

@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 from typing import List
 from datetime import datetime
@@ -168,34 +169,6 @@ def create_agent(agent_data: schemas.AgentCreate, db: Session = Depends(get_db))
 
     return db_agent
 
-import ast
-
-def analyze_python_file(content: str, filename: str):
-    """Analyze a python file's AST to block dangerous imports unless overridden"""
-    try:
-        tree = ast.parse(content, filename=filename)
-    except SyntaxError as e:
-        raise ValueError(f"Syntax error in {filename}: {e}")
-        
-    blocked_imports = {'subprocess', 'pty'}
-    
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name.split('.')[0] in blocked_imports:
-                    raise ValueError(f"Dangerous import '{alias.name}' detected in {filename}")
-        elif isinstance(node, ast.ImportFrom):
-            if node.module and node.module.split('.')[0] in blocked_imports:
-                 raise ValueError(f"Dangerous import '{node.module}' detected in {filename}")
-        elif isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name) and node.func.id in {'eval', 'exec', '__import__', 'getattr', 'setattr', 'globals', 'locals', 'compile'}:
-                raise ValueError(f"Dangerous function call '{node.func.id}' in {filename}")
-        elif isinstance(node, ast.Attribute):
-            if node.attr in {'__class__', '__subclasses__', '__bases__', '__mro__', '__builtins__'}:
-                raise ValueError(f"Dangerous attribute access '{node.attr}' in {filename}")
-        elif isinstance(node, ast.Name):
-            if node.id in {'__builtins__', 'builtins'}:
-                raise ValueError(f"Dangerous variable access '{node.id}' in {filename}")
 
 MAX_FILE_SIZE = 10 * 1024 * 1024 # 10MB
 
@@ -237,12 +210,6 @@ def deploy_tool_files(tool_id: int, files: List[schemas.ToolFile], db: Session):
         if len(decoded_content) > MAX_FILE_SIZE:
             raise HTTPException(status_code=413, detail=f"File {f.path} exceeds max size limit of 10MB")
             
-        if f.path.endswith('.py'):
-            try:
-                analyze_python_file(decoded_content.decode('utf-8'), f.path)
-            except ValueError as e:
-                raise HTTPException(status_code=400, detail=str(e))
-                
         requested_path.parent.mkdir(parents=True, exist_ok=True)
         with open(requested_path, "wb") as file:
             file.write(decoded_content)
@@ -263,7 +230,7 @@ def deploy_tool_files(tool_id: int, files: List[schemas.ToolFile], db: Session):
             raise HTTPException(status_code=500, detail=f"Failed to install tool dependencies: {e}")
 
 @app.post("/marketplace/tools", response_model=schemas.Tool, dependencies=[Depends(verify_api_key)])
-def create_tool(tool_data: schemas.ToolRegister, db: Session = Depends(get_db)):
+async def create_tool(tool_data: schemas.ToolRegister, db: Session = Depends(get_db)):
     db_tool = models.Tool(
         name=tool_data.name,
         description=tool_data.description,
@@ -280,7 +247,7 @@ def create_tool(tool_data: schemas.ToolRegister, db: Session = Depends(get_db)):
     
     # If files are provided during registration, deploy them
     if tool_data.files:
-        deploy_tool_files(db_tool.id, tool_data.files, db)
+        await run_in_threadpool(deploy_tool_files, db_tool.id, tool_data.files, db)
         
     return db_tool
 
@@ -299,7 +266,7 @@ def update_tool(tool_id: int, tool_data: schemas.ToolUpdate, db: Session = Depen
 
 @app.post("/marketplace/tools/{tool_id}/deploy", dependencies=[Depends(verify_api_key)])
 async def deploy_tool_endpoint(tool_id: int, deploy_data: schemas.ToolDeploy, db: Session = Depends(get_db)):
-    deploy_tool_files(tool_id, deploy_data.files, db)
+    await run_in_threadpool(deploy_tool_files, tool_id, deploy_data.files, db)
     # Trigger All Tools MCP Server to reload tools
     await reload_mcp()
     return {"status": "deployed", "mcp_reloaded": True}
