@@ -75,3 +75,8 @@ export const createCredential = async (data: any) => {
   const response = await api.post('/marketplace/credentials', data);
   return response.data;
 };
+
+export const assignAgentTools = async (agentId: number, toolIds: number[]) => {
+  const response = await api.put(`/marketplace/agents/${agentId}/tools`, toolIds);
+  return response.data;
+};

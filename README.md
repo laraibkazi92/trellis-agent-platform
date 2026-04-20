@@ -17,7 +17,7 @@ The system consists of several key components:
 ### Prerequisites
 
 - Docker and Docker Compose
-- Python 3.11+
+- Python 3.13+
 - [uv](https://github.com/astral-sh/uv) (for local testing and dependency management)
 
 ### Local Development

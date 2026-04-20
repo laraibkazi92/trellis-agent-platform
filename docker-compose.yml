@@ -1,8 +1,6 @@
-version: '3.8'
-
 services:
   traefik:
-    image: traefik:v2.10
+    build: ./traefik
     container_name: traefik
     command:
       - "--api.insecure=true"
@@ -14,7 +12,6 @@ services:
       - "8081:8080" # Dashboard
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
     networks:
       - agent-network
 
@@ -34,15 +31,16 @@ services:
       - agent-network
 
   control-plane:
-    build: ./control-plane
+    build:
+      context: .
+      dockerfile: ./control-plane/Dockerfile
     container_name: control-plane
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-agent_registry}
       - ETCD_ENDPOINT=http://etcd:2379
       - TOOLS_DIR=/app/tools
       - CONTROL_PLANE_API_KEY=${CONTROL_PLANE_API_KEY:-}
-    volumes:
-      - ./tools:/app/tools
+      - DEV_MODE=true
     ports:
       - "8000:8000"
     labels:
@@ -82,14 +80,14 @@ services:
       - agent-network
 
   all-tools-mcp-server:
-    build: ./all-tools-mcp-server
+    build:
+      context: .
+      dockerfile: ./all-tools-mcp-server/Dockerfile
     container_name: all-tools-mcp-server
     environment:
       - ETCD_ENDPOINT=http://etcd:2379
       - TOOLS_DIR=/app/tools
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-agent_registry}
-    volumes:
-      - ./tools:/app/tools
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-agent_registry}
     depends_on:
       - etcd
       - postgres

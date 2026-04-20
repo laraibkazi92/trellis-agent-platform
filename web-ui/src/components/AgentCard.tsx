@@ -47,7 +47,7 @@ export const AgentCard: React.FC<AgentCardProps> = ({ agent }) => {
 
         <div className="flex gap-2">
           <a
-            href={`/agents/${agent.id}`}
+            href={`/agents/manage?id=${agent.id}`}
             className="flex-1 text-center bg-indigo-50 text-indigo-600 hover:bg-indigo-100 px-4 py-2 rounded-md text-sm font-medium transition-colors flex items-center justify-center gap-1"
           >
             Manage <ExternalLink className="w-3 h-3" />

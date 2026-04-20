@@ -1,9 +1,0 @@
-mcp[cli]
-fastapi
-uvicorn
-etcd3gw
-sqlalchemy[asyncio]
-asyncpg
-psycopg2-binary
-httpx
-pydantic-settings
