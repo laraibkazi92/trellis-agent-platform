@@ -1,14 +1,14 @@
 import os
 import yaml
-import asyncio
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.gemini import GeminiModel
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart, TextPart
+from mcp import ClientSession
+from mcp.client.sse import sse_client
 from core.models import AgentConfig
 
 app = FastAPI(title="Universal Agent Host")
@@ -16,7 +16,7 @@ app = FastAPI(title="Universal Agent Host")
 # Setup directories
 BASE_DIR = Path(__file__).parent.parent
 AGENTS_DIR = BASE_DIR / "agents"
-HUB_PATH = BASE_DIR / "core" / "hub.py"
+HUB_URL = os.getenv("HUB_URL", "http://localhost:8001/sse")
 
 class ChatRequest(BaseModel):
     model: str
@@ -28,6 +28,7 @@ class AgentManager:
         self.configs: Dict[str, AgentConfig] = {}
         self.mcp_session: Optional[ClientSession] = None
         self._mcp_cleanup = None
+        self._mcp_tools_cache = []
 
     async def start(self):
         """Initializes agents and connects to the Tool Hub."""
@@ -57,8 +58,7 @@ class AgentManager:
                         self.configs[config.name] = config
                         
                         # Initialize PydanticAI Agent
-                        # Use GEMINI_API_KEY from env
-                        api_key = os.getenv("GEMINI_API_KEY")
+                        api_key = os.getenv("GEMINI_API_KEY", "")
                         model = GeminiModel(config.model, api_key=api_key)
                         agent = Agent(
                             model,
@@ -72,42 +72,59 @@ class AgentManager:
                         print(f"Error loading agent at {agent_dir}: {e}")
 
     async def connect_to_hub(self):
-        """Connects to the Polyglot Tool Hub via MCP stdio."""
-        print("Connecting to Polyglot Tool Hub...")
-        server_params = StdioServerParameters(
-            command="python",
-            args=[str(HUB_PATH)],
-            env={**os.environ, "PYTHONPATH": str(BASE_DIR)}
-        )
+        """Connects to the Polyglot Tool Hub via MCP SSE and registers tools."""
+        print(f"Connecting to Polyglot Tool Hub at {HUB_URL}...")
+        try:
+            await self._establish_mcp_connection()
+            # Discover and register tools to all agents
+            tools_result = await self.mcp_session.list_tools()
+            self._mcp_tools_cache = tools_result.tools
+            
+            for tool in self._mcp_tools_cache:
+                print(f"Injecting MCP tool '{tool.name}' into all agents")
+                for agent_name, agent in self.agents.items():
+                    self._register_mcp_tool(agent, tool)
+        except Exception as e:
+            print(f"Failed to connect to Tool Hub at startup: {e}")
+            print("Tools will be unavailable until connection is established.")
+
+    async def _establish_mcp_connection(self):
+        """Creates the SSE connection and ClientSession."""
+        if self.mcp_session:
+            try:
+                await self.stop()
+            except Exception:
+                pass
         
-        # We need to keep the connection alive. 
-        # In a real production app, we might use a background task or SSE.
-        # For this refactor, we'll use a simplified approach where the Host
-        # manages the Hub lifecycle for now.
-        
-        self._mcp_cleanup = stdio_client(server_params)
+        self._mcp_cleanup = sse_client(HUB_URL)
         read, write = await self._mcp_cleanup.__aenter__()
         self.mcp_session = ClientSession(read, write)
         await self.mcp_session.__aenter__()
         await self.mcp_session.initialize()
-        
-        # Discover and register tools to all agents
-        tools_result = await self.mcp_session.list_tools()
-        for tool in tools_result.tools:
-            print(f"Injecting MCP tool '{tool.name}' into all agents")
-            for agent_name, agent in self.agents.items():
-                self._register_mcp_tool(agent, tool)
+
+    async def _execute_mcp_tool_with_retry(self, mcp_tool_name: str, arguments: Dict[str, Any]) -> Any:
+        """Executes an MCP tool, retrying the connection if it fails."""
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                if not self.mcp_session:
+                    await self._establish_mcp_connection()
+                result = await self.mcp_session.call_tool(mcp_tool_name, arguments)
+                return result.content
+            except Exception as e:
+                print(f"MCP Tool error on attempt {attempt + 1}: {e}")
+                self.mcp_session = None # Force reconnect
+                if attempt == max_retries - 1:
+                    raise Exception(f"Failed to execute MCP tool '{mcp_tool_name}' after {max_retries} attempts: {e}")
 
     def _register_mcp_tool(self, agent: Agent, mcp_tool: Any):
         """Helper to register an MCP tool to a PydanticAI agent."""
         
         # Define a wrapper that calls the MCP tool
         async def tool_wrapper(ctx: RunContext[None], arguments: Dict[str, Any]) -> Any:
-            result = await self.mcp_session.call_tool(mcp_tool.name, arguments)
-            return result.content
+            return await self._execute_mcp_tool_with_retry(mcp_tool.name, arguments)
 
         # Register with PydanticAI
-        # Note: We use a simplified schema for now as Phase 2 used generic 'arguments'
         agent.tool(name=mcp_tool.name, description=mcp_tool.description)(tool_wrapper)
 
     def inject_a2a_tools(self):
@@ -134,8 +151,10 @@ class AgentManager:
     async def stop(self):
         if self.mcp_session:
             await self.mcp_session.__aexit__(None, None, None)
+            self.mcp_session = None
         if self._mcp_cleanup:
             await self._mcp_cleanup.__aexit__(None, None, None)
+            self._mcp_cleanup = None
 
 manager = AgentManager()
 
@@ -154,12 +173,18 @@ async def chat_completions(request: ChatRequest):
     
     agent = manager.agents[request.model]
     
-    # Simple conversion of messages to a single prompt for now
-    # PydanticAI supports message history, but for simplicity in this V2 phase:
+    # Map OpenAI-style messages to PydanticAI message history
+    history = []
+    for msg in request.messages[:-1]:
+        if msg["role"] == "user":
+            history.append(ModelRequest(parts=[UserPromptPart(content=msg["content"])]))
+        elif msg["role"] == "assistant":
+            history.append(ModelResponse(parts=[TextPart(content=msg["content"])]))
+    
     prompt = request.messages[-1]["content"]
     
     try:
-        result = await agent.run(prompt)
+        result = await agent.run(prompt, message_history=history)
         return {
             "choices": [
                 {

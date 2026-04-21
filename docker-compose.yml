@@ -1,118 +1,52 @@
 services:
-  traefik:
-    build: ./traefik
-    container_name: traefik
-    command:
-      - "--api.insecure=true"
-      - "--providers.docker=true"
-      - "--providers.docker.exposedbydefault=false"
-      - "--entrypoints.web.address=:80"
+  # Universal Agent Host (FastAPI + PydanticAI)
+  # This is the main entry point for the agent fleet.
+  host:
+    build: .
+    image: trellis-agent-platform:v2
+    container_name: agent-host
     ports:
-      - "80:80"
-      - "8081:8080" # Dashboard
+      - "127.0.0.1:8000:8000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - HOST_URL=http://host:8000
+      - HUB_URL=http://hub:8001/sse
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks:
-      - agent-network
-
-  web-ui:
-    build: ./web-ui
-    container_name: web-ui
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.web-ui.rule=PathPrefix(`/`)"
-      - "traefik.http.services.web-ui.loadbalancer.server.port=80"
-    environment:
-      - PUBLIC_API_URL=http://localhost:8000
-      - PUBLIC_API_KEY=${CONTROL_PLANE_API_KEY:-}
+      - ./agents:/app/agents
+      - ./tools:/app/tools
+    command: uvicorn core.host:app --host 0.0.0.0 --port 8000
     depends_on:
-      - control-plane
-    networks:
-      - agent-network
+      - hub
+    restart: unless-stopped
 
-  control-plane:
-    build:
-      context: .
-      dockerfile: ./control-plane/Dockerfile
-    container_name: control-plane
-    environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-agent_registry}
-      - ETCD_ENDPOINT=http://etcd:2379
-      - TOOLS_DIR=/app/tools
-      - CONTROL_PLANE_API_KEY=${CONTROL_PLANE_API_KEY:-}
-      - DEV_MODE=true
+  # Polyglot Tool Hub (Internal MCP Server)
+  # Executes local polyglot tools and exposes them to the Host via SSE
+  hub:
+    build: .
+    image: trellis-agent-platform:v2
+    container_name: tool-hub
     ports:
-      - "8000:8000"
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.control-plane.rule=PathPrefix(`/api`)"
-      - "traefik.http.routers.control-plane.middlewares=control-plane-strip"
-      - "traefik.http.middlewares.control-plane-strip.stripprefix.prefixes=/api"
-      - "traefik.http.services.control-plane.loadbalancer.server.port=8000"
-    depends_on:
-      postgres:
-        condition: service_started
-      etcd:
-        condition: service_started
-    networks:
-      - agent-network
+      - "127.0.0.1:8001:8001"
+    volumes:
+      - ./tools:/app/tools
+    command: python core/hub.py
+    restart: unless-stopped
 
-  postgres:
-    image: postgres:15
-    container_name: postgres
+  # External Gateway MCP Server
+  # Bridges external MCP clients to the internal agent fleet via the Host's HTTP API.
+  gateway:
+    build: .
+    image: trellis-agent-platform:v2
+    container_name: agent-gateway
     environment:
-      - POSTGRES_DB=${POSTGRES_DB:-agent_registry}
-      - POSTGRES_USER=${POSTGRES_USER:-user}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
-    ports:
-      - "5432:5432"
-    networks:
-      - agent-network
-
-  etcd:
-    image: quay.io/coreos/etcd:v3.5.0
-    container_name: etcd
-    command: etcd -advertise-client-urls http://0.0.0.0:2379 -listen-client-urls http://0.0.0.0:2379
-    ports:
-      - "2379:2379"
-      - "2380:2380"
-    networks:
-      - agent-network
-
-  all-tools-mcp-server:
-    build:
-      context: .
-      dockerfile: ./all-tools-mcp-server/Dockerfile
-    container_name: all-tools-mcp-server
-    environment:
-      - ETCD_ENDPOINT=http://etcd:2379
-      - TOOLS_DIR=/app/tools
-      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-user}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-agent_registry}
+      - HOST_URL=http://host:8000
+    volumes:
+      - ./agents:/app/agents
+    command: python core/gateway.py
     depends_on:
-      - etcd
-      - postgres
-    networks:
-      - agent-network
-
-  finance-agent:
-    build: ./agents/finance-agent
-    container_name: finance-agent-1
-    environment:
-      - AGENT_NAME=finance-agent
-      - REGISTRY_URL=http://control-plane:8000
-      - ETCD_ENDPOINT=http://etcd:2379
-      - CONTROL_PLANE_API_KEY=${CONTROL_PLANE_API_KEY:-}
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.finance-agent.rule=PathPrefix(`/mcp/finance-agent`)"
-      - "traefik.http.services.finance-agent.loadbalancer.server.port=8001"
-    depends_on:
-      - control-plane
-      - etcd
-      - all-tools-mcp-server
-    networks:
-      - agent-network
+      - host
+    restart: unless-stopped
 
 networks:
-  agent-network:
-    driver: bridge
+  default:
+    name: trellis-network

@@ -4,3 +4,4 @@ fastapi
 pydantic-ai
 mcp[all]
 uvicorn
+httpx

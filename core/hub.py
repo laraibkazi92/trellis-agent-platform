@@ -1,4 +1,4 @@
-import os
+import sys
 import json
 import yaml
 import subprocess
@@ -28,14 +28,12 @@ def load_tool_configs() -> Dict[str, tuple[ToolConfig, Path]]:
 
 async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Executes a tool as a subprocess and handles JSON stdin/stdout."""
-    import sys
     cmd = []
     if config.runtime == "python":
         cmd = [sys.executable, str(tool_dir / config.entrypoint)]
     elif config.runtime == "go":
-        # Assuming go entrypoint is a source file that needs 'go run'
-        # or it could be a pre-compiled binary. Let's assume 'go run' for now.
-        cmd = ["go", "run", str(tool_dir / config.entrypoint)]
+        bin_path = tool_dir / ".bin" / config.name
+        cmd = [str(bin_path)]
     elif config.runtime == "ts":
         cmd = ["npx", "tsx", str(tool_dir / config.entrypoint)]
     else:
@@ -68,10 +66,21 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
         return {"error": f"Failed to execute tool: {str(e)}"}
 
 def register_tools():
-    """Dynamically registers tools with the FastMCP server."""
+    """Dynamically registers tools with the FastMCP server and pre-compiles Go tools."""
     configs = load_tool_configs()
     
     for name, (config, tool_dir) in configs.items():
+        if config.runtime == "go":
+            print(f"Pre-compiling Go tool: {name}")
+            bin_dir = tool_dir / ".bin"
+            bin_dir.mkdir(exist_ok=True)
+            bin_path = bin_dir / config.name
+            try:
+                subprocess.run(["go", "build", "-o", str(bin_path), config.entrypoint], cwd=str(tool_dir), check=True)
+            except subprocess.CalledProcessError as e:
+                print(f"Failed to compile Go tool {name}: {e}")
+                continue
+
         # Use a closure to capture the current config and tool_dir
         def create_handler(c, d):
             async def handler(arguments: Dict[str, Any] = {}):
@@ -83,4 +92,4 @@ def register_tools():
 
 if __name__ == "__main__":
     register_tools()
-    mcp.run()
+    mcp.run(transport="sse", host="0.0.0.0", port=8001)
