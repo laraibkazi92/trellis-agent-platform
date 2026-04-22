@@ -116,3 +116,49 @@ async def revoke_key(request: Request, api_key: str = Form(...)):
         identity_mgr.delete_key(api_key)
         
     return RedirectResponse(url='/keys', status_code=303)
+
+@app.get("/editor/{agent_name}", response_class=HTMLResponse)
+async def editor_page(request: Request, agent_name: str):
+    user = request.session.get('user')
+    if not user:
+        return RedirectResponse(url='/login')
+        
+    admin_users = os.getenv("ADMIN_USERS", "").split(",")
+    if user.get("email") not in admin_users:
+        return HTMLResponse("Unauthorized", status_code=403)
+        
+    agents_dir = os.path.join(os.path.dirname(__file__), "..", "agents")
+    skills_path = os.path.join(agents_dir, agent_name, "skills.md")
+    
+    skills_content = ""
+    if os.path.exists(skills_path):
+        with open(skills_path, "r") as f:
+            skills_content = f.read()
+            
+    return templates.TemplateResponse("editor.html", {
+        "request": request,
+        "agent_name": agent_name,
+        "skills_content": skills_content
+    })
+
+@app.post("/editor/{agent_name}")
+async def save_skills(request: Request, agent_name: str, skills_content: str = Form(...)):
+    user = request.session.get('user')
+    if not user:
+        return RedirectResponse(url='/login')
+        
+    admin_users = os.getenv("ADMIN_USERS", "").split(",")
+    if user.get("email") not in admin_users:
+        return HTMLResponse("Unauthorized", status_code=403)
+        
+    agents_dir = os.path.join(os.path.dirname(__file__), "..", "agents")
+    agent_dir = os.path.join(agents_dir, agent_name)
+    
+    if not os.path.exists(agent_dir):
+        return HTMLResponse("Agent not found", status_code=404)
+        
+    skills_path = os.path.join(agent_dir, "skills.md")
+    with open(skills_path, "w") as f:
+        f.write(skills_content)
+        
+    return RedirectResponse(url='/catalog', status_code=303)
