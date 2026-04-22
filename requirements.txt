@@ -6,3 +6,6 @@ google-generativeai
 mcp[all]
 uvicorn
 httpx
+etcd3
+authlib
+python3-saml
