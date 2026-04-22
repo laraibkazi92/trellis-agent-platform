@@ -80,3 +80,39 @@ async def catalog(request: Request):
         "tools": tools,
         "is_admin": is_admin
     })
+
+from fastapi import Form
+
+@app.get("/keys", response_class=HTMLResponse)
+async def keys_page(request: Request):
+    user = request.session.get('user')
+    if not user:
+        return RedirectResponse(url='/login')
+    
+    keys = identity_mgr.list_keys(user['sub'])
+    return templates.TemplateResponse("keys.html", {
+        "request": request,
+        "keys": keys
+    })
+
+@app.post("/keys/generate")
+async def generate_key(request: Request, key_name: str = Form(...)):
+    user = request.session.get('user')
+    if not user:
+        return RedirectResponse(url='/login')
+        
+    identity_mgr.create_key(user['sub'], key_name)
+    return RedirectResponse(url='/keys', status_code=303)
+
+@app.post("/keys/revoke")
+async def revoke_key(request: Request, api_key: str = Form(...)):
+    user = request.session.get('user')
+    if not user:
+        return RedirectResponse(url='/login')
+        
+    # Verify the key belongs to the user before deleting
+    key_user_id = identity_mgr.validate_key(api_key)
+    if key_user_id == user['sub']:
+        identity_mgr.delete_key(api_key)
+        
+    return RedirectResponse(url='/keys', status_code=303)
