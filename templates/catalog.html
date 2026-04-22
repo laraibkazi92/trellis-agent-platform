@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Marketplace</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 min-h-screen">
+    <nav class="bg-white shadow-md p-4 flex justify-between items-center">
+        <h1 class="text-xl font-bold text-gray-800">Agent Framework Marketplace</h1>
+        <div class="space-x-4">
+            <span class="text-gray-600">Welcome, {{ user.name }}</span>
+            <a href="/keys" class="text-blue-500 hover:underline">API Keys</a>
+            <a href="/logout" class="text-red-500 hover:underline">Logout</a>
+        </div>
+    </nav>
+
+    <div class="container mx-auto p-6">
+        <h2 class="text-2xl font-bold mb-4">Agents</h2>
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
+            {% for agent in agents %}
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <h3 class="text-xl font-semibold mb-2">{{ agent.name }}</h3>
+                <p class="text-gray-600 mb-4">{{ agent.description }}</p>
+                <div class="mb-4">
+                    <span class="text-sm font-semibold text-gray-500">Capabilities:</span>
+                    <ul class="list-disc list-inside text-sm text-gray-600">
+                        {% for cap in agent.capabilities %}
+                        <li>{{ cap }}</li>
+                        {% endfor %}
+                    </ul>
+                </div>
+                {% if is_admin %}
+                <a href="/editor/{{ agent.name }}" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600 inline-block">Edit Skills</a>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+
+        <h2 class="text-2xl font-bold mb-4">Tools</h2>
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            {% for tool in tools %}
+            <div class="bg-white rounded-lg shadow-md p-6">
+                <h3 class="text-xl font-semibold mb-2">{{ tool.name }}</h3>
+                <p class="text-gray-600 mb-4">{{ tool.description }}</p>
+                <span class="inline-block bg-gray-200 rounded-full px-3 py-1 text-sm font-semibold text-gray-700">
+                    {{ tool.runtime }}
+                </span>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</body>
+</html>

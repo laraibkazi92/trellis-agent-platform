@@ -6,6 +6,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 from authlib.integrations.starlette_client import OAuth
 from core.auth import IdentityManager
+from core.discovery import discover_agents, discover_tools
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -59,3 +60,23 @@ async def auth_callback(request: Request):
 async def logout(request: Request):
     request.session.pop('user', None)
     return RedirectResponse(url='/')
+
+@app.get("/catalog", response_class=HTMLResponse)
+async def catalog(request: Request):
+    user = request.session.get('user')
+    if not user:
+        return RedirectResponse(url='/login')
+        
+    admin_users = os.getenv("ADMIN_USERS", "").split(",")
+    is_admin = user.get("email") in admin_users
+    
+    agents = discover_agents()
+    tools = discover_tools()
+    
+    return templates.TemplateResponse("catalog.html", {
+        "request": request,
+        "user": user,
+        "agents": agents,
+        "tools": tools,
+        "is_admin": is_admin
+    })
