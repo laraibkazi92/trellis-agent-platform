@@ -3,7 +3,9 @@ import httpx
 import yaml
 from pathlib import Path
 from typing import Dict, List
+import uvicorn
 from mcp.server.fastmcp import FastMCP
+from core.auth import AuthMiddleware, IdentityManager
 
 # Initialize FastMCP server with host and port
 mcp = FastMCP("Agent Gateway", host="0.0.0.0", port=8002)
@@ -78,4 +80,10 @@ async def marketplace_router(prompt: str) -> str:
     return await use_agent("supervisor", routing_prompt)
 
 if __name__ == "__main__":
-    mcp.run(transport="sse")
+    app = mcp.sse_app()
+    identity_mgr = IdentityManager(
+        host=os.getenv("ETCD_HOST", "127.0.0.1"),
+        port=int(os.getenv("ETCD_PORT", 2379))
+    )
+    app.add_middleware(AuthMiddleware, identity_mgr=identity_mgr)
+    uvicorn.run(app, host="0.0.0.0", port=8002)

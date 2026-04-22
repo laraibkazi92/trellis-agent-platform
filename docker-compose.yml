@@ -55,6 +55,23 @@ services:
     restart: unless-stopped
 
 
+  ui:
+    build: .
+    image: trellis-agent-platform:v2
+    container_name: agent-ui
+    ports:
+      - "127.0.0.1:8080:8080"
+    env_file:
+      - .env
+    environment:
+      - ETCD_HOST=etcd
+      - ETCD_PORT=2379
+    command: uvicorn core.ui:app --host 0.0.0.0 --port 8080
+    depends_on:
+      - etcd
+    restart: unless-stopped
+
+
 networks:
   default:
     name: trellis-network

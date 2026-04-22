@@ -3,6 +3,8 @@ import yaml
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from fastapi import FastAPI, HTTPException
+from core.auth import AuthMiddleware, IdentityManager
+
 from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.google import GoogleModel
@@ -12,6 +14,13 @@ from mcp.client.sse import sse_client
 from core.models import AgentConfig
 
 app = FastAPI(title="Universal Agent Host")
+
+identity_mgr = IdentityManager(
+    host=os.getenv("ETCD_HOST", "127.0.0.1"),
+    port=int(os.getenv("ETCD_PORT", 2379))
+)
+app.add_middleware(AuthMiddleware, identity_mgr=identity_mgr)
+
 
 # Setup directories
 BASE_DIR = Path(__file__).parent.parent

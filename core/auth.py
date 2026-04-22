@@ -50,3 +50,30 @@ class IdentityManager:
             data = json.loads(value.decode('utf-8'))
             return data.get("user_id")
         return None
+
+from fastapi import Request, HTTPException
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, identity_mgr: IdentityManager):
+        super().__init__(app)
+        self.identity_mgr = identity_mgr
+
+    async def dispatch(self, request: Request, call_next):
+        # We only protect specific routes, typically /v1/chat/completions and /sse
+        if request.url.path in ["/v1/chat/completions", "/sse"]:
+            auth_header = request.headers.get("Authorization")
+            if not auth_header or not auth_header.startswith("Bearer "):
+                return JSONResponse({"error": "Missing or invalid Authorization header"}, status_code=401)
+            
+            token = auth_header.split(" ")[1]
+            user_id = self.identity_mgr.validate_key(token)
+            
+            if not user_id:
+                return JSONResponse({"error": "Invalid API Key"}, status_code=401)
+                
+            # Add user_id to request state
+            request.state.user_id = user_id
+            
+        return await call_next(request)
