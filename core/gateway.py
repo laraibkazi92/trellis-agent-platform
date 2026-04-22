@@ -1,11 +1,13 @@
 import os
 import httpx
 import yaml
+import asyncio
 from pathlib import Path
 from typing import Dict, List
 import uvicorn
+import aiofiles
 from mcp.server.fastmcp import FastMCP
-from core.auth import AuthMiddleware, IdentityManager
+from core.auth import AuthMiddleware, IdentityManager, auth_token_var
 
 # Initialize FastMCP server with host and port
 mcp = FastMCP("Agent Gateway", host="0.0.0.0", port=8002)
@@ -14,14 +16,14 @@ BASE_DIR = Path(__file__).parent.parent
 AGENTS_DIR = BASE_DIR / "agents"
 HOST_URL = os.getenv("HOST_URL", "http://localhost:8000")
 
-def get_agent_description(config: dict, skills_path: Path) -> str:
+async def get_agent_description(config: dict, skills_path: Path) -> str:
     """Extracts description from config.yaml or the first paragraph of the skills.md file."""
     if config.get("description"):
         return config["description"]
         
     try:
-        with open(skills_path, "r") as f:
-            content = f.read()
+        async with aiofiles.open(skills_path, "r") as f:
+            content = await f.read()
             # Split by newlines and find the first non-empty paragraph that isn't a header
             paragraphs = [p.strip() for p in content.split("\n\n") if p.strip() and not p.strip().startswith("#")]
             if paragraphs:
@@ -34,20 +36,28 @@ def get_agent_description(config: dict, skills_path: Path) -> str:
 async def list_agents() -> List[Dict[str, str]]:
     """List all available agents and their descriptions."""
     agents = []
-    if not AGENTS_DIR.exists():
+    if not await asyncio.to_thread(AGENTS_DIR.exists):
         return agents
 
-    for agent_dir in AGENTS_DIR.iterdir():
-        if agent_dir.is_dir():
+    for agent_dir in await asyncio.to_thread(lambda: list(AGENTS_DIR.iterdir())):
+        is_dir = await asyncio.to_thread(agent_dir.is_dir)
+        if is_dir:
             config_path = agent_dir / "config.yaml"
             skills_path = agent_dir / "skills.md"
-            if config_path.exists() and skills_path.exists():
+            
+            config_exists = await asyncio.to_thread(config_path.exists)
+            skills_exists = await asyncio.to_thread(skills_path.exists)
+            
+            if config_exists and skills_exists:
                 try:
-                    with open(config_path, "r") as f:
-                        config = yaml.safe_load(f)
+                    async with aiofiles.open(config_path, "r") as f:
+                        content = await f.read()
+                        config = yaml.safe_load(content)
+                    
+                    description = await get_agent_description(config, skills_path)
                     agents.append({
                         "name": config.get("name", agent_dir.name),
-                        "description": get_agent_description(config, skills_path)
+                        "description": description
                     })
                 except Exception:
                     continue
@@ -56,6 +66,11 @@ async def list_agents() -> List[Dict[str, str]]:
 @mcp.tool()
 async def use_agent(agent_name: str, prompt: str) -> str:
     """Call a specific agent with a prompt."""
+    token = auth_token_var.get()
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{HOST_URL}/v1/chat/completions",
@@ -63,6 +78,7 @@ async def use_agent(agent_name: str, prompt: str) -> str:
                 "model": agent_name,
                 "messages": [{"role": "user", "content": prompt}]
             },
+            headers=headers,
             timeout=60.0
         )
         response.raise_for_status()

@@ -1,5 +1,7 @@
 import os
 import yaml
+import aiofiles
+import asyncio
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from fastapi import FastAPI, HTTPException
@@ -50,22 +52,28 @@ class AgentManager:
     async def load_agents(self):
         """Scans the agents directory and initializes PydanticAI agents."""
         print(f"Loading agents from {AGENTS_DIR}...")
-        if not AGENTS_DIR.exists():
+        if not await asyncio.to_thread(AGENTS_DIR.exists):
             print(f"Agents directory not found at {AGENTS_DIR}")
             return
 
-        for agent_dir in AGENTS_DIR.iterdir():
-            if agent_dir.is_dir():
+        for agent_dir in await asyncio.to_thread(lambda: list(AGENTS_DIR.iterdir())):
+            is_dir = await asyncio.to_thread(agent_dir.is_dir)
+            if is_dir:
                 config_path = agent_dir / "config.yaml"
                 skills_path = agent_dir / "skills.md"
-                if config_path.exists() and skills_path.exists():
+                
+                config_exists = await asyncio.to_thread(config_path.exists)
+                skills_exists = await asyncio.to_thread(skills_path.exists)
+                
+                if config_exists and skills_exists:
                     try:
-                        with open(config_path, 'r') as f:
-                            config_data = yaml.safe_load(f)
+                        async with aiofiles.open(config_path, 'r') as f:
+                            content = await f.read()
+                            config_data = yaml.safe_load(content)
                             config = AgentConfig(**config_data)
                         
-                        with open(skills_path, 'r') as f:
-                            system_prompt = f.read()
+                        async with aiofiles.open(skills_path, 'r') as f:
+                            system_prompt = await f.read()
                         
                         self.configs[config.name] = config
                         
