@@ -8,8 +8,8 @@ from typing import Dict, Any
 from mcp.server.fastmcp import FastMCP
 from core.models import ToolConfig
 
-# Initialize FastMCP server
-mcp = FastMCP("Polyglot Tool Hub")
+# Initialize FastMCP server with host and port
+mcp = FastMCP("Polyglot Tool Hub", host="0.0.0.0", port=8001)
 
 TOOLS_DIR = Path(__file__).parent.parent / "tools"
 
@@ -92,4 +92,4 @@ def register_tools():
 
 if __name__ == "__main__":
     register_tools()
-    mcp.run(transport="sse", host="0.0.0.0", port=8001)
+    mcp.run(transport="sse")

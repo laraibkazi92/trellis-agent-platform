@@ -12,9 +12,7 @@ services:
     environment:
       - HOST_URL=http://host:8000
       - HUB_URL=http://hub:8001/sse
-    volumes:
-      - ./agents:/app/agents
-      - ./tools:/app/tools
+      - GOOGLE_API_KEY=${GEMINI_API_KEY}
     command: uvicorn core.host:app --host 0.0.0.0 --port 8000
     depends_on:
       - hub
@@ -28,8 +26,6 @@ services:
     container_name: tool-hub
     ports:
       - "127.0.0.1:8001:8001"
-    volumes:
-      - ./tools:/app/tools
     command: python core/hub.py
     restart: unless-stopped
 
@@ -39,10 +35,10 @@ services:
     build: .
     image: trellis-agent-platform:v2
     container_name: agent-gateway
+    ports:
+      - "127.0.0.1:8002:8002"
     environment:
       - HOST_URL=http://host:8000
-    volumes:
-      - ./agents:/app/agents
     command: python core/gateway.py
     depends_on:
       - host

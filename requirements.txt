@@ -1,7 +1,8 @@
 pydantic>=2.0.0
 pyyaml
 fastapi
-pydantic-ai
+pydantic-ai[gemini]
+google-generativeai
 mcp[all]
 uvicorn
 httpx

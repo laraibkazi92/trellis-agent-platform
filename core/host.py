@@ -5,7 +5,7 @@ from typing import Dict, List, Any, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.models.gemini import GeminiModel
+from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart, TextPart
 from mcp import ClientSession
 from mcp.client.sse import sse_client
@@ -32,12 +32,15 @@ class AgentManager:
 
     async def start(self):
         """Initializes agents and connects to the Tool Hub."""
+        print("Starting Agent Manager...")
         await self.load_agents()
         await self.connect_to_hub()
         self.inject_a2a_tools()
+        print("Agent Manager started successfully.")
 
     async def load_agents(self):
         """Scans the agents directory and initializes PydanticAI agents."""
+        print(f"Loading agents from {AGENTS_DIR}...")
         if not AGENTS_DIR.exists():
             print(f"Agents directory not found at {AGENTS_DIR}")
             return
@@ -58,8 +61,7 @@ class AgentManager:
                         self.configs[config.name] = config
                         
                         # Initialize PydanticAI Agent
-                        api_key = os.getenv("GEMINI_API_KEY", "")
-                        model = GeminiModel(config.model, api_key=api_key)
+                        model = GoogleModel(config.model)
                         agent = Agent(
                             model,
                             system_prompt=system_prompt,
@@ -67,7 +69,7 @@ class AgentManager:
                             retries=3
                         )
                         self.agents[config.name] = agent
-                        print(f"Loaded agent: {config.name}")
+                        print(f"Successfully loaded agent: {config.name}")
                     except Exception as e:
                         print(f"Error loading agent at {agent_dir}: {e}")
 
@@ -130,6 +132,8 @@ class AgentManager:
     def inject_a2a_tools(self):
         """Injects call_{other_agent} tools based on a2a_access configuration."""
         for name, config in self.configs.items():
+            if name not in self.agents:
+                continue
             agent = self.agents[name]
             for target_agent_name in config.a2a_access:
                 if target_agent_name in self.agents:
@@ -162,9 +166,17 @@ manager = AgentManager()
 async def startup_event():
     await manager.start()
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    await manager.stop()
+@app.on_event("startup")
+async def log_startup():
+    print("FastAPI startup event triggered.")
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "agents": list(manager.agents.keys()),
+        "hub_connected": manager.mcp_session is not None
+    }
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatRequest):

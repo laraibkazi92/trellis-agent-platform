@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Dict, List
 from mcp.server.fastmcp import FastMCP
 
-# Initialize FastMCP server
-mcp = FastMCP("Agent Gateway")
+# Initialize FastMCP server with host and port
+mcp = FastMCP("Agent Gateway", host="0.0.0.0", port=8002)
 
 BASE_DIR = Path(__file__).parent.parent
 AGENTS_DIR = BASE_DIR / "agents"
@@ -78,4 +78,4 @@ async def marketplace_router(prompt: str) -> str:
     return await use_agent("supervisor", routing_prompt)
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="sse")
