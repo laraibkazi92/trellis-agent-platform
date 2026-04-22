@@ -35,13 +35,28 @@ async def get_agent_description(config: dict, skills_path: Path) -> str:
 @mcp.tool()
 async def list_agents() -> List[Dict[str, str]]:
     """List all available agents and their descriptions."""
+    
+    # We will fetch from Host API /health to get active and disabled agents
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{HOST_URL}/health", timeout=5.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                active_names = set(data.get("agents_active", []))
+            else:
+                return [{"name": "Error", "description": f"Host API unreachable (HTTP {resp.status_code})"}]
+    except Exception as e:
+        print(f"Error fetching active agents from host: {e}")
+        return [{"name": "Error", "description": f"Host API unreachable ({str(e)})"}]
+
     agents = []
     if not await asyncio.to_thread(AGENTS_DIR.exists):
         return agents
 
     for agent_dir in await asyncio.to_thread(lambda: list(AGENTS_DIR.iterdir())):
         is_dir = await asyncio.to_thread(agent_dir.is_dir)
-        if is_dir:
+        # Only list agents that are active in the host
+        if is_dir and agent_dir.name in active_names:
             config_path = agent_dir / "config.yaml"
             skills_path = agent_dir / "skills.md"
             

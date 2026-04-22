@@ -2,6 +2,7 @@ import os
 import yaml
 import aiofiles
 import asyncio
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from fastapi import FastAPI, HTTPException
@@ -9,7 +10,7 @@ from core.auth import AuthMiddleware, IdentityManager
 
 from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.models.google import GoogleModel
+from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart, TextPart
 from mcp import ClientSession
 from mcp.client.sse import sse_client
@@ -27,7 +28,16 @@ app.add_middleware(AuthMiddleware, identity_mgr=identity_mgr)
 # Setup directories
 BASE_DIR = Path(__file__).parent.parent
 AGENTS_DIR = BASE_DIR / "agents"
-HUB_URL = os.getenv("HUB_URL", "http://localhost:8001/sse")
+INTERNAL_ASSETS_DIR = BASE_DIR / "core" / "assets"
+DEFAULT_HUB_URL = os.getenv("HUB_URL", "http://localhost:8001/sse")
+
+GEMINI_2_5_PRO_MODELS = {"gemini-2.5-pro"}
+GEMINI_2_5_FLASH_MODELS = {"gemini-2.5-flash"}
+LITE_MODELS = {"gemini-3.1-flash-lite-preview", "gemini-2.5-flash-lite"}
+GEMINI_3_MODELS = {"gemini-3.1-pro-preview", "gemini-3-flash-preview"}
+
+GEMINI_2_5_PRO_BUDGETS = {"low": 1024, "medium": 8192, "high": 16384}
+GEMINI_2_5_FLASH_BUDGETS = {"low": 1024, "medium": 4096, "high": 8192}
 
 class ChatRequest(BaseModel):
     model: str
@@ -40,74 +50,224 @@ class AgentManager:
         self.mcp_session: Optional[ClientSession] = None
         self._mcp_cleanup = None
         self._mcp_tools_cache = []
+        self._lock = asyncio.Lock()
 
     async def start(self):
         """Initializes agents and connects to the Tool Hub."""
         print("Starting Agent Manager...")
+        await self._init_supervisor()
         await self.load_agents()
         await self.connect_to_hub()
-        self.inject_a2a_tools()
+        await self.inject_a2a_tools()
         print("Agent Manager started successfully.")
 
-    async def load_agents(self):
-        """Scans the agents directory and initializes PydanticAI agents."""
-        print(f"Loading agents from {AGENTS_DIR}...")
-        if not await asyncio.to_thread(AGENTS_DIR.exists):
-            print(f"Agents directory not found at {AGENTS_DIR}")
+    async def _init_supervisor(self):
+        """Loads the internal Supervisor agent from etcd."""
+        config_data = await asyncio.to_thread(identity_mgr.get_agent_config, "supervisor")
+        system_prompt = await asyncio.to_thread(identity_mgr.get_agent_skills, "supervisor")
+        
+        if not config_data or not system_prompt:
+            print("Internal supervisor configuration not found in etcd!")
             return
 
-        for agent_dir in await asyncio.to_thread(lambda: list(AGENTS_DIR.iterdir())):
-            is_dir = await asyncio.to_thread(agent_dir.is_dir)
-            if is_dir:
-                config_path = agent_dir / "config.yaml"
-                skills_path = agent_dir / "skills.md"
-                
-                config_exists = await asyncio.to_thread(config_path.exists)
-                skills_exists = await asyncio.to_thread(skills_path.exists)
-                
-                if config_exists and skills_exists:
-                    try:
-                        async with aiofiles.open(config_path, 'r') as f:
-                            content = await f.read()
-                            config_data = yaml.safe_load(content)
-                            config = AgentConfig(**config_data)
-                        
-                        async with aiofiles.open(skills_path, 'r') as f:
-                            system_prompt = await f.read()
-                        
-                        self.configs[config.name] = config
-                        
-                        # Initialize PydanticAI Agent
-                        model = GoogleModel(config.model)
-                        agent = Agent(
-                            model,
-                            system_prompt=system_prompt,
-                            name=config.name,
-                            retries=3
-                        )
-                        self.agents[config.name] = agent
-                        print(f"Successfully loaded agent: {config.name}")
-                    except Exception as e:
-                        print(f"Error loading agent at {agent_dir}: {e}")
+        try:
+            # clear a2a_access as it's injected dynamically
+            config_data['a2a_access'] = []
+            config = AgentConfig(**config_data)
+            
+            self.configs[config.name] = config
+            
+            model = GoogleModel(config.model)
+            model_settings = self._get_model_settings(config.model, config.thinking_level)
+            
+            agent = Agent(
+                model,
+                system_prompt=system_prompt,
+                name=config.name,
+                model_settings=model_settings,
+                retries=3
+            )
+            
+            # Inject administrative tools
+            self._register_admin_tools(agent)
+
+            async with self._lock:
+                self.agents[config.name] = agent
+            print(f"Successfully loaded internal agent: {config.name}")
+        except Exception as e:
+            print(f"Error loading internal supervisor: {e}")
+
+    def _get_model_settings(self, model_name: str, thinking_level: str) -> Optional[GoogleModelSettings]:
+        """Translates UI thinking_level into PydanticAI GoogleModelSettings."""
+        if not thinking_level or thinking_level in ("none", "n/a"):
+            return None
+
+        if model_name in LITE_MODELS:
+            return None
+
+        if model_name in GEMINI_2_5_PRO_MODELS:
+            budget = GEMINI_2_5_PRO_BUDGETS.get(thinking_level.lower(), 8192) # fallback to medium
+            return GoogleModelSettings(
+                google_thinking_config={"thinking_budget": budget, "include_thoughts": False}
+            )
+            
+        elif model_name in GEMINI_2_5_FLASH_MODELS:
+            budget = GEMINI_2_5_FLASH_BUDGETS.get(thinking_level.lower(), 4096) # fallback to medium
+            return GoogleModelSettings(
+                google_thinking_config={"thinking_budget": budget, "include_thoughts": False}
+            )
+            
+        elif model_name in GEMINI_3_MODELS:
+            # Gemini 3.x uses thinking_level parameter directly
+            return GoogleModelSettings(
+                google_thinking_config={"thinking_level": thinking_level.lower(), "include_thoughts": False}
+            )
+
+        return None
+
+    def _register_admin_tools(self, agent: Agent):
+        """Registers framework management tools specifically for the Supervisor."""
+
+        @agent.tool_plain(name="list_agents", description="List all available specialized agents.")
+        def list_agents() -> List[Dict[str, str]]:
+            disabled = identity_mgr.get_disabled_agents()
+            agents_info = []
+            for name, config in self.configs.items():
+                if name == "supervisor": continue
+                status = "disabled" if name in disabled else "active"
+                agents_info.append({"name": name, "description": config.description or "No description", "status": status})
+            return agents_info
+
+        @agent.tool_plain(name="manage_agent", description="Enable, disable or reload an agent.")
+        async def manage_agent(name: str, action: str) -> str:
+            if action == "disable":
+                disabled = identity_mgr.get_disabled_agents()
+                if name not in disabled:
+                    disabled.append(name)
+                    identity_mgr.set_disabled_agents(disabled)
+                    async with self._lock:
+                        if name in self.agents:
+                            del self.agents[name]
+                        # Don't delete from configs to keep knowledge of it
+                return f"Agent {name} disabled."
+            elif action == "enable":
+                disabled = identity_mgr.get_disabled_agents()
+                if name in disabled:
+                    disabled.remove(name)
+                    identity_mgr.set_disabled_agents(disabled)
+                    await self._load_agent_from_registry(name)
+                    await self._reinject_tools_for_agent(name)
+                return f"Agent {name} enabled."
+            elif action == "reload":
+                await self._load_agent_from_registry(name)
+                await self._reinject_tools_for_agent(name)
+                return f"Agent {name} reloaded."
+            return "Invalid action."
+
+        @agent.tool_plain(name="get_framework_status", description="Get MCP Hub connection status and tool count.")
+        def get_framework_status() -> Dict[str, Any]:
+            hub_url = identity_mgr.get_config("HUB_URL", DEFAULT_HUB_URL)
+            return {
+                "hub_url": hub_url,
+                "connected": self.mcp_session is not None,
+                "tool_count": len(self._mcp_tools_cache)
+            }
+
+        @agent.tool_plain(name="update_mcp_config", description="Update the Polyglot Tool Hub URL and reconnect.")
+        async def update_mcp_config(hub_url: str) -> str:
+            parsed = urlparse(hub_url)
+            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                return f"Error: Invalid URL format '{hub_url}'. Must be a valid HTTP/HTTPS URL."
+            
+            identity_mgr.set_config("HUB_URL", hub_url)
+            try:
+                await self.connect_to_hub()
+                return f"Successfully updated and connected to {hub_url}."
+            except Exception as e:
+                return f"Updated config, but connection failed: {e}"
+
+    async def _reinject_tools_for_agent(self, name: str):
+        """Helper to inject MCP tools into a specific agent if active."""
+        async with self._lock:
+            if name in self.agents and self.mcp_session:
+                agent_config = self.configs.get(name)
+                allowed_tools = agent_config.allowed_tools if agent_config else []
+                for tool in self._mcp_tools_cache:
+                    if tool.name in allowed_tools:
+                        self._register_mcp_tool(self.agents[name], tool)
+
+    async def _load_agent_from_registry(self, name: str):
+        """Loads a single agent from etcd."""
+        if name == "supervisor":
+            return # Ignore supervisor in public agents directory
+
+        config_data = await asyncio.to_thread(identity_mgr.get_agent_config, name)
+        system_prompt = await asyncio.to_thread(identity_mgr.get_agent_skills, name)
+        
+        if not config_data or not system_prompt:
+            return
+
+        try:
+            config = AgentConfig(**config_data)
+            
+            model = GoogleModel(config.model)
+            model_settings = self._get_model_settings(config.model, config.thinking_level)
+            
+            agent = Agent(
+                model,
+                system_prompt=system_prompt,
+                name=config.name,
+                model_settings=model_settings,
+                retries=3
+            )
+            async with self._lock:
+                self.configs[config.name] = config
+                self.agents[config.name] = agent
+            print(f"Successfully loaded agent: {config.name}")
+        except Exception as e:
+            print(f"Error loading agent {name}: {e}")
+
+    async def load_agents(self):
+        """Scans the etcd registry and initializes PydanticAI agents."""
+        print(f"Loading agents from etcd...")
+        agent_names = await asyncio.to_thread(identity_mgr.list_agents)
+
+        disabled_agents = identity_mgr.get_disabled_agents()
+
+        for name in agent_names:
+            if name in disabled_agents:
+                print(f"Skipping disabled agent: {name}")
+                continue
+            await self._load_agent_from_registry(name)
 
     async def connect_to_hub(self):
         """Connects to the Polyglot Tool Hub via MCP SSE and registers tools."""
-        print(f"Connecting to Polyglot Tool Hub at {HUB_URL}...")
+        hub_url = identity_mgr.get_config("HUB_URL", DEFAULT_HUB_URL)
+        print(f"Connecting to Polyglot Tool Hub at {hub_url}...")
         try:
-            await self._establish_mcp_connection()
-            # Discover and register tools to all agents
+            await self._establish_mcp_connection(hub_url)
+            # Discover and register tools to specialized agents ONLY
             tools_result = await self.mcp_session.list_tools()
             self._mcp_tools_cache = tools_result.tools
             
-            for tool in self._mcp_tools_cache:
-                print(f"Injecting MCP tool '{tool.name}' into all agents")
-                for agent_name, agent in self.agents.items():
-                    self._register_mcp_tool(agent, tool)
+            async with self._lock:
+                for tool in self._mcp_tools_cache:
+                    print(f"Evaluating MCP tool '{tool.name}' for specialized agents")
+                    # Using a safe copy to iterate
+                    agent_items = list(self.agents.items())
+                    for agent_name, agent in agent_items:
+                        if agent_name == "supervisor":
+                            continue # Supervisor does not get business logic tools
+                        agent_config = self.configs.get(agent_name)
+                        allowed_tools = agent_config.allowed_tools if agent_config else []
+                        if tool.name in allowed_tools:
+                            print(f"Injecting MCP tool '{tool.name}' into agent '{agent_name}'")
+                            self._register_mcp_tool(agent, tool)
         except Exception as e:
             print(f"Failed to connect to Tool Hub at startup: {e}")
             print("Tools will be unavailable until connection is established.")
 
-    async def _establish_mcp_connection(self):
+    async def _establish_mcp_connection(self, hub_url: str):
         """Creates the SSE connection and ClientSession."""
         if self.mcp_session:
             try:
@@ -115,7 +275,7 @@ class AgentManager:
             except Exception:
                 pass
         
-        self._mcp_cleanup = sse_client(HUB_URL)
+        self._mcp_cleanup = sse_client(hub_url)
         read, write = await self._mcp_cleanup.__aenter__()
         self.mcp_session = ClientSession(read, write)
         await self.mcp_session.__aenter__()
@@ -127,7 +287,8 @@ class AgentManager:
         for attempt in range(max_retries):
             try:
                 if not self.mcp_session:
-                    await self._establish_mcp_connection()
+                    hub_url = identity_mgr.get_config("HUB_URL", DEFAULT_HUB_URL)
+                    await self._establish_mcp_connection(hub_url)
                 result = await self.mcp_session.call_tool(mcp_tool_name, arguments)
                 return result.content
             except Exception as e:
@@ -146,16 +307,27 @@ class AgentManager:
         # Register with PydanticAI
         agent.tool(name=mcp_tool.name, description=mcp_tool.description)(tool_wrapper)
 
-    def inject_a2a_tools(self):
-        """Injects call_{other_agent} tools based on a2a_access configuration."""
-        for name, config in self.configs.items():
-            if name not in self.agents:
-                continue
-            agent = self.agents[name]
-            for target_agent_name in config.a2a_access:
-                if target_agent_name in self.agents:
-                    print(f"Injecting A2A tool 'call_{target_agent_name}' into agent '{name}'")
-                    self._register_a2a_tool(agent, target_agent_name)
+    async def inject_a2a_tools(self):
+        """Injects call_{other_agent} tools based on a2a_access configuration and globally for supervisor."""
+        
+        async with self._lock:
+            agent_names = list(self.agents.keys())
+            # Supervisor gets access to ALL agents
+            if "supervisor" in self.agents:
+                supervisor = self.agents["supervisor"]
+                for target_name in agent_names:
+                    if target_name != "supervisor":
+                        self._register_a2a_tool(supervisor, target_name)
+                        
+            # Other agents get a2a according to their config
+            for name, config in self.configs.items():
+                if name not in self.agents or name == "supervisor":
+                    continue
+                agent = self.agents[name]
+                for target_agent_name in config.a2a_access:
+                    if target_agent_name in self.agents:
+                        print(f"Injecting A2A tool 'call_{target_agent_name}' into agent '{name}'")
+                        self._register_a2a_tool(agent, target_agent_name)
 
     def _register_a2a_tool(self, agent: Agent, target_agent_name: str):
         """Helper to register an A2A tool."""
@@ -189,16 +361,19 @@ async def log_startup():
 
 @app.get("/health")
 async def health():
+    disabled = identity_mgr.get_disabled_agents()
     return {
         "status": "healthy",
-        "agents": list(manager.agents.keys()),
-        "hub_connected": manager.mcp_session is not None
+        "agents_active": [name for name in manager.agents.keys() if name != "supervisor"],
+        "agents_disabled": disabled,
+        "hub_connected": manager.mcp_session is not None,
+        "hub_url": identity_mgr.get_config("HUB_URL", DEFAULT_HUB_URL)
     }
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatRequest):
     if request.model not in manager.agents:
-        raise HTTPException(status_code=404, detail=f"Agent '{request.model}' not found")
+        raise HTTPException(status_code=404, detail=f"Agent '{request.model}' not found or disabled")
     
     agent = manager.agents[request.model]
     

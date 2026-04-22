@@ -15,12 +15,15 @@ async def keys_page(request: Request):
     flash_msg = request.session.pop("flash_msg", None)
     generated_key = request.session.pop("generated_key", None)
     
-    return templates.TemplateResponse("keys.html", {
-        "request": request,
-        "keys": keys,
-        "flash_msg": flash_msg,
-        "generated_key": generated_key
-    })
+    return templates.TemplateResponse(
+        request=request,
+        name="keys.html", 
+        context={
+            "keys": keys,
+            "flash_msg": flash_msg,
+            "generated_key": generated_key
+        }
+    )
 
 @router.post("/keys/generate")
 async def generate_key(request: Request, key_name: str = Form(...)):

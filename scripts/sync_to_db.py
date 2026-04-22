@@ -1,0 +1,89 @@
+import os
+import sys
+import yaml
+from pathlib import Path
+
+# Add the parent directory to sys.path to import core
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from core.auth import IdentityManager
+
+BASE_DIR = Path(__file__).parent.parent
+AGENTS_DIR = BASE_DIR / "agents"
+TOOLS_DIR = BASE_DIR / "tools"
+SUPERVISOR_DIR = BASE_DIR / "core" / "assets" / "supervisor"
+
+def main():
+    identity_mgr = IdentityManager(
+        host=os.getenv("ETCD_HOST", "127.0.0.1"),
+        port=int(os.getenv("ETCD_PORT", 2379))
+    )
+    
+    print("Syncing agents to etcd...")
+    if AGENTS_DIR.exists():
+        for agent_dir in AGENTS_DIR.iterdir():
+            if not agent_dir.is_dir() or agent_dir.name == "supervisor":
+                continue
+                
+            config_path = agent_dir / "config.yaml"
+            skills_path = agent_dir / "skills.md"
+            
+            if config_path.exists():
+                with open(config_path, "r") as f:
+                    config = yaml.safe_load(f)
+                    
+                # Ensure the name matches the directory for consistency
+                if not config.get("name"):
+                    config["name"] = agent_dir.name
+                
+                if "allowed_tools" not in config:
+                    config["allowed_tools"] = []
+                    
+                identity_mgr.save_agent_config(agent_dir.name, config)
+                print(f"  Saved config for agent: {agent_dir.name}")
+                
+            if skills_path.exists():
+                with open(skills_path, "r") as f:
+                    skills = f.read()
+                identity_mgr.save_agent_skills(agent_dir.name, skills)
+                print(f"  Saved skills for agent: {agent_dir.name}")
+    
+    # Sync Supervisor separately
+    if SUPERVISOR_DIR.exists():
+        config_path = SUPERVISOR_DIR / "config.yaml"
+        skills_path = SUPERVISOR_DIR / "skills.md"
+        if config_path.exists():
+            with open(config_path, "r") as f:
+                config = yaml.safe_load(f)
+            config["a2a_access"] = []
+            if "allowed_tools" not in config:
+                config["allowed_tools"] = []
+            identity_mgr.save_agent_config("supervisor", config)
+            print("  Saved config for supervisor")
+        if skills_path.exists():
+            with open(skills_path, "r") as f:
+                skills = f.read()
+            identity_mgr.save_agent_skills("supervisor", skills)
+            print("  Saved skills for supervisor")
+
+    print("\nSyncing tools to etcd...")
+    if TOOLS_DIR.exists():
+        for tool_yaml in TOOLS_DIR.glob("**/tool.yaml"):
+            tool_dir = tool_yaml.parent
+            with open(tool_yaml, "r") as f:
+                config = yaml.safe_load(f)
+                
+            if not config.get("name"):
+                config["name"] = tool_dir.name
+                
+            # Add relative path so Hub knows where to execute it
+            rel_path = tool_dir.relative_to(BASE_DIR)
+            config["rel_path"] = str(rel_path)
+            
+            identity_mgr.save_tool_config(config["name"], config)
+            print(f"  Saved config for tool: {config['name']}")
+
+    print("\nSync complete.")
+
+if __name__ == "__main__":
+    main()

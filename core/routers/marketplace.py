@@ -21,11 +21,14 @@ async def catalog(request: Request):
     # Check for flash messages
     flash_msg = request.session.pop("flash_msg", None)
     
-    return templates.TemplateResponse("catalog.html", {
-        "request": request,
-        "user": user,
-        "agents": agents,
-        "tools": tools,
-        "is_admin": is_admin,
-        "flash_msg": flash_msg
-    })
+    return templates.TemplateResponse(
+        request=request,
+        name="catalog.html", 
+        context={
+            "user": user,
+            "agents": agents,
+            "tools": tools,
+            "is_admin": is_admin,
+            "flash_msg": flash_msg
+        }
+    )

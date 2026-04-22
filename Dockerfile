@@ -28,9 +28,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY core/ core/
 COPY agents/ agents/
 COPY tools/ tools/
+COPY templates/ templates/
 
 # Set PYTHONPATH to the root so core imports work
 ENV PYTHONPATH=/app
+ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 
 # Expose ports for Host and potentially Gateway/Hub (if using SSE)
 EXPOSE 8000 8001 8002

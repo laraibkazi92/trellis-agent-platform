@@ -5,13 +5,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SESSION_SECRET = os.getenv("SESSION_SECRET")
+DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
+SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-secret-key" if DEV_MODE else None)
 OIDC_CLIENT_ID = os.getenv("OIDC_CLIENT_ID")
 OIDC_CLIENT_SECRET = os.getenv("OIDC_CLIENT_SECRET")
 OIDC_METADATA_URL = os.getenv("OIDC_METADATA_URL")
 ADMIN_USERS_ENV = os.getenv("ADMIN_USERS")
 
-if not all([SESSION_SECRET, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_METADATA_URL, ADMIN_USERS_ENV]):
+if not DEV_MODE and not all([SESSION_SECRET, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_METADATA_URL, ADMIN_USERS_ENV]):
     raise ValueError("Missing required environment variables for UI (SESSION_SECRET, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_METADATA_URL, ADMIN_USERS).")
 
 from core.routers import auth, marketplace, keys, admin

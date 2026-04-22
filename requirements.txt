@@ -10,3 +10,5 @@ etcd3
 authlib
 python3-saml
 aiofiles
+itsdangerous
+jinja2

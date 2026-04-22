@@ -1,29 +1,38 @@
 import sys
 import json
-import yaml
+import os
 import subprocess
 import asyncio
 from pathlib import Path
 from typing import Dict, Any
 from mcp.server.fastmcp import FastMCP
 from core.models import ToolConfig
+from core.auth import IdentityManager
 
 # Initialize FastMCP server with host and port
 mcp = FastMCP("Polyglot Tool Hub", host="0.0.0.0", port=8001)
 
-TOOLS_DIR = Path(__file__).parent.parent / "tools"
+BASE_DIR = Path(__file__).parent.parent
+
+identity_mgr = IdentityManager(
+    host=os.getenv("ETCD_HOST", "127.0.0.1"),
+    port=int(os.getenv("ETCD_PORT", 2379))
+)
 
 def load_tool_configs() -> Dict[str, tuple[ToolConfig, Path]]:
-    """Scans the tools directory for tool.yaml files."""
+    """Fetches tool configurations from etcd."""
     configs = {}
-    for yaml_path in TOOLS_DIR.glob("**/tool.yaml"):
-        try:
-            with open(yaml_path, 'r') as f:
-                data = yaml.safe_load(f)
+    try:
+        tool_names = identity_mgr.list_tools()
+        for name in tool_names:
+            data = identity_mgr.get_tool_config(name)
+            if data and "rel_path" in data:
+                rel_path = data.pop("rel_path")
                 config = ToolConfig(**data)
-                configs[config.name] = (config, yaml_path.parent)
-        except Exception as e:
-            print(f"Error loading tool config at {yaml_path}: {e}")
+                tool_dir = BASE_DIR / rel_path
+                configs[config.name] = (config, tool_dir)
+    except Exception as e:
+        print(f"Error loading tools from etcd: {e}")
     return configs
 
 async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]) -> Dict[str, Any]:

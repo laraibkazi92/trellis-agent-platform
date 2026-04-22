@@ -1,0 +1,8 @@
+name: supervisor
+version: 0.1.0
+description: Central router agent for the framework.
+model: gemini-3-flash-preview
+thinking_level: medium
+a2a_access:
+  - agent_a
+  - agent_b

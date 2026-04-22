@@ -5,7 +5,7 @@ import time
 import re
 import contextvars
 import asyncio
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from functools import wraps
 
 import etcd3
@@ -109,6 +109,95 @@ class IdentityManager:
             return data.get("user_id")
         return None
 
+    @retry_etcd()
+    def get_config(self, key: str, default: Any = None) -> Any:
+        """Retrieve a framework configuration value."""
+        value, _ = self.client.get(f"/config/framework/{key}")
+        if value:
+            return json.loads(value.decode('utf-8'))
+        return default
+
+    @retry_etcd()
+    def set_config(self, key: str, value: Any) -> None:
+        """Set a framework configuration value."""
+        self.client.put(f"/config/framework/{key}", json.dumps(value))
+
+    @retry_etcd()
+    def get_disabled_agents(self) -> List[str]:
+        """Retrieve the list of disabled agents."""
+        disabled = self.get_config("disabled_agents", [])
+        return disabled
+
+    @retry_etcd()
+    def set_disabled_agents(self, agents: List[str]) -> None:
+        """Set the list of disabled agents."""
+        self.set_config("disabled_agents", agents)
+
+    # --- Registry Methods for Agents and Tools ---
+
+    @retry_etcd()
+    def save_agent_config(self, name: str, config: Dict) -> None:
+        self.client.put(f"/registry/agents/{name}/config", json.dumps(config))
+
+    @retry_etcd()
+    def get_agent_config(self, name: str) -> Optional[Dict]:
+        value, _ = self.client.get(f"/registry/agents/{name}/config")
+        if value:
+            return json.loads(value.decode('utf-8'))
+        return None
+
+    @retry_etcd()
+    def save_agent_skills(self, name: str, skills: str) -> None:
+        self.client.put(f"/registry/agents/{name}/skills", skills)
+
+    @retry_etcd()
+    def get_agent_skills(self, name: str) -> Optional[str]:
+        value, _ = self.client.get(f"/registry/agents/{name}/skills")
+        if value:
+            return value.decode('utf-8')
+        return None
+
+    @retry_etcd()
+    def list_agents(self) -> List[str]:
+        """List all agent names in the registry."""
+        names = set()
+        prefix = "/registry/agents/"
+        for value, metadata in self.client.get_prefix(prefix):
+            key_str = metadata.key.decode('utf-8')
+            if key_str.startswith(prefix):
+                # Extract the name part after the prefix
+                rest = key_str[len(prefix):]
+                name = rest.split('/')[0]
+                if name:
+                    names.add(name)
+        return list(names)
+
+    @retry_etcd()
+    def save_tool_config(self, name: str, config: Dict) -> None:
+        self.client.put(f"/registry/tools/{name}/config", json.dumps(config))
+
+    @retry_etcd()
+    def get_tool_config(self, name: str) -> Optional[Dict]:
+        value, _ = self.client.get(f"/registry/tools/{name}/config")
+        if value:
+            return json.loads(value.decode('utf-8'))
+        return None
+
+    @retry_etcd()
+    def list_tools(self) -> List[str]:
+        """List all tool names in the registry."""
+        names = set()
+        prefix = "/registry/tools/"
+        for value, metadata in self.client.get_prefix(prefix):
+            key_str = metadata.key.decode('utf-8')
+            if key_str.startswith(prefix):
+                # Extract the name part after the prefix
+                rest = key_str[len(prefix):]
+                name = rest.split('/')[0]
+                if name:
+                    names.add(name)
+        return list(names)
+
 class AuthMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, identity_mgr: IdentityManager):
         super().__init__(app)
@@ -118,16 +207,33 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # Normalize the path to prevent bypasses like //v1/chat/completions
         normalized_path = re.sub(r'/+', '/', request.url.path)
         
+        import os
+        DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
+        
         protected_prefixes = ("/v1/chat/completions", "/sse", "/messages", "/mcp")
         if any(normalized_path.startswith(prefix) for prefix in protected_prefixes):
             auth_header = request.headers.get("Authorization")
+            
+            if DEV_MODE and (not auth_header or not auth_header.startswith("Bearer ")):
+                request.state.user_id = "dev-user-id"
+                auth_token_var.set("dev-token")
+                return await call_next(request)
+                
             if not auth_header or not auth_header.startswith("Bearer "):
                 return JSONResponse({"error": "Missing or invalid Authorization header"}, status_code=401)
             
             token = auth_header.split(" ")[1]
-            user_id = await asyncio.to_thread(self.identity_mgr.validate_key, token)
+            try:
+                user_id = await asyncio.to_thread(self.identity_mgr.validate_key, token)
+            except Exception as e:
+                logger.error(f"Error validating key: {e}")
+                user_id = None
             
             if not user_id:
+                if DEV_MODE:
+                    request.state.user_id = "dev-user-id"
+                    auth_token_var.set("dev-token")
+                    return await call_next(request)
                 return JSONResponse({"error": "Invalid API Key"}, status_code=401)
                 
             # Add user_id to request state
