@@ -4,60 +4,230 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Edit {{ type|capitalize }} - {{ name }}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Syne:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet" />
     <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'media',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Syne', 'sans-serif'],
+                        mono: ['"IBM Plex Mono"', 'monospace'],
+                    },
+                    colors: {
+                        accent: { DEFAULT: '#0055FF', dark: '#3377FF' }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { background-color: theme('colors.neutral.50'); color: theme('colors.neutral.900'); }
+        
+        /* Base Form Elements */
+        .form-input {
+            width: 100%;
+            display: block;
+            background-color: transparent;
+            border: 1px solid theme('colors.neutral.300');
+            color: theme('colors.neutral.900');
+            padding: 0.75rem;
+            font-size: 0.875rem;
+            font-family: 'IBM Plex Mono', monospace;
+            border-radius: 0;
+            outline: none;
+            transition: all 0.2s ease;
+        }
+        .form-input:focus {
+            border-color: theme('colors.accent.DEFAULT');
+            box-shadow: 0 0 0 1px theme('colors.accent.DEFAULT');
+        }
+        .form-label {
+            display: block;
+            font-size: 0.75rem;
+            font-weight: 700;
+            color: theme('colors.neutral.500');
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            margin-bottom: 0.5rem;
+            font-family: 'IBM Plex Mono', monospace;
+        }
+
+        /* Select2 Custom Dark/Light Theme Overrides */
+        .select2-container--default .select2-selection--multiple,
+        .select2-container--default .select2-selection--single {
+            background-color: transparent !important;
+            border: 1px solid theme('colors.neutral.300') !important;
+            border-radius: 0 !important;
+            min-height: 46px !important;
+            padding-bottom: 0px !important;
+        }
+        .select2-container--default .select2-selection--single .select2-selection__rendered {
+            color: theme('colors.neutral.900') !important;
+            font-family: 'IBM Plex Mono', monospace;
+            line-height: 44px !important;
+            padding-left: 0.75rem !important;
+        }
+        .select2-container--default .select2-selection--single .select2-selection__arrow {
+            height: 44px !important;
+        }
+        .select2-container--default.select2-container--focus .select2-selection--multiple,
+        .select2-container--default.select2-container--focus .select2-selection--single {
+            border-color: theme('colors.accent.DEFAULT') !important;
+            box-shadow: 0 0 0 1px theme('colors.accent.DEFAULT');
+        }
+        .select2-container--default .select2-selection--multiple .select2-selection__choice {
+            background-color: theme('colors.neutral.100') !important;
+            border: 1px solid theme('colors.neutral.300') !important;
+            border-radius: 0 !important;
+            color: theme('colors.neutral.900') !important;
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.75rem;
+            padding: 4px 8px !important;
+            margin-top: 6px !important;
+            margin-left: 6px !important;
+            text-transform: uppercase;
+        }
+        .select2-container--default .select2-selection--multiple .select2-selection__choice__remove {
+            color: theme('colors.neutral.500') !important;
+            border-right: 1px solid theme('colors.neutral.300') !important;
+            padding-right: 6px !important;
+            margin-right: 6px !important;
+        }
+        .select2-dropdown {
+            border: 1px solid theme('colors.accent.DEFAULT') !important;
+            border-radius: 0 !important;
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.875rem;
+        }
+        
+        @media (prefers-color-scheme: dark) {
+            body { background-color: theme('colors.neutral.950'); color: theme('colors.neutral.50'); }
+            
+            .form-input {
+                border-color: theme('colors.neutral.700');
+                color: theme('colors.neutral.100');
+            }
+            .form-input:focus {
+                border-color: theme('colors.accent.dark');
+                box-shadow: 0 0 0 1px theme('colors.accent.dark');
+            }
+            .form-label {
+                color: theme('colors.neutral.400');
+            }
+
+            .select2-container--default .select2-selection--multiple,
+            .select2-container--default .select2-selection--single {
+                border-color: theme('colors.neutral.700') !important;
+            }
+            .select2-container--default .select2-selection--single .select2-selection__rendered {
+                color: theme('colors.neutral.100') !important;
+            }
+            .select2-container--default.select2-container--focus .select2-selection--multiple,
+            .select2-container--default.select2-container--focus .select2-selection--single {
+                border-color: theme('colors.accent.dark') !important;
+                box-shadow: 0 0 0 1px theme('colors.accent.dark');
+            }
+            .select2-container--default .select2-selection--multiple .select2-selection__choice {
+                background-color: theme('colors.neutral.800') !important;
+                border-color: theme('colors.neutral.600') !important;
+                color: theme('colors.neutral.100') !important;
+            }
+            .select2-container--default .select2-selection--multiple .select2-selection__choice__remove {
+                color: theme('colors.neutral.400') !important;
+                border-right-color: theme('colors.neutral.600') !important;
+            }
+            .select2-container--default .select2-selection--multiple .select2-selection__choice__remove:hover {
+                background-color: theme('colors.red.900') !important;
+                color: theme('colors.red.100') !important;
+            }
+            .select2-dropdown {
+                background-color: theme('colors.neutral.900') !important;
+                border-color: theme('colors.neutral.700') !important;
+            }
+            .select2-container--default .select2-results__option[aria-selected=true] {
+                background-color: theme('colors.neutral.800') !important;
+            }
+            .select2-container--default .select2-results__option--highlighted[aria-selected] {
+                background-color: theme('colors.accent.dark') !important;
+                color: white !important;
+            }
+            .select2-search--dropdown .select2-search__field {
+                background-color: theme('colors.neutral.950') !important;
+                border: 1px solid theme('colors.neutral.700') !important;
+                color: theme('colors.neutral.100') !important;
+                font-family: 'IBM Plex Mono', monospace;
+            }
+        }
+    </style>
 </head>
-<body class="bg-gray-100 min-h-screen">
-    <nav class="bg-white shadow-md p-4 flex justify-between items-center mb-6">
-        <h1 class="text-xl font-bold text-gray-800">Edit {{ type|capitalize }}: {{ name }}</h1>
-        <div class="space-x-4">
-            <a href="/catalog" class="text-blue-500 hover:underline">Back to Catalog</a>
+<body class="min-h-screen antialiased selection:bg-accent selection:text-white dark:selection:bg-accent-dark">
+    <nav class="border-b border-neutral-200 dark:border-neutral-800 p-4 px-6 flex justify-between items-center bg-white dark:bg-neutral-900 mb-8">
+        <div class="flex items-center gap-4">
+            <span class="font-mono text-xs font-bold bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 px-3 py-1 uppercase tracking-widest">{{ type }}</span>
+            <h1 class="text-xl font-bold tracking-tight uppercase">{{ name }} <span class="text-neutral-400 font-normal ml-2">/ CONFIG</span></h1>
+        </div>
+        <div class="space-x-6 text-sm font-bold font-mono">
+            <a href="/catalog" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase tracking-widest">← Back to Catalog</a>
         </div>
     </nav>
 
-    <div class="container mx-auto p-6 max-w-4xl bg-white rounded-lg shadow-md">
+    <div class="container mx-auto p-6 max-w-4xl">
         {% if error %}
-        <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4">
-            {{ error }}
+        <div class="border border-red-500 text-red-700 dark:text-red-400 px-4 py-3 mb-8 font-mono text-sm uppercase tracking-wide bg-red-50/50 dark:bg-red-900/10">
+            > ERROR: {{ error }}
         </div>
         {% endif %}
         
-        <form action="/editor/{{ type }}/{{ name }}" method="POST">
+        <form action="/editor/{{ type }}/{{ name }}" method="POST" class="border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 p-8 shadow-sm">
+            
+            <div class="border-b border-neutral-200 dark:border-neutral-800 pb-4 mb-8">
+                <h2 class="text-2xl font-bold uppercase tracking-wider">Properties</h2>
+            </div>
+
             {% if type == 'agent' %}
-                <div class="mb-4">
-                    <label class="block text-sm font-medium text-gray-700 mb-2">Model</label>
-                    <select name="model" id="modelSelect" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border">
-                        <option value="gemini-3.1-pro-preview" {% if config.model == 'gemini-3.1-pro-preview' %}selected{% endif %}>gemini-3.1-pro-preview</option>
-                        <option value="gemini-3-flash-preview" {% if config.model == 'gemini-3-flash-preview' %}selected{% endif %}>gemini-3-flash-preview (default)</option>
-                        <option value="gemini-3.1-flash-lite-preview" {% if config.model == 'gemini-3.1-flash-lite-preview' %}selected{% endif %}>gemini-3.1-flash-lite-preview</option>
-                        <option value="gemini-2.5-flash" {% if config.model == 'gemini-2.5-flash' %}selected{% endif %}>gemini-2.5-flash</option>
-                        <option value="gemini-2.5-flash-lite" {% if config.model == 'gemini-2.5-flash-lite' %}selected{% endif %}>gemini-2.5-flash-lite</option>
-                        <option value="gemini-2.5-pro" {% if config.model == 'gemini-2.5-pro' %}selected{% endif %}>gemini-2.5-pro</option>
-                    </select>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-8">
+                    <div>
+                        <label class="form-label">Model Engine</label>
+                        <select name="model" id="modelSelect" class="form-input">
+                            <option value="gemini-3.1-pro-preview" {% if config.model == 'gemini-3.1-pro-preview' %}selected{% endif %}>gemini-3.1-pro-preview</option>
+                            <option value="gemini-3-flash-preview" {% if config.model == 'gemini-3-flash-preview' %}selected{% endif %}>gemini-3-flash-preview (default)</option>
+                            <option value="gemini-3.1-flash-lite-preview" {% if config.model == 'gemini-3.1-flash-lite-preview' %}selected{% endif %}>gemini-3.1-flash-lite-preview</option>
+                            <option value="gemini-2.5-flash" {% if config.model == 'gemini-2.5-flash' %}selected{% endif %}>gemini-2.5-flash</option>
+                            <option value="gemini-2.5-flash-lite" {% if config.model == 'gemini-2.5-flash-lite' %}selected{% endif %}>gemini-2.5-flash-lite</option>
+                            <option value="gemini-2.5-pro" {% if config.model == 'gemini-2.5-pro' %}selected{% endif %}>gemini-2.5-pro</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="form-label">Thinking Level</label>
+                        <select name="thinking_level" id="thinkingLevelSelect" class="form-input">
+                            <option value="none" {% if config.thinking_level == 'none' %}selected{% endif %}>None (Disabled)</option>
+                            <option value="low" {% if config.thinking_level == 'low' %}selected{% endif %}>Low</option>
+                            <option value="medium" {% if config.thinking_level == 'medium' %}selected{% endif %}>Medium</option>
+                            <option value="high" {% if config.thinking_level == 'high' %}selected{% endif %}>High</option>
+                            <option value="n/a" {% if config.thinking_level == 'n/a' %}selected{% endif %} hidden>N/A</option>
+                        </select>
+                    </div>
                 </div>
-                <div class="mb-4">
-                    <label class="block text-sm font-medium text-gray-700 mb-2">Thinking Level</label>
-                    <select name="thinking_level" id="thinkingLevelSelect" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border">
-                        <option value="none" {% if config.thinking_level == 'none' %}selected{% endif %}>None (Disabled)</option>
-                        <option value="low" {% if config.thinking_level == 'low' %}selected{% endif %}>Low</option>
-                        <option value="medium" {% if config.thinking_level == 'medium' %}selected{% endif %}>Medium</option>
-                        <option value="high" {% if config.thinking_level == 'high' %}selected{% endif %}>High</option>
-                        <option value="n/a" {% if config.thinking_level == 'n/a' %}selected{% endif %} hidden>N/A</option>
-                    </select>
+
+                <div class="mb-8">
+                    <label class="form-label">Version</label>
+                    <input type="text" name="version" value="{{ config.version }}" class="form-input md:w-1/3">
                 </div>
-                <div class="mb-4">
-                    <label class="block text-sm font-medium text-gray-700 mb-2">Version</label>
-                    <input type="text" name="version" value="{{ config.version }}" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border">
+                <div class="mb-8">
+                    <label class="form-label">Description</label>
+                    <input type="text" name="description" value="{{ config.description }}" class="form-input">
                 </div>
-                <div class="mb-4">
-                    <label class="block text-sm font-medium text-gray-700 mb-2">Description</label>
-                    <input type="text" name="description" value="{{ config.description }}" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border">
-                </div>
-                <div class="mb-4">
-                    <label class="block text-sm font-medium text-gray-700 mb-2">A2A Access</label>
-                    <select name="a2a_access" class="a2a-select mt-1 block w-full rounded-md border-gray-300 shadow-sm" multiple="multiple">
+                
+                <div class="mb-8 border-t border-neutral-200 dark:border-neutral-800 pt-8">
+                    <label class="form-label">A2A Access (Inter-Agent Comms)</label>
+                    <select name="a2a_access" class="a2a-select form-input" multiple="multiple">
                         {% for agent_name in all_agents %}
                             {% if agent_name != name and agent_name != 'supervisor' %}
                             <option value="{{ agent_name }}" {% if agent_name in config.a2a_access %}selected{% endif %}>{{ agent_name }}</option>
@@ -65,59 +235,74 @@
                         {% endfor %}
                     </select>
                 </div>
-                <div class="mb-4">
-                    <label class="block text-sm font-medium text-gray-700 mb-2">Allowed MCP Tools</label>
-                    <input type="text" id="toolSearch" placeholder="Search tools..." class="mb-2 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border">
-                    <div class="mt-1 block w-full rounded-md border-gray-300 shadow-sm border p-4 max-h-60 overflow-y-auto bg-gray-50" id="toolList">
+                
+                <div class="mb-8 pt-8 border-t border-neutral-200 dark:border-neutral-800">
+                    <label class="form-label flex justify-between items-end mb-4">
+                        Allowed MCP Tools
+                        <span class="font-normal text-[10px] bg-neutral-100 dark:bg-neutral-800 px-2 py-1 border border-neutral-200 dark:border-neutral-700 text-neutral-500">FILTER</span>
+                    </label>
+                    <input type="text" id="toolSearch" placeholder="Type to filter tools..." class="form-input mb-4 !border-b-0">
+                    <div class="border border-neutral-300 dark:border-neutral-700 p-4 max-h-64 overflow-y-auto bg-neutral-50 dark:bg-neutral-950/50" id="toolList">
                         {% for tool_name in all_tools %}
-                        <div class="flex items-center mb-2 tool-item">
-                            <input id="tool_{{ tool_name }}" name="allowed_tools" value="{{ tool_name }}" type="checkbox" class="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded" {% if tool_name in config.get('allowed_tools', []) %}checked{% endif %}>
-                            <label for="tool_{{ tool_name }}" class="ml-2 block text-sm text-gray-900 tool-name-label">
+                        <div class="flex items-center mb-3 tool-item p-2 hover:bg-white dark:hover:bg-neutral-800 transition-colors border border-transparent hover:border-neutral-200 dark:hover:border-neutral-700">
+                            <input id="tool_{{ tool_name }}" name="allowed_tools" value="{{ tool_name }}" type="checkbox" class="h-4 w-4 text-accent border-neutral-300 dark:border-neutral-600 bg-white dark:bg-neutral-900 rounded-none focus:ring-accent focus:ring-offset-0 dark:focus:ring-offset-neutral-900" {% if tool_name in config.get('allowed_tools', []) %}checked{% endif %}>
+                            <label for="tool_{{ tool_name }}" class="ml-3 block text-sm font-mono text-neutral-900 dark:text-neutral-100 tool-name-label cursor-pointer w-full">
                                 {{ tool_name }}
                             </label>
                         </div>
                         {% else %}
-                        <div class="text-sm text-gray-500 italic">No tools registered.</div>
+                        <div class="text-sm font-mono text-neutral-500 p-4 text-center border border-dashed border-neutral-300 dark:border-neutral-700">No tools registered in system.</div>
                         {% endfor %}
                     </div>
                 </div>
-                <div class="mb-4">
-                    <label class="block text-sm font-medium text-gray-700 mb-2">Skills (Markdown)</label>
-                    <textarea name="skills_content" rows="15" class="shadow-sm focus:ring-blue-500 focus:border-blue-500 mt-1 block w-full sm:text-sm border border-gray-300 rounded-md p-2 font-mono">{{ skills_content }}</textarea>
+                
+                <div class="mb-8 border-t border-neutral-200 dark:border-neutral-800 pt-8">
+                    <label class="form-label">Skills Payload (Markdown / System Prompt)</label>
+                    <textarea name="skills_content" rows="18" class="form-input leading-relaxed">{{ skills_content }}</textarea>
                 </div>
+
             {% elif type == 'tool' %}
-                <div class="mb-4">
-                    <label class="block text-sm font-medium text-gray-700 mb-2">Runtime</label>
-                    <select name="runtime" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border">
-                        <option value="python" {% if config.runtime == 'python' %}selected{% endif %}>Python</option>
-                        <option value="go" {% if config.runtime == 'go' %}selected{% endif %}>Go</option>
-                        <option value="ts" {% if config.runtime == 'ts' %}selected{% endif %}>TypeScript</option>
-                    </select>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-8">
+                    <div>
+                        <label class="form-label">Runtime Engine</label>
+                        <select name="runtime" class="form-input">
+                            <option value="python" {% if config.runtime == 'python' %}selected{% endif %}>Python 3</option>
+                            <option value="go" {% if config.runtime == 'go' %}selected{% endif %}>Go</option>
+                            <option value="ts" {% if config.runtime == 'ts' %}selected{% endif %}>TypeScript / Node</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="form-label">Version</label>
+                        <input type="text" name="version" value="{{ config.version }}" class="form-input">
+                    </div>
                 </div>
-                <div class="mb-4">
-                    <label class="block text-sm font-medium text-gray-700 mb-2">Version</label>
-                    <input type="text" name="version" value="{{ config.version }}" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border">
+                
+                <div class="mb-8">
+                    <label class="form-label">Description</label>
+                    <input type="text" name="description" value="{{ config.description }}" class="form-input">
                 </div>
-                <div class="mb-4">
-                    <label class="block text-sm font-medium text-gray-700 mb-2">Description</label>
-                    <input type="text" name="description" value="{{ config.description }}" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border">
-                </div>
-                <div class="mb-4">
-                    <label class="block text-sm font-medium text-gray-700 mb-2">Entrypoint</label>
-                    <input type="text" name="entrypoint" value="{{ config.entrypoint }}" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2 border">
+                <div class="mb-8">
+                    <label class="form-label">Entrypoint Executable</label>
+                    <input type="text" name="entrypoint" value="{{ config.entrypoint }}" class="form-input font-mono text-accent dark:text-accent-dark">
                 </div>
                 <input type="hidden" name="rel_path" value="{{ config.rel_path }}">
             {% endif %}
-            <div class="flex justify-end">
-                <button type="submit" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600">Save Changes & Commit</button>
+            
+            <div class="flex justify-end pt-6 border-t border-neutral-200 dark:border-neutral-800 mt-8">
+                <button type="submit" class="border border-neutral-900 dark:border-neutral-100 bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 px-8 py-3 font-bold text-sm hover:bg-neutral-800 dark:hover:bg-neutral-200 transition-colors uppercase tracking-widest font-mono">
+                    Commit Changes
+                </button>
             </div>
         </form>
     </div>
+
     <script>
         $(document).ready(function() {
             $('.a2a-select').select2({
-                placeholder: "Select agents for A2A access"
+                placeholder: "SELECT AGENTS...",
+                width: '100%'
             });
+
             $('#toolSearch').on('input', function() {
                 var searchTerm = $(this).val().toLowerCase();
                 $('.tool-item').each(function() {

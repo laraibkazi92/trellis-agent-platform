@@ -4,58 +4,89 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Marketplace</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Syne:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'media',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Syne', 'sans-serif'],
+                        mono: ['"IBM Plex Mono"', 'monospace'],
+                    },
+                    colors: {
+                        accent: { DEFAULT: '#0055FF', dark: '#3377FF' }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { background-color: theme('colors.neutral.50'); color: theme('colors.neutral.900'); }
+        @media (prefers-color-scheme: dark) {
+            body { background-color: theme('colors.neutral.950'); color: theme('colors.neutral.50'); }
+        }
+    </style>
 </head>
-<body class="bg-gray-100 min-h-screen">
-    <nav class="bg-white shadow-md p-4 flex justify-between items-center">
-        <h1 class="text-xl font-bold text-gray-800">Agent Framework Marketplace</h1>
-        <div class="space-x-4">
-            <span class="text-gray-600">Welcome, {{ user.name }}</span>
-            <a href="/keys" class="text-blue-500 hover:underline">API Keys</a>
-            <a href="/logout" class="text-red-500 hover:underline">Logout</a>
+<body class="min-h-screen antialiased selection:bg-accent selection:text-white dark:selection:bg-accent-dark">
+    <nav class="border-b border-neutral-200 dark:border-neutral-800 p-4 px-6 flex justify-between items-center bg-white dark:bg-neutral-900">
+        <h1 class="text-xl font-bold tracking-tight uppercase">Agent Framework Marketplace</h1>
+        <div class="space-x-6 text-sm font-bold font-mono tracking-wide">
+            <span class="text-neutral-500 dark:text-neutral-400">USER:{{ user.name }}</span>
+            <a href="/keys" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase">API Keys</a>
+            <a href="/logout" class="text-red-600 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300 transition-colors uppercase">Logout</a>
         </div>
     </nav>
 
-    <div class="container mx-auto p-6">
+    <div class="container mx-auto p-6 max-w-7xl mt-8">
         {% if flash_msg %}
-        <div class="bg-blue-100 border border-blue-400 text-blue-700 px-4 py-3 rounded relative mb-4" role="alert">
-            <span class="block sm:inline">{{ flash_msg }}</span>
+        <div class="border border-accent text-accent dark:border-accent-dark dark:text-accent-dark px-4 py-3 mb-8 font-mono text-sm uppercase tracking-wide bg-accent/5 dark:bg-accent-dark/10">
+            > {{ flash_msg }}
         </div>
         {% endif %}
 
-        <h2 class="text-2xl font-bold mb-4">Agents</h2>
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
+        <div class="flex items-center justify-between mb-6">
+            <h2 class="text-2xl font-bold uppercase tracking-wider">Agents</h2>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6 mb-12">
             {% for agent in agents %}
-            <div class="bg-white rounded-lg shadow-md p-6">
-                <h3 class="text-xl font-semibold mb-2">{{ agent.name }}</h3>
-                <p class="text-gray-600 mb-4">{{ agent.description }}</p>
-                <div class="mb-4">
-                    <span class="text-sm font-semibold text-gray-500">Capabilities:</span>
-                    <ul class="list-disc list-inside text-sm text-gray-600">
+            <div class="border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 p-6 hover:border-accent dark:hover:border-accent-dark transition-colors flex flex-col">
+                <h3 class="text-xl font-bold mb-3">{{ agent.name }}</h3>
+                <p class="text-neutral-600 dark:text-neutral-400 mb-6 flex-grow text-sm leading-relaxed font-mono">{{ agent.description }}</p>
+                <div class="mb-6 pt-4 border-t border-neutral-100 dark:border-neutral-800">
+                    <span class="text-xs font-bold text-neutral-400 dark:text-neutral-500 uppercase tracking-wider block mb-3 font-mono">Capabilities</span>
+                    <ul class="flex flex-wrap gap-2">
                         {% for cap in agent.capabilities %}
-                        <li>{{ cap }}</li>
+                        <li class="font-mono text-xs border border-neutral-200 dark:border-neutral-700 px-2 py-1 bg-neutral-50 dark:bg-neutral-950 text-neutral-600 dark:text-neutral-300">{{ cap }}</li>
                         {% endfor %}
                     </ul>
                 </div>
                 {% if is_admin %}
-                <a href="/editor/agent/{{ agent.name }}" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600 inline-block">Edit Agent</a>
+                <a href="/editor/agent/{{ agent.name }}" class="border border-neutral-900 dark:border-neutral-100 text-neutral-900 dark:text-neutral-100 hover:bg-neutral-900 hover:text-white dark:hover:bg-neutral-100 dark:hover:text-neutral-900 text-sm font-bold uppercase tracking-wider px-4 py-2 text-center transition-colors font-mono">Edit Agent</a>
                 {% endif %}
             </div>
             {% endfor %}
         </div>
 
-        <h2 class="text-2xl font-bold mb-4">Tools</h2>
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+        <div class="flex items-center justify-between mb-6 pt-8 border-t border-neutral-200 dark:border-neutral-800">
+            <h2 class="text-2xl font-bold uppercase tracking-wider">Tools</h2>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6 mb-12">
             {% for tool in tools %}
-            <div class="bg-white rounded-lg shadow-md p-6">
-                <h3 class="text-xl font-semibold mb-2">{{ tool.name }}</h3>
-                <p class="text-gray-600 mb-4">{{ tool.description }}</p>
-                <span class="inline-block bg-gray-200 rounded-full px-3 py-1 text-sm font-semibold text-gray-700 mb-4">
-                    {{ tool.runtime }}
-                </span>
+            <div class="border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 p-6 hover:border-accent dark:hover:border-accent-dark transition-colors flex flex-col">
+                <div class="flex justify-between items-start mb-3">
+                    <h3 class="text-xl font-bold">{{ tool.name }}</h3>
+                    <span class="font-mono text-xs font-bold border border-accent text-accent dark:border-accent-dark dark:text-accent-dark px-2 py-1 uppercase tracking-wider">
+                        {{ tool.runtime }}
+                    </span>
+                </div>
+                <p class="text-neutral-600 dark:text-neutral-400 mb-6 flex-grow text-sm leading-relaxed font-mono">{{ tool.description }}</p>
                 {% if is_admin %}
-                <div>
-                    <a href="/editor/tool/{{ tool.name }}" class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600 inline-block">Edit Tool</a>
+                <div class="pt-4 border-t border-neutral-100 dark:border-neutral-800">
+                    <a href="/editor/tool/{{ tool.name }}" class="border border-neutral-900 dark:border-neutral-100 text-neutral-900 dark:text-neutral-100 hover:bg-neutral-900 hover:text-white dark:hover:bg-neutral-100 dark:hover:text-neutral-900 text-sm font-bold uppercase tracking-wider px-4 py-2 block text-center transition-colors font-mono">Edit Tool</a>
                 </div>
                 {% endif %}
             </div>
