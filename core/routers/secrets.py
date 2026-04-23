@@ -35,6 +35,7 @@ async def secrets_page(request: Request):
         request=request,
         name="secrets.html",
         context={
+            "user": user,
             "required_secrets": required_secrets,
             "current_secrets": current_secrets,
             "flash_msg": flash_msg

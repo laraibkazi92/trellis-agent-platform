@@ -91,6 +91,7 @@ async def editor_page(request: Request, type: str, name: str):
             request=request,
             name="editor.html", 
             context={
+                "user": user,
                 "type": type,
                 "name": safe_name,
                 "config": config,
@@ -109,6 +110,7 @@ async def editor_page(request: Request, type: str, name: str):
             request=request,
             name="editor.html", 
             context={
+                "user": user,
                 "type": type,
                 "name": safe_name,
                 "config": config

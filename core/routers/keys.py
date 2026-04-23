@@ -19,6 +19,7 @@ async def keys_page(request: Request):
         request=request,
         name="keys.html", 
         context={
+            "user": user,
             "keys": keys,
             "flash_msg": flash_msg,
             "generated_key": generated_key
