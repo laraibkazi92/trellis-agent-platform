@@ -23,6 +23,9 @@ async def read_doc(request: Request, doc_type: str):
     elif doc_type == "tools":
         file_path = BASE_DIR / "DOCS_TOOLS.md"
         title = "Tool Developer Guide"
+    elif doc_type == "builder":
+        file_path = BASE_DIR / "DOCS_AGENT_BUILDER.md"
+        title = "Agent Builder Guide"
     else:
         return HTMLResponse(content="Documentation not found", status_code=404)
 
