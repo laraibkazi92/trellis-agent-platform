@@ -85,9 +85,12 @@
                 <div class="relative group">
                     <pre class="bg-neutral-100 dark:bg-neutral-950 p-4 text-xs overflow-x-auto border border-neutral-200 dark:border-neutral-800 text-neutral-800 dark:text-neutral-300"><code>{
   "mcpServers": {
-    "trellis-agent-platform": {
-      "command": "curl",
-      "args": ["-s", "{{ public_mcp_url }}"]
+    "trellis": {
+      "type": "http",
+      "url": "{{ public_mcp_url }}",
+      "headers": {
+        "Authorization": "Bearer YOUR_API_KEY"
+      }
     }
   }
 }</code></pre>
