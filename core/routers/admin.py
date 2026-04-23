@@ -9,6 +9,7 @@ from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import templates
 from core.auth import IdentityManager
+from core.health import HealthMonitor
 
 router = APIRouter()
 
@@ -16,6 +17,7 @@ identity_mgr = IdentityManager(
     host=os.getenv("ETCD_HOST", "127.0.0.1"),
     port=int(os.getenv("ETCD_PORT", 2379))
 )
+health_monitor = HealthMonitor(identity_mgr)
 
 GITHUB_REPO = os.getenv("GITHUB_REPO", "") # e.g. user/repo
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
@@ -112,21 +114,27 @@ async def editor_page(request: Request, type: str, name: str):
         config = await asyncio.to_thread(identity_mgr.get_tool_config, safe_name)
         if not config:
             request.session["flash_msg"] = "Tool not found."
-            return RedirectResponse(url='/tools', status_code=303)
-            
-        return templates.TemplateResponse(
-            request=request,
-            name="editor.html", 
-            context={
-                "user": user,
-                "type": type,
-                "name": safe_name,
-                "config": config
-            }
-        )
-    else:
-        request.session["flash_msg"] = "Invalid editor type."
+    return RedirectResponse(url='/tools', status_code=303)
+
+@router.post("/reset-health/{entity_type}/{name}")
+async def reset_health(request: Request, entity_type: str, name: str):
+    if entity_type not in ["agent", "tool"]:
+        request.session["flash_msg"] = "Invalid entity type."
         return RedirectResponse(url='/', status_code=303)
+        
+    fallback_url = f'/{entity_type}s'
+    if redirect := require_admin(request, fallback_url):
+        return redirect
+        
+    safe_name = sanitize_name(name)
+    if not safe_name:
+        request.session["flash_msg"] = "Invalid name parameter."
+        return RedirectResponse(url=fallback_url, status_code=303)
+        
+    await asyncio.to_thread(health_monitor.reset_status, entity_type, safe_name)
+    
+    request.session["flash_msg"] = f"Health status for {entity_type} '{safe_name}' has been reset."
+    return RedirectResponse(url=fallback_url, status_code=303)
 
 @router.post("/editor/agent/{name}")
 async def save_agent(request: Request, name: str):

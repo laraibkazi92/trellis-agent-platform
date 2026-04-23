@@ -22,6 +22,8 @@ async def discover_agents() -> List[Dict]:
         if config:
             skills_content = await asyncio.to_thread(identity_mgr.get_agent_skills, name) or ""
             
+            health = await asyncio.to_thread(identity_mgr.get_health_status, "agent", name)
+            
             agents.append({
                 "name": config.get("name", name),
                 "author": config.get("author", "Unknown"),
@@ -33,6 +35,7 @@ async def discover_agents() -> List[Dict]:
                 "model": config.get("model", "gemini-3-flash-preview"),
                 "thinking_level": config.get("thinking_level", "medium"),
                 "version": config.get("version", "0.1.0"),
+                "health": health or {"status": "Online"}
             })
     return agents
 
@@ -44,6 +47,7 @@ async def discover_tools() -> List[Dict]:
     for name in tool_names:
         config = await asyncio.to_thread(identity_mgr.get_tool_config, name)
         if config:
+            health = await asyncio.to_thread(identity_mgr.get_health_status, "tool", name)
             tools.append({
                 "name": config.get("name", name),
                 "description": config.get("description", ""),
@@ -53,5 +57,6 @@ async def discover_tools() -> List[Dict]:
                 "inputs": config.get("inputs", {}),
                 "outputs": config.get("outputs", {}),
                 "version": config.get("version", "0.1.0"),
+                "health": health or {"status": "Online"}
             })
     return tools

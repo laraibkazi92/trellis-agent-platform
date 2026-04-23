@@ -221,29 +221,9 @@ class IdentityManager:
         return None
 
     @retry_etcd()
-    def record_health_event(self, entity_type: str, name: str, is_success: bool, error_details: Optional[str] = None) -> Dict:
-        """Record a health event and return the updated status."""
-        # Simple circuit breaker logic can also be placed in HealthMonitor, 
-        # but storing/updating here is straightforward.
-        # We will fetch current, update consecutive failures, and save.
-        current_status = self.get_health_status(entity_type, name) or {
-            "status": "Online",
-            "consecutive_failures": 0,
-            "last_error": None
-        }
-        
-        if is_success:
-            current_status["status"] = "Online"
-            current_status["consecutive_failures"] = 0
-            current_status["last_error"] = None
-        else:
-            current_status["consecutive_failures"] = current_status.get("consecutive_failures", 0) + 1
-            current_status["last_error"] = error_details
-            if current_status["consecutive_failures"] >= 5:
-                current_status["status"] = "Offline"
-                
-        self.client.put(f"/health/{entity_type}/{name}", json.dumps(current_status))
-        return current_status
+    def save_health_status(self, entity_type: str, name: str, status_data: Dict) -> None:
+        """Save the health status dictionary directly."""
+        self.client.put(f"/health/{entity_type}/{name}", json.dumps(status_data))
 
 class AuthMiddleware:
     def __init__(self, app, identity_mgr: IdentityManager):

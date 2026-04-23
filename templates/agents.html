@@ -58,6 +58,13 @@
         <div class="flex items-center gap-2 mb-4">
             <span class="text-[10px] font-mono font-bold bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400 px-2 py-0.5 rounded border border-neutral-200 dark:border-neutral-700 uppercase">v{{ agent.version }}</span>
             <span class="text-xs font-mono text-neutral-500 dark:text-neutral-500">By: {{ agent.author }}</span>
+            {% if agent.health.status == 'Offline' %}
+            <span class="text-[10px] font-mono font-bold bg-red-100 text-red-600 px-2 py-0.5 rounded border border-red-200 uppercase">Offline</span>
+            {% elif agent.health.status == 'Degraded' %}
+            <span class="text-[10px] font-mono font-bold bg-yellow-100 text-yellow-600 px-2 py-0.5 rounded border border-yellow-200 uppercase">Degraded</span>
+            {% else %}
+            <span class="text-[10px] font-mono font-bold bg-green-100 text-green-600 px-2 py-0.5 rounded border border-green-200 uppercase">Online</span>
+            {% endif %}
         </div>
         <p class="text-neutral-600 dark:text-neutral-400 mb-6 flex-grow text-sm leading-relaxed font-mono">{{ agent.description }}</p>
         
@@ -85,6 +92,17 @@
             </div>
             
             <div class="flex flex-col gap-8 flex-grow min-h-0">
+                {% if is_admin and agent.health.status != 'Online' %}
+                <div class="p-4 bg-red-50 border border-red-200 rounded">
+                    <h4 class="text-red-800 font-bold mb-2">Health Issues (Failures: {{ agent.health.consecutive_failures }})</h4>
+                    {% if agent.health.last_error %}
+                    <pre class="text-xs text-red-600 font-mono overflow-auto max-h-32 mb-4">{{ agent.health.last_error }}</pre>
+                    {% endif %}
+                    <form method="POST" action="/reset-health/agent/{{ agent.name }}">
+                        <button type="submit" class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 text-xs font-bold uppercase rounded">Reset Health Status</button>
+                    </form>
+                </div>
+                {% endif %}
                 <div class="flex flex-col">
                     <h4 class="font-bold mb-4 uppercase text-sm border-b border-neutral-200 dark:border-neutral-800 pb-2">OpenAI API Compatible</h4>
                     <div class="relative group">

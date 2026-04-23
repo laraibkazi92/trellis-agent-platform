@@ -17,7 +17,7 @@
     {% for tool in tools %}
     <div class="tool-card group border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 hover:border-accent dark:hover:border-accent-dark transition-all duration-300 flex flex-col md:flex-row md:items-center p-4 gap-6" data-tool-name="{{ tool.name }}">
         <!-- Status Indicator -->
-        <div class="hidden md:block w-1 self-stretch bg-neutral-200 dark:bg-neutral-800 group-hover:bg-accent dark:group-hover:bg-accent-dark transition-colors"></div>
+        <div class="hidden md:block w-1 self-stretch {% if tool.health.status == 'Offline' %}bg-red-500{% elif tool.health.status == 'Degraded' %}bg-yellow-500{% else %}bg-green-500{% endif %} transition-colors"></div>
 
         <!-- Identity Section -->
         <div class="flex-1 min-w-0">
@@ -27,6 +27,13 @@
                 </span>
                 <h3 class="text-lg font-bold tracking-tight truncate">{{ tool.name }}</h3>
                 <span class="text-[10px] font-mono font-bold bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400 px-2 py-0.5 rounded border border-neutral-200 dark:border-neutral-700 uppercase">v{{ tool.version }}</span>
+                {% if tool.health.status == 'Offline' %}
+                <span class="text-[10px] font-mono font-bold bg-red-100 text-red-600 px-2 py-0.5 rounded border border-red-200 uppercase">Offline</span>
+                {% elif tool.health.status == 'Degraded' %}
+                <span class="text-[10px] font-mono font-bold bg-yellow-100 text-yellow-600 px-2 py-0.5 rounded border border-yellow-200 uppercase">Degraded</span>
+                {% else %}
+                <span class="text-[10px] font-mono font-bold bg-green-100 text-green-600 px-2 py-0.5 rounded border border-green-200 uppercase">Online</span>
+                {% endif %}
             </div>
             <p class="text-neutral-500 dark:text-neutral-400 text-xs font-mono truncate max-w-2xl">
                 {{ tool.description }}
@@ -60,10 +67,28 @@
                     <div class="flex items-center gap-4 mt-4">
                         <h3 class="text-3xl font-bold tracking-tight">{{ tool.name }}</h3>
                         <span class="text-sm font-mono font-bold bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400 px-2 py-0.5 rounded border border-neutral-200 dark:border-neutral-700 uppercase">v{{ tool.version }}</span>
+                        {% if tool.health.status == 'Offline' %}
+                        <span class="text-sm font-mono font-bold bg-red-100 text-red-600 px-2 py-0.5 rounded border border-red-200 uppercase">Offline</span>
+                        {% elif tool.health.status == 'Degraded' %}
+                        <span class="text-sm font-mono font-bold bg-yellow-100 text-yellow-600 px-2 py-0.5 rounded border border-yellow-200 uppercase">Degraded</span>
+                        {% else %}
+                        <span class="text-sm font-mono font-bold bg-green-100 text-green-600 px-2 py-0.5 rounded border border-green-200 uppercase">Online</span>
+                        {% endif %}
                     </div>
                     <p class="text-neutral-500 dark:text-neutral-400 mt-4 font-mono text-sm max-w-3xl">
                         {{ tool.description }}
                     </p>
+                    {% if is_admin and tool.health.status != 'Online' %}
+                    <div class="mt-4 p-4 bg-red-50 border border-red-200 rounded">
+                        <h4 class="text-red-800 font-bold mb-2">Health Issues (Failures: {{ tool.health.consecutive_failures }})</h4>
+                        {% if tool.health.last_error %}
+                        <pre class="text-xs text-red-600 font-mono overflow-auto max-h-32 mb-4">{{ tool.health.last_error }}</pre>
+                        {% endif %}
+                        <form method="POST" action="/reset-health/tool/{{ tool.name }}">
+                            <button type="submit" class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 text-xs font-bold uppercase rounded">Reset Health Status</button>
+                        </form>
+                    </div>
+                    {% endif %}
                 </div>
                 <button onclick="document.getElementById('details-{{ loop.index }}').classList.add('hidden')" class="text-neutral-400 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors uppercase text-xs font-mono font-bold tracking-widest">
                     Close [X]
