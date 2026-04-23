@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+
+{% block title %}{{ title }}{% endblock %}
+
+{% block content %}
+<style>
+    /* Basic markdown styling matching the Tailwind theme */
+    .prose h1 { font-size: 2.25rem; font-weight: 700; margin-bottom: 1.5rem; color: inherit; }
+    .prose h2 { font-size: 1.5rem; font-weight: 600; margin-top: 2rem; margin-bottom: 1rem; color: inherit; border-bottom: 1px solid currentColor; padding-bottom: 0.5rem; }
+    .prose h3 { font-size: 1.25rem; font-weight: 600; margin-top: 1.5rem; margin-bottom: 0.5rem; color: inherit; }
+    .prose p { margin-bottom: 1.25rem; line-height: 1.75; }
+    .prose ul { list-style-type: disc; margin-left: 1.5rem; margin-bottom: 1.25rem; }
+    .prose ol { list-style-type: decimal; margin-left: 1.5rem; margin-bottom: 1.25rem; }
+    .prose li { margin-bottom: 0.5rem; }
+    .prose code { font-family: "IBM Plex Mono", monospace; background-color: rgba(150, 150, 150, 0.2); padding: 0.125rem 0.25rem; border-radius: 0.25rem; font-size: 0.875em; }
+    .prose pre { font-family: "IBM Plex Mono", monospace; background-color: #1a1a1a; color: #f5f5f5; padding: 1rem; border-radius: 0.5rem; overflow-x: auto; margin-bottom: 1.5rem; font-size: 0.875em; }
+    .prose pre code { background-color: transparent; padding: 0; border-radius: 0; color: inherit; font-size: inherit; }
+    .prose blockquote { border-left: 4px solid #4b5563; padding-left: 1rem; font-style: italic; color: #6b7280; margin-bottom: 1.5rem; }
+    .prose a { color: #0055FF; text-decoration: underline; }
+    .dark .prose a { color: #3377FF; }
+    .prose hr { margin-top: 2rem; margin-bottom: 2rem; border-color: rgba(150, 150, 150, 0.2); }
+</style>
+
+<div class="max-w-4xl mx-auto bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 p-8 md:p-12 font-sans text-neutral-900 dark:text-neutral-50 shadow-sm">
+    <div class="prose max-w-none">
+        {{ html_content | safe }}
+    </div>
+</div>
+{% endblock %}

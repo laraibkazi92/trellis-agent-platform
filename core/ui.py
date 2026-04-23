@@ -30,7 +30,7 @@ if not DEV_MODE:
     if missing:
         raise ValueError(f"Missing required environment variables for UI: {', '.join(missing)}")
 
-from core.routers import auth, marketplace, keys, admin, secrets
+from core.routers import auth, marketplace, keys, admin, secrets, docs
 
 app = FastAPI(title="Marketplace UI")
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
@@ -40,3 +40,4 @@ app.include_router(marketplace.router)
 app.include_router(keys.router)
 app.include_router(admin.router)
 app.include_router(secrets.router)
+app.include_router(docs.router)

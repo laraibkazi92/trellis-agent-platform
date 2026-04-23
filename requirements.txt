@@ -18,3 +18,4 @@ tenacity
 structlog
 click
 python-dotenv
+markdown
