@@ -2,35 +2,26 @@ import os
 import asyncio
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
-from core.dependencies import oauth, identity_mgr, HAS_GITHUB_AUTH, HAS_OIDC_AUTH
+from core.dependencies import oauth, identity_mgr, HAS_GITHUB_AUTH, HAS_OIDC_AUTH, templates
 
 router = APIRouter()
 
 DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
 
-@router.get("/")
-async def homepage(request: Request):
-    user = request.session.get('user')
-    if user:
-        return RedirectResponse(url='/')
-        
-    links = []
-    if DEV_MODE:
-        links.append('<a href="/login">Login (Dev Mode)</a>')
-    else:
-        if HAS_OIDC_AUTH:
-            links.append('<a href="/login">Login with OIDC</a>')
-        if HAS_GITHUB_AUTH:
-            links.append('<a href="/login/github">Login with GitHub</a>')
-            
-    if not links:
-        return HTMLResponse('No authentication methods configured.')
-        
-    html_content = "<br><br>".join(links)
-    return HTMLResponse(f'<div>{html_content}</div>')
+@router.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    return templates.TemplateResponse(
+        "login.html", 
+        {
+            "request": request,
+            "has_github": HAS_GITHUB_AUTH,
+            "has_oidc": HAS_OIDC_AUTH,
+            "dev_mode": DEV_MODE
+        }
+    )
 
-@router.get("/login")
-async def login(request: Request):
+@router.get("/login/dev")
+async def login_dev(request: Request):
     if DEV_MODE:
         user = {
             "sub": "dev-user-id",
@@ -42,8 +33,10 @@ async def login(request: Request):
             await asyncio.to_thread(identity_mgr.upsert_user, user['sub'], user)
         except Exception as e:
             print(f"Warning: Failed to upsert mock user in etcd: {e}")
-        return RedirectResponse(url='/')
-        
+    return RedirectResponse(url='/')
+
+@router.get("/login/oidc")
+async def login_oidc(request: Request):
     redirect_uri = request.url_for('auth_callback')
     return await oauth.oidc.authorize_redirect(request, redirect_uri)
 
