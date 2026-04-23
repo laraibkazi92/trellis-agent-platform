@@ -55,12 +55,23 @@
         <div class="space-x-4 md:space-x-6 text-sm font-bold font-mono tracking-wide flex items-center flex-wrap">
             <a href="/agents" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/agents' %}text-accent dark:text-accent-dark{% endif %}">Agents</a>
             <a href="/tools" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/tools' %}text-accent dark:text-accent-dark{% endif %}">Tools</a>
-            <span class="text-neutral-300 dark:text-neutral-700 hidden sm:inline">|</span>
-            {% if user %}
-            <span class="text-neutral-500 dark:text-neutral-400 hidden sm:inline">USER:{{ user.name }}</span>
+        <span class="text-neutral-300 dark:text-neutral-700 hidden sm:inline">|</span>
+        {% if user %}
+        <div class="relative group inline-block">
             <a href="/keys" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/keys' %}text-accent dark:text-accent-dark{% endif %}">API Keys</a>
-            <a href="/secrets" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/secrets' %}text-accent dark:text-accent-dark{% endif %}">Secrets</a>
-            <a href="/logout" class="text-red-600 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300 transition-colors uppercase">Logout</a>
+            <div class="absolute hidden group-hover:block w-48 top-full mt-2 left-1/2 -translate-x-1/2 bg-neutral-800 text-white text-xs p-2 rounded shadow-lg z-50 text-center font-sans normal-case tracking-normal">
+                API Keys used to authenticate to the Agent Framework via API, MCP etc
+            </div>
+        </div>
+        <div class="relative group inline-block">
+            <a href="/secrets" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/secrets' %}text-accent dark:text-accent-dark{% endif %}">Tool Secrets</a>
+            <div class="absolute hidden group-hover:block w-56 top-full mt-2 left-1/2 -translate-x-1/2 bg-neutral-800 text-white text-xs p-2 rounded shadow-lg z-50 text-center font-sans normal-case tracking-normal">
+                Third-party credentials (e.g., Issues, Support etc.) securely stored for use by your Agents and Tools.
+            </div>
+        </div>
+        <span class="text-neutral-300 dark:text-neutral-700 hidden sm:inline">|</span>
+        <span class="text-neutral-500 dark:text-neutral-400 hidden sm:inline">{{ user.name }}</span>
+        <a href="/logout" class="text-red-600 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300 transition-colors uppercase">Logout</a>
             {% else %}
             <a href="/login" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase">Login</a>
             {% endif %}
