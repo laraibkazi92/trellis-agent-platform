@@ -18,7 +18,7 @@ class ToolConfig(BaseModel):
     name: str
     version: str = "0.1.0"
     description: str
-    runtime: str = Field(..., pattern="^(python|go|ts)$")
+    runtime: str = Field(..., pattern="^(python|go|ts|bash)$")
     entrypoint: str
     inputs: Optional[Dict[str, Any]] = None
     outputs: Optional[Dict[str, Any]] = None

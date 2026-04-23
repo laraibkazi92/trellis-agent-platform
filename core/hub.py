@@ -50,6 +50,8 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
         cmd = [str(bin_path)]
     elif config.runtime == "ts":
         cmd = ["npx", "tsx", str(tool_dir / config.entrypoint)]
+    elif config.runtime == "bash":
+        cmd = ["bash", str(tool_dir / config.entrypoint)]
     else:
         return {"error": f"Unsupported runtime: {config.runtime}"}
 
