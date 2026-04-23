@@ -28,3 +28,11 @@
 - **Multi-Tool Support**: A single directory can host multiple tools; `tool.yaml` should be a list of configurations.
 - **Logical Porting**: When porting external skills (e.g. from Claude Code), preserve all business logic/formatting but translate shell commands into framework tool calls.
 - **Auth**: Endpoints under `/v1/chat/completions`, `/mcp`, `/sse`, and `/messages` require Bearer tokens unless `DEV_MODE=true` is set. Note that `/sse` and `/messages` are typically sub-paths of `/mcp`.
+
+## 🎨 UI/UX & Frontend Design Patterns
+- **Terminology**: 
+  - `API Keys`: Inbound authentication tokens (accessing the framework).
+  - `Tool Secrets`: Outbound credentials for 3rd-party integrations (e.g., Issues, Support).
+- **Notifications**: Use auto-dismissible toasts for success/error flashes (see `templates/base.html` for the `setTimeout` pattern).
+- **Navigation & Modals**: For deep-linking to specific items (like a tool details modal), use query parameters (e.g., `?tool=name`). Parse this on `DOMContentLoaded`, trigger the modal/filter, and use `window.history.replaceState` to strip the parameter to prevent loop issues on refresh.
+- **Tooltips**: Avoid native browser `title` attributes. Use Tailwind CSS utility classes (e.g., `group`, `group-hover:block`, `absolute`) for clean, floating tooltips.
