@@ -16,6 +16,11 @@ BASE_DIR = Path(__file__).parent.parent
 AGENTS_DIR = BASE_DIR / "agents"
 HOST_URL = os.getenv("HOST_URL", "http://localhost:8000")
 
+identity_mgr = IdentityManager(
+    host=os.getenv("ETCD_HOST", "127.0.0.1"),
+    port=int(os.getenv("ETCD_PORT", 2379))
+)
+
 async def get_agent_description(config: dict, skills_path: Path) -> str:
     """Extracts description from config.yaml or the first paragraph of the skills.md file."""
     if config.get("description"):
@@ -36,13 +41,12 @@ async def get_agent_description(config: dict, skills_path: Path) -> str:
 async def list_agents() -> List[Dict[str, str]]:
     """List all available agents and their descriptions."""
     
-    # We will fetch from Host API /health to get active and disabled agents
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(f"{HOST_URL}/health", timeout=5.0)
             if resp.status_code == 200:
                 data = resp.json()
-                active_names = set(data.get("agents_active", []))
+                agents_data = data.get("agents", {})
             else:
                 return [{"name": "Error", "description": f"Host API unreachable (HTTP {resp.status_code})"}]
     except Exception as e:
@@ -50,32 +54,32 @@ async def list_agents() -> List[Dict[str, str]]:
         return [{"name": "Error", "description": f"Host API unreachable ({str(e)})"}]
 
     agents = []
-    if not await asyncio.to_thread(AGENTS_DIR.exists):
-        return agents
-
-    for agent_dir in await asyncio.to_thread(lambda: list(AGENTS_DIR.iterdir())):
-        is_dir = await asyncio.to_thread(agent_dir.is_dir)
-        # Only list agents that are active in the host
-        if is_dir and agent_dir.name in active_names:
-            config_path = agent_dir / "config.yaml"
-            skills_path = agent_dir / "skills.md"
+    
+    for agent_name, agent_info in agents_data.items():
+        config_data = await asyncio.to_thread(identity_mgr.get_agent_config, agent_name)
+        skills = await asyncio.to_thread(identity_mgr.get_agent_skills, agent_name)
+        
+        description = "No description available."
+        if config_data and "description" in config_data:
+            description = config_data["description"]
+        elif skills:
+            paragraphs = [p.strip() for p in skills.split("\n\n") if p.strip() and not p.strip().startswith("#")]
+            if paragraphs:
+                description = paragraphs[0]
+                
+        status = agent_info.get("status", "Online")
+        offline_tools = agent_info.get("offline_tools", [])
+        
+        if status == "Offline":
+            description += " [STATUS: OFFLINE - DO NOT ROUTE REQUESTS HERE]"
+        elif status == "Degraded":
+            description += f" [STATUS: DEGRADED - Offline tools: {', '.join(offline_tools)}]"
             
-            config_exists = await asyncio.to_thread(config_path.exists)
-            skills_exists = await asyncio.to_thread(skills_path.exists)
-            
-            if config_exists and skills_exists:
-                try:
-                    async with aiofiles.open(config_path, "r") as f:
-                        content = await f.read()
-                        config = yaml.safe_load(content)
-                    
-                    description = await get_agent_description(config, skills_path)
-                    agents.append({
-                        "name": config.get("name", agent_dir.name),
-                        "description": description
-                    })
-                except Exception:
-                    continue
+        agents.append({
+            "name": agent_name,
+            "description": description
+        })
+        
     return agents
 
 @mcp.tool()
@@ -86,19 +90,28 @@ async def use_agent(agent_name: str, prompt: str) -> str:
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"{HOST_URL}/v1/chat/completions",
-            json={
-                "model": agent_name,
-                "messages": [{"role": "user", "content": prompt}]
-            },
-            headers=headers,
-            timeout=60.0
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"]
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{HOST_URL}/v1/chat/completions",
+                json={
+                    "model": agent_name,
+                    "messages": [{"role": "user", "content": prompt}]
+                },
+                headers=headers,
+                timeout=60.0
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["choices"][0]["message"]["content"]
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 503:
+            return f"SYSTEM: The agent '{agent_name}' is currently offline due to technical failures and cannot process requests."
+        if e.response.status_code == 404:
+            return f"SYSTEM: The agent '{agent_name}' was not found or is disabled."
+        return f"SYSTEM: Error calling agent '{agent_name}': {e.response.text}"
+    except Exception as e:
+        return f"SYSTEM: Failed to connect to agent '{agent_name}': {str(e)}"
 
 @mcp.tool()
 async def marketplace_router(prompt: str) -> str:
@@ -112,9 +125,5 @@ async def marketplace_router(prompt: str) -> str:
 
 if __name__ == "__main__":
     app = mcp.http_app()
-    identity_mgr = IdentityManager(
-        host=os.getenv("ETCD_HOST", "127.0.0.1"),
-        port=int(os.getenv("ETCD_PORT", 2379))
-    )
     app.add_middleware(AuthMiddleware, identity_mgr=identity_mgr)
     uvicorn.run(app, host="0.0.0.0", port=8002)
