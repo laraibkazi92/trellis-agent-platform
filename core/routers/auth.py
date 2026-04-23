@@ -52,6 +52,10 @@ async def auth_callback(request: Request):
     token = await oauth.oidc.authorize_access_token(request)
     user = token.get('userinfo')
     if user:
+        # Ensure name is not None for UI display
+        if not user.get('name'):
+            user['name'] = user.get('email') or user.get('preferred_username') or user.get('sub')
+            
         request.session['user'] = user
         # Upsert user to etcd
         await asyncio.to_thread(identity_mgr.upsert_user, user['sub'], dict(user))
@@ -75,6 +79,11 @@ async def auth_github_callback(request: Request):
     if userinfo:
         # Normalize Identity: ensure consistent string format for IdentityManager
         userinfo['sub'] = f"github|{userinfo['id']}"
+        
+        # Ensure name is not None for UI display
+        if not userinfo.get('name'):
+            userinfo['name'] = userinfo.get('login')
+            
         # Some GitHub accounts might not have a public email in the basic user info
         if not userinfo.get('email'):
             email_resp = await oauth.github.get('user/emails', token=token)
