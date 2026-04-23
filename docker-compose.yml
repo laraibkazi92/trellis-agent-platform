@@ -13,7 +13,7 @@ services:
       - HOST_URL=http://host:8000
       - HUB_URL=http://hub:8001/mcp
       - GOOGLE_API_KEY=${GEMINI_API_KEY}
-      - DEV_MODE=true
+      - DEV_MODE=${DEV_MODE:-false}
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
     command: uvicorn core.host:app --host 0.0.0.0 --port 8000
@@ -51,7 +51,7 @@ services:
       - "0.0.0.0:8002:8002"
     environment:
       - HOST_URL=http://host:8000
-      - DEV_MODE=true
+      - DEV_MODE=${DEV_MODE:-false}
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
     command: python core/gateway.py
@@ -86,7 +86,7 @@ services:
     environment:
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
-      - DEV_MODE=true
+      - DEV_MODE=${DEV_MODE:-false}
       - ADMIN_USERS=${ADMIN_USERS}
     command: uvicorn core.ui:app --host 0.0.0.0 --port 8080
     depends_on:

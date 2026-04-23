@@ -10,10 +10,25 @@ SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-secret-key" if DEV_MODE else N
 OIDC_CLIENT_ID = os.getenv("OIDC_CLIENT_ID")
 OIDC_CLIENT_SECRET = os.getenv("OIDC_CLIENT_SECRET")
 OIDC_METADATA_URL = os.getenv("OIDC_METADATA_URL")
+GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
+GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
 ADMIN_USERS_ENV = os.getenv("ADMIN_USERS")
 
-if not DEV_MODE and not all([SESSION_SECRET, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_METADATA_URL, ADMIN_USERS_ENV]):
-    raise ValueError("Missing required environment variables for UI (SESSION_SECRET, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_METADATA_URL, ADMIN_USERS).")
+if not DEV_MODE:
+    missing = []
+    if not SESSION_SECRET:
+        missing.append("SESSION_SECRET")
+    if not ADMIN_USERS_ENV:
+        missing.append("ADMIN_USERS")
+    
+    has_oidc = all([OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_METADATA_URL])
+    has_github = all([GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET])
+    
+    if not (has_oidc or has_github):
+        missing.append("Authentication Provider (GitHub or OIDC variables)")
+    
+    if missing:
+        raise ValueError(f"Missing required environment variables for UI: {', '.join(missing)}")
 
 from core.routers import auth, marketplace, keys, admin, secrets
 
