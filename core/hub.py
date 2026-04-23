@@ -9,6 +9,8 @@ from fastmcp import FastMCP
 from core.models import ToolConfig
 from core.auth import IdentityManager
 
+from core.health import HealthMonitor
+
 # Initialize FastMCP server with host and port
 mcp = FastMCP("Polyglot Tool Hub")
 
@@ -18,6 +20,7 @@ identity_mgr = IdentityManager(
     host=os.getenv("ETCD_HOST", "127.0.0.1"),
     port=int(os.getenv("ETCD_PORT", 2379))
 )
+health_monitor = HealthMonitor(identity_mgr)
 
 def load_tool_configs() -> Dict[str, tuple[ToolConfig, Path]]:
     """Fetches tool configurations from etcd."""
@@ -73,18 +76,32 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
             print(f"Tool {config.name} stderr: {stderr.decode().strip()}")
 
         if process.returncode != 0:
+            error_msg = f"Tool exited with code {process.returncode}: {stderr.decode().strip()}"
+            health_monitor.record_event("tool", config.name, is_success=False, error_details=error_msg)
             return {
-                "error": f"Tool exited with code {process.returncode}",
+                "error": error_msg,
                 "stderr": stderr.decode().strip()
             }
 
         try:
-            return json.loads(stdout.decode())
+            result = json.loads(stdout.decode())
+            # A valid JSON output with an 'error' key is considered a User-Scoped Failure,
+            # which does NOT trip the global circuit breaker. We count it as a success for global health.
+            health_monitor.record_event("tool", config.name, is_success=True)
+            return result
         except json.JSONDecodeError:
-            return {"output": stdout.decode().strip(), "warning": "Output was not valid JSON"}
+            error_msg = f"Output was not valid JSON: {stdout.decode().strip()}"
+            health_monitor.record_event("tool", config.name, is_success=False, error_details=error_msg)
+            return {"output": stdout.decode().strip(), "warning": error_msg}
 
+    except asyncio.TimeoutError:
+        error_msg = "Tool execution timed out."
+        health_monitor.record_event("tool", config.name, is_success=False, error_details=error_msg)
+        return {"error": error_msg}
     except Exception as e:
-        return {"error": f"Failed to execute tool: {str(e)}"}
+        error_msg = f"Failed to execute tool: {str(e)}"
+        health_monitor.record_event("tool", config.name, is_success=False, error_details=error_msg)
+        return {"error": error_msg}
 
 def register_tools():
     """Dynamically registers tools with the FastMCP server and pre-compiles Go tools."""
