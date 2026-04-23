@@ -69,9 +69,21 @@
 
     <main class="flex-grow container mx-auto p-4 md:p-6 max-w-7xl mt-4 md:mt-8">
         {% if flash_msg %}
-        <div class="border border-accent text-accent dark:border-accent-dark dark:text-accent-dark px-4 py-3 mb-8 font-mono text-sm uppercase tracking-wide bg-accent/5 dark:bg-accent-dark/10">
-            > {{ flash_msg }}
+        <div id="flash-toast" class="flex justify-between items-center border border-accent text-accent dark:border-accent-dark dark:text-accent-dark px-4 py-3 mb-8 font-mono text-sm uppercase tracking-wide bg-accent/5 dark:bg-accent-dark/10 transition-opacity duration-500">
+            <span>> {{ flash_msg }}</span>
+            <button onclick="document.getElementById('flash-toast').remove()" class="text-accent hover:text-accent-dark dark:text-accent-dark dark:hover:text-accent transition-colors">
+                [X]
+            </button>
         </div>
+        <script>
+            setTimeout(() => {
+                const toast = document.getElementById('flash-toast');
+                if (toast) {
+                    toast.style.opacity = '0';
+                    setTimeout(() => toast.remove(), 500); // Wait for transition
+                }
+            }, 3000);
+        </script>
         {% endif %}
         
         {% block content %}{% endblock %}

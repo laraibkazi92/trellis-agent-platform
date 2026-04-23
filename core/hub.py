@@ -69,6 +69,9 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
         input_json = json.dumps(arguments).encode()
         stdout, stderr = await process.communicate(input=input_json)
 
+        if stderr:
+            print(f"Tool {config.name} stderr: {stderr.decode().strip()}")
+
         if process.returncode != 0:
             return {
                 "error": f"Tool exited with code {process.returncode}",

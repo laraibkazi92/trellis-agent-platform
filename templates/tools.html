@@ -176,5 +176,34 @@
             }
         });
     });
+
+    // Handle URL parameters for auto-searching and opening modals
+    window.addEventListener('DOMContentLoaded', () => {
+        const urlParams = new URLSearchParams(window.location.search);
+        const toolQuery = urlParams.get('tool');
+        
+        if (toolQuery) {
+            // Set the search input
+            searchInput.value = toolQuery;
+            
+            // Trigger the input event to filter the list
+            searchInput.dispatchEvent(new Event('input'));
+            
+            // Look for the specific tool card and trigger the view details button
+            toolCards.forEach((card, index) => {
+                if (card.dataset.toolName === toolQuery) {
+                    const modalId = 'details-' + (index + 1); // loop.index starts at 1
+                    const modal = document.getElementById(modalId);
+                    if (modal) {
+                        modal.classList.remove('hidden');
+                    }
+                }
+            });
+            
+            // Clean up the URL without refreshing the page
+            const newUrl = window.location.protocol + "//" + window.location.host + window.location.pathname;
+            window.history.replaceState({path: newUrl}, '', newUrl);
+        }
+    });
 </script>
 {% endblock %}
