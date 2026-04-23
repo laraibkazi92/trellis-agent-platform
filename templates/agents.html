@@ -33,17 +33,20 @@
     </div>
 </div>
 
+<a href="/" class="font-mono text-xs uppercase tracking-widest text-neutral-500 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark transition-colors mb-6 inline-flex items-center gap-2">
+    <i data-lucide="arrow-left" class="w-4 h-4"></i> BACK TO DASHBOARD
+</a>
 <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-6 gap-4">
     <div class="flex items-center gap-4">
         <h2 class="text-2xl font-bold uppercase tracking-wider">Agents</h2>
         <button onclick="document.getElementById('global-connection').classList.remove('hidden')" class="text-xs font-mono font-bold bg-neutral-200 hover:bg-neutral-300 dark:bg-neutral-800 dark:hover:bg-neutral-700 text-neutral-800 dark:text-neutral-200 px-3 py-1.5 transition-colors border border-neutral-300 dark:border-neutral-700 uppercase">Gateway Setup</button>
     </div>
     <div class="relative w-full sm:w-72">
-        <input type="text" id="agent-search" placeholder="Search fuzzy..." class="w-full bg-white dark:bg-neutral-900 border border-neutral-300 dark:border-neutral-700 px-4 py-2 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 placeholder-neutral-500">
+        <input type="text" id="agent-search" placeholder="Search..." class="w-full bg-white dark:bg-neutral-900 border border-neutral-300 dark:border-neutral-700 px-4 py-2 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 placeholder-neutral-500">
     </div>
 </div>
 
-<div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6 mb-12" id="agents-grid">
+<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-6 mb-12" id="agents-grid">
     {% for agent in agents %}
     <div class="agent-card border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 p-6 hover:border-accent dark:hover:border-accent-dark transition-colors flex flex-col" data-agent-name="{{ agent.name }}">
         <div class="flex justify-between items-start mb-2">

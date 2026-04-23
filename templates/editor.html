@@ -9,6 +9,7 @@
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Syne:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet" />
+    <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
     <script>
@@ -171,7 +172,9 @@
             <h1 class="text-xl font-bold tracking-tight uppercase">{{ name }} <span class="text-neutral-400 font-normal ml-2">/ CONFIG</span></h1>
         </div>
         <div class="space-x-6 text-sm font-bold font-mono">
-            <a href="/catalog" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase tracking-widest">← Back to Catalog</a>
+            <a href="{% if type == 'agent' %}/agents{% else %}/tools{% endif %}" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase tracking-widest inline-flex items-center gap-2">
+                <i data-lucide="arrow-left" class="w-4 h-4"></i> Back to {% if type == 'agent' %}Agents{% else %}Tools{% endif %}
+            </a>
         </div>
     </nav>
 
@@ -351,6 +354,7 @@
             $('#modelSelect').on('change', updateThinkingLevel);
             updateThinkingLevel(); // Run on init
         });
+        lucide.createIcons();
     </script>
 </body>
 </html>

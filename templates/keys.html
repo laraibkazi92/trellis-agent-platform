@@ -8,6 +8,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Syne:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
     <script>
         tailwind.config = {
             darkMode: 'media',
@@ -51,8 +52,10 @@
 <body class="bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-50 min-h-screen antialiased selection:bg-accent selection:text-white dark:selection:bg-accent-dark">
     <nav class="border-b border-neutral-200 dark:border-neutral-800 p-4 px-6 flex justify-between items-center bg-white dark:bg-neutral-900 mb-8">
         <h1 class="text-xl font-bold tracking-tight uppercase">API Keys</h1>
-        <div class="space-x-6 text-sm font-bold font-mono tracking-wide">
-            <a href="/catalog" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase">Catalog</a>
+        <div class="space-x-6 text-sm font-bold font-mono tracking-wide flex items-center">
+            <a href="/" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase tracking-widest inline-flex items-center gap-2">
+                <i data-lucide="arrow-left" class="w-4 h-4"></i> BACK TO DASHBOARD
+            </a>
             <a href="/logout" class="text-red-600 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300 transition-colors uppercase">Logout</a>
         </div>
     </nav>
@@ -120,5 +123,8 @@
             </table>
         </div>
     </div>
+    <script>
+        lucide.createIcons();
+    </script>
 </body>
 </html>

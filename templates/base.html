@@ -8,6 +8,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Syne:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/fuse.js/dist/fuse.min.js"></script>
     <script>
         tailwind.config = {
@@ -78,7 +79,7 @@
         </div>
     </nav>
 
-    <main class="flex-grow container mx-auto p-4 md:p-6 max-w-7xl mt-4 md:mt-8">
+    <main class="flex-grow container mx-auto p-4 md:p-6 max-w-[1600px] mt-4 md:mt-8">
         {% if flash_msg %}
         <div id="flash-toast" class="flex justify-between items-center border border-accent text-accent dark:border-accent-dark dark:text-accent-dark px-4 py-3 mb-8 font-mono text-sm uppercase tracking-wide bg-accent/5 dark:bg-accent-dark/10 transition-opacity duration-500">
             <span>> {{ flash_msg }}</span>
@@ -103,5 +104,8 @@
     <footer class="border-t border-neutral-200 dark:border-neutral-800 py-6 text-center text-sm font-mono text-neutral-500 mt-12 bg-white dark:bg-neutral-900">
         Trellis Agent Platform
     </footer>
+    <script>
+        lucide.createIcons();
+    </script>
 </body>
 </html>

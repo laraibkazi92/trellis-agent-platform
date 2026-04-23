@@ -61,21 +61,29 @@ def sanitize_name(name: str) -> str:
     """Sanitize name parameter to prevent path traversal and registry injection."""
     return re.sub(r'[^a-zA-Z0-9_\.-]', '', name)
 
-@router.get("/editor/{type}/{name}", response_class=HTMLResponse)
-async def editor_page(request: Request, type: str, name: str):
+def require_admin(request: Request, fallback_url: str):
     user = request.session.get('user')
     if not user:
         return RedirectResponse(url='/login')
         
     admin_users = os.getenv("ADMIN_USERS", "").split(",")
     if user.get("email") not in admin_users:
-        request.session["flash_msg"] = "Unauthorized access to editor."
-        return RedirectResponse(url='/catalog', status_code=303)
+        request.session["flash_msg"] = "Unauthorized access."
+        return RedirectResponse(url=fallback_url, status_code=303)
+    return None
+
+@router.get("/editor/{type}/{name}", response_class=HTMLResponse)
+async def editor_page(request: Request, type: str, name: str):
+    fallback_url = '/agents' if type == 'agent' else '/tools'
+    if redirect := require_admin(request, fallback_url):
+        return redirect
+    
+    user = request.session.get('user')
         
     safe_name = sanitize_name(name)
     if not safe_name:
         request.session["flash_msg"] = "Invalid name parameter."
-        return RedirectResponse(url='/catalog', status_code=303)
+        return RedirectResponse(url='/agents', status_code=303)
 
     if type == "agent":
         config = await asyncio.to_thread(identity_mgr.get_agent_config, safe_name)
@@ -85,7 +93,7 @@ async def editor_page(request: Request, type: str, name: str):
         
         if not config:
             request.session["flash_msg"] = "Agent not found."
-            return RedirectResponse(url='/catalog', status_code=303)
+            return RedirectResponse(url='/agents', status_code=303)
             
         return templates.TemplateResponse(
             request=request,
@@ -104,7 +112,7 @@ async def editor_page(request: Request, type: str, name: str):
         config = await asyncio.to_thread(identity_mgr.get_tool_config, safe_name)
         if not config:
             request.session["flash_msg"] = "Tool not found."
-            return RedirectResponse(url='/catalog', status_code=303)
+            return RedirectResponse(url='/tools', status_code=303)
             
         return templates.TemplateResponse(
             request=request,
@@ -118,23 +126,17 @@ async def editor_page(request: Request, type: str, name: str):
         )
     else:
         request.session["flash_msg"] = "Invalid editor type."
-        return RedirectResponse(url='/catalog', status_code=303)
+        return RedirectResponse(url='/', status_code=303)
 
 @router.post("/editor/agent/{name}")
 async def save_agent(request: Request, name: str):
-    user = request.session.get('user')
-    if not user:
-        return RedirectResponse(url='/login')
-        
-    admin_users = os.getenv("ADMIN_USERS", "").split(",")
-    if user.get("email") not in admin_users:
-        request.session["flash_msg"] = "Unauthorized access."
-        return RedirectResponse(url='/catalog', status_code=303)
+    if redirect := require_admin(request, '/agents'):
+        return redirect
         
     safe_name = sanitize_name(name)
     if not safe_name:
         request.session["flash_msg"] = "Invalid name parameter."
-        return RedirectResponse(url='/catalog', status_code=303)
+        return RedirectResponse(url='/agents', status_code=303)
         
     form = await request.form()
     
@@ -170,23 +172,17 @@ async def save_agent(request: Request, name: str):
     else:
         request.session["flash_msg"] = f"Agent {safe_name} updated successfully."
         
-    return RedirectResponse(url='/catalog', status_code=303)
+    return RedirectResponse(url='/agents', status_code=303)
 
 @router.post("/editor/tool/{name}")
 async def save_tool(request: Request, name: str):
-    user = request.session.get('user')
-    if not user:
-        return RedirectResponse(url='/login')
-        
-    admin_users = os.getenv("ADMIN_USERS", "").split(",")
-    if user.get("email") not in admin_users:
-        request.session["flash_msg"] = "Unauthorized access."
-        return RedirectResponse(url='/catalog', status_code=303)
+    if redirect := require_admin(request, '/tools'):
+        return redirect
         
     safe_name = sanitize_name(name)
     if not safe_name:
         request.session["flash_msg"] = "Invalid name parameter."
-        return RedirectResponse(url='/catalog', status_code=303)
+        return RedirectResponse(url='/tools', status_code=303)
         
     form = await request.form()
     
@@ -212,4 +208,4 @@ async def save_tool(request: Request, name: str):
     else:
         request.session["flash_msg"] = f"Tool {safe_name} updated successfully."
         
-    return RedirectResponse(url='/catalog', status_code=303)
+    return RedirectResponse(url='/tools', status_code=303)
