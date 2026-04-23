@@ -55,7 +55,7 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
         if user_id:
             secrets = identity_mgr.get_user_secrets(user_id)
             if secrets:
-                env.update(secrets)
+                env.update({str(k): str(v) for k, v in secrets.items()})
 
         process = await asyncio.create_subprocess_exec(
             *cmd,

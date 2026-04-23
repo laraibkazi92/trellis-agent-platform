@@ -322,6 +322,15 @@ class AgentManager:
     def _register_mcp_tool(self, agent: Agent, mcp_tool: Any):
         """Helper to register an MCP tool to a PydanticAI agent."""
         
+        # Strip __user_id from the schema to prevent context waste and hallucinations
+        if hasattr(mcp_tool, "inputSchema") and isinstance(mcp_tool.inputSchema, dict):
+            props = mcp_tool.inputSchema.get("properties", {})
+            if "__user_id" in props:
+                del props["__user_id"]
+            reqs = mcp_tool.inputSchema.get("required", [])
+            if "__user_id" in reqs:
+                reqs.remove("__user_id")
+        
         # Define a wrapper that calls the MCP tool
         async def tool_wrapper(ctx: RunContext[None], **kwargs: Any) -> Any:
             return await self._execute_mcp_tool_with_retry(mcp_tool.name, kwargs)

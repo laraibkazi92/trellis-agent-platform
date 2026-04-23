@@ -212,30 +212,36 @@ class IdentityManager:
                     names.add(name)
         return list(names)
 
-class AuthMiddleware(BaseHTTPMiddleware):
+class AuthMiddleware:
     def __init__(self, app, identity_mgr: IdentityManager):
-        super().__init__(app)
+        self.app = app
         self.identity_mgr = identity_mgr
 
-    async def dispatch(self, request: Request, call_next):
-        # Normalize the path to prevent bypasses like //v1/chat/completions
-        normalized_path = re.sub(r'/+', '/', request.url.path)
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+            
+        path = scope.get("path", "")
+        normalized_path = re.sub(r'/+', '/', path)
         
         import os
         DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
         
         protected_prefixes = ("/v1/chat/completions", "/sse", "/messages", "/mcp")
         if any(normalized_path.startswith(prefix) for prefix in protected_prefixes):
-            auth_header = request.headers.get("Authorization")
+            headers = dict(scope.get("headers", []))
+            auth_header = headers.get(b"authorization", b"").decode("utf-8", errors="ignore")
             
             if DEV_MODE and (not auth_header or not auth_header.startswith("Bearer ")):
-                request.state.user_id = "dev-user-id"
                 auth_token_var.set("dev-token")
                 user_id_var.set("dev-user-id")
-                return await call_next(request)
+                scope["state"] = scope.get("state", {})
+                scope["state"]["user_id"] = "dev-user-id"
+                return await self.app(scope, receive, send)
                 
             if not auth_header or not auth_header.startswith("Bearer "):
-                return JSONResponse({"error": "Missing or invalid Authorization header"}, status_code=401)
+                await self._send_response(send, 401, b'{"error": "Missing or invalid Authorization header"}')
+                return
             
             token = auth_header.split(" ")[1]
             try:
@@ -246,16 +252,31 @@ class AuthMiddleware(BaseHTTPMiddleware):
             
             if not user_id:
                 if DEV_MODE:
-                    request.state.user_id = "dev-user-id"
                     auth_token_var.set("dev-token")
                     user_id_var.set("dev-user-id")
-                    return await call_next(request)
-                return JSONResponse({"error": "Invalid API Key"}, status_code=401)
+                    scope["state"] = scope.get("state", {})
+                    scope["state"]["user_id"] = "dev-user-id"
+                    return await self.app(scope, receive, send)
+                await self._send_response(send, 401, b'{"error": "Invalid API Key"}')
+                return
                 
-            # Add user_id to request state
-            request.state.user_id = user_id
             # Set the ContextVars so downstream async functions can access them
             auth_token_var.set(token)
             user_id_var.set(user_id)
             
-        return await call_next(request)
+            # Add user_id to scope state for framework compatibility
+            scope["state"] = scope.get("state", {})
+            scope["state"]["user_id"] = user_id
+            
+        return await self.app(scope, receive, send)
+
+    async def _send_response(self, send, status: int, body: bytes):
+        await send({
+            "type": "http.response.start",
+            "status": status,
+            "headers": [(b"content-type", b"application/json")],
+        })
+        await send({
+            "type": "http.response.body",
+            "body": body,
+        })
