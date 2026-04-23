@@ -321,22 +321,31 @@ class AgentManager:
 
     def _register_mcp_tool(self, agent: Agent, mcp_tool: Any):
         """Helper to register an MCP tool to a PydanticAI agent."""
+        import copy
         
         # Strip __user_id from the schema to prevent context waste and hallucinations
+        # Create a deep copy to avoid modifying the shared original schema
+        safe_mcp_tool = mcp_tool
         if hasattr(mcp_tool, "inputSchema") and isinstance(mcp_tool.inputSchema, dict):
-            props = mcp_tool.inputSchema.get("properties", {})
+            if hasattr(mcp_tool, "model_copy"):
+                safe_mcp_tool = mcp_tool.model_copy(deep=True)
+            else:
+                safe_mcp_tool = copy.copy(mcp_tool)
+                safe_mcp_tool.inputSchema = copy.deepcopy(mcp_tool.inputSchema)
+                
+            props = safe_mcp_tool.inputSchema.get("properties", {})
             if "__user_id" in props:
                 del props["__user_id"]
-            reqs = mcp_tool.inputSchema.get("required", [])
+            reqs = safe_mcp_tool.inputSchema.get("required", [])
             if "__user_id" in reqs:
                 reqs.remove("__user_id")
         
         # Define a wrapper that calls the MCP tool
         async def tool_wrapper(ctx: RunContext[None], **kwargs: Any) -> Any:
-            return await self._execute_mcp_tool_with_retry(mcp_tool.name, kwargs)
+            return await self._execute_mcp_tool_with_retry(safe_mcp_tool.name, kwargs)
 
         # Register with PydanticAI
-        agent.tool(name=mcp_tool.name, description=mcp_tool.description)(tool_wrapper)
+        agent.tool(name=safe_mcp_tool.name, description=safe_mcp_tool.description)(tool_wrapper)
 
     async def inject_a2a_tools(self):
         """Injects call_{other_agent} tools based on a2a_access configuration and globally for supervisor."""

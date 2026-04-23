@@ -57,9 +57,6 @@ async def save_secrets(request: Request):
     for key, value in form.items():
         if value.strip(): # only update if not empty
             current_secrets[key] = value.strip()
-        elif key in current_secrets and not value.strip():
-             # if they submit an empty field for an existing secret, they might want to clear it
-             del current_secrets[key]
             
     await asyncio.to_thread(identity_mgr.save_user_secrets, user_id, current_secrets)
     

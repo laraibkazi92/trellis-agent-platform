@@ -221,54 +221,58 @@ class AuthMiddleware:
         if scope["type"] not in ("http", "websocket"):
             return await self.app(scope, receive, send)
             
-        path = scope.get("path", "")
-        normalized_path = re.sub(r'/+', '/', path)
-        
-        import os
-        DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
-        
-        protected_prefixes = ("/v1/chat/completions", "/sse", "/messages", "/mcp")
-        if any(normalized_path.startswith(prefix) for prefix in protected_prefixes):
-            headers = dict(scope.get("headers", []))
-            auth_header = headers.get(b"authorization", b"").decode("utf-8", errors="ignore")
+        try:
+            path = scope.get("path", "")
+            normalized_path = re.sub(r'/+', '/', path)
             
-            if DEV_MODE and (not auth_header or not auth_header.startswith("Bearer ")):
-                auth_token_var.set("dev-token")
-                user_id_var.set("dev-user-id")
-                scope["state"] = scope.get("state", {})
-                scope["state"]["user_id"] = "dev-user-id"
-                return await self.app(scope, receive, send)
+            import os
+            DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
+            
+            protected_prefixes = ("/v1/chat/completions", "/sse", "/messages", "/mcp")
+            if any(normalized_path.startswith(prefix) for prefix in protected_prefixes):
+                headers = dict(scope.get("headers", []))
+                auth_header = headers.get(b"authorization", b"").decode("utf-8", errors="ignore")
                 
-            if not auth_header or not auth_header.startswith("Bearer "):
-                await self._send_response(send, 401, b'{"error": "Missing or invalid Authorization header"}')
-                return
-            
-            token = auth_header.split(" ")[1]
-            try:
-                user_id = await asyncio.to_thread(self.identity_mgr.validate_key, token)
-            except Exception as e:
-                logger.error(f"Error validating key: {e}")
-                user_id = None
-            
-            if not user_id:
-                if DEV_MODE:
+                if DEV_MODE and (not auth_header or not auth_header.startswith("Bearer ")):
                     auth_token_var.set("dev-token")
                     user_id_var.set("dev-user-id")
                     scope["state"] = scope.get("state", {})
                     scope["state"]["user_id"] = "dev-user-id"
                     return await self.app(scope, receive, send)
-                await self._send_response(send, 401, b'{"error": "Invalid API Key"}')
-                return
+                    
+                if not auth_header or not auth_header.startswith("Bearer "):
+                    await self._send_response(send, 401, b'{"error": "Missing or invalid Authorization header"}')
+                    return
                 
-            # Set the ContextVars so downstream async functions can access them
-            auth_token_var.set(token)
-            user_id_var.set(user_id)
-            
-            # Add user_id to scope state for framework compatibility
-            scope["state"] = scope.get("state", {})
-            scope["state"]["user_id"] = user_id
-            
-        return await self.app(scope, receive, send)
+                token = auth_header.split(" ")[1]
+                try:
+                    user_id = await asyncio.to_thread(self.identity_mgr.validate_key, token)
+                except Exception as e:
+                    logger.error(f"Error validating key: {e}")
+                    user_id = None
+                
+                if not user_id:
+                    if DEV_MODE:
+                        auth_token_var.set("dev-token")
+                        user_id_var.set("dev-user-id")
+                        scope["state"] = scope.get("state", {})
+                        scope["state"]["user_id"] = "dev-user-id"
+                        return await self.app(scope, receive, send)
+                    await self._send_response(send, 401, b'{"error": "Invalid API Key"}')
+                    return
+                    
+                # Set the ContextVars so downstream async functions can access them
+                auth_token_var.set(token)
+                user_id_var.set(user_id)
+                
+                # Add user_id to scope state for framework compatibility
+                scope["state"] = scope.get("state", {})
+                scope["state"]["user_id"] = user_id
+                
+            return await self.app(scope, receive, send)
+        except Exception as e:
+            logger.error(f"Unhandled exception in ASGI AuthMiddleware: {e}", exc_info=True)
+            await self._send_response(send, 500, b'{"error": "Internal Server Error"}')
 
     async def _send_response(self, send, status: int, body: bytes):
         await send({
