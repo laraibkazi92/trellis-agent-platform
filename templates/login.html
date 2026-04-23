@@ -1,85 +1,83 @@
 {% extends "base.html" %}
 
-{% block title %}Authentication{% endblock %}
+{% block title %}Sign In{% endblock %}
 
 {% block content %}
-<div class="min-h-[75vh] flex flex-col items-center justify-center py-12 px-4">
-    <div class="w-full max-w-md border-2 border-neutral-900 dark:border-neutral-100 bg-white dark:bg-neutral-900 shadow-[8px_8px_0px_0px_rgba(0,0,0,1)] dark:shadow-[8px_8px_0px_0px_rgba(255,255,255,1)] p-8 transition-all hover:-translate-y-1 hover:shadow-[12px_12px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[12px_12px_0px_0px_rgba(255,255,255,1)]">
-        
-        <div class="mb-10 border-b-2 border-neutral-900 dark:border-neutral-100 pb-6 relative">
-            <!-- Decorative corner accent -->
-            <div class="absolute top-0 right-0 w-4 h-4 border-t-2 border-r-2 border-accent dark:border-accent-dark"></div>
-            
-            <h1 class="text-4xl font-bold uppercase tracking-tighter mb-2 leading-none">Access<br>Gateway</h1>
-            <p class="font-mono text-xs uppercase tracking-widest text-neutral-500 dark:text-neutral-400 mt-4 flex items-center gap-2">
-                <i data-lucide="shield-alert" class="w-4 h-4"></i>
-                Identify to proceed
-            </p>
-        </div>
-
-        <div class="flex flex-col gap-4">
-            {% if has_github %}
-            <a href="/login/github" class="group relative flex items-center justify-between p-4 border-2 border-neutral-200 dark:border-neutral-800 hover:border-neutral-900 dark:hover:border-neutral-100 hover:bg-neutral-50 dark:hover:bg-neutral-800 transition-all duration-200">
-                <div class="flex items-center gap-4">
-                    <i data-lucide="github" class="w-6 h-6 text-neutral-900 dark:text-neutral-100 transition-colors"></i>
-                    <div>
-                        <div class="font-bold uppercase tracking-wide group-hover:text-accent dark:group-hover:text-accent-dark transition-colors">GitHub</div>
-                        <div class="font-mono text-[10px] text-neutral-500 uppercase">OAuth 2.0 Identity</div>
-                    </div>
-                </div>
-                <div class="w-8 h-8 flex items-center justify-center border border-transparent group-hover:border-accent dark:group-hover:border-accent-dark transition-colors">
-                    <i data-lucide="arrow-right" class="w-4 h-4 opacity-0 -translate-x-2 group-hover:opacity-100 group-hover:translate-x-0 transition-all text-accent dark:text-accent-dark"></i>
-                </div>
-            </a>
-            {% endif %}
-
-            {% if has_oidc %}
-            <a href="/login/oidc" class="group relative flex items-center justify-between p-4 border-2 border-neutral-200 dark:border-neutral-800 hover:border-neutral-900 dark:hover:border-neutral-100 hover:bg-neutral-50 dark:hover:bg-neutral-800 transition-all duration-200">
-                <div class="flex items-center gap-4">
-                    <i data-lucide="building-2" class="w-6 h-6 text-neutral-900 dark:text-neutral-100 transition-colors"></i>
-                    <div>
-                        <div class="font-bold uppercase tracking-wide group-hover:text-accent dark:group-hover:text-accent-dark transition-colors">OIDC SSO</div>
-                        <div class="font-mono text-[10px] text-neutral-500 uppercase">Enterprise Access</div>
-                    </div>
-                </div>
-                <div class="w-8 h-8 flex items-center justify-center border border-transparent group-hover:border-accent dark:group-hover:border-accent-dark transition-colors">
-                    <i data-lucide="arrow-right" class="w-4 h-4 opacity-0 -translate-x-2 group-hover:opacity-100 group-hover:translate-x-0 transition-all text-accent dark:text-accent-dark"></i>
-                </div>
-            </a>
-            {% endif %}
-
-            {% if dev_mode %}
-            <a href="/login/dev" class="group relative flex items-center justify-between p-4 border-2 border-dashed border-red-500/30 hover:border-red-500 hover:bg-red-500/5 transition-all duration-200 mt-2">
-                <div class="flex items-center gap-4">
-                    <i data-lucide="terminal" class="w-6 h-6 text-red-500 group-hover:text-red-600 transition-colors"></i>
-                    <div>
-                        <div class="font-bold uppercase tracking-wide text-red-500 group-hover:text-red-600 transition-colors">Developer Mode</div>
-                        <div class="font-mono text-[10px] text-red-500/70 uppercase">Local Bypass Token</div>
-                    </div>
-                </div>
-                <div class="w-8 h-8 flex items-center justify-center border border-transparent group-hover:border-red-500 transition-colors">
-                    <i data-lucide="arrow-right" class="w-4 h-4 opacity-0 -translate-x-2 group-hover:opacity-100 group-hover:translate-x-0 transition-all text-red-500"></i>
-                </div>
-            </a>
-            {% endif %}
-            
-            {% if not has_github and not has_oidc and not dev_mode %}
-            <div class="p-6 border-2 border-red-500 bg-red-500/10 text-red-500 flex flex-col items-center text-center gap-3">
-                <i data-lucide="alert-triangle" class="w-8 h-8"></i>
-                <div>
-                    <div class="font-bold uppercase tracking-wide">Auth Disabled</div>
-                    <div class="font-mono text-xs uppercase mt-1 opacity-80">No providers configured</div>
-                </div>
+<div class="min-h-[80vh] flex flex-col items-center justify-center p-6">
+    <div class="w-full max-w-[420px]">
+        <!-- Brand/Logo Area -->
+        <div class="text-center mb-8">
+            <div class="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-accent/10 dark:bg-accent/20 mb-6 group">
+                <i data-lucide="shield-check" class="w-8 h-8 text-accent animate-[pulse_2s_cubic-bezier(0.4,0,0.6,1)_infinite]"></i>
             </div>
-            {% endif %}
+            <h1 class="text-3xl font-bold tracking-tight text-neutral-900 dark:text-white">Welcome Back</h1>
+            <p class="text-neutral-500 dark:text-neutral-400 mt-2">Sign in to your enterprise workspace</p>
         </div>
 
-        <div class="mt-10 pt-6 border-t-2 border-neutral-100 dark:border-neutral-800 flex justify-between items-center">
-            <span class="inline-flex items-center gap-2 font-mono text-[10px] uppercase text-neutral-400">
-                <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
-                Secure Connection
-            </span>
-            <span class="font-mono text-[10px] uppercase text-neutral-300 dark:text-neutral-700">v1.0.0</span>
+        <!-- Login Card -->
+        <div class="bg-white dark:bg-neutral-900 rounded-3xl shadow-[0_20px_50px_rgba(0,0,0,0.1)] dark:shadow-[0_20px_50px_rgba(0,0,0,0.5)] border border-neutral-200/60 dark:border-neutral-800 p-8 relative overflow-hidden">
+            <!-- Subtle background accent -->
+            <div class="absolute top-0 right-0 w-32 h-32 bg-accent/5 rounded-full -mr-16 -mt-16 blur-3xl pointer-events-none"></div>
+            
+            <div class="flex flex-col gap-4 relative">
+                {% if has_oidc %}
+                <a href="/login/oidc" class="flex items-center justify-center gap-3 w-full py-3.5 px-4 bg-accent hover:bg-accent/90 text-white rounded-xl font-semibold transition-all duration-200 shadow-lg shadow-accent/20 active:scale-[0.98]">
+                    <i data-lucide="building-2" class="w-5 h-5"></i>
+                    Continue with OIDC SSO
+                </a>
+                {% endif %}
+
+                {% if has_github %}
+                <a href="/login/github" class="flex items-center justify-center gap-3 w-full py-3.5 px-4 bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 hover:bg-black dark:hover:bg-neutral-100 rounded-xl font-semibold transition-all duration-200 shadow-lg dark:shadow-none active:scale-[0.98]">
+                    <i data-lucide="github" class="w-5 h-5"></i>
+                    Continue with GitHub
+                </a>
+                {% endif %}
+
+                {% if not has_github and not has_oidc and not dev_mode %}
+                <div class="py-10 flex flex-col items-center text-center gap-4 bg-red-50 dark:bg-red-950/20 rounded-2xl border border-red-100 dark:border-red-900/30 px-4">
+                    <div class="w-12 h-12 rounded-full bg-red-100 dark:bg-red-900/50 flex items-center justify-center text-red-600">
+                        <i data-lucide="alert-circle" class="w-6 h-6"></i>
+                    </div>
+                    <div>
+                        <h3 class="font-bold text-red-900 dark:text-red-400">Auth Configuration Required</h3>
+                        <p class="text-sm text-red-700/70 dark:text-red-500/60 max-w-[240px] mt-1">No identity providers have been configured for this environment.</p>
+                    </div>
+                </div>
+                {% endif %}
+
+                {% if dev_mode %}
+                <div class="relative my-4">
+                    <div class="absolute inset-0 flex items-center">
+                        <div class="w-full border-t border-neutral-200 dark:border-neutral-800"></div>
+                    </div>
+                    <div class="relative flex justify-center text-[10px] uppercase tracking-[0.2em] text-neutral-400 bg-white dark:bg-neutral-900 px-4">
+                        Developer Access
+                    </div>
+                </div>
+
+                <a href="/login/dev" class="flex items-center justify-center gap-3 w-full py-3 px-4 border border-red-200 dark:border-red-900/30 bg-red-50/50 dark:bg-red-950/10 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/20 rounded-xl text-sm font-medium transition-all duration-200 active:scale-[0.98]">
+                    <i data-lucide="terminal" class="w-4 h-4"></i>
+                    Bypass with Dev Token
+                </a>
+                {% endif %}
+            </div>
+        </div>
+
+        <!-- Footer Info -->
+        <div class="mt-10 flex flex-col items-center gap-6">
+            <div class="flex items-center gap-6 text-[10px] font-bold text-neutral-400 uppercase tracking-[0.15em]">
+                <span class="flex items-center gap-2">
+                    <span class="w-1.5 h-1.5 rounded-full bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.6)] animate-pulse"></span>
+                    Verified Secure
+                </span>
+                <span class="text-neutral-300 dark:text-neutral-800 font-normal">|</span>
+                <span>System v1.0.0</span>
+            </div>
+            
+            <p class="text-[10px] text-neutral-400 dark:text-neutral-500 text-center max-w-[320px] leading-relaxed opacity-60">
+                This system is for authorized use only. All activities are monitored and logged for security and compliance purposes.
+            </p>
         </div>
     </div>
 </div>
