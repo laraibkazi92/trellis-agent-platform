@@ -11,8 +11,9 @@ DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
 @router.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
     return templates.TemplateResponse(
-        "login.html", 
-        {
+        request=request,
+        name="login.html", 
+        context={
             "request": request,
             "has_github": HAS_GITHUB_AUTH,
             "has_oidc": HAS_OIDC_AUTH,
