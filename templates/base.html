@@ -54,11 +54,11 @@
     <nav class="border-b border-neutral-200 dark:border-neutral-800 p-4 px-6 flex flex-wrap gap-4 justify-between items-center bg-white dark:bg-neutral-900 sticky top-0 z-40">
         <a href="/" class="text-xl font-bold tracking-tight uppercase hover:text-accent dark:hover:text-accent-dark transition-colors">Agent Framework</a>
         <div class="space-x-4 md:space-x-6 text-sm font-bold font-mono tracking-wide flex items-center flex-wrap">
+        {% if user %}
             <a href="/agents" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/agents' %}text-accent dark:text-accent-dark{% endif %}">Agents</a>
             <a href="/tools" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/tools' %}text-accent dark:text-accent-dark{% endif %}">Tools</a>
             <a href="/docs" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path.startswith('/docs') %}text-accent dark:text-accent-dark{% endif %}">Docs</a>
         <span class="text-neutral-300 dark:text-neutral-700 hidden sm:inline">|</span>
-        {% if user %}
         <div class="relative group inline-block">
             <a href="/keys" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/keys' %}text-accent dark:text-accent-dark{% endif %}">API Keys</a>
             <div class="absolute hidden group-hover:block w-48 top-full mt-2 left-1/2 -translate-x-1/2 bg-neutral-800 text-white text-xs p-2 rounded shadow-lg z-50 text-center font-sans normal-case tracking-normal">
@@ -73,7 +73,7 @@
         </div>
         <span class="text-neutral-300 dark:text-neutral-700 hidden sm:inline">|</span>
         <span class="text-neutral-500 dark:text-neutral-400 hidden sm:inline">{{ user.name }}</span>
-        <a href="/logout" class="text-red-600 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300 transition-colors uppercase">Logout</a>
+        <a href="/logout" onclick="showGlobalLoading('Signing out...')" class="text-red-600 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300 transition-colors uppercase">Logout</a>
             {% else %}
             <a href="/login" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase">Login</a>
             {% endif %}
@@ -105,8 +105,27 @@
     <footer class="border-t border-neutral-200 dark:border-neutral-800 py-6 text-center text-sm font-mono text-neutral-500 mt-12 bg-white dark:bg-neutral-900">
         Trellis Agent Platform
     </footer>
+
+    <!-- Global Loading Overlay -->
+    <div id="global-loading-overlay" class="fixed inset-0 bg-white/80 dark:bg-neutral-950/80 backdrop-blur-md z-[100] hidden flex-col items-center justify-center">
+        <div class="flex flex-col items-center gap-4">
+            <div class="w-12 h-12 border-4 border-accent border-t-transparent rounded-full animate-spin"></div>
+            <p id="global-loading-text" class="text-sm font-mono uppercase tracking-widest text-accent animate-pulse">Processing...</p>
+        </div>
+    </div>
+
     <script>
         lucide.createIcons();
+
+        function showGlobalLoading(message) {
+            const overlay = document.getElementById('global-loading-overlay');
+            const textElement = document.getElementById('global-loading-text');
+            if (message) {
+                textElement.innerText = message;
+            }
+            overlay.classList.remove('hidden');
+            overlay.classList.add('flex');
+        }
     </script>
 </body>
 </html>

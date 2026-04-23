@@ -57,8 +57,10 @@ async def auth_callback(request: Request):
 
 @router.get("/logout")
 async def logout(request: Request):
-    request.session.pop('user', None)
-    return RedirectResponse(url='/')
+    request.session.clear()
+    response = RedirectResponse(url='/login')
+    response.delete_cookie("session") # Just in case, ensure the cookie is cleared
+    return response
 
 @router.get("/login/github")
 async def login_github(request: Request):

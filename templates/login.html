@@ -73,4 +73,14 @@
         </div>
     </div>
 </div>
+
+<script>
+    document.addEventListener('DOMContentLoaded', () => {
+        document.querySelectorAll('a[href^="/login/"]').forEach(link => {
+            link.addEventListener('click', () => {
+                showGlobalLoading('Authenticating...');
+            });
+        });
+    });
+</script>
 {% endblock %}
