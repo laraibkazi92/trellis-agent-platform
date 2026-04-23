@@ -22,3 +22,4 @@ class ToolConfig(BaseModel):
     entrypoint: str
     inputs: Optional[Dict[str, Any]] = None
     outputs: Optional[Dict[str, Any]] = None
+    secrets: Optional[List[str]] = Field(default_factory=list)
