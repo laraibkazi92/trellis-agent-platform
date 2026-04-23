@@ -12,8 +12,7 @@ from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart, TextPart
-from mcp import ClientSession
-from mcp.client.sse import sse_client
+from fastmcp import Client as FastMCPClient
 from core.models import AgentConfig
 
 app = FastAPI(title="Universal Agent Host")
@@ -29,7 +28,7 @@ app.add_middleware(AuthMiddleware, identity_mgr=identity_mgr)
 BASE_DIR = Path(__file__).parent.parent
 AGENTS_DIR = BASE_DIR / "agents"
 INTERNAL_ASSETS_DIR = BASE_DIR / "core" / "assets"
-DEFAULT_HUB_URL = os.getenv("HUB_URL", "http://localhost:8001/sse")
+DEFAULT_HUB_URL = os.getenv("HUB_URL", "http://localhost:8001/mcp")
 
 GEMINI_2_5_PRO_MODELS = {"gemini-2.5-pro"}
 GEMINI_2_5_FLASH_MODELS = {"gemini-2.5-flash"}
@@ -47,8 +46,7 @@ class AgentManager:
     def __init__(self):
         self.agents: Dict[str, Agent] = {}
         self.configs: Dict[str, AgentConfig] = {}
-        self.mcp_session: Optional[ClientSession] = None
-        self._mcp_cleanup = None
+        self.mcp_client: Optional[FastMCPClient] = None
         self._mcp_tools_cache = []
         self._lock = asyncio.Lock()
 
@@ -62,13 +60,32 @@ class AgentManager:
         print("Agent Manager started successfully.")
 
     async def _init_supervisor(self):
-        """Loads the internal Supervisor agent from etcd."""
+        """Loads the internal Supervisor agent from etcd or falls back to filesystem."""
         config_data = await asyncio.to_thread(identity_mgr.get_agent_config, "supervisor")
         system_prompt = await asyncio.to_thread(identity_mgr.get_agent_skills, "supervisor")
         
         if not config_data or not system_prompt:
-            print("Internal supervisor configuration not found in etcd!")
-            return
+            print("Internal supervisor configuration not found in etcd. Loading from filesystem...")
+            supervisor_dir = INTERNAL_ASSETS_DIR / "supervisor"
+            config_path = supervisor_dir / "config.yaml"
+            skills_path = supervisor_dir / "skills.md"
+            
+            if not config_path.exists() or not skills_path.exists():
+                print("Critical: Supervisor assets missing from filesystem!")
+                return
+                
+            with open(config_path, "r") as f:
+                config_data = yaml.safe_load(f)
+            with open(skills_path, "r") as f:
+                system_prompt = f.read()
+                
+            config_data['a2a_access'] = []
+            if "allowed_tools" not in config_data:
+                config_data["allowed_tools"] = []
+                
+            await asyncio.to_thread(identity_mgr.save_agent_config, "supervisor", config_data)
+            await asyncio.to_thread(identity_mgr.save_agent_skills, "supervisor", system_prompt)
+            print("Supervisor configuration populated to etcd from filesystem.")
 
         try:
             # clear a2a_access as it's injected dynamically
@@ -169,7 +186,7 @@ class AgentManager:
             hub_url = identity_mgr.get_config("HUB_URL", DEFAULT_HUB_URL)
             return {
                 "hub_url": hub_url,
-                "connected": self.mcp_session is not None,
+                "connected": self.mcp_client is not None,
                 "tool_count": len(self._mcp_tools_cache)
             }
 
@@ -189,7 +206,7 @@ class AgentManager:
     async def _reinject_tools_for_agent(self, name: str):
         """Helper to inject MCP tools into a specific agent if active."""
         async with self._lock:
-            if name in self.agents and self.mcp_session:
+            if name in self.agents and self.mcp_client:
                 agent_config = self.configs.get(name)
                 allowed_tools = agent_config.allowed_tools if agent_config else []
                 for tool in self._mcp_tools_cache:
@@ -247,8 +264,8 @@ class AgentManager:
         try:
             await self._establish_mcp_connection(hub_url)
             # Discover and register tools to specialized agents ONLY
-            tools_result = await self.mcp_session.list_tools()
-            self._mcp_tools_cache = tools_result.tools
+            tools = await self.mcp_client.list_tools()
+            self._mcp_tools_cache = tools
             
             async with self._lock:
                 for tool in self._mcp_tools_cache:
@@ -268,32 +285,29 @@ class AgentManager:
             print("Tools will be unavailable until connection is established.")
 
     async def _establish_mcp_connection(self, hub_url: str):
-        """Creates the SSE connection and ClientSession."""
-        if self.mcp_session:
+        """Creates the connection and FastMCPClient."""
+        if self.mcp_client:
             try:
                 await self.stop()
             except Exception:
                 pass
         
-        self._mcp_cleanup = sse_client(hub_url)
-        read, write = await self._mcp_cleanup.__aenter__()
-        self.mcp_session = ClientSession(read, write)
-        await self.mcp_session.__aenter__()
-        await self.mcp_session.initialize()
+        self.mcp_client = FastMCPClient(hub_url)
+        await self.mcp_client.__aenter__()
 
     async def _execute_mcp_tool_with_retry(self, mcp_tool_name: str, arguments: Dict[str, Any]) -> Any:
         """Executes an MCP tool, retrying the connection if it fails."""
         max_retries = 2
         for attempt in range(max_retries):
             try:
-                if not self.mcp_session:
+                if not self.mcp_client:
                     hub_url = identity_mgr.get_config("HUB_URL", DEFAULT_HUB_URL)
                     await self._establish_mcp_connection(hub_url)
-                result = await self.mcp_session.call_tool(mcp_tool_name, arguments)
+                result = await self.mcp_client.call_tool(mcp_tool_name, arguments)
                 return result.content
             except Exception as e:
                 print(f"MCP Tool error on attempt {attempt + 1}: {e}")
-                self.mcp_session = None # Force reconnect
+                self.mcp_client = None # Force reconnect
                 if attempt == max_retries - 1:
                     raise Exception(f"Failed to execute MCP tool '{mcp_tool_name}' after {max_retries} attempts: {e}")
 
@@ -342,12 +356,9 @@ class AgentManager:
         agent.tool(name=tool_name, description=description)(a2a_tool_wrapper)
 
     async def stop(self):
-        if self.mcp_session:
-            await self.mcp_session.__aexit__(None, None, None)
-            self.mcp_session = None
-        if self._mcp_cleanup:
-            await self._mcp_cleanup.__aexit__(None, None, None)
-            self._mcp_cleanup = None
+        if self.mcp_client:
+            await self.mcp_client.__aexit__(None, None, None)
+            self.mcp_client = None
 
 manager = AgentManager()
 
@@ -366,7 +377,7 @@ async def health():
         "status": "healthy",
         "agents_active": [name for name in manager.agents.keys() if name != "supervisor"],
         "agents_disabled": disabled,
-        "hub_connected": manager.mcp_session is not None,
+        "hub_connected": manager.mcp_client is not None,
         "hub_url": identity_mgr.get_config("HUB_URL", DEFAULT_HUB_URL)
     }
 

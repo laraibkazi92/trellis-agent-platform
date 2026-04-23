@@ -29,6 +29,7 @@ COPY core/ core/
 COPY agents/ agents/
 COPY tools/ tools/
 COPY templates/ templates/
+COPY scripts/ scripts/
 
 # Set PYTHONPATH to the root so core imports work
 ENV PYTHONPATH=/app

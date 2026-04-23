@@ -5,12 +5,12 @@ import subprocess
 import asyncio
 from pathlib import Path
 from typing import Dict, Any
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from core.models import ToolConfig
 from core.auth import IdentityManager
 
 # Initialize FastMCP server with host and port
-mcp = FastMCP("Polyglot Tool Hub", host="0.0.0.0", port=8001)
+mcp = FastMCP("Polyglot Tool Hub")
 
 BASE_DIR = Path(__file__).parent.parent
 
@@ -101,4 +101,6 @@ def register_tools():
 
 if __name__ == "__main__":
     register_tools()
-    mcp.run(transport="sse")
+    import uvicorn
+    app = mcp.http_app()
+    uvicorn.run(app, host="0.0.0.0", port=8001)

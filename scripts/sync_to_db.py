@@ -48,24 +48,6 @@ def main():
                 identity_mgr.save_agent_skills(agent_dir.name, skills)
                 print(f"  Saved skills for agent: {agent_dir.name}")
     
-    # Sync Supervisor separately
-    if SUPERVISOR_DIR.exists():
-        config_path = SUPERVISOR_DIR / "config.yaml"
-        skills_path = SUPERVISOR_DIR / "skills.md"
-        if config_path.exists():
-            with open(config_path, "r") as f:
-                config = yaml.safe_load(f)
-            config["a2a_access"] = []
-            if "allowed_tools" not in config:
-                config["allowed_tools"] = []
-            identity_mgr.save_agent_config("supervisor", config)
-            print("  Saved config for supervisor")
-        if skills_path.exists():
-            with open(skills_path, "r") as f:
-                skills = f.read()
-            identity_mgr.save_agent_skills("supervisor", skills)
-            print("  Saved skills for supervisor")
-
     print("\nSyncing tools to etcd...")
     if TOOLS_DIR.exists():
         for tool_yaml in TOOLS_DIR.glob("**/tool.yaml"):

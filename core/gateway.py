@@ -6,11 +6,11 @@ from pathlib import Path
 from typing import Dict, List
 import uvicorn
 import aiofiles
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from core.auth import AuthMiddleware, IdentityManager, auth_token_var
 
 # Initialize FastMCP server with host and port
-mcp = FastMCP("Agent Gateway", host="0.0.0.0", port=8002)
+mcp = FastMCP("Agent Gateway")
 
 BASE_DIR = Path(__file__).parent.parent
 AGENTS_DIR = BASE_DIR / "agents"
@@ -111,7 +111,7 @@ async def marketplace_router(prompt: str) -> str:
     return await use_agent("supervisor", routing_prompt)
 
 if __name__ == "__main__":
-    app = mcp.sse_app()
+    app = mcp.http_app()
     identity_mgr = IdentityManager(
         host=os.getenv("ETCD_HOST", "127.0.0.1"),
         port=int(os.getenv("ETCD_PORT", 2379))

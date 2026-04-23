@@ -24,7 +24,9 @@ async def discover_agents() -> List[Dict]:
             
             agents.append({
                 "name": config.get("name", name),
+                "author": config.get("author", "Unknown"),
                 "description": config.get("description", ""),
+                "tags": config.get("tags", []),
                 "capabilities": config.get("capabilities", []),
                 "skills": skills_content,
                 "a2a_access": config.get("a2a_access", []),
@@ -47,6 +49,9 @@ async def discover_tools() -> List[Dict]:
                 "description": config.get("description", ""),
                 "runtime": config.get("runtime", "unknown"),
                 "entrypoint": config.get("entrypoint", ""),
-                "rel_path": config.get("rel_path", "")
+                "rel_path": config.get("rel_path", ""),
+                "inputs": config.get("inputs", {}),
+                "outputs": config.get("outputs", {}),
+                "version": config.get("version", "0.1.0"),
             })
     return tools

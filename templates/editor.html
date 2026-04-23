@@ -27,9 +27,7 @@
             }
         }
     </script>
-    <style>
-        body { background-color: theme('colors.neutral.50'); color: theme('colors.neutral.900'); }
-        
+    <style type="text/tailwindcss">
         /* Base Form Elements */
         .form-input {
             width: 100%;
@@ -108,7 +106,6 @@
         }
         
         @media (prefers-color-scheme: dark) {
-            body { background-color: theme('colors.neutral.950'); color: theme('colors.neutral.50'); }
             
             .form-input {
                 border-color: theme('colors.neutral.700');
@@ -167,7 +164,7 @@
         }
     </style>
 </head>
-<body class="min-h-screen antialiased selection:bg-accent selection:text-white dark:selection:bg-accent-dark">
+<body class="bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-50 min-h-screen antialiased selection:bg-accent selection:text-white dark:selection:bg-accent-dark">
     <nav class="border-b border-neutral-200 dark:border-neutral-800 p-4 px-6 flex justify-between items-center bg-white dark:bg-neutral-900 mb-8">
         <div class="flex items-center gap-4">
             <span class="font-mono text-xs font-bold bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 px-3 py-1 uppercase tracking-widest">{{ type }}</span>

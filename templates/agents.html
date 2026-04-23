@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+
+{% block title %}Agents{% endblock %}
+
+{% block content %}
+<!-- Global Connection Modal -->
+<div id="global-connection" class="hidden fixed inset-0 bg-neutral-950/80 z-50 flex items-center justify-center p-4">
+    <div class="bg-neutral-100 dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 p-6 max-w-3xl w-full max-h-[90vh] overflow-y-auto shadow-2xl relative flex flex-col">
+        <div class="flex justify-between items-center mb-6">
+            <h3 class="text-xl font-bold uppercase tracking-wider">Framework Connection Guide</h3>
+            <button onclick="document.getElementById('global-connection').classList.add('hidden')" class="text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 uppercase text-sm font-mono font-bold">Close [X]</button>
+        </div>
+        
+        <div class="flex flex-col gap-8 flex-grow min-h-0">
+            <div class="flex flex-col">
+                <h4 class="font-bold mb-4 uppercase text-sm border-b border-neutral-200 dark:border-neutral-800 pb-2">Connect to MCP Gateway</h4>
+                <p class="text-sm text-neutral-600 dark:text-neutral-400 font-mono mb-4">Run this command to add the entire agent framework directly to Claude Code:</p>
+                <div class="relative group mb-4">
+                    <button onclick="copyToClipboard(this, 'code')" class="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity bg-neutral-100 dark:bg-neutral-800 border border-neutral-300 dark:border-neutral-600 text-xs font-bold font-mono px-2 py-1 uppercase text-neutral-600 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark z-10">Copy</button>
+                    <pre class="bg-white dark:bg-[#0a0a0a] p-4 text-xs font-mono overflow-x-auto text-neutral-800 dark:text-neutral-300 border border-neutral-200 dark:border-neutral-800 flex-grow rounded-sm m-0"><code>claude mcp add --transport http trellis {{ public_mcp_url }} --header "Authorization: Bearer YOUR_API_KEY"</code></pre>
+                </div>
+            </div>
+
+            <div class="flex flex-col">
+                <h4 class="font-bold mb-4 uppercase text-sm border-b border-neutral-200 dark:border-neutral-800 pb-2">OpenAI API Compatible Base URL</h4>
+                <p class="text-sm text-neutral-600 dark:text-neutral-400 font-mono mb-4">You can use this base URL in any standard OpenAI API client to talk to the agents directly.</p>
+                <div class="relative group">
+                    <button onclick="copyToClipboard(this, 'code')" class="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity bg-neutral-100 dark:bg-neutral-800 border border-neutral-300 dark:border-neutral-600 text-xs font-bold font-mono px-2 py-1 uppercase text-neutral-600 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark z-10">Copy</button>
+                    <pre class="bg-white dark:bg-[#0a0a0a] p-4 text-xs font-mono overflow-x-auto text-neutral-800 dark:text-neutral-300 border border-neutral-200 dark:border-neutral-800 flex-grow rounded-sm"><code>BASE_URL={{ public_host_url }}/v1</code></pre>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-6 gap-4">
+    <div class="flex items-center gap-4">
+        <h2 class="text-2xl font-bold uppercase tracking-wider">Agents</h2>
+        <button onclick="document.getElementById('global-connection').classList.remove('hidden')" class="text-xs font-mono font-bold bg-neutral-200 hover:bg-neutral-300 dark:bg-neutral-800 dark:hover:bg-neutral-700 text-neutral-800 dark:text-neutral-200 px-3 py-1.5 transition-colors border border-neutral-300 dark:border-neutral-700 uppercase">Gateway Setup</button>
+    </div>
+    <div class="relative w-full sm:w-72">
+        <input type="text" id="agent-search" placeholder="Search fuzzy..." class="w-full bg-white dark:bg-neutral-900 border border-neutral-300 dark:border-neutral-700 px-4 py-2 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 placeholder-neutral-500">
+    </div>
+</div>
+
+<div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6 mb-12" id="agents-grid">
+    {% for agent in agents %}
+    <div class="agent-card border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 p-6 hover:border-accent dark:hover:border-accent-dark transition-colors flex flex-col" data-agent-name="{{ agent.name }}">
+        <div class="flex justify-between items-start mb-2">
+            <h3 class="text-xl font-bold">{{ agent.name }} <span class="text-xs font-mono text-neutral-500 font-normal ml-2">v{{ agent.version }}</span></h3>
+            {% if is_admin %}
+            <a href="/editor/agent/{{ agent.name }}" class="font-mono text-xs font-bold border border-neutral-900 dark:border-neutral-100 text-neutral-900 dark:text-neutral-100 hover:bg-neutral-900 hover:text-white dark:hover:bg-neutral-100 dark:hover:text-neutral-900 px-2 py-1 uppercase tracking-wider transition-colors">Edit</a>
+            {% endif %}
+        </div>
+        <p class="text-xs font-mono text-neutral-500 dark:text-neutral-500 mb-4">By: {{ agent.author }}</p>
+        <p class="text-neutral-600 dark:text-neutral-400 mb-6 flex-grow text-sm leading-relaxed font-mono">{{ agent.description }}</p>
+        
+        <div class="mb-6 pt-4 border-t border-neutral-100 dark:border-neutral-800">
+            <span class="text-xs font-bold text-neutral-400 dark:text-neutral-500 uppercase tracking-wider block mb-3 font-mono">Tags</span>
+            <ul class="flex flex-wrap gap-2">
+                {% for tag in agent.tags %}
+                <li class="font-mono text-xs border border-neutral-200 dark:border-neutral-700 px-2 py-1 bg-neutral-50 dark:bg-neutral-950 text-neutral-600 dark:text-neutral-300">{{ tag }}</li>
+                {% endfor %}
+                {% if not agent.tags %}
+                <li class="font-mono text-xs text-neutral-400 italic">No tags</li>
+                {% endif %}
+            </ul>
+        </div>
+        <div class="flex">
+            <button onclick="document.getElementById('connect-{{ agent.name }}').classList.remove('hidden')" class="w-full border border-accent text-accent hover:bg-accent hover:text-white dark:border-accent-dark dark:text-accent-dark dark:hover:bg-accent-dark dark:hover:text-white text-sm font-bold uppercase tracking-wider px-4 py-2 text-center transition-colors font-mono">Connection Details</button>
+        </div>
+    </div>
+    
+    <div id="connect-{{ agent.name }}" class="hidden fixed inset-0 bg-neutral-950/80 z-50 flex items-center justify-center p-4">
+        <div class="bg-neutral-100 dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 p-6 max-w-3xl w-full max-h-[90vh] overflow-y-auto shadow-2xl relative flex flex-col">
+            <div class="flex justify-between items-center mb-6">
+                <h3 class="text-xl font-bold uppercase tracking-wider">Connect to {{ agent.name }}</h3>
+                <button onclick="document.getElementById('connect-{{ agent.name }}').classList.add('hidden')" class="text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 uppercase text-sm font-mono font-bold">Close [X]</button>
+            </div>
+            
+            <div class="flex flex-col gap-8 flex-grow min-h-0">
+                <div class="flex flex-col">
+                    <h4 class="font-bold mb-4 uppercase text-sm border-b border-neutral-200 dark:border-neutral-800 pb-2">OpenAI API Compatible</h4>
+                    <div class="relative group">
+                        <button onclick="copyToClipboard(this, 'code')" class="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity bg-neutral-100 dark:bg-neutral-800 border border-neutral-300 dark:border-neutral-600 text-xs font-bold font-mono px-2 py-1 uppercase text-neutral-600 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark z-10">Copy</button>
+                        <pre class="bg-white dark:bg-[#0a0a0a] p-4 text-xs font-mono overflow-x-auto text-neutral-800 dark:text-neutral-300 border border-neutral-200 dark:border-neutral-800 flex-grow rounded-sm"><code>curl -X POST {{ public_host_url }}/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{
+    "model": "{{ agent.name }}",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'</code></pre>
+                    </div>
+                </div>
+
+                <div class="flex flex-col">
+                    <h4 class="font-bold mb-4 uppercase text-sm border-b border-neutral-200 dark:border-neutral-800 pb-2">A2A (Agent-to-Agent)</h4>
+                    <p class="text-sm text-neutral-600 dark:text-neutral-400 font-mono mb-4">To call this agent from another agent, add it to the caller's <code class="bg-neutral-200 dark:bg-neutral-800 px-1.5 py-0.5 text-xs text-accent dark:text-accent-dark rounded-sm">a2a_access</code> list in config.yaml.</p>
+                    <div class="relative group">
+                        <button onclick="copyToClipboard(this, 'code')" class="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity bg-neutral-100 dark:bg-neutral-800 border border-neutral-300 dark:border-neutral-600 text-xs font-bold font-mono px-2 py-1 uppercase text-neutral-600 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark z-10">Copy</button>
+                        <pre class="bg-white dark:bg-[#0a0a0a] p-4 text-xs font-mono overflow-x-auto text-neutral-800 dark:text-neutral-300 border border-neutral-200 dark:border-neutral-800 flex-grow rounded-sm"><code># caller config.yaml
+a2a_access:
+  - "{{ agent.name }}"</code></pre>
+                    </div>
+                </div>
+
+                <div class="flex flex-col">
+                    <h4 class="font-bold mb-4 uppercase text-sm border-b border-neutral-200 dark:border-neutral-800 pb-2">MCP Usage</h4>
+                    <p class="text-sm text-neutral-600 dark:text-neutral-400 font-mono mb-4">Assuming you have connected the Framework MCP Gateway, you can call this agent via the `use_agent` tool.</p>
+                    <div class="relative group mb-4">
+                        <button onclick="copyToClipboard(this, 'code')" class="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity bg-neutral-100 dark:bg-neutral-800 border border-neutral-300 dark:border-neutral-600 text-xs font-bold font-mono px-2 py-1 uppercase text-neutral-600 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark z-10">Copy</button>
+                        <pre class="bg-white dark:bg-[#0a0a0a] p-4 text-xs font-mono overflow-x-auto text-neutral-800 dark:text-neutral-300 border border-neutral-200 dark:border-neutral-800 flex-grow rounded-sm m-0"><code>use_agent(agent_name="{{ agent.name }}", prompt="...")</code></pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+
+<script>
+    const agentsData = [
+        {% for agent in agents %}
+        {
+            "name": "{{ agent.name }}",
+            "description": "{{ agent.description|e }}",
+            "author": "{{ agent.author }}",
+            "tags": {{ agent.tags | tojson | safe }}
+        }{% if not loop.last %},{% endif %}
+        {% endfor %}
+    ];
+
+    const fuse = new Fuse(agentsData, {
+        keys: ['name', 'description', 'author', 'tags'],
+        threshold: 0.3
+    });
+
+    const searchInput = document.getElementById('agent-search');
+    const agentCards = document.querySelectorAll('.agent-card');
+
+    searchInput.addEventListener('input', (e) => {
+        const query = e.target.value;
+        if (!query) {
+            agentCards.forEach(card => card.style.display = 'flex');
+            return;
+        }
+
+        const results = fuse.search(query);
+        const matchedNames = new Set(results.map(r => r.item.name));
+
+        agentCards.forEach(card => {
+            if (matchedNames.has(card.dataset.agentName)) {
+                card.style.display = 'flex';
+            } else {
+                card.style.display = 'none';
+            }
+        });
+    });
+</script>
+{% endblock %}

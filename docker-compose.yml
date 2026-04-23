@@ -11,7 +11,7 @@ services:
       - .env
     environment:
       - HOST_URL=http://host:8000
-      - HUB_URL=http://hub:8001/sse
+      - HUB_URL=http://hub:8001/mcp
       - GOOGLE_API_KEY=${GEMINI_API_KEY}
       - DEV_MODE=true
       - ETCD_HOST=etcd
@@ -53,9 +53,11 @@ services:
   etcd:
     image: quay.io/coreos/etcd:v3.5.0
     container_name: etcd-server
-    command: etcd --advertise-client-urls http://etcd:2379 --listen-client-urls http://0.0.0.0:2379
+    command: etcd --advertise-client-urls http://etcd:2379 --listen-client-urls http://0.0.0.0:2379 --data-dir /etcd-data
     ports:
       - "2379:2379"
+    volumes:
+      - etcd-data:/etcd-data
     restart: unless-stopped
 
 
@@ -81,3 +83,6 @@ services:
 networks:
   default:
     name: trellis-network
+
+volumes:
+  etcd-data:

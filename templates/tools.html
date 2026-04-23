@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+
+{% block title %}Tools{% endblock %}
+
+{% block content %}
+<div class="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-6 gap-4">
+    <h2 class="text-2xl font-bold uppercase tracking-wider">Tools Library</h2>
+    <div class="relative w-full sm:w-72">
+        <input type="text" id="tool-search" placeholder="Search fuzzy..." class="w-full bg-white dark:bg-neutral-900 border border-neutral-300 dark:border-neutral-700 px-4 py-2 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 placeholder-neutral-500">
+    </div>
+</div>
+
+<div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6 mb-12" id="tools-grid">
+    {% for tool in tools %}
+    <div class="tool-card border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 hover:border-accent dark:hover:border-accent-dark transition-colors flex flex-col" data-tool-name="{{ tool.name }}">
+        <div class="p-6 flex-grow flex flex-col">
+            <div class="flex justify-between items-start mb-3">
+                <div class="flex items-center gap-2">
+                    <h3 class="text-xl font-bold">{{ tool.name }}</h3>
+                    <span class="text-xs font-mono text-neutral-500 font-normal">v{{ tool.version }}</span>
+                </div>
+                <span class="font-mono text-xs font-bold border border-accent text-accent dark:border-accent-dark dark:text-accent-dark px-2 py-1 uppercase tracking-wider">
+                    {{ tool.runtime }}
+                </span>
+            </div>
+            
+            <p class="text-neutral-600 dark:text-neutral-400 mb-6 flex-grow text-sm leading-relaxed font-mono">{{ tool.description }}</p>
+            
+            <!-- Quick Documentation -->
+            <div class="mt-auto space-y-4 pt-4 border-t border-neutral-100 dark:border-neutral-800">
+                {% if tool.inputs %}
+                <div>
+                    <span class="text-[10px] font-bold text-neutral-400 dark:text-neutral-500 uppercase tracking-wider block mb-2 font-mono">Inputs</span>
+                    <div class="space-y-2">
+                        {% for name, details in tool.inputs.items() %}
+                        <div class="text-xs font-mono bg-neutral-50 dark:bg-neutral-950 p-2 border border-neutral-100 dark:border-neutral-800">
+                            <div class="flex justify-between mb-1">
+                                <span class="font-bold text-accent dark:text-accent-dark">{{ name }}</span>
+                                <span class="text-neutral-500">{{ details.type }}{% if details.required %} <span class="text-red-500">*</span>{% endif %}</span>
+                            </div>
+                            <div class="text-neutral-600 dark:text-neutral-400">{{ details.description }}</div>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+                {% endif %}
+                
+                {% if tool.outputs %}
+                <div>
+                    <span class="text-[10px] font-bold text-neutral-400 dark:text-neutral-500 uppercase tracking-wider block mb-2 font-mono">Outputs</span>
+                    <div class="space-y-2">
+                        {% for name, details in tool.outputs.items() %}
+                        <div class="text-xs font-mono bg-neutral-50 dark:bg-neutral-950 p-2 border border-neutral-100 dark:border-neutral-800">
+                            <div class="flex justify-between mb-1">
+                                <span class="font-bold text-green-600 dark:text-green-500">{{ name }}</span>
+                                <span class="text-neutral-500">{{ details.type }}</span>
+                            </div>
+                            <div class="text-neutral-600 dark:text-neutral-400">{{ details.description }}</div>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+
+        {% if is_admin %}
+        <div class="border-t border-neutral-200 dark:border-neutral-800 mt-auto">
+            <a href="/editor/tool/{{ tool.name }}" class="text-neutral-900 dark:text-neutral-100 hover:bg-neutral-900 hover:text-white dark:hover:bg-neutral-100 dark:hover:text-neutral-900 text-sm font-bold uppercase tracking-wider px-4 py-3 block text-center transition-colors font-mono w-full">Edit Tool</a>
+        </div>
+        {% endif %}
+    </div>
+    {% endfor %}
+</div>
+
+<script>
+    const toolsData = [
+        {% for tool in tools %}
+        {
+            "name": "{{ tool.name }}",
+            "description": "{{ tool.description|e }}",
+            "runtime": "{{ tool.runtime }}"
+        }{% if not loop.last %},{% endif %}
+        {% endfor %}
+    ];
+
+    const fuse = new Fuse(toolsData, {
+        keys: ['name', 'description', 'runtime'],
+        threshold: 0.3
+    });
+
+    const searchInput = document.getElementById('tool-search');
+    const toolCards = document.querySelectorAll('.tool-card');
+
+    searchInput.addEventListener('input', (e) => {
+        const query = e.target.value;
+        if (!query) {
+            toolCards.forEach(card => card.style.display = 'flex');
+            return;
+        }
+
+        const results = fuse.search(query);
+        const matchedNames = new Set(results.map(r => r.item.name));
+
+        toolCards.forEach(card => {
+            if (matchedNames.has(card.dataset.toolName)) {
+                card.style.display = 'flex';
+            } else {
+                card.style.display = 'none';
+            }
+        });
+    });
+</script>
+{% endblock %}

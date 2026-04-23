@@ -4,6 +4,7 @@ fastapi
 pydantic-ai[gemini]
 google-generativeai
 mcp[all]
+fastmcp
 uvicorn
 httpx
 etcd3
