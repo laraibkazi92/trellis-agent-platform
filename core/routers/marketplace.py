@@ -12,10 +12,24 @@ async def index(request: Request):
     if not user:
         return RedirectResponse(url='/login')
         
+    agents = await discover_agents()
+    tools = await discover_tools()
+    
+    dev_mode = os.getenv("DEV_MODE", "false").lower() == "true"
+    public_host_url = os.getenv("PUBLIC_HOST_URL", "http://localhost:8000")
+    public_mcp_url = os.getenv("PUBLIC_MCP_URL", "http://localhost:8002/mcp")
+
     return templates.TemplateResponse(
         request=request,
         name="index.html", 
-        context={"user": user}
+        context={
+            "user": user,
+            "agents_count": len(agents),
+            "tools_count": len(tools),
+            "dev_mode": dev_mode,
+            "public_host_url": public_host_url,
+            "public_mcp_url": public_mcp_url
+        }
     )
 
 @router.get("/agents", response_class=HTMLResponse)

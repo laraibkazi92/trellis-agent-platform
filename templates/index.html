@@ -1,24 +1,115 @@
 {% extends "base.html" %}
 
-{% block title %}Home{% endblock %}
+{% block title %}Dashboard{% endblock %}
 
 {% block content %}
-<div class="max-w-3xl mx-auto py-12 flex flex-col items-center text-center">
-    <h1 class="text-5xl font-bold uppercase tracking-tighter mb-6">Agent Framework</h1>
-    <p class="text-xl text-neutral-600 dark:text-neutral-400 mb-12 font-mono leading-relaxed">
-        A polyglot ecosystem for autonomous agents and tools. Build, discover, and deploy intelligent workflows.
-    </p>
+<div class="max-w-5xl mx-auto space-y-8 font-mono mt-8">
     
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-6 w-full max-w-2xl">
-        <a href="/agents" class="group border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 p-8 hover:border-accent dark:hover:border-accent-dark transition-all flex flex-col items-center text-center h-full">
-            <h2 class="text-2xl font-bold uppercase mb-4 group-hover:text-accent dark:group-hover:text-accent-dark transition-colors">Agent Marketplace</h2>
-            <p class="text-neutral-600 dark:text-neutral-400 font-mono text-sm">Discover specialized AI agents ready to orchestrate your tasks.</p>
-        </a>
+    <!-- System Metadata (Header) -->
+    <div class="border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 p-6">
+        <h1 class="text-2xl font-bold uppercase tracking-tight mb-6 flex items-center gap-2">
+            <i data-lucide="terminal" class="w-6 h-6 text-accent dark:text-accent-dark"></i>
+            System Telemetry
+        </h1>
         
-        <a href="/tools" class="group border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 p-8 hover:border-accent dark:hover:border-accent-dark transition-all flex flex-col items-center text-center h-full">
-            <h2 class="text-2xl font-bold uppercase mb-4 group-hover:text-accent dark:group-hover:text-accent-dark transition-colors">Tools Library</h2>
-            <p class="text-neutral-600 dark:text-neutral-400 font-mono text-sm">Explore polyglot tools (Go, Python, TS) to extend agent capabilities.</p>
-        </a>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm mb-6">
+            <div class="flex items-center gap-2">
+                <span class="text-neutral-500">AGENTS_COUNT:</span>
+                <span class="font-bold text-accent dark:text-accent-dark">{{ agents_count }}</span>
+            </div>
+            <div class="flex items-center gap-2">
+                <span class="text-neutral-500">TOOLS_COUNT:</span>
+                <span class="font-bold text-accent dark:text-accent-dark">{{ tools_count }}</span>
+            </div>
+            <div class="flex items-center gap-2">
+                <span class="text-neutral-500">ENVIRONMENT:</span>
+                <span class="font-bold {% if dev_mode %}text-yellow-600 dark:text-yellow-500{% else %}text-green-600 dark:text-green-500{% endif %}">
+                    {% if dev_mode %}DEV{% else %}PROD{% endif %}
+                </span>
+            </div>
+        </div>
+
+        <div class="space-y-2 text-sm border-t border-neutral-100 dark:border-neutral-800 pt-4">
+            <div class="flex items-center gap-2">
+                <div class="w-2 h-2 rounded-full bg-green-500"></div>
+                <span class="text-neutral-500 w-24">HOST_URL:</span>
+                <span class="select-all bg-neutral-100 dark:bg-neutral-950 px-2 py-1 text-neutral-800 dark:text-neutral-300">{{ public_host_url }}</span>
+            </div>
+            <div class="flex items-center gap-2">
+                <div class="w-2 h-2 rounded-full bg-green-500"></div>
+                <span class="text-neutral-500 w-24">MCP_URL:</span>
+                <span class="select-all bg-neutral-100 dark:bg-neutral-950 px-2 py-1 text-neutral-800 dark:text-neutral-300">{{ public_mcp_url }}</span>
+            </div>
+        </div>
     </div>
+
+    <!-- Component Registry (Body) -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div class="border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 p-6 flex flex-col group hover:border-accent dark:hover:border-accent-dark transition-colors">
+            <h2 class="text-lg font-bold uppercase mb-2 flex items-center gap-2">
+                <i data-lucide="cpu" class="w-5 h-5 text-accent dark:text-accent-dark"></i>
+                Agent Registry
+            </h2>
+            <p class="text-neutral-500 text-sm mb-6 flex-grow">
+                Specialized AI agents ready to orchestrate tasks across the framework.
+            </p>
+            <a href="/agents" class="inline-flex items-center gap-2 text-sm font-bold uppercase text-accent dark:text-accent-dark group-hover:underline">
+                View Agents <i data-lucide="arrow-right" class="w-4 h-4"></i>
+            </a>
+        </div>
+
+        <div class="border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 p-6 flex flex-col group hover:border-accent dark:hover:border-accent-dark transition-colors">
+            <h2 class="text-lg font-bold uppercase mb-2 flex items-center gap-2">
+                <i data-lucide="wrench" class="w-5 h-5 text-accent dark:text-accent-dark"></i>
+                Tool Library
+            </h2>
+            <p class="text-neutral-500 text-sm mb-6 flex-grow">
+                Polyglot tools (Go, Python, TS) extending agent capabilities.
+            </p>
+            <a href="/tools" class="inline-flex items-center gap-2 text-sm font-bold uppercase text-accent dark:text-accent-dark group-hover:underline">
+                View Tools <i data-lucide="arrow-right" class="w-4 h-4"></i>
+            </a>
+        </div>
+    </div>
+
+    <!-- Developer Reference (Footer) -->
+    <div class="border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 p-6">
+        <h2 class="text-lg font-bold uppercase mb-6 flex items-center gap-2">
+            <i data-lucide="code" class="w-5 h-5 text-accent dark:text-accent-dark"></i>
+            Developer Reference
+        </h2>
+        
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            <div>
+                <h3 class="text-sm font-bold text-neutral-500 uppercase mb-2">MCP Connection Snippet</h3>
+                <div class="relative group">
+                    <pre class="bg-neutral-100 dark:bg-neutral-950 p-4 text-xs overflow-x-auto border border-neutral-200 dark:border-neutral-800 text-neutral-800 dark:text-neutral-300"><code>{
+  "mcpServers": {
+    "trellis-agent-platform": {
+      "command": "curl",
+      "args": ["-s", "{{ public_mcp_url }}"]
+    }
+  }
+}</code></pre>
+                </div>
+            </div>
+            
+            <div class="space-y-6">
+                <div>
+                    <a href="/keys" class="text-sm font-bold uppercase text-neutral-900 dark:text-white hover:text-accent dark:hover:text-accent-dark transition-colors flex items-center gap-2">
+                        <i data-lucide="key" class="w-4 h-4 text-neutral-400"></i> API Keys
+                    </a>
+                    <p class="text-xs text-neutral-500 mt-1">Manage inbound authentication tokens for external clients accessing the framework.</p>
+                </div>
+                <div>
+                    <a href="/secrets" class="text-sm font-bold uppercase text-neutral-900 dark:text-white hover:text-accent dark:hover:text-accent-dark transition-colors flex items-center gap-2">
+                        <i data-lucide="lock" class="w-4 h-4 text-neutral-400"></i> Tool Secrets
+                    </a>
+                    <p class="text-xs text-neutral-500 mt-1">Manage outbound credentials for 3rd-party integrations used by tools (e.g., Issues, Support).</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
 </div>
 {% endblock %}
