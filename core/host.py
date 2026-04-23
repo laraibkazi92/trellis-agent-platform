@@ -14,6 +14,7 @@ from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart, TextPart
 from fastmcp import Client as FastMCPClient
 from core.models import AgentConfig
+from core.health import HealthMonitor
 
 app = FastAPI(title="Universal Agent Host")
 
@@ -22,6 +23,7 @@ identity_mgr = IdentityManager(
     port=int(os.getenv("ETCD_PORT", 2379))
 )
 app.add_middleware(AuthMiddleware, identity_mgr=identity_mgr)
+health_monitor = HealthMonitor(identity_mgr)
 
 
 # Setup directories
@@ -342,6 +344,11 @@ class AgentManager:
         
         # Define a wrapper that calls the MCP tool
         async def tool_wrapper(ctx: RunContext[None], **kwargs: Any) -> Any:
+            # Check tool health before execution
+            status = health_monitor.get_status("tool", safe_mcp_tool.name)
+            if status.get("status") == "Offline":
+                return f"SYSTEM: This tool is currently offline due to technical failures. Inform the user you cannot perform this action right now."
+
             return await self._execute_mcp_tool_with_retry(safe_mcp_tool.name, kwargs)
 
         # Register with PydanticAI
@@ -399,9 +406,35 @@ async def log_startup():
 @app.get("/health")
 async def health():
     disabled = identity_mgr.get_disabled_agents()
+    agents_status = {}
+    
+    for agent_name, agent_config in manager.configs.items():
+        if agent_name == "supervisor" or agent_name in disabled:
+            continue
+            
+        offline_tools = []
+        for tool_name in agent_config.allowed_tools:
+            tool_status = health_monitor.get_status("tool", tool_name)
+            if tool_status.get("status") == "Offline":
+                offline_tools.append(tool_name)
+                
+        agent_global_status = health_monitor.get_status("agent", agent_name)
+        if agent_global_status.get("status") == "Offline":
+            status_str = "Offline"
+        elif offline_tools:
+            status_str = "Degraded"
+        else:
+            status_str = "Online"
+            
+        agents_status[agent_name] = {
+            "status": status_str,
+            "offline_tools": offline_tools,
+            "agent_error": agent_global_status.get("last_error")
+        }
+
     return {
         "status": "healthy",
-        "agents_active": [name for name in manager.agents.keys() if name != "supervisor"],
+        "agents": agents_status,
         "agents_disabled": disabled,
         "hub_connected": manager.mcp_client is not None,
         "hub_url": identity_mgr.get_config("HUB_URL", DEFAULT_HUB_URL)
@@ -412,6 +445,11 @@ async def chat_completions(request: ChatRequest):
     if request.model not in manager.agents:
         raise HTTPException(status_code=404, detail=f"Agent '{request.model}' not found or disabled")
     
+    # Check if agent is Offline
+    agent_status = health_monitor.get_status("agent", request.model)
+    if agent_status.get("status") == "Offline":
+        raise HTTPException(status_code=503, detail=f"Agent '{request.model}' is currently offline due to failures.")
+
     agent = manager.agents[request.model]
     
     # Map OpenAI-style messages to PydanticAI message history
@@ -426,6 +464,7 @@ async def chat_completions(request: ChatRequest):
     
     try:
         result = await agent.run(prompt, message_history=history)
+        health_monitor.record_event("agent", request.model, is_success=True)
         return {
             "choices": [
                 {
@@ -437,6 +476,7 @@ async def chat_completions(request: ChatRequest):
             ]
         }
     except Exception as e:
+        health_monitor.record_event("agent", request.model, is_success=False, error_details=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
