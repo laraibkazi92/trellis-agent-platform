@@ -6,7 +6,7 @@ services:
     image: trellis-agent-platform:v2
     container_name: agent-host
     ports:
-      - "127.0.0.1:8000:8000"
+      - "0.0.0.0:8000:8000"
     env_file:
       - .env
     environment:
@@ -31,7 +31,7 @@ services:
     image: trellis-agent-platform:v2
     container_name: tool-hub
     ports:
-      - "127.0.0.1:8001:8001"
+      - "0.0.0.0:8001:8001"
     command: python core/hub.py
     restart: unless-stopped
     depends_on:
@@ -48,7 +48,7 @@ services:
     image: trellis-agent-platform:v2
     container_name: agent-gateway
     ports:
-      - "127.0.0.1:8002:8002"
+      - "0.0.0.0:8002:8002"
     environment:
       - HOST_URL=http://host:8000
       - DEV_MODE=true
@@ -80,14 +80,14 @@ services:
     image: trellis-agent-platform:v2
     container_name: agent-ui
     ports:
-      - "127.0.0.1:8080:8080"
+      - "0.0.0.0:8080:8080"
     env_file:
       - .env
     environment:
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
       - DEV_MODE=true
-      - ADMIN_USERS=dev-user@local.host
+      - ADMIN_USERS=${ADMIN_USERS}
     command: uvicorn core.ui:app --host 0.0.0.0 --port 8080
     depends_on:
       - etcd
