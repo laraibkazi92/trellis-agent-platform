@@ -1,8 +1,11 @@
 name: supervisor
 version: 0.1.0
+author: markh@acme.com
 description: Central router agent for the framework.
+tags: ["routing", "orchestration"]
 model: gemini-3-flash-preview
 thinking_level: medium
 a2a_access:
-  - agent_a
-  - agent_b
+  - ticket-summary-agent
+  - probable-cause-agent
+  - troubleshooting-agent

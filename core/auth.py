@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 auth_token_var = contextvars.ContextVar("auth_token", default=None)
 
-def retry_etcd(max_retries=3, delay=1):
+def retry_etcd(max_retries=10, delay=2):
     def decorator(func):
         @wraps(func)
         def wrapper(self, *args, **kwargs):

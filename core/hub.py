@@ -92,8 +92,48 @@ def register_tools():
 
         # Use a closure to capture the current config and tool_dir
         def create_handler(c, d):
-            async def handler(arguments: Dict[str, Any] = {}):
-                return await run_tool(c, d, arguments)
+            sig_parts = []
+            string_fields = []
+            if c.inputs:
+                for input_name, input_def in c.inputs.items():
+                    input_type = input_def.get("type", "string")
+                    type_str = "str"
+                    if input_type == "string":
+                        type_str = "typing.Any"
+                        string_fields.append(input_name)
+                    elif input_type == "integer": type_str = "int"
+                    elif input_type == "boolean": type_str = "bool"
+                    elif input_type == "array": type_str = "list"
+                    elif input_type == "object": type_str = "dict"
+                    
+                    is_req = input_def.get("required", False)
+                    if is_req:
+                        sig_parts.append(f"{input_name}: {type_str}")
+                    else:
+                        sig_parts.append(f"{input_name}: {type_str} = None")
+            
+            sig = ", ".join(sig_parts)
+            fn_name = f"handler_{c.name.replace('-', '_')}"
+            
+            code = f'''
+import typing
+
+async def {fn_name}({sig}):
+    kwargs = locals()
+    filtered_kwargs = {{}}
+    for k, v in kwargs.items():
+        if v is not None:
+            if k in {string_fields} and not isinstance(v, str):
+                filtered_kwargs[k] = str(v)
+            else:
+                filtered_kwargs[k] = v
+    return await run_tool(c, d, filtered_kwargs)
+'''
+            loc = {'run_tool': run_tool, 'c': c, 'd': d}
+            exec(code, loc, loc)
+            handler = loc[fn_name]
+            handler.__name__ = c.name
+            handler.__doc__ = c.description
             return handler
 
         mcp.tool(name=name, description=config.description)(create_handler(config, tool_dir))

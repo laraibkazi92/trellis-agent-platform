@@ -257,32 +257,39 @@ class AgentManager:
                 continue
             await self._load_agent_from_registry(name)
 
-    async def connect_to_hub(self):
+    async def connect_to_hub(self, max_retries: int = 5, retry_delay: int = 5):
         """Connects to the Polyglot Tool Hub via MCP SSE and registers tools."""
         hub_url = identity_mgr.get_config("HUB_URL", DEFAULT_HUB_URL)
-        print(f"Connecting to Polyglot Tool Hub at {hub_url}...")
-        try:
-            await self._establish_mcp_connection(hub_url)
-            # Discover and register tools to specialized agents ONLY
-            tools = await self.mcp_client.list_tools()
-            self._mcp_tools_cache = tools
-            
-            async with self._lock:
-                for tool in self._mcp_tools_cache:
-                    print(f"Evaluating MCP tool '{tool.name}' for specialized agents")
-                    # Using a safe copy to iterate
-                    agent_items = list(self.agents.items())
-                    for agent_name, agent in agent_items:
-                        if agent_name == "supervisor":
-                            continue # Supervisor does not get business logic tools
-                        agent_config = self.configs.get(agent_name)
-                        allowed_tools = agent_config.allowed_tools if agent_config else []
-                        if tool.name in allowed_tools:
-                            print(f"Injecting MCP tool '{tool.name}' into agent '{agent_name}'")
-                            self._register_mcp_tool(agent, tool)
-        except Exception as e:
-            print(f"Failed to connect to Tool Hub at startup: {e}")
-            print("Tools will be unavailable until connection is established.")
+        
+        for attempt in range(max_retries):
+            print(f"Connecting to Polyglot Tool Hub at {hub_url} (attempt {attempt + 1}/{max_retries})...")
+            try:
+                await self._establish_mcp_connection(hub_url)
+                # Discover and register tools to specialized agents ONLY
+                tools = await self.mcp_client.list_tools()
+                self._mcp_tools_cache = tools
+                
+                async with self._lock:
+                    for tool in self._mcp_tools_cache:
+                        print(f"Evaluating MCP tool '{tool.name}' for specialized agents")
+                        # Using a safe copy to iterate
+                        agent_items = list(self.agents.items())
+                        for agent_name, agent in agent_items:
+                            if agent_name == "supervisor":
+                                continue # Supervisor does not get business logic tools
+                            agent_config = self.configs.get(agent_name)
+                            allowed_tools = agent_config.allowed_tools if agent_config else []
+                            if tool.name in allowed_tools:
+                                print(f"Injecting MCP tool '{tool.name}' into agent '{agent_name}'")
+                                self._register_mcp_tool(agent, tool)
+                print("Successfully connected to Tool Hub and registered tools.")
+                return
+            except Exception as e:
+                print(f"Attempt {attempt + 1} failed to connect to Tool Hub: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                else:
+                    print("Max retries reached. Tools will be unavailable until connection is established.")
 
     async def _establish_mcp_connection(self, hub_url: str):
         """Creates the connection and FastMCPClient."""
@@ -315,8 +322,8 @@ class AgentManager:
         """Helper to register an MCP tool to a PydanticAI agent."""
         
         # Define a wrapper that calls the MCP tool
-        async def tool_wrapper(ctx: RunContext[None], arguments: Dict[str, Any]) -> Any:
-            return await self._execute_mcp_tool_with_retry(mcp_tool.name, arguments)
+        async def tool_wrapper(ctx: RunContext[None], **kwargs: Any) -> Any:
+            return await self._execute_mcp_tool_with_retry(mcp_tool.name, kwargs)
 
         # Register with PydanticAI
         agent.tool(name=mcp_tool.name, description=mcp_tool.description)(tool_wrapper)
@@ -349,7 +356,7 @@ class AgentManager:
         async def a2a_tool_wrapper(ctx: RunContext[None], prompt: str) -> str:
             target_agent = self.agents[target_agent_name]
             result = await target_agent.run(prompt)
-            return result.data
+            return result.output
 
         tool_name = f"call_{target_agent_name}"
         description = f"Call the {target_agent_name} agent with a prompt and get a response."
@@ -405,7 +412,7 @@ async def chat_completions(request: ChatRequest):
                 {
                     "message": {
                         "role": "assistant",
-                        "content": result.data
+                        "content": result.output
                     }
                 }
             ]

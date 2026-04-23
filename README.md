@@ -35,6 +35,12 @@ curl -X POST http://localhost:8000/v1/chat/completions \
   }'
 ```
 
+### 4. Connecting via MCP
+To use the entire agent fleet from an MCP client (like Claude Desktop), use the following command:
+```bash
+claude mcp add --transport http trellis http://localhost:8002/mcp --header "Authorization: Bearer YOUR_API_KEY"
+```
+
 ## Directory Structure
 - `core/`: Framework logic (Host, Hub, Gateway, Models).
 - `agents/`: Directory-based agent definitions.

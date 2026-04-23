@@ -32,7 +32,7 @@ async def agents(request: Request):
     flash_msg = request.session.pop("flash_msg", None)
     
     public_host_url = os.getenv("PUBLIC_HOST_URL", "http://localhost:8000")
-    public_mcp_url = os.getenv("PUBLIC_MCP_URL", "http://localhost:8002/sse")
+    public_mcp_url = os.getenv("PUBLIC_MCP_URL", "http://localhost:8002/mcp")
     
     return templates.TemplateResponse(
         request=request,
