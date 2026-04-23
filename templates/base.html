@@ -56,13 +56,7 @@
         <div class="space-x-4 md:space-x-6 text-sm font-bold font-mono tracking-wide flex items-center flex-wrap">
             <a href="/agents" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/agents' %}text-accent dark:text-accent-dark{% endif %}">Agents</a>
             <a href="/tools" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/tools' %}text-accent dark:text-accent-dark{% endif %}">Tools</a>
-        <div class="relative group inline-block">
-            <span class="cursor-pointer hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if '/docs' in request.url.path %}text-accent dark:text-accent-dark{% endif %}">Docs ▼</span>
-            <div class="absolute hidden group-hover:flex flex-col w-40 top-full mt-2 left-1/2 -translate-x-1/2 bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 text-sm rounded shadow-lg z-50 py-1 font-sans normal-case tracking-normal text-left overflow-hidden">
-                <a href="/docs/agents" class="px-4 py-2 hover:bg-neutral-100 dark:hover:bg-neutral-700 hover:text-accent dark:hover:text-accent-dark whitespace-nowrap">Agent Guide</a>
-                <a href="/docs/tools" class="px-4 py-2 hover:bg-neutral-100 dark:hover:bg-neutral-700 hover:text-accent dark:hover:text-accent-dark whitespace-nowrap">Tool Guide</a>
-            </div>
-        </div>
+            <a href="/docs" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path.startswith('/docs') %}text-accent dark:text-accent-dark{% endif %}">Docs</a>
         <span class="text-neutral-300 dark:text-neutral-700 hidden sm:inline">|</span>
         {% if user %}
         <div class="relative group inline-block">

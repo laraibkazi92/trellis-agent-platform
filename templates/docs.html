@@ -21,9 +21,25 @@
     .prose hr { margin-top: 2rem; margin-bottom: 2rem; border-color: rgba(150, 150, 150, 0.2); }
 </style>
 
-<div class="max-w-4xl mx-auto bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 p-8 md:p-12 font-sans text-neutral-900 dark:text-neutral-50 shadow-sm">
-    <div class="prose max-w-none">
-        {{ html_content | safe }}
+<div class="max-w-6xl mx-auto flex flex-col md:flex-row gap-8">
+    <aside class="w-full md:w-64 flex-shrink-0">
+        <div class="sticky top-24 bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 p-4 font-sans text-neutral-900 dark:text-neutral-50 shadow-sm">
+            <h3 class="font-bold text-lg mb-4 uppercase tracking-tight">Documentation</h3>
+            <ul class="space-y-2 font-mono text-sm">
+                <li>
+                    <a href="/docs/agents" class="block py-2 px-3 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-accent dark:hover:text-accent-dark transition-colors {% if 'agents' in request.url.path %}text-accent dark:text-accent-dark font-bold bg-neutral-50 dark:bg-neutral-800{% endif %}">Agent Guide</a>
+                </li>
+                <li>
+                    <a href="/docs/tools" class="block py-2 px-3 hover:bg-neutral-100 dark:hover:bg-neutral-800 hover:text-accent dark:hover:text-accent-dark transition-colors {% if 'tools' in request.url.path %}text-accent dark:text-accent-dark font-bold bg-neutral-50 dark:bg-neutral-800{% endif %}">Tool Guide</a>
+                </li>
+            </ul>
+        </div>
+    </aside>
+    
+    <div class="flex-grow bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 p-8 md:p-12 font-sans text-neutral-900 dark:text-neutral-50 shadow-sm min-w-0">
+        <div class="prose max-w-none">
+            {{ html_content | safe }}
+        </div>
     </div>
 </div>
 {% endblock %}

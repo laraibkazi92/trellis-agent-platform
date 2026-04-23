@@ -1,12 +1,17 @@
 import os
 from pathlib import Path
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 import markdown
 from core.dependencies import templates
 
 router = APIRouter(prefix="/docs", tags=["docs"])
 BASE_DIR = Path(__file__).parent.parent.parent
+
+@router.get("", response_class=RedirectResponse)
+@router.get("/", response_class=RedirectResponse)
+async def read_docs_index():
+    return RedirectResponse(url="/docs/agents")
 
 @router.get("/{doc_type}", response_class=HTMLResponse)
 async def read_doc(request: Request, doc_type: str):
