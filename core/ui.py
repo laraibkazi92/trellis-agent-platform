@@ -32,7 +32,7 @@ if not DEV_MODE:
 
 from core.routers import auth, marketplace, keys, admin, secrets, docs
 
-app = FastAPI(title="Marketplace UI")
+app = FastAPI(title="Marketplace UI", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
 
 app.include_router(auth.router)
