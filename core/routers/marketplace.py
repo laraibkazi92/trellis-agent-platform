@@ -87,4 +87,4 @@ async def tools(request: Request):
 
 @router.get("/catalog")
 async def catalog_redirect():
-    return RedirectResponse(url='/agents')
+    return RedirectResponse(url='/')

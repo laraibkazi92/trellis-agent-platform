@@ -12,7 +12,7 @@ DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
 async def homepage(request: Request):
     user = request.session.get('user')
     if user:
-        return RedirectResponse(url='/catalog')
+        return RedirectResponse(url='/')
         
     links = []
     if DEV_MODE:
@@ -42,7 +42,7 @@ async def login(request: Request):
             await asyncio.to_thread(identity_mgr.upsert_user, user['sub'], user)
         except Exception as e:
             print(f"Warning: Failed to upsert mock user in etcd: {e}")
-        return RedirectResponse(url='/catalog')
+        return RedirectResponse(url='/')
         
     redirect_uri = request.url_for('auth_callback')
     return await oauth.oidc.authorize_redirect(request, redirect_uri)
@@ -59,7 +59,7 @@ async def auth_callback(request: Request):
         request.session['user'] = user
         # Upsert user to etcd
         await asyncio.to_thread(identity_mgr.upsert_user, user['sub'], dict(user))
-    return RedirectResponse(url='/catalog')
+    return RedirectResponse(url='/')
 
 @router.get("/logout")
 async def logout(request: Request):
@@ -95,4 +95,4 @@ async def auth_github_callback(request: Request):
         request.session['user'] = userinfo
         # Upsert user to etcd
         await asyncio.to_thread(identity_mgr.upsert_user, userinfo['sub'], dict(userinfo))
-    return RedirectResponse(url='/catalog')
+    return RedirectResponse(url='/')
