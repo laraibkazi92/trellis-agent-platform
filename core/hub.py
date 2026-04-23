@@ -37,6 +37,8 @@ def load_tool_configs() -> Dict[str, tuple[ToolConfig, Path]]:
 
 async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Executes a tool as a subprocess and handles JSON stdin/stdout."""
+    user_id = arguments.pop("__user_id", None)
+    
     cmd = []
     if config.runtime == "python":
         cmd = [sys.executable, str(tool_dir / config.entrypoint)]
@@ -49,12 +51,19 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
         return {"error": f"Unsupported runtime: {config.runtime}"}
 
     try:
+        env = os.environ.copy()
+        if user_id:
+            secrets = identity_mgr.get_user_secrets(user_id)
+            if secrets:
+                env.update(secrets)
+
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            cwd=str(tool_dir)
+            cwd=str(tool_dir),
+            env=env
         )
 
         input_json = json.dumps(arguments).encode()
@@ -112,6 +121,7 @@ def register_tools():
                     else:
                         sig_parts.append(f"{input_name}: {type_str} = None")
             
+            sig_parts.append("__user_id: typing.Optional[str] = None")
             sig = ", ".join(sig_parts)
             fn_name = f"handler_{c.name.replace('-', '_')}"
             

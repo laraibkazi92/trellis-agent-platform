@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from fastapi import FastAPI, HTTPException
-from core.auth import AuthMiddleware, IdentityManager
+from core.auth import AuthMiddleware, IdentityManager, user_id_var
 
 from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext
@@ -304,6 +304,7 @@ class AgentManager:
 
     async def _execute_mcp_tool_with_retry(self, mcp_tool_name: str, arguments: Dict[str, Any]) -> Any:
         """Executes an MCP tool, retrying the connection if it fails."""
+        arguments["__user_id"] = user_id_var.get()
         max_retries = 2
         for attempt in range(max_retries):
             try:

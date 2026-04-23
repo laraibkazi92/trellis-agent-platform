@@ -16,6 +16,7 @@ from starlette.responses import JSONResponse
 logger = logging.getLogger(__name__)
 
 auth_token_var = contextvars.ContextVar("auth_token", default=None)
+user_id_var = contextvars.ContextVar("user_id", default=None)
 
 def retry_etcd(max_retries=10, delay=2):
     def decorator(func):
@@ -49,6 +50,19 @@ class IdentityManager:
         if value:
             return json.loads(value.decode('utf-8'))
         return None
+
+    @retry_etcd()
+    def get_user_secrets(self, user_id: str) -> Dict[str, str]:
+        """Retrieve user-specific secrets."""
+        value, _ = self.client.get(f"/users/{user_id}/secrets")
+        if value:
+            return json.loads(value.decode('utf-8'))
+        return {}
+
+    @retry_etcd()
+    def save_user_secrets(self, user_id: str, secrets_data: Dict[str, str]) -> None:
+        """Save user-specific secrets."""
+        self.client.put(f"/users/{user_id}/secrets", json.dumps(secrets_data))
 
     @retry_etcd()
     def create_key(self, user_id: str, key_name: str) -> str:
@@ -217,6 +231,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             if DEV_MODE and (not auth_header or not auth_header.startswith("Bearer ")):
                 request.state.user_id = "dev-user-id"
                 auth_token_var.set("dev-token")
+                user_id_var.set("dev-user-id")
                 return await call_next(request)
                 
             if not auth_header or not auth_header.startswith("Bearer "):
@@ -233,12 +248,14 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 if DEV_MODE:
                     request.state.user_id = "dev-user-id"
                     auth_token_var.set("dev-token")
+                    user_id_var.set("dev-user-id")
                     return await call_next(request)
                 return JSONResponse({"error": "Invalid API Key"}, status_code=401)
                 
             # Add user_id to request state
             request.state.user_id = user_id
-            # Set the ContextVar so downstream async functions (like gateway tools) can access it
+            # Set the ContextVars so downstream async functions can access them
             auth_token_var.set(token)
+            user_id_var.set(user_id)
             
         return await call_next(request)
