@@ -57,6 +57,9 @@ GEMINI_3_MODELS = {"gemini-3.1-pro-preview", "gemini-3-flash-preview"}
 GEMINI_2_5_PRO_BUDGETS = {"low": 1024, "medium": 8192, "high": 16384}
 GEMINI_2_5_FLASH_BUDGETS = {"low": 1024, "medium": 4096, "high": 8192}
 
+# Maintain a set of background tasks to prevent garbage collection
+background_tasks = set()
+
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -134,11 +137,8 @@ class AgentManager:
             async with self._lock:
                 self.agents[config.name] = agent
             print(f"Successfully loaded internal agent: {config.name}")
-    except Exception as e:
-        print(f"Error loading internal supervisor: {e}")
-
-# Maintain a set of background tasks to prevent garbage collection
-background_tasks = set()
+        except Exception as e:
+            print(f"Error loading internal supervisor: {e}")
 
     def _get_model_settings(self, model_name: str, thinking_level: str) -> Optional[GoogleModelSettings]:
         """Translates UI thinking_level into PydanticAI GoogleModelSettings."""
