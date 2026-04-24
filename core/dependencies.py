@@ -9,7 +9,12 @@ load_dotenv()
 # Templates
 templates_dir = os.path.join(os.path.dirname(__file__), "..", "templates")
 os.makedirs(templates_dir, exist_ok=True)
-templates = Jinja2Templates(directory=templates_dir)
+
+def admin_context(request):
+    from core.auth import is_admin
+    return {"is_admin": is_admin(request)}
+
+templates = Jinja2Templates(directory=templates_dir, context_processors=[admin_context])
 
 # OAuth setup
 OIDC_CLIENT_ID = os.getenv("OIDC_CLIENT_ID")

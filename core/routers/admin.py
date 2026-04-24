@@ -80,7 +80,6 @@ async def admin_dashboard(request: Request):
         return redirect
     
     user = request.session.get('user')
-    is_admin = True
     
     # Gather global stats concurrently
     users, keys, agents = await asyncio.gather(
@@ -109,7 +108,6 @@ async def admin_dashboard(request: Request):
         name="admin.html", 
         context={
             "user": user,
-            "is_admin": is_admin,
             "users": users,
             "keys": keys,
             "stats": {

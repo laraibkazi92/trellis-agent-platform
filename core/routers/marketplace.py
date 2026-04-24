@@ -38,9 +38,6 @@ async def agents(request: Request):
     if not user:
         return RedirectResponse(url='/login')
         
-    admin_users = os.getenv("ADMIN_USERS", "").split(",")
-    is_admin = user.get("email") in admin_users
-    
     agents = await discover_agents()
     
     flash_msg = request.session.pop("flash_msg", None)
@@ -54,7 +51,6 @@ async def agents(request: Request):
         context={
             "user": user,
             "agents": agents,
-            "is_admin": is_admin,
             "flash_msg": flash_msg,
             "public_host_url": public_host_url,
             "public_mcp_url": public_mcp_url
@@ -67,9 +63,6 @@ async def tools(request: Request):
     if not user:
         return RedirectResponse(url='/login')
         
-    admin_users = os.getenv("ADMIN_USERS", "").split(",")
-    is_admin = user.get("email") in admin_users
-    
     tools = await discover_tools()
     
     flash_msg = request.session.pop("flash_msg", None)
@@ -80,7 +73,6 @@ async def tools(request: Request):
         context={
             "user": user,
             "tools": tools,
-            "is_admin": is_admin,
             "flash_msg": flash_msg
         }
     )

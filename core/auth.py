@@ -6,6 +6,7 @@ import re
 import contextvars
 import asyncio
 import hashlib
+import os
 from typing import Dict, List, Optional, Any
 from functools import wraps
 
@@ -403,3 +404,12 @@ class AuthMiddleware:
                 "type": "http.response.body",
                 "body": body,
             })
+
+def is_admin(request: Request) -> bool:
+    """Helper to check if the current session user is an admin."""
+    user = request.session.get('user')
+    if not user:
+        return False
+        
+    admin_users = [u.strip() for u in os.getenv("ADMIN_USERS", "").split(",") if u.strip()]
+    return user.get("email") in admin_users
