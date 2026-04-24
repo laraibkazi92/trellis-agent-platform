@@ -74,6 +74,71 @@ def require_admin(request: Request, fallback_url: str):
         return RedirectResponse(url=fallback_url, status_code=303)
     return None
 
+@router.get("/admin", response_class=HTMLResponse)
+async def admin_dashboard(request: Request):
+    if redirect := require_admin(request, '/'):
+        return redirect
+    
+    user = request.session.get('user')
+    
+    # Gather global stats
+    users = await asyncio.to_thread(identity_mgr.list_all_users)
+    keys = await asyncio.to_thread(identity_mgr.list_all_keys)
+    agents = await asyncio.to_thread(identity_mgr.list_agents)
+    
+    # Enhance users with usage stats
+    for u in users:
+        usage = await asyncio.to_thread(identity_mgr.get_user_usage, u["sub"])
+        u["usage"] = usage
+        
+    # Map keys to user emails for display
+    user_email_map = {u["sub"]: u.get("email", "Unknown") for u in users}
+    for k in keys:
+        k["user_email"] = user_email_map.get(k.get("user_id"), "Unknown User")
+        
+    flash_msg = request.session.pop("flash_msg", None)
+    
+    return templates.TemplateResponse(
+        request=request,
+        name="admin.html", 
+        context={
+            "user": user,
+            "users": users,
+            "keys": keys,
+            "stats": {
+                "total_users": len(users),
+                "total_keys": len(keys),
+                "total_agents": len(agents)
+            },
+            "flash_msg": flash_msg
+        }
+    )
+
+@router.post("/admin/users/toggle_ban")
+async def toggle_user_ban(request: Request, user_id: str = Form(...), is_banned: str = Form(...)):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+        
+    should_ban = is_banned.lower() == 'true'
+    await asyncio.to_thread(identity_mgr.toggle_user_ban, user_id, should_ban)
+    
+    status_str = "banned" if should_ban else "unbanned"
+    request.session["flash_msg"] = f"User {status_str} successfully."
+    return RedirectResponse(url='/admin', status_code=303)
+
+@router.post("/admin/keys/revoke_global")
+async def revoke_global_key(request: Request, api_key: str = Form(...)):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+        
+    success = await asyncio.to_thread(identity_mgr.delete_key, api_key)
+    if success:
+        request.session["flash_msg"] = "Key revoked globally."
+    else:
+        request.session["flash_msg"] = "Failed to revoke key or key not found."
+        
+    return RedirectResponse(url='/admin', status_code=303)
+
 @router.get("/editor/{type}/{name}", response_class=HTMLResponse)
 async def editor_page(request: Request, type: str, name: str):
     fallback_url = '/agents' if type == 'agent' else '/tools'
