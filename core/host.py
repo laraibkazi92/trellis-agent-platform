@@ -57,9 +57,13 @@ GEMINI_3_MODELS = {"gemini-3.1-pro-preview", "gemini-3-flash-preview"}
 GEMINI_2_5_PRO_BUDGETS = {"low": 1024, "medium": 8192, "high": 16384}
 GEMINI_2_5_FLASH_BUDGETS = {"low": 1024, "medium": 4096, "high": 8192}
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
 class ChatRequest(BaseModel):
     model: str
-    messages: List[Dict[str, str]]
+    messages: List[ChatMessage]
 
 class AgentManager:
     def __init__(self):
@@ -130,8 +134,11 @@ class AgentManager:
             async with self._lock:
                 self.agents[config.name] = agent
             print(f"Successfully loaded internal agent: {config.name}")
-        except Exception as e:
-            print(f"Error loading internal supervisor: {e}")
+    except Exception as e:
+        print(f"Error loading internal supervisor: {e}")
+
+# Maintain a set of background tasks to prevent garbage collection
+background_tasks = set()
 
     def _get_model_settings(self, model_name: str, thinking_level: str) -> Optional[GoogleModelSettings]:
         """Translates UI thinking_level into PydanticAI GoogleModelSettings."""
@@ -459,6 +466,12 @@ async def health():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatRequest):
+    if not request.messages:
+        raise HTTPException(status_code=400, detail="Messages array cannot be empty")
+
+    if request.messages[-1].role != "user":
+        raise HTTPException(status_code=400, detail="The last message must be from the 'user' role")
+
     if request.model not in manager.agents:
         raise HTTPException(status_code=404, detail=f"Agent '{request.model}' not found or disabled")
     
@@ -472,12 +485,16 @@ async def chat_completions(request: ChatRequest):
     # Map OpenAI-style messages to PydanticAI message history
     history = []
     for msg in request.messages[:-1]:
-        if msg["role"] == "user":
-            history.append(ModelRequest(parts=[UserPromptPart(content=msg["content"])]))
-        elif msg["role"] == "assistant":
-            history.append(ModelResponse(parts=[TextPart(content=msg["content"])]))
+        if msg.role == "user":
+            history.append(ModelRequest(parts=[UserPromptPart(content=msg.content)]))
+        elif msg.role == "assistant":
+            history.append(ModelResponse(parts=[TextPart(content=msg.content)]))
+        elif msg.role == "system":
+            # Silently convert system prompts to user context to prevent overriding agent skills
+            system_content = f"[System Note]: {msg.content}"
+            history.append(ModelRequest(parts=[UserPromptPart(content=system_content)]))
     
-    prompt = request.messages[-1]["content"]
+    prompt = request.messages[-1].content
     
     try:
         result = await agent.run(prompt, message_history=history)
@@ -488,14 +505,21 @@ async def chat_completions(request: ChatRequest):
         if user_id and hasattr(result, 'usage'):
             usage = result.usage()
             if usage:
-                asyncio.create_task(
-                    asyncio.to_thread(
-                        identity_mgr.record_usage,
+                async def safe_record_usage(uid, req_tok, res_tok):
+                    try:
+                        await asyncio.to_thread(identity_mgr.record_usage, uid, req_tok, res_tok)
+                    except Exception as e:
+                        print(f"Failed to record token usage for {uid}: {e}")
+                        
+                task = asyncio.create_task(
+                    safe_record_usage(
                         user_id,
                         usage.request_tokens or 0,
                         usage.response_tokens or 0
                     )
                 )
+                background_tasks.add(task)
+                task.add_done_callback(background_tasks.discard)
 
         return {
             "choices": [

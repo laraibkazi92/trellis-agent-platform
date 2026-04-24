@@ -36,7 +36,7 @@ async def commit_to_github(path: str, content: str, message: str) -> bool:
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
     
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             # Get file SHA if it exists
             sha = None
             get_resp = await client.get(url, headers=headers)
@@ -61,14 +61,14 @@ async def commit_to_github(path: str, content: str, message: str) -> bool:
 
 def sanitize_name(name: str) -> str:
     """Sanitize name parameter to prevent path traversal and registry injection."""
-    return re.sub(r'[^a-zA-Z0-9_\.-]', '', name)
+    return re.sub(r'[^a-zA-Z0-9_-]', '', name)
 
 def require_admin(request: Request, fallback_url: str):
     user = request.session.get('user')
     if not user:
         return RedirectResponse(url='/login')
         
-    admin_users = os.getenv("ADMIN_USERS", "").split(",")
+    admin_users = [u.strip() for u in os.getenv("ADMIN_USERS", "").split(",") if u.strip()]
     if user.get("email") not in admin_users:
         request.session["flash_msg"] = "Unauthorized access."
         return RedirectResponse(url=fallback_url, status_code=303)
@@ -82,15 +82,20 @@ async def admin_dashboard(request: Request):
     user = request.session.get('user')
     is_admin = True
     
-    # Gather global stats
-    users = await asyncio.to_thread(identity_mgr.list_all_users)
-    keys = await asyncio.to_thread(identity_mgr.list_all_keys)
-    agents = await asyncio.to_thread(identity_mgr.list_agents)
+    # Gather global stats concurrently
+    users, keys, agents = await asyncio.gather(
+        asyncio.to_thread(identity_mgr.list_all_users),
+        asyncio.to_thread(identity_mgr.list_all_keys),
+        asyncio.to_thread(identity_mgr.list_agents)
+    )
     
-    # Enhance users with usage stats
-    for u in users:
-        usage = await asyncio.to_thread(identity_mgr.get_user_usage, u["sub"])
-        u["usage"] = usage
+    # Enhance users with usage stats concurrently, limiting concurrency
+    sem = asyncio.Semaphore(10)
+    async def fetch_usage(u):
+        async with sem:
+            u["usage"] = await asyncio.to_thread(identity_mgr.get_user_usage, u["sub"])
+        
+    await asyncio.gather(*(fetch_usage(u) for u in users))
         
     # Map keys to user emails for display
     user_email_map = {u["sub"]: u.get("email", "Unknown") for u in users}
@@ -129,11 +134,11 @@ async def toggle_user_ban(request: Request, user_id: str = Form(...), is_banned:
     return RedirectResponse(url='/admin', status_code=303)
 
 @router.post("/admin/keys/revoke_global")
-async def revoke_global_key(request: Request, api_key: str = Form(...)):
+async def revoke_global_key(request: Request, key_id: str = Form(...)):
     if redirect := require_admin(request, '/admin'):
         return redirect
         
-    success = await asyncio.to_thread(identity_mgr.delete_key, api_key)
+    success = await asyncio.to_thread(identity_mgr.delete_key_by_id, key_id)
     if success:
         request.session["flash_msg"] = "Key revoked globally."
     else:

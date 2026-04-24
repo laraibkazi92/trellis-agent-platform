@@ -5,6 +5,7 @@ import time
 import re
 import contextvars
 import asyncio
+import hashlib
 from typing import Dict, List, Optional, Any
 from functools import wraps
 
@@ -76,6 +77,9 @@ class IdentityManager:
         self.client.put(f"/keys/{api_key}", json.dumps(key_data))
         # Maintain a secondary index for fast retrieval by user
         self.client.put(f"/user_keys/{user_id}/{api_key}", "1")
+        # Maintain a secondary index for fast revocation by hash
+        key_id = hashlib.sha256(api_key.encode()).hexdigest()
+        self.client.put(f"/key_ids/{key_id}", api_key)
         return api_key
 
     @retry_etcd()
@@ -90,14 +94,19 @@ class IdentityManager:
             # Retrieve actual key data
             key_data_raw, _ = self.client.get(f"/keys/{api_key}")
             if key_data_raw:
-                data = json.loads(key_data_raw.decode('utf-8'))
-                # Mask the key to prevent HTML source leaks
-                raw_key = data.get("key", "")
-                if raw_key.startswith("tl_") and len(raw_key) > 8:
-                    data["key_masked"] = raw_key[:6] + "..." + raw_key[-4:]
-                else:
-                    data["key_masked"] = "***"
-                keys.append(data)
+                try:
+                    data = json.loads(key_data_raw.decode('utf-8'))
+                    # Mask the key to prevent HTML source leaks
+                    raw_key = data.get("key", api_key)
+                    if raw_key.startswith("tl_") and len(raw_key) > 8:
+                        data["key_masked"] = raw_key[:6] + "..." + raw_key[-4:]
+                    else:
+                        data["key_masked"] = "***"
+                    data["key_id"] = hashlib.sha256(raw_key.encode()).hexdigest()
+                    data.pop("key", None)
+                    keys.append(data)
+                except Exception as e:
+                    logger.warning(f"Failed to process key record for user {user_id}: {e}")
         return keys
 
     @retry_etcd()
@@ -111,8 +120,34 @@ class IdentityManager:
             if user_id:
                 self.client.delete(f"/user_keys/{user_id}/{api_key}")
         
+        key_id = hashlib.sha256(api_key.encode()).hexdigest()
+        self.client.delete(f"/key_ids/{key_id}")
+        
         deleted = self.client.delete(f"/keys/{api_key}")
         return deleted
+
+    @retry_etcd()
+    def delete_key_by_id(self, key_id: str) -> bool:
+        """Revoke an API key using its SHA256 hash."""
+        # Try fast path first
+        value, _ = self.client.get(f"/key_ids/{key_id}")
+        if value:
+            raw_key = value.decode('utf-8')
+            return self.delete_key(raw_key)
+            
+        # Fallback to slow O(N) scan for older keys
+        for value, metadata in self.client.get_prefix("/keys/"):
+            if value:
+                try:
+                    data = json.loads(value.decode('utf-8'))
+                    raw_key = data.get("key")
+                    if not raw_key:
+                        raw_key = metadata.key.decode('utf-8').split('/')[-1]
+                    if hashlib.sha256(raw_key.encode()).hexdigest() == key_id:
+                        return self.delete_key(raw_key)
+                except Exception as e:
+                    logger.warning(f"Error checking key during deletion: {e}")
+        return False
 
     @retry_etcd()
     def validate_key(self, api_key: str) -> Optional[str]:
@@ -240,9 +275,9 @@ class IdentityManager:
             return
             
         current = self.get_user_usage(user_id)
-        current["input_tokens"] += input_tokens
-        current["output_tokens"] += output_tokens
-        current["total_requests"] += 1
+        current["input_tokens"] = current.get("input_tokens", 0) + input_tokens
+        current["output_tokens"] = current.get("output_tokens", 0) + output_tokens
+        current["total_requests"] = current.get("total_requests", 0) + 1
         
         self.client.put(f"/usage/{user_id}", json.dumps(current))
 
@@ -254,26 +289,30 @@ class IdentityManager:
             if value:
                 try:
                     users.append(json.loads(value.decode('utf-8')))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to decode user record: {e}")
         return users
 
     @retry_etcd()
     def list_all_keys(self) -> List[Dict]:
         """List all API keys across the system."""
         keys = []
-        for value, _ in self.client.get_prefix("/keys/"):
+        for value, metadata in self.client.get_prefix("/keys/"):
             if value:
                 try:
                     data = json.loads(value.decode('utf-8'))
-                    raw_key = data.get("key", "")
+                    raw_key = data.get("key")
+                    if not raw_key:
+                        raw_key = metadata.key.decode('utf-8').split('/')[-1]
                     if raw_key.startswith("tl_") and len(raw_key) > 8:
                         data["key_masked"] = raw_key[:6] + "..." + raw_key[-4:]
                     else:
                         data["key_masked"] = "***"
+                    data["key_id"] = hashlib.sha256(raw_key.encode()).hexdigest()
+                    data.pop("key", None)
                     keys.append(data)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to decode key record: {e}")
         return keys
 
     @retry_etcd()
@@ -288,6 +327,8 @@ class AuthMiddleware:
     def __init__(self, app, identity_mgr: IdentityManager):
         self.app = app
         self.identity_mgr = identity_mgr
+        import os
+        self.dev_mode = os.getenv("DEV_MODE", "false").lower() == "true"
 
     async def __call__(self, scope, receive, send):
         if scope["type"] not in ("http", "websocket"):
@@ -297,23 +338,20 @@ class AuthMiddleware:
             path = scope.get("path", "")
             normalized_path = re.sub(r'/+', '/', path)
             
-            import os
-            DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
-            
             protected_prefixes = ("/v1/chat/completions", "/sse", "/messages", "/mcp")
             if any(normalized_path.startswith(prefix) for prefix in protected_prefixes):
                 headers = dict(scope.get("headers", []))
                 auth_header = headers.get(b"authorization", b"").decode("utf-8", errors="ignore")
                 
-                if DEV_MODE and (not auth_header or not auth_header.startswith("Bearer ")):
+                if self.dev_mode and (not auth_header or not auth_header.startswith("Bearer ")):
                     auth_token_var.set("dev-token")
                     user_id_var.set("dev-user-id")
                     scope["state"] = scope.get("state", {})
                     scope["state"]["user_id"] = "dev-user-id"
                     return await self.app(scope, receive, send)
-                    
+                
                 if not auth_header or not auth_header.startswith("Bearer "):
-                    await self._send_response(send, 401, b'{"error": "Missing or invalid Authorization header"}')
+                    await self._send_error(scope, send, 401, b'{"error": "Missing or invalid Authorization header"}')
                     return
                 
                 token = auth_header.split(" ")[1]
@@ -324,13 +362,13 @@ class AuthMiddleware:
                     user_id = None
                 
                 if not user_id:
-                    if DEV_MODE:
+                    if self.dev_mode:
                         auth_token_var.set("dev-token")
                         user_id_var.set("dev-user-id")
                         scope["state"] = scope.get("state", {})
                         scope["state"]["user_id"] = "dev-user-id"
                         return await self.app(scope, receive, send)
-                    await self._send_response(send, 401, b'{"error": "Invalid API Key"}')
+                    await self._send_error(scope, send, 401, b'{"error": "Invalid API Key"}')
                     return
                     
                 # Set the ContextVars so downstream async functions can access them
@@ -340,7 +378,7 @@ class AuthMiddleware:
                 # Check if user is banned
                 user = await asyncio.to_thread(self.identity_mgr.get_user, user_id)
                 if user and user.get("is_banned"):
-                    await self._send_response(send, 403, b'{"error": "Account suspended"}')
+                    await self._send_error(scope, send, 403, b'{"error": "Account suspended"}')
                     return
                 
                 # Add user_id to scope state for framework compatibility
@@ -350,15 +388,18 @@ class AuthMiddleware:
             return await self.app(scope, receive, send)
         except Exception as e:
             logger.error(f"Unhandled exception in ASGI AuthMiddleware: {e}", exc_info=True)
-            await self._send_response(send, 500, b'{"error": "Internal Server Error"}')
+            await self._send_error(scope, send, 500, b'{"error": "Internal Server Error"}')
 
-    async def _send_response(self, send, status: int, body: bytes):
-        await send({
-            "type": "http.response.start",
-            "status": status,
-            "headers": [(b"content-type", b"application/json")],
-        })
-        await send({
-            "type": "http.response.body",
-            "body": body,
-        })
+    async def _send_error(self, scope, send, status: int, body: bytes):
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
+        else:
+            await send({
+                "type": "http.response.start",
+                "status": status,
+                "headers": [(b"content-type", b"application/json")],
+            })
+            await send({
+                "type": "http.response.body",
+                "body": body,
+            })
