@@ -72,6 +72,9 @@
             </div>
         </div>
         <span class="text-neutral-300 dark:text-neutral-700 hidden sm:inline">|</span>
+        {% if is_admin %}
+        <a href="/admin" class="text-emerald-600 dark:text-emerald-400 hover:text-emerald-700 dark:hover:text-emerald-300 transition-colors uppercase {% if request.url.path == '/admin' %}text-emerald-700 dark:text-emerald-300{% endif %}">Admin</a>
+        {% endif %}
         <span class="text-neutral-500 dark:text-neutral-400 hidden sm:inline">{{ user.name }}</span>
         <a href="/logout" onclick="showGlobalLoading('Signing out...')" class="text-red-600 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300 transition-colors uppercase">Logout</a>
             {% else %}
