@@ -3,4 +3,4 @@ test_*.py
 *pycache*
 .env
 
-./*.png
+./*.pngdata/

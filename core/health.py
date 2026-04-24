@@ -1,13 +1,17 @@
 import json
 import os
+import threading
 from typing import Optional, Dict, Any
 
 from core.auth import IdentityManager
+import core.health_db as health_db
 
 class HealthMonitor:
     def __init__(self, identity_mgr: IdentityManager):
         self.identity_mgr = identity_mgr
         self.failure_threshold = int(os.getenv("HEALTH_FAILURE_THRESHOLD", "5"))
+        # Initialize the health events database
+        health_db.init_db()
 
     def record_event(self, entity_type: str, name: str, is_success: bool, error_details: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -16,6 +20,7 @@ class HealthMonitor:
         User-scoped failures should not be recorded as failures here.
         """
         current_status = self.get_status(entity_type, name)
+        old_status_val = current_status.get("status", "Online")
         
         if is_success:
             current_status["status"] = "Online"
@@ -28,6 +33,21 @@ class HealthMonitor:
             if current_status["consecutive_failures"] >= self.failure_threshold:
                 current_status["status"] = "Offline"
                 
+        new_status_val = current_status["status"]
+        
+        # If the status changed, log it to the sqlite db
+        if old_status_val != new_status_val or (not is_success and current_status["consecutive_failures"] == 1):
+            # Also log if it's the first failure to track intermittent errors if needed, 
+            # but the spec says "state changes (e.g., Online to Offline)". Let's stick to state change.
+            pass
+            
+        if old_status_val != new_status_val:
+            # Log the change
+            health_db.log_event(entity_type, name, new_status_val, current_status.get("last_error"))
+            
+            # Run cleanup synchronously; it's throttled internally to run at most once a day
+            health_db.cleanup_old_events(30)
+
         self.identity_mgr.save_health_status(entity_type, name, current_status)
         return current_status
 
