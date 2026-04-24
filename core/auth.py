@@ -337,6 +337,12 @@ class AuthMiddleware:
                 auth_token_var.set(token)
                 user_id_var.set(user_id)
                 
+                # Check if user is banned
+                user = await asyncio.to_thread(self.identity_mgr.get_user, user_id)
+                if user and user.get("is_banned"):
+                    await self._send_response(send, 403, b'{"error": "Account suspended"}')
+                    return
+                
                 # Add user_id to scope state for framework compatibility
                 scope["state"] = scope.get("state", {})
                 scope["state"]["user_id"] = user_id

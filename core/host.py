@@ -482,6 +482,21 @@ async def chat_completions(request: ChatRequest):
     try:
         result = await agent.run(prompt, message_history=history)
         health_monitor.record_event("agent", request.model, is_success=True)
+        
+        # Record usage in background
+        user_id = user_id_var.get()
+        if user_id and hasattr(result, 'usage'):
+            usage = result.usage()
+            if usage:
+                asyncio.create_task(
+                    asyncio.to_thread(
+                        identity_mgr.record_usage,
+                        user_id,
+                        usage.request_tokens or 0,
+                        usage.response_tokens or 0
+                    )
+                )
+
         return {
             "choices": [
                 {
