@@ -225,6 +225,65 @@ class IdentityManager:
         """Save the health status dictionary directly."""
         self.client.put(f"/health/{entity_type}/{name}", json.dumps(status_data))
 
+    @retry_etcd()
+    def get_user_usage(self, user_id: str) -> Dict[str, int]:
+        """Retrieve token usage for a user."""
+        value, _ = self.client.get(f"/usage/{user_id}")
+        if value:
+            return json.loads(value.decode('utf-8'))
+        return {"input_tokens": 0, "output_tokens": 0, "total_requests": 0}
+
+    @retry_etcd()
+    def record_usage(self, user_id: str, input_tokens: int, output_tokens: int) -> None:
+        """Increment token usage for a user."""
+        if not user_id:
+            return
+            
+        current = self.get_user_usage(user_id)
+        current["input_tokens"] += input_tokens
+        current["output_tokens"] += output_tokens
+        current["total_requests"] += 1
+        
+        self.client.put(f"/usage/{user_id}", json.dumps(current))
+
+    @retry_etcd()
+    def list_all_users(self) -> List[Dict]:
+        """List all user profiles."""
+        users = []
+        for value, _ in self.client.get_prefix("/users/"):
+            if value:
+                try:
+                    users.append(json.loads(value.decode('utf-8')))
+                except Exception:
+                    pass
+        return users
+
+    @retry_etcd()
+    def list_all_keys(self) -> List[Dict]:
+        """List all API keys across the system."""
+        keys = []
+        for value, _ in self.client.get_prefix("/keys/"):
+            if value:
+                try:
+                    data = json.loads(value.decode('utf-8'))
+                    raw_key = data.get("key", "")
+                    if raw_key.startswith("tl_") and len(raw_key) > 8:
+                        data["key_masked"] = raw_key[:6] + "..." + raw_key[-4:]
+                    else:
+                        data["key_masked"] = "***"
+                    keys.append(data)
+                except Exception:
+                    pass
+        return keys
+
+    @retry_etcd()
+    def toggle_user_ban(self, user_id: str, is_banned: bool) -> None:
+        """Toggle ban status for a user."""
+        user = self.get_user(user_id)
+        if user:
+            user["is_banned"] = is_banned
+            self.upsert_user(user_id, user)
+
 class AuthMiddleware:
     def __init__(self, app, identity_mgr: IdentityManager):
         self.app = app
