@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from core.auth import AuthMiddleware, IdentityManager, user_id_var
 
 from pydantic import BaseModel
@@ -17,6 +18,22 @@ from core.models import AgentConfig
 from core.health import HealthMonitor
 
 app = FastAPI(title="Universal Agent Host")
+
+# CORS Setup
+DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
+cors_origins_str = os.getenv("CORS_ALLOWED_ORIGINS", "")
+if DEV_MODE:
+    allow_origins = ["*"]
+else:
+    allow_origins = [origin.strip() for origin in cors_origins_str.split(",")] if cors_origins_str else []
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 identity_mgr = IdentityManager(
     host=os.getenv("ETCD_HOST", "127.0.0.1"),

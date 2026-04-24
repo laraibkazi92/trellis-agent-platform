@@ -31,9 +31,24 @@ if not DEV_MODE:
         raise ValueError(f"Missing required environment variables for UI: {', '.join(missing)}")
 
 from core.routers import auth, marketplace, keys, admin, secrets, docs
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Marketplace UI", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
+
+cors_origins_str = os.getenv("CORS_ALLOWED_ORIGINS", "")
+if DEV_MODE:
+    allow_origins = ["*"]
+else:
+    allow_origins = [origin.strip() for origin in cors_origins_str.split(",")] if cors_origins_str else []
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(auth.router)
 app.include_router(marketplace.router)

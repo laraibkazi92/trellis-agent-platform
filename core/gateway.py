@@ -8,9 +8,28 @@ import uvicorn
 import aiofiles
 from fastmcp import FastMCP
 from core.auth import AuthMiddleware, IdentityManager, auth_token_var
+from fastapi.middleware.cors import CORSMiddleware
 
 # Initialize FastMCP server with host and port
 mcp = FastMCP("Agent Gateway")
+
+# FastMCP underlying FastAPI app
+if hasattr(mcp, "_app"):
+    app = mcp._app
+    DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
+    cors_origins_str = os.getenv("CORS_ALLOWED_ORIGINS", "")
+    if DEV_MODE:
+        allow_origins = ["*"]
+    else:
+        allow_origins = [origin.strip() for origin in cors_origins_str.split(",")] if cors_origins_str else []
+        
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allow_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 BASE_DIR = Path(__file__).parent.parent
 AGENTS_DIR = BASE_DIR / "agents"

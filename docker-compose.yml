@@ -5,8 +5,6 @@ services:
     build: .
     image: trellis-agent-platform:v2
     container_name: agent-host
-    ports:
-      - "0.0.0.0:8000:8000"
     env_file:
       - .env
     environment:
@@ -14,6 +12,7 @@ services:
       - HUB_URL=http://hub:8001/mcp
       - GOOGLE_API_KEY=${GEMINI_API_KEY}
       - DEV_MODE=${DEV_MODE:-false}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
     command: uvicorn core.host:app --host 0.0.0.0 --port 8000
@@ -30,8 +29,6 @@ services:
     build: .
     image: trellis-agent-platform:v2
     container_name: tool-hub
-    ports:
-      - "0.0.0.0:8001:8001"
     command: python core/hub.py
     restart: unless-stopped
     depends_on:
@@ -47,11 +44,10 @@ services:
     build: .
     image: trellis-agent-platform:v2
     container_name: agent-gateway
-    ports:
-      - "0.0.0.0:8002:8002"
     environment:
       - HOST_URL=http://host:8000
       - DEV_MODE=${DEV_MODE:-false}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
     command: python core/gateway.py
@@ -74,25 +70,48 @@ services:
       timeout: 5s
       retries: 5
 
-
   ui:
     build: .
     image: trellis-agent-platform:v2
     container_name: agent-ui
-    ports:
-      - "0.0.0.0:8080:8080"
     env_file:
       - .env
     environment:
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
       - DEV_MODE=${DEV_MODE:-false}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
       - ADMIN_USERS=${ADMIN_USERS}
     command: uvicorn core.ui:app --host 0.0.0.0 --port 8080
     depends_on:
       - etcd
     restart: unless-stopped
 
+  nginx-gateway:
+    build: ./gateway
+    container_name: nginx-gateway
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # Set SSL_ENABLED=True in your .env to enable HTTPS
+      - SSL_ENABLED=${SSL_ENABLED:-False}
+      - SSL_DNS_NAME=${SSL_DNS_NAME:-localhost}
+    # volumes:
+    #   # Map host certificates directory via .env variables:
+    #   # Place your cert.pem and key.pem in a directory and map it here
+    #   # SSL_CERT_DIR=/path/to/ssl/dir
+    #   - ${SSL_CERT_DIR:-./gateway/ssl}:/etc/nginx/ssl:ro
+    depends_on:
+      - ui
+      - host
+      - gateway
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost/ > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
 
 networks:
   default:
