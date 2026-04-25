@@ -1,10 +1,17 @@
 import os
 import asyncio
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Depends
 from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import oauth, identity_mgr, HAS_GITHUB_AUTH, HAS_OIDC_AUTH, templates
 
+def require_auth(request: Request):
+    user = request.session.get('user')
+    if not user:
+        return RedirectResponse(url='/login')
+    return user
+
 router = APIRouter()
+
 
 DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
 

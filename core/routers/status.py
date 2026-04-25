@@ -115,7 +115,11 @@ async def status_page(request: Request, user=Depends(require_auth)):
     
     # Temporarily return JSON if the template doesn't exist yet (Phase 4 creates it)
     if templates and os.path.exists(os.path.join(templates_dir, "status.html")):
-        return templates.TemplateResponse("status.html", context)
+        return templates.TemplateResponse(
+            request=request,
+            name="status.html", 
+            context=context
+        )
     else:
         # Before Phase 4, return JSON to verify aggregation works
         return JSONResponse({
