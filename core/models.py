@@ -12,6 +12,16 @@ class AgentConfig(BaseModel):
     thinking_level: Literal['none', 'low', 'medium', 'high', 'n/a']
     a2a_access: List[str] = Field(default_factory=list, description="List of other agents this agent can call.")
     allowed_tools: List[str] = Field(default_factory=list, description="List of MCP tools this agent is allowed to use.")
+    allowed_mcps: List[str] = Field(default_factory=list, description="List of MCP servers this agent is allowed to connect to.")
+
+class MCPConfig(BaseModel):
+    """Configuration for an external MCP server, parsed from mcp.yaml or DB."""
+    name: str
+    transport: Literal["stdio", "sse"] = "stdio"
+    command: Optional[str] = None
+    args: Optional[List[str]] = Field(default_factory=list)
+    env: Optional[Dict[str, str]] = Field(default_factory=dict)
+    secrets: Optional[List[str]] = Field(default_factory=list, description="List of user secrets required by this MCP.")
 
 class ToolConfig(BaseModel):
     """Configuration for a Tool, parsed from tool.yaml."""

@@ -249,6 +249,37 @@ class IdentityManager:
         return list(names)
 
     @retry_etcd()
+    def save_mcp_config(self, name: str, config: Dict) -> None:
+        self.client.put(f"/registry/mcps/{name}/config", json.dumps(config))
+
+    @retry_etcd()
+    def get_mcp_config(self, name: str) -> Optional[Dict]:
+        value, _ = self.client.get(f"/registry/mcps/{name}/config")
+        if value:
+            return json.loads(value.decode('utf-8'))
+        return None
+
+    @retry_etcd()
+    def list_mcps(self) -> List[str]:
+        """List all MCP names in the registry."""
+        names = set()
+        prefix = "/registry/mcps/"
+        for value, metadata in self.client.get_prefix(prefix):
+            key_str = metadata.key.decode('utf-8')
+            if key_str.startswith(prefix):
+                rest = key_str[len(prefix):]
+                name = rest.split('/')[0]
+                if name:
+                    names.add(name)
+        return list(names)
+
+    @retry_etcd()
+    def delete_mcp(self, name: str) -> bool:
+        """Delete an MCP config from the registry."""
+        deleted = self.client.delete(f"/registry/mcps/{name}/config")
+        return deleted
+
+    @retry_etcd()
     def get_health_status(self, entity_type: str, name: str) -> Optional[Dict]:
         """Retrieve the health status of an agent or tool."""
         value, _ = self.client.get(f"/health/{entity_type}/{name}")

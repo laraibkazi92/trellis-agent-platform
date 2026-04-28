@@ -16,6 +16,7 @@ BASE_DIR = Path(__file__).parent.parent
 AGENTS_DIR = BASE_DIR / "agents"
 TOOLS_DIR = BASE_DIR / "tools"
 SUPERVISOR_DIR = BASE_DIR / "core" / "assets" / "supervisor"
+MCPS_DIR = BASE_DIR / "mcps"
 
 def sync_agent(identity_mgr, agent_dir, name=None):
     if not name:
@@ -80,6 +81,22 @@ def main():
                 
                 identity_mgr.save_tool_config(config["name"], config)
                 print(f"  Saved config for tool: {config['name']}")
+
+    print("\nSyncing MCPs to etcd...")
+    if MCPS_DIR.exists():
+        for mcp_yaml in MCPS_DIR.glob("**/mcp.yaml"):
+            mcp_dir = mcp_yaml.parent
+            with open(mcp_yaml, "r") as f:
+                data = yaml.safe_load(f)
+                
+            mcp_configs = data if isinstance(data, list) else [data]
+            
+            for config in mcp_configs:
+                if not config.get("name"):
+                    config["name"] = mcp_dir.name
+                
+                identity_mgr.save_mcp_config(config["name"], config)
+                print(f"  Saved config for MCP: {config['name']}")
 
     print("\nSync complete.")
 
