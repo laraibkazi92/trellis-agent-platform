@@ -15,6 +15,8 @@ services:
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
+    volumes:
+      - health-data:/app/data
     command: uvicorn core.host:app --host 0.0.0.0 --port 8000
     depends_on:
       hub:
@@ -38,6 +40,8 @@ services:
     environment:
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
+    volumes:
+      - health-data:/app/data
 
   # External Gateway MCP Server
   # Bridges external MCP clients to the internal agent fleet via the Host's HTTP API.
@@ -83,6 +87,8 @@ services:
       - DEV_MODE=${DEV_MODE:-false}
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
       - ADMIN_USERS=${ADMIN_USERS}
+    volumes:
+      - health-data:/app/data
     command: uvicorn core.ui:app --host 0.0.0.0 --port 8080
     depends_on:
       - etcd
@@ -120,3 +126,4 @@ networks:
 
 volumes:
   etcd-data:
+  health-data:
