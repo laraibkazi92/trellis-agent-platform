@@ -38,7 +38,7 @@ ROUTES="
         proxy_send_timeout 3600s;
     }
 
-    location /mcp {
+    location ~ ^/mcp(/|$) {
         set \$upstream_gateway http://gateway:8002;
         proxy_pass \$upstream_gateway;
         proxy_http_version 1.1;
