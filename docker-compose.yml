@@ -31,6 +31,7 @@ services:
     container_name: tool-hub
     command: python core/hub.py
     restart: unless-stopped
+    privileged: true
     depends_on:
       etcd:
         condition: service_healthy
