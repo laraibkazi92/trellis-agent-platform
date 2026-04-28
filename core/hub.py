@@ -32,7 +32,10 @@ def load_tool_configs() -> Dict[str, tuple[ToolConfig, Path]]:
             if data and "rel_path" in data:
                 rel_path = data.pop("rel_path")
                 config = ToolConfig(**data)
-                tool_dir = BASE_DIR / rel_path
+                tool_dir = (BASE_DIR / rel_path).resolve()
+                if not str(tool_dir).startswith(str(BASE_DIR.resolve())):
+                    print(f"Error: Tool directory {tool_dir} is outside BASE_DIR {BASE_DIR}")
+                    continue
                 configs[config.name] = (config, tool_dir)
     except Exception as e:
         print(f"Error loading tools from etcd: {e}")
@@ -42,16 +45,22 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
     """Executes a tool as a subprocess and handles JSON stdin/stdout."""
     user_id = arguments.pop("__user_id", None)
     
+    entrypoint_path = (tool_dir / config.entrypoint).resolve()
+    if not str(entrypoint_path).startswith(str(tool_dir)):
+        return {"error": f"Entrypoint resolves outside tool directory"}
+    if not entrypoint_path.is_file():
+        return {"error": f"Entrypoint does not exist or is not a file"}
+
     cmd = []
     if config.runtime == "python":
-        cmd = [sys.executable, str(tool_dir / config.entrypoint)]
+        cmd = [sys.executable, str(entrypoint_path)]
     elif config.runtime == "go":
         bin_path = tool_dir / ".bin" / config.name
         cmd = [str(bin_path)]
     elif config.runtime == "ts":
-        cmd = ["npx", "tsx", str(tool_dir / config.entrypoint)]
+        cmd = ["npx", "tsx", str(entrypoint_path)]
     elif config.runtime == "bash":
-        cmd = ["bash", str(tool_dir / config.entrypoint)]
+        cmd = ["bash", str(entrypoint_path)]
     else:
         return {"error": f"Unsupported runtime: {config.runtime}"}
 
@@ -111,6 +120,11 @@ def register_tools():
     
     for name, (config, tool_dir) in configs.items():
         if config.runtime == "go":
+            entrypoint_path = (tool_dir / config.entrypoint).resolve()
+            if not str(entrypoint_path).startswith(str(tool_dir)) or not entrypoint_path.is_file():
+                print(f"Skipping compilation of Go tool {name}: invalid entrypoint {config.entrypoint}")
+                continue
+            
             print(f"Pre-compiling Go tool: {name}")
             bin_dir = tool_dir / ".bin"
             bin_dir.mkdir(exist_ok=True)

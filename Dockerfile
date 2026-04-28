@@ -5,6 +5,7 @@ FROM python:3.12-slim
 RUN apt-get update && apt-get install -y \
     curl \
     git \
+    bubblewrap \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && curl -fsSL https://golang.org/dl/go1.22.2.linux-amd64.tar.gz | tar -C /usr/local -xzf - \
