@@ -6,6 +6,8 @@ RUN apt-get update && apt-get install -y \
     curl \
     git \
     bubblewrap \
+    ca-certificates \
+    && update-ca-certificates \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && curl -fsSL https://golang.org/dl/go1.22.2.linux-amd64.tar.gz | tar -C /usr/local -xzf - \
@@ -23,7 +25,7 @@ WORKDIR /app
 
 # Copy requirements and install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && pip install --upgrade certifi
 
 # Copy the rest of the application code
 COPY core/ core/
