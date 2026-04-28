@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+
+{% block title %}MCPs{% endblock %}
+
+{% block content %}
+<a href="/" class="font-mono text-xs uppercase tracking-widest text-neutral-500 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark transition-colors mb-6 inline-flex items-center gap-2">
+    <i data-lucide="arrow-left" class="w-4 h-4"></i> BACK TO DASHBOARD
+</a>
+
+<div class="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-6 gap-4">
+    <h2 class="text-2xl font-bold uppercase tracking-wider">MCP Servers</h2>
+    {% if is_admin %}
+    <button onclick="document.getElementById('add-mcp-modal').classList.remove('hidden')" class="bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 px-6 py-2 text-xs font-bold uppercase tracking-widest hover:bg-accent dark:hover:bg-accent-dark dark:hover:text-white transition-colors font-mono">
+        Add MCP Server
+    </button>
+    {% endif %}
+</div>
+
+<div class="flex flex-col gap-4 mb-20" id="mcps-grid">
+    {% for mcp in mcps %}
+    <div class="tool-card group border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 hover:border-accent dark:hover:border-accent-dark transition-all duration-300 flex flex-col md:flex-row md:items-center p-4 gap-6">
+        <!-- Status Indicator -->
+        <div class="hidden md:block w-1 self-stretch bg-green-500 transition-colors"></div>
+
+        <!-- Identity Section -->
+        <div class="flex-1 min-w-0">
+            <div class="flex flex-wrap items-center gap-3 mb-1">
+                <span class="font-mono text-[9px] font-bold border border-accent/30 text-accent dark:border-accent-dark/30 dark:text-accent-dark px-1.5 py-0.5 uppercase tracking-widest">
+                    {{ mcp.transport }}
+                </span>
+                <h3 class="text-lg font-bold tracking-tight truncate">{{ mcp.name }}</h3>
+            </div>
+            <p class="text-neutral-500 dark:text-neutral-400 text-xs font-mono truncate max-w-2xl">
+                Command: {{ mcp.command }} {% if mcp.args %}{{ mcp.args|join(' ') }}{% endif %}
+            </p>
+        </div>
+
+        <!-- Actions -->
+        <div class="flex items-center gap-4 ml-auto">
+            <button onclick="document.getElementById('mcp-details-{{ loop.index }}').classList.remove('hidden')" class="text-[10px] font-bold uppercase tracking-widest font-mono text-neutral-500 hover:text-accent dark:hover:text-accent-dark transition-colors">
+                View Details
+            </button>
+        </div>
+    </div>
+
+    <!-- Detail Modal -->
+    <div id="mcp-details-{{ loop.index }}" class="hidden fixed inset-0 bg-neutral-950/90 z-50 flex items-center justify-center p-4 backdrop-blur-sm">
+        <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 max-w-2xl w-full max-h-[90vh] overflow-hidden shadow-2xl flex flex-col">
+            <!-- Modal Header -->
+            <div class="p-8 border-b border-neutral-100 dark:border-neutral-800 flex justify-between items-start bg-neutral-50/50 dark:bg-neutral-950/50">
+                <div>
+                    <span class="font-mono text-[10px] font-bold border border-accent/30 text-accent dark:border-accent-dark/30 dark:text-accent-dark px-2 py-0.5 uppercase tracking-[0.2em]">
+                        {{ mcp.transport }}
+                    </span>
+                    <div class="flex items-center gap-4 mt-4">
+                        <h3 class="text-3xl font-bold tracking-tight">{{ mcp.name }}</h3>
+                    </div>
+                </div>
+                <button onclick="document.getElementById('mcp-details-{{ loop.index }}').classList.add('hidden')" class="text-neutral-400 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors uppercase text-xs font-mono font-bold tracking-widest">
+                    Close [X]
+                </button>
+            </div>
+
+            <!-- Modal Content -->
+            <div class="flex-grow overflow-y-auto p-8 space-y-6">
+                <div>
+                    <h4 class="text-xs font-bold text-neutral-400 dark:text-neutral-500 uppercase tracking-[0.3em] font-mono mb-2">Command</h4>
+                    <pre class="bg-neutral-100 dark:bg-neutral-950 p-4 rounded text-sm font-mono border border-neutral-200 dark:border-neutral-800">{{ mcp.command }} {% if mcp.args %}{{ mcp.args|join(' ') }}{% endif %}</pre>
+                </div>
+                
+                {% if mcp.env %}
+                <div>
+                    <h4 class="text-xs font-bold text-neutral-400 dark:text-neutral-500 uppercase tracking-[0.3em] font-mono mb-2">Environment Variables</h4>
+                    <pre class="bg-neutral-100 dark:bg-neutral-950 p-4 rounded text-sm font-mono border border-neutral-200 dark:border-neutral-800">{% for k, v in mcp.env.items() %}{{ k }}={{ v }}
+{% endfor %}</pre>
+                </div>
+                {% endif %}
+
+                {% if mcp.secrets %}
+                <div>
+                    <h4 class="text-xs font-bold text-neutral-400 dark:text-neutral-500 uppercase tracking-[0.3em] font-mono mb-2">Required Secrets</h4>
+                    <ul class="list-disc list-inside bg-neutral-100 dark:bg-neutral-950 p-4 rounded text-sm font-mono border border-neutral-200 dark:border-neutral-800">
+                        {% for secret in mcp.secrets %}
+                        <li>{{ secret }}</li>
+                        {% endfor %}
+                    </ul>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+
+    {% if not mcps %}
+    <div class="border-2 border-dashed border-neutral-200 dark:border-neutral-800 p-12 text-center flex flex-col items-center justify-center text-neutral-500">
+        <i data-lucide="server" class="w-12 h-12 mb-4 text-neutral-300 dark:text-neutral-700"></i>
+        <h3 class="text-lg font-bold uppercase tracking-wider mb-2 text-neutral-900 dark:text-neutral-100">No MCP Servers Configured</h3>
+        <p class="font-mono text-sm max-w-md">No external Model Context Protocol servers are currently registered.</p>
+    </div>
+    {% endif %}
+</div>
+
+{% if is_admin %}
+<!-- Add MCP Modal -->
+<div id="add-mcp-modal" class="hidden fixed inset-0 bg-neutral-950/90 z-50 flex items-center justify-center p-4 backdrop-blur-sm">
+    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 max-w-2xl w-full max-h-[90vh] overflow-hidden shadow-2xl flex flex-col">
+        <div class="p-6 border-b border-neutral-100 dark:border-neutral-800 flex justify-between items-center bg-neutral-50/50 dark:bg-neutral-950/50">
+            <h3 class="text-xl font-bold uppercase tracking-wider">Add MCP Server</h3>
+            <button onclick="document.getElementById('add-mcp-modal').classList.add('hidden')" class="text-neutral-400 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors uppercase text-xs font-mono font-bold tracking-widest">
+                Close [X]
+            </button>
+        </div>
+        
+        <form action="/mcps" method="POST" class="flex flex-col flex-grow overflow-hidden">
+            <div class="p-6 overflow-y-auto space-y-6">
+                <div>
+                    <label class="block text-xs font-bold font-mono uppercase text-neutral-500 mb-2">Name *</label>
+                    <input type="text" name="name" required class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:border-accent dark:focus:border-accent-dark focus:outline-none transition-colors" placeholder="e.g. weather-mcp">
+                </div>
+                
+                <div>
+                    <label class="block text-xs font-bold font-mono uppercase text-neutral-500 mb-2">Transport</label>
+                    <select name="transport" class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:border-accent dark:focus:border-accent-dark focus:outline-none transition-colors appearance-none">
+                        <option value="stdio">stdio</option>
+                        <option value="sse">sse</option>
+                    </select>
+                </div>
+                
+                <div>
+                    <label class="block text-xs font-bold font-mono uppercase text-neutral-500 mb-2">Command *</label>
+                    <input type="text" name="command" required class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:border-accent dark:focus:border-accent-dark focus:outline-none transition-colors" placeholder="e.g. npx">
+                </div>
+
+                <div>
+                    <label class="block text-xs font-bold font-mono uppercase text-neutral-500 mb-2">Arguments (Comma Separated)</label>
+                    <input type="text" name="args" class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:border-accent dark:focus:border-accent-dark focus:outline-none transition-colors" placeholder="e.g. -y, @modelcontextprotocol/server-weather">
+                </div>
+
+                <div>
+                    <label class="block text-xs font-bold font-mono uppercase text-neutral-500 mb-2">Environment Variables (JSON)</label>
+                    <textarea name="env" class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm h-24 focus:border-accent dark:focus:border-accent-dark focus:outline-none transition-colors" placeholder='{"WEATHER_API_KEY": "xxx"}'></textarea>
+                </div>
+
+                <div>
+                    <label class="block text-xs font-bold font-mono uppercase text-neutral-500 mb-2">User Secrets (Comma Separated)</label>
+                    <input type="text" name="secrets" class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:border-accent dark:focus:border-accent-dark focus:outline-none transition-colors" placeholder="e.g. WEATHER_API_KEY">
+                    <p class="text-[10px] text-neutral-400 font-mono mt-1">These will be requested from users via the /secrets UI.</p>
+                </div>
+            </div>
+            
+            <div class="p-6 border-t border-neutral-100 dark:border-neutral-800 bg-neutral-50/50 dark:bg-neutral-950/50">
+                <button type="submit" class="w-full bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 font-bold uppercase tracking-widest py-3 text-sm hover:bg-accent dark:hover:bg-accent-dark dark:hover:text-white transition-colors font-mono">
+                    Register MCP Server
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endif %}
+{% endblock %}

@@ -14,8 +14,9 @@ async def secrets_page(request: Request):
         
     user_id = user['sub']
     
-    # 1. Gather all required secrets from registered tools
+    # 1. Gather all required secrets from registered tools and MCPs
     tool_names = await asyncio.to_thread(identity_mgr.list_tools)
+    mcp_names = await asyncio.to_thread(identity_mgr.list_mcps)
     required_secrets: Dict[str, List[str]] = {}
     
     for name in tool_names:
@@ -24,7 +25,15 @@ async def secrets_page(request: Request):
             for secret_key in config.get("secrets", []):
                 if secret_key not in required_secrets:
                     required_secrets[secret_key] = []
-                required_secrets[secret_key].append(name)
+                required_secrets[secret_key].append(f"Tool: {name}")
+
+    for name in mcp_names:
+        config = await asyncio.to_thread(identity_mgr.get_mcp_config, name)
+        if config and config.get("secrets"):
+            for secret_key in config.get("secrets", []):
+                if secret_key not in required_secrets:
+                    required_secrets[secret_key] = []
+                required_secrets[secret_key].append(f"MCP: {name}")
                 
     # 2. Get current user secrets
     current_secrets = await asyncio.to_thread(identity_mgr.get_user_secrets, user_id)
