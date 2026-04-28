@@ -68,6 +68,21 @@ class ChatRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
 
+def _inject_secrets(env: Optional[Dict[str, str]], secrets: Optional[List[str]], user_secrets: Dict[str, str]) -> Dict[str, str]:
+    """Inject user secrets into the environment dict, supporting string interpolation."""
+    env_copy = env.copy() if env else {}
+    for req_secret in (secrets or []):
+        val = user_secrets.get(req_secret)
+        if val:
+            interpolated = False
+            for k, v in env_copy.items():
+                if isinstance(v, str) and f"{{{req_secret}}}" in v:
+                    env_copy[k] = v.replace(f"{{{req_secret}}}", val)
+                    interpolated = True
+            if not interpolated:
+                env_copy[req_secret] = val
+    return env_copy
+
 class AgentManager:
     def __init__(self):
         self.agents: Dict[str, Agent] = {}
@@ -318,6 +333,36 @@ class AgentManager:
                 from fastmcp.client import StdioTransport, SSETransport
                 config = MCPConfig(**config_data)
                 
+                if config.tools:
+                    tools = config.tools
+                    self._external_mcp_tools_cache[name] = tools
+                    print(f"Loaded {len(tools)} static tools for MCP '{name}'")
+                    
+                    # Register to agents
+                    async with self._lock:
+                        for agent_name, agent in self.agents.items():
+                            if agent_name == "supervisor":
+                                continue
+                            agent_config = self.configs.get(agent_name)
+                            if not agent_config:
+                                continue
+                            
+                            allowed_mcps = agent_config.allowed_mcps or []
+                            allowed_tools = agent_config.allowed_tools or []
+                            
+                            if name in allowed_mcps:
+                                # Agent is allowed to use all tools from this MCP
+                                for tool in tools:
+                                    print(f"Injecting external MCP tool '{tool.name}' (from '{name}') into agent '{agent_name}'")
+                                    self._register_external_mcp_tool(agent, name, tool)
+                            else:
+                                # Check if specific tools from this MCP are allowed
+                                for tool in tools:
+                                    if tool.name in allowed_tools:
+                                        print(f"Injecting external MCP tool '{tool.name}' (from '{name}') into agent '{agent_name}'")
+                                        self._register_external_mcp_tool(agent, name, tool)
+                    continue
+
                 transport = None
                 if config.transport == "stdio":
                     if not config.command:
@@ -459,12 +504,7 @@ class AgentManager:
             if not client:
                 transport = None
                 
-                env = config.env or {}
-                # Inject user secrets
-                for req_secret in (config.secrets or []):
-                    val = user_secrets.get(req_secret)
-                    if val:
-                        env[req_secret] = val
+                env = _inject_secrets(config.env, config.secrets, user_secrets)
                         
                 if config.transport == "stdio":
                     if not config.command:
