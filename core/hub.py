@@ -22,6 +22,8 @@ identity_mgr = IdentityManager(
 )
 health_monitor = HealthMonitor(identity_mgr)
 
+RESTRICTED_ENV_VARS = {"PATH", "PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "BASH_ENV", "ENV", "HOSTALIASES"}
+
 def load_tool_configs() -> Dict[str, tuple[ToolConfig, Path]]:
     """Fetches tool configurations from etcd."""
     configs = {}
@@ -69,7 +71,8 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
         if user_id:
             secrets = identity_mgr.get_user_secrets(user_id)
             if secrets:
-                env.update({str(k): str(v) for k, v in secrets.items()})
+                safe_secrets = {str(k): str(v) for k, v in secrets.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
+                env.update(safe_secrets)
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
