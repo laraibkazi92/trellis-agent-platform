@@ -74,6 +74,7 @@ class AgentManager:
         self.configs: Dict[str, AgentConfig] = {}
         self.mcp_client: Optional[FastMCPClient] = None
         self._mcp_tools_cache = []
+        self._external_mcp_tools_cache = {}  # mcp_name -> list of tools
         self._lock = asyncio.Lock()
 
     async def start(self):
@@ -82,6 +83,7 @@ class AgentManager:
         await self._init_supervisor()
         await self.load_agents()
         await self.connect_to_hub()
+        await self.discover_mcps()
         await self.inject_a2a_tools()
         print("Agent Manager started successfully.")
 
@@ -213,7 +215,8 @@ class AgentManager:
             return {
                 "hub_url": hub_url,
                 "connected": self.mcp_client is not None,
-                "tool_count": len(self._mcp_tools_cache)
+                "tool_count": len(self._mcp_tools_cache),
+                "external_mcps": list(self._external_mcp_tools_cache.keys())
             }
 
         @agent.tool_plain(name="update_mcp_config", description="Update the Polyglot Tool Hub URL and reconnect.")
@@ -232,12 +235,27 @@ class AgentManager:
     async def _reinject_tools_for_agent(self, name: str):
         """Helper to inject MCP tools into a specific agent if active."""
         async with self._lock:
-            if name in self.agents and self.mcp_client:
+            if name in self.agents:
                 agent_config = self.configs.get(name)
+                if not agent_config:
+                    return
+                
                 allowed_tools = agent_config.allowed_tools if agent_config else []
-                for tool in self._mcp_tools_cache:
-                    if tool.name in allowed_tools:
-                        self._register_mcp_tool(self.agents[name], tool)
+                allowed_mcps = agent_config.allowed_mcps if agent_config else []
+                
+                if self.mcp_client:
+                    for tool in self._mcp_tools_cache:
+                        if tool.name in allowed_tools:
+                            self._register_mcp_tool(self.agents[name], tool)
+                
+                for mcp_name, tools in self._external_mcp_tools_cache.items():
+                    if mcp_name in allowed_mcps:
+                        for tool in tools:
+                            self._register_external_mcp_tool(self.agents[name], mcp_name, tool)
+                    else:
+                        for tool in tools:
+                            if tool.name in allowed_tools:
+                                self._register_external_mcp_tool(self.agents[name], mcp_name, tool)
 
     async def _load_agent_from_registry(self, name: str):
         """Loads a single agent from etcd."""
@@ -283,7 +301,74 @@ class AgentManager:
                 continue
             await self._load_agent_from_registry(name)
 
-    async def connect_to_hub(self, max_retries: int = 5, retry_delay: int = 5):
+    async def discover_mcps(self):
+        """Iterates over registered MCPs and temporarily connects to discover their tools."""
+        print("Discovering external MCPs...")
+        mcp_names = await asyncio.to_thread(identity_mgr.list_mcps)
+        
+        # Avoid overriding the entire dict if not needed, just in case
+        for name in mcp_names:
+            config_data = await asyncio.to_thread(identity_mgr.get_mcp_config, name)
+            if not config_data:
+                continue
+            
+            try:
+                from core.models import MCPConfig
+                from fastmcp.client import StdioTransport, SSETransport
+                config = MCPConfig(**config_data)
+                
+                transport = None
+                if config.transport == "stdio":
+                    if not config.command:
+                        print(f"Skipping MCP '{name}' (stdio missing command)")
+                        continue
+                    transport = StdioTransport(
+                        command=config.command,
+                        args=config.args or [],
+                        env=config.env or {},
+                        keep_alive=False
+                    )
+                elif config.transport == "sse":
+                    if not config.command:
+                        print(f"Skipping MCP '{name}' (sse missing url)")
+                        continue
+                    transport = SSETransport(url=config.command)
+                else:
+                    print(f"Skipping MCP '{name}' (unknown transport {config.transport})")
+                    continue
+                
+                client = FastMCPClient(transport)
+                async with client:
+                    tools = await client.list_tools()
+                    self._external_mcp_tools_cache[name] = tools
+                    print(f"Successfully discovered {len(tools)} tools from MCP '{name}'")
+                    
+                    # Register to agents
+                    async with self._lock:
+                        for agent_name, agent in self.agents.items():
+                            if agent_name == "supervisor":
+                                continue
+                            agent_config = self.configs.get(agent_name)
+                            if not agent_config:
+                                continue
+                            
+                            allowed_mcps = agent_config.allowed_mcps or []
+                            allowed_tools = agent_config.allowed_tools or []
+                            
+                            if name in allowed_mcps:
+                                # Agent is allowed to use all tools from this MCP
+                                for tool in tools:
+                                    print(f"Injecting external MCP tool '{tool.name}' (from '{name}') into agent '{agent_name}'")
+                                    self._register_external_mcp_tool(agent, name, tool)
+                            else:
+                                # Check if specific tools from this MCP are allowed
+                                for tool in tools:
+                                    if tool.name in allowed_tools:
+                                        print(f"Injecting external MCP tool '{tool.name}' (from '{name}') into agent '{agent_name}'")
+                                        self._register_external_mcp_tool(agent, name, tool)
+                                        
+            except Exception as e:
+                print(f"Failed to discover tools for MCP '{name}': {e}")
         """Connects to the Polyglot Tool Hub via MCP SSE and registers tools."""
         hub_url = identity_mgr.get_config("HUB_URL", DEFAULT_HUB_URL)
         
@@ -344,6 +429,31 @@ class AgentManager:
                 self.mcp_client = None # Force reconnect
                 if attempt == max_retries - 1:
                     raise Exception(f"Failed to execute MCP tool '{mcp_tool_name}' after {max_retries} attempts: {e}")
+
+    async def _execute_external_mcp_tool(self, mcp_name: str, tool_name: str, arguments: Dict[str, Any]) -> Any:
+        raise NotImplementedError("Per-user MCP execution will be implemented in Phase 4.")
+
+    def _register_external_mcp_tool(self, agent: Agent, mcp_name: str, mcp_tool: Any):
+        """Helper to register an external MCP tool to a PydanticAI agent."""
+        import copy
+        
+        safe_mcp_tool = mcp_tool
+        if hasattr(mcp_tool, "inputSchema") and isinstance(mcp_tool.inputSchema, dict):
+            if hasattr(mcp_tool, "model_copy"):
+                safe_mcp_tool = mcp_tool.model_copy(deep=True)
+            else:
+                safe_mcp_tool = copy.copy(mcp_tool)
+                safe_mcp_tool.inputSchema = copy.deepcopy(mcp_tool.inputSchema)
+        
+        async def tool_wrapper(ctx: RunContext[None], **kwargs: Any) -> Any:
+            # Check tool health before execution
+            status = health_monitor.get_status("tool", safe_mcp_tool.name)
+            if status.get("status") == "Offline":
+                return f"SYSTEM: This tool is currently offline due to technical failures. Inform the user you cannot perform this action right now."
+
+            return await self._execute_external_mcp_tool(mcp_name, safe_mcp_tool.name, kwargs)
+
+        agent.tool(name=safe_mcp_tool.name, description=safe_mcp_tool.description)(tool_wrapper)
 
     def _register_mcp_tool(self, agent: Agent, mcp_tool: Any):
         """Helper to register an MCP tool to a PydanticAI agent."""
