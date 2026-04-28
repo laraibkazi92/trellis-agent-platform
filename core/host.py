@@ -333,7 +333,7 @@ class AgentManager:
                     if not config.command:
                         print(f"Skipping MCP '{name}' (sse missing url)")
                         continue
-                    transport = SSETransport(url=config.command)
+                    transport = SSETransport(url=config.command, headers=config.env or {})
                 else:
                     print(f"Skipping MCP '{name}' (unknown transport {config.transport})")
                     continue
@@ -458,16 +458,17 @@ class AgentManager:
             client = self._user_mcp_pools.get(pool_key)
             if not client:
                 transport = None
+                
+                env = config.env or {}
+                # Inject user secrets
+                for req_secret in (config.secrets or []):
+                    val = user_secrets.get(req_secret)
+                    if val:
+                        env[req_secret] = val
+                        
                 if config.transport == "stdio":
                     if not config.command:
                         raise Exception(f"MCP '{mcp_name}' stdio missing command")
-                    
-                    env = config.env or {}
-                    # Inject user secrets
-                    for req_secret in (config.secrets or []):
-                        val = user_secrets.get(req_secret)
-                        if val:
-                            env[req_secret] = val
                     
                     # Merge with os.environ so PATH etc is available
                     full_env = os.environ.copy()
@@ -482,7 +483,7 @@ class AgentManager:
                 elif config.transport == "sse":
                     if not config.command:
                         raise Exception(f"MCP '{mcp_name}' sse missing url")
-                    transport = SSETransport(url=config.command)
+                    transport = SSETransport(url=config.command, headers=env)
                 else:
                     raise Exception(f"Unknown transport {config.transport}")
                     
