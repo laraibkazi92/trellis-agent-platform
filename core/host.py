@@ -370,6 +370,8 @@ class AgentManager:
                                         
             except Exception as e:
                 print(f"Failed to discover tools for MCP '{name}': {e}")
+
+    async def connect_to_hub(self, max_retries: int = 5, retry_delay: int = 2):
         """Connects to the Polyglot Tool Hub via MCP SSE and registers tools."""
         hub_url = identity_mgr.get_config("HUB_URL", DEFAULT_HUB_URL)
         
