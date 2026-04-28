@@ -1,5 +1,6 @@
 # Use Python 3.12 slim as the base image
 FROM python:3.12-slim
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 # Install system dependencies for Node.js and Go
 RUN apt-get update && apt-get install -y \
@@ -25,7 +26,7 @@ WORKDIR /app
 
 # Copy requirements and install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && pip install --upgrade certifi
+RUN uv pip install --system --no-cache -r requirements.txt && uv pip install --system --upgrade certifi
 
 # Copy the rest of the application code
 COPY core/ core/
