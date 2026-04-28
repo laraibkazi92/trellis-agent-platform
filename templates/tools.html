@@ -46,7 +46,7 @@
                 View Details
             </button>
             
-            {% if is_admin %}
+            {% if is_admin and not tool.is_mcp %}
             <span class="text-neutral-200 dark:text-neutral-800">|</span>
             <a href="/editor/tool/{{ tool.name }}" class="text-[10px] font-bold uppercase tracking-widest font-mono text-neutral-500 hover:text-accent dark:hover:text-accent-dark transition-colors">
                 Edit
@@ -61,9 +61,15 @@
             <!-- Modal Header -->
             <div class="p-8 border-b border-neutral-100 dark:border-neutral-800 flex justify-between items-start bg-neutral-50/50 dark:bg-neutral-950/50">
                 <div>
+                    {% if tool.is_mcp %}
+                    <span class="font-mono text-[10px] font-bold border border-blue-300 text-blue-600 dark:border-blue-800/30 dark:text-blue-400 px-2 py-0.5 uppercase tracking-[0.2em] bg-blue-50 dark:bg-blue-900/10">
+                        MCP: {{ tool.mcp_source }}
+                    </span>
+                    {% else %}
                     <span class="font-mono text-[10px] font-bold border border-accent/30 text-accent dark:border-accent-dark/30 dark:text-accent-dark px-2 py-0.5 uppercase tracking-[0.2em]">
                         {{ tool.runtime }}
                     </span>
+                    {% endif %}
                     <div class="flex items-center gap-4 mt-4">
                         <h3 class="text-3xl font-bold tracking-tight">{{ tool.name }}</h3>
                         <span class="text-sm font-mono font-bold bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400 px-2 py-0.5 rounded border border-neutral-200 dark:border-neutral-700 uppercase">v{{ tool.version }}</span>
@@ -156,7 +162,7 @@
 
             <!-- Modal Footer -->
             <div class="p-6 border-t border-neutral-100 dark:border-neutral-800 bg-neutral-50/30 dark:bg-neutral-950/30 flex justify-end">
-                {% if is_admin %}
+                {% if is_admin and not tool.is_mcp %}
                 <a href="/editor/tool/{{ tool.name }}" class="bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 px-6 py-2 text-xs font-bold uppercase tracking-widest hover:bg-accent dark:hover:bg-accent-dark dark:hover:text-white transition-colors font-mono">
                     Edit Configuration
                 </a>

@@ -57,6 +57,36 @@ async def discover_tools() -> List[Dict]:
                 "inputs": config.get("inputs", {}),
                 "outputs": config.get("outputs", {}),
                 "version": config.get("version", "0.1.0"),
-                "health": health or {"status": "Online"}
+                "health": health or {"status": "Online"},
+                "is_mcp": False
             })
+            
+    mcp_names = await asyncio.to_thread(identity_mgr.list_mcps)
+    for mcp_name in mcp_names:
+        mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
+        if mcp_config and "tools" in mcp_config:
+            for t in mcp_config["tools"]:
+                inputs = {}
+                if "inputSchema" in t and "properties" in t["inputSchema"]:
+                    required = t["inputSchema"].get("required", [])
+                    for prop_name, prop_details in t["inputSchema"]["properties"].items():
+                        inputs[prop_name] = {
+                            "type": prop_details.get("type", "string"),
+                            "description": prop_details.get("description", ""),
+                            "required": prop_name in required
+                        }
+                tools.append({
+                    "name": t.get("name", ""),
+                    "description": t.get("description", ""),
+                    "runtime": "mcp",
+                    "entrypoint": mcp_name,
+                    "rel_path": "",
+                    "inputs": inputs,
+                    "outputs": {},
+                    "version": "1.0.0",
+                    "health": {"status": "Online"},
+                    "is_mcp": True,
+                    "mcp_source": mcp_name
+                })
+                
     return tools

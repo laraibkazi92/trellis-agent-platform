@@ -166,7 +166,23 @@ async def editor_page(request: Request, type: str, name: str):
         config = await asyncio.to_thread(identity_mgr.get_agent_config, safe_name)
         skills_content = await asyncio.to_thread(identity_mgr.get_agent_skills, safe_name) or ""
         all_agents = await asyncio.to_thread(identity_mgr.list_agents)
-        all_tools = await asyncio.to_thread(identity_mgr.list_tools)
+        
+        all_tools_data = []
+        # Local Tools
+        local_tools = await asyncio.to_thread(identity_mgr.list_tools)
+        for t in local_tools:
+            all_tools_data.append({"name": t, "type": "local", "source": "Hub"})
+            
+        # MCP Tools
+        mcp_names = await asyncio.to_thread(identity_mgr.list_mcps)
+        for mcp in mcp_names:
+            mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp)
+            if mcp_config and "tools" in mcp_config:
+                for t in mcp_config["tools"]:
+                    all_tools_data.append({"name": t.get("name", ""), "type": "mcp", "source": mcp})
+                    
+        all_tools_data.sort(key=lambda x: x["name"])
+        all_tools = all_tools_data
         
         if not config:
             request.session["flash_msg"] = "Agent not found."
@@ -189,7 +205,33 @@ async def editor_page(request: Request, type: str, name: str):
         config = await asyncio.to_thread(identity_mgr.get_tool_config, safe_name)
         if not config:
             request.session["flash_msg"] = "Tool not found."
-    return RedirectResponse(url='/tools', status_code=303)
+            return RedirectResponse(url='/tools', status_code=303)
+        return templates.TemplateResponse(
+            request=request,
+            name="editor.html", 
+            context={
+                "user": user,
+                "type": type,
+                "name": safe_name,
+                "config": config
+            }
+        )
+    elif type == "mcp":
+        config = await asyncio.to_thread(identity_mgr.get_mcp_config, safe_name)
+        if not config:
+            request.session["flash_msg"] = "MCP not found."
+            return RedirectResponse(url='/mcps', status_code=303)
+        return templates.TemplateResponse(
+            request=request,
+            name="editor.html", 
+            context={
+                "user": user,
+                "type": type,
+                "name": safe_name,
+                "config": config
+            }
+        )
+    return RedirectResponse(url='/admin', status_code=303)
 
 @router.post("/reset-health/{entity_type}/{name}")
 async def reset_health(request: Request, entity_type: str, name: str):
@@ -256,6 +298,50 @@ async def save_agent(request: Request, name: str):
         request.session["flash_msg"] = f"Agent {safe_name} updated successfully."
         
     return RedirectResponse(url='/agents', status_code=303)
+
+@router.post("/editor/mcp/{name}")
+async def save_mcp(request: Request, name: str):
+    if redirect := require_admin(request, '/mcps'):
+        return redirect
+        
+    safe_name = sanitize_name(name)
+    if not safe_name:
+        request.session["flash_msg"] = "Invalid name parameter."
+        return RedirectResponse(url='/mcps', status_code=303)
+        
+    form = await request.form()
+    
+    config = await asyncio.to_thread(identity_mgr.get_mcp_config, safe_name) or {"name": safe_name}
+    config["transport"] = form.get("transport")
+    config["command"] = form.get("command")
+    
+    args_str = form.get("args", "")
+    config["args"] = [a.strip() for a in args_str.split(",") if a.strip()] if args_str else []
+    
+    env_str = form.get("env", "")
+    if env_str:
+        try:
+            config["env"] = json.loads(env_str)
+        except:
+            pass
+    else:
+        config["env"] = {}
+            
+    secrets_str = form.get("secrets", "")
+    config["secrets"] = [s.strip() for s in secrets_str.split(",") if s.strip()] if secrets_str else []
+    
+    await asyncio.to_thread(identity_mgr.save_mcp_config, safe_name, config)
+    
+    # Sync to GitHub
+    yaml_content = yaml.dump(config, sort_keys=False)
+    success = await commit_to_github(f"mcps/{safe_name}/mcp.yaml", yaml_content, f"Update config for MCP {safe_name}")
+    
+    if GITHUB_REPO and GITHUB_TOKEN and not success:
+        request.session["flash_msg"] = f"MCP {safe_name} updated locally, but GitHub sync failed."
+    else:
+        request.session["flash_msg"] = f"MCP {safe_name} updated successfully."
+        
+    return RedirectResponse(url='/mcps', status_code=303)
 
 @router.post("/editor/tool/{name}")
 async def save_tool(request: Request, name: str):

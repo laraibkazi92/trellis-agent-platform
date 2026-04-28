@@ -40,8 +40,34 @@
             <button onclick="document.getElementById('mcp-details-{{ loop.index }}').classList.remove('hidden')" class="text-[10px] font-bold uppercase tracking-widest font-mono text-neutral-500 hover:text-accent dark:hover:text-accent-dark transition-colors">
                 View Details
             </button>
+            {% if is_admin %}
+            <span class="text-neutral-200 dark:text-neutral-800">|</span>
+            <a href="/editor/mcp/{{ mcp.name }}" class="text-[10px] font-bold uppercase tracking-widest font-mono text-neutral-500 hover:text-accent dark:hover:text-accent-dark transition-colors">
+                Edit Configuration
+            </a>
+            {% endif %}
         </div>
     </div>
+
+    {% if mcp.tools %}
+    <div class="mt-2 mb-6 ml-6 border-l-2 border-neutral-200 dark:border-neutral-800 pl-4 w-full max-w-4xl">
+        <details class="group">
+            <summary class="text-xs font-bold font-mono text-neutral-500 hover:text-accent dark:hover:text-accent-dark cursor-pointer list-none flex items-center gap-2 mb-2">
+                <i data-lucide="chevron-right" class="w-4 h-4 group-open:rotate-90 transition-transform"></i>
+                Provided Tools ({{ mcp.tools|length }})
+            </summary>
+            <div class="mt-2 space-y-2">
+                {% for tool in mcp.tools %}
+                <div class="text-sm font-mono flex items-start gap-2">
+                    <span class="text-accent dark:text-accent-dark font-bold">{{ tool.name }}</span>
+                    <span class="text-neutral-400 dark:text-neutral-600">-</span>
+                    <span class="text-neutral-600 dark:text-neutral-400 text-xs">{{ tool.description }}</span>
+                </div>
+                {% endfor %}
+            </div>
+        </details>
+    </div>
+    {% endif %}
 
     <!-- Detail Modal -->
     <div id="mcp-details-{{ loop.index }}" class="hidden fixed inset-0 bg-neutral-950/90 z-50 flex items-center justify-center p-4 backdrop-blur-sm">
