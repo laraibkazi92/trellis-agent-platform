@@ -75,6 +75,7 @@ class AgentManager:
         self.mcp_client: Optional[FastMCPClient] = None
         self._mcp_tools_cache = []
         self._external_mcp_tools_cache = {}  # mcp_name -> list of tools
+        self._user_mcp_pools: Dict[tuple[str, str], FastMCPClient] = {}  # (user_id, mcp_name) -> FastMCPClient
         self._lock = asyncio.Lock()
 
     async def start(self):
@@ -431,7 +432,76 @@ class AgentManager:
                     raise Exception(f"Failed to execute MCP tool '{mcp_tool_name}' after {max_retries} attempts: {e}")
 
     async def _execute_external_mcp_tool(self, mcp_name: str, tool_name: str, arguments: Dict[str, Any]) -> Any:
-        raise NotImplementedError("Per-user MCP execution will be implemented in Phase 4.")
+        user_id = user_id_var.get()
+        if not user_id:
+            raise Exception("No user_id found in context")
+
+        # 1. Fetch user secrets
+        user_secrets = await asyncio.to_thread(identity_mgr.get_user_secrets, user_id)
+        
+        # 2. Get MCP config
+        config_data = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
+        if not config_data:
+            raise Exception(f"MCP config '{mcp_name}' not found")
+            
+        from core.models import MCPConfig
+        from fastmcp.client import StdioTransport, SSETransport
+        config = MCPConfig(**config_data)
+
+        pool_key = (user_id, mcp_name)
+        
+        # 3. Check connection pool
+        client = None
+        async with self._lock:
+            client = self._user_mcp_pools.get(pool_key)
+            if not client:
+                transport = None
+                if config.transport == "stdio":
+                    if not config.command:
+                        raise Exception(f"MCP '{mcp_name}' stdio missing command")
+                    
+                    env = config.env or {}
+                    # Inject user secrets
+                    for req_secret in (config.secrets or []):
+                        val = user_secrets.get(req_secret)
+                        if val:
+                            env[req_secret] = val
+                    
+                    # Merge with os.environ so PATH etc is available
+                    full_env = os.environ.copy()
+                    full_env.update(env)
+
+                    transport = StdioTransport(
+                        command=config.command,
+                        args=config.args or [],
+                        env=full_env,
+                        keep_alive=True  # Important: keep alive for pooling
+                    )
+                elif config.transport == "sse":
+                    if not config.command:
+                        raise Exception(f"MCP '{mcp_name}' sse missing url")
+                    transport = SSETransport(url=config.command)
+                else:
+                    raise Exception(f"Unknown transport {config.transport}")
+                    
+                client = FastMCPClient(transport)
+                await client.__aenter__()
+                self._user_mcp_pools[pool_key] = client
+
+        # 4. Execute tool
+        try:
+            result = await client.call_tool(tool_name, arguments)
+            return result.content
+        except Exception as e:
+            print(f"External MCP Tool error: {e}")
+            async with self._lock:
+                if pool_key in self._user_mcp_pools:
+                    try:
+                        await self._user_mcp_pools[pool_key].__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                    del self._user_mcp_pools[pool_key]
+            raise Exception(f"Failed to execute external MCP tool '{tool_name}': {e}")
 
     def _register_external_mcp_tool(self, agent: Agent, mcp_name: str, mcp_tool: Any):
         """Helper to register an external MCP tool to a PydanticAI agent."""
@@ -526,12 +596,24 @@ class AgentManager:
         if self.mcp_client:
             await self.mcp_client.__aexit__(None, None, None)
             self.mcp_client = None
+            
+        async with self._lock:
+            for pool_key, client in list(self._user_mcp_pools.items()):
+                try:
+                    await client.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            self._user_mcp_pools.clear()
 
 manager = AgentManager()
 
 @app.on_event("startup")
 async def startup_event():
     await manager.start()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await manager.stop()
 
 @app.on_event("startup")
 async def log_startup():
