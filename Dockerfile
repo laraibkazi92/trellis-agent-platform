@@ -28,6 +28,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN uv pip install --system --no-cache -r requirements.txt && uv pip install --system --upgrade certifi
 
+# Natively install the updated certificates into the Debian OS
+RUN cp $(python -c "import certifi; print(certifi.where())") /usr/local/share/ca-certificates/mozilla-certifi.crt \
+    && update-ca-certificates
+
 # Copy the rest of the application code
 COPY core/ core/
 COPY agents/ agents/

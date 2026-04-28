@@ -47,7 +47,10 @@ if HAS_GITHUB_AUTH:
         authorize_url='https://github.com/login/oauth/authorize',
         authorize_params=None,
         api_base_url='https://api.github.com/',
-        client_kwargs={'scope': 'user:email'}
+        client_kwargs={
+            'scope': 'user:email',
+            'verify': '/etc/ssl/certs/ca-certificates.crt'
+        }
     )
 
 identity_mgr = IdentityManager(
