@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import asyncio
+import shutil
 from pathlib import Path
 from typing import Dict, Any
 from fastmcp import FastMCP
@@ -65,6 +66,23 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
         cmd = ["bash", str(entrypoint_path)]
     else:
         return {"error": f"Unsupported runtime: {config.runtime}"}
+
+    if not shutil.which("bwrap"):
+        raise RuntimeError("bwrap not found on system. Sandboxing is required.")
+
+    bwrap_cmd = [
+        "bwrap",
+        "--ro-bind", "/", "/",
+        "--dev", "/dev",
+        "--proc", "/proc",
+        "--tmpfs", "/tmp",
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--die-with-parent"
+    ]
+    cmd = bwrap_cmd + cmd
 
     try:
         env = os.environ.copy()
