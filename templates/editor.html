@@ -265,13 +265,13 @@
                                     {% endif %}
                                 </div>
                                 {% if tool.description %}
-                                    <div class="text-xs text-neutral-500 dark:text-neutral-400 mt-1 truncate w-full">
-                                        {{ tool.description }}
-                                    </div>
-                                    <!-- Custom Tooltip -->
-                                    <div class="hidden group-hover:block absolute z-50 left-0 top-full mt-1 w-full bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 p-2 text-xs font-mono shadow-lg border border-neutral-800 dark:border-neutral-200 whitespace-normal break-words">
-                                        {{ tool.description }}
-                                    </div>
+                                <div class="text-xs text-neutral-500 dark:text-neutral-400 mt-1 truncate w-full tool-desc">
+                                    {{ tool.description }}
+                                </div>
+                                <!-- Custom Tooltip -->
+                                <div class="opacity-0 invisible group-[.is-truncated]:hover:opacity-100 group-[.is-truncated]:hover:visible transition-all duration-200 delay-500 absolute z-50 left-0 top-full mt-1 w-full bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 p-2 text-xs font-mono shadow-lg border border-neutral-800 dark:border-neutral-200 whitespace-normal break-words pointer-events-none">
+                                    {{ tool.description }}
+                                </div>
                                 {% endif %}
                             </label>
                         </div>
@@ -326,6 +326,15 @@
             $('.a2a-select').select2({
                 placeholder: "SELECT AGENTS...",
                 width: '100%'
+            });
+
+            $('.tool-item').on('mouseenter', function() {
+                var desc = $(this).find('.tool-desc')[0];
+                if (desc && desc.scrollWidth > desc.clientWidth) {
+                    $(this).addClass('is-truncated');
+                } else {
+                    $(this).removeClass('is-truncated');
+                }
             });
 
             $('#toolSearch').on('input', function() {
