@@ -168,18 +168,31 @@ async def editor_page(request: Request, type: str, name: str):
         all_agents = await asyncio.to_thread(identity_mgr.list_agents)
         
         all_tools_data = []
+        # Bulk fetch all tools and MCPs
+        local_tool_configs = await asyncio.to_thread(identity_mgr.get_all_tool_configs)
+        mcp_configs = await asyncio.to_thread(identity_mgr.get_all_mcp_configs)
+        
         # Local Tools
-        local_tools = await asyncio.to_thread(identity_mgr.list_tools)
-        for t in local_tools:
-            all_tools_data.append({"name": t, "type": "local", "source": "Hub"})
+        for t_name, t_config in local_tool_configs.items():
+            all_tools_data.append({
+                "name": t_name, 
+                "type": "local", 
+                "source": "Hub",
+                "version": t_config.get("version", ""),
+                "description": t_config.get("description", "")
+            })
             
         # MCP Tools
-        mcp_names = await asyncio.to_thread(identity_mgr.list_mcps)
-        for mcp in mcp_names:
-            mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp)
+        for mcp_name, mcp_config in mcp_configs.items():
             if mcp_config and "tools" in mcp_config:
                 for t in mcp_config["tools"]:
-                    all_tools_data.append({"name": t.get("name", ""), "type": "mcp", "source": mcp})
+                    all_tools_data.append({
+                        "name": t.get("name", ""), 
+                        "type": "mcp", 
+                        "source": mcp_name,
+                        "version": t.get("version", ""),
+                        "description": t.get("description", "")
+                    })
                     
         all_tools_data.sort(key=lambda x: x["name"])
         all_tools = all_tools_data

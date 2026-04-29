@@ -248,6 +248,26 @@ class IdentityManager:
                     names.add(name)
         return list(names)
 
+    def _get_all_configs_by_prefix(self, prefix: str) -> Dict[str, Dict]:
+        """Helper to fetch all configs under a given registry prefix."""
+        configs = {}
+        for value, metadata in self.client.get_prefix(prefix):
+            key_str = metadata.key.decode('utf-8')
+            if key_str.startswith(prefix) and key_str.endswith("/config") and value:
+                rest = key_str[len(prefix):]
+                name = rest.split('/')[0]
+                if name:
+                    try:
+                        configs[name] = json.loads(value.decode('utf-8'))
+                    except json.JSONDecodeError:
+                        pass
+        return configs
+
+    @retry_etcd()
+    def get_all_tool_configs(self) -> Dict[str, Dict]:
+        """Get all tool configs in a single fetch."""
+        return self._get_all_configs_by_prefix("/registry/tools/")
+
     @retry_etcd()
     def save_mcp_config(self, name: str, config: Dict) -> None:
         self.client.put(f"/registry/mcps/{name}/config", json.dumps(config))
@@ -272,6 +292,11 @@ class IdentityManager:
                 if name:
                     names.add(name)
         return list(names)
+
+    @retry_etcd()
+    def get_all_mcp_configs(self) -> Dict[str, Dict]:
+        """Get all MCP configs in a single fetch."""
+        return self._get_all_configs_by_prefix("/registry/mcps/")
 
     @retry_etcd()
     def delete_mcp(self, name: str) -> bool:
