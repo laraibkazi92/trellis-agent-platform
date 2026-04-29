@@ -7,11 +7,15 @@
     <div class="w-full max-w-[420px]">
         <!-- Brand/Logo Area -->
         <div class="text-center mb-8">
-            <div class="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-accent/10 dark:bg-accent/20 mb-6 group">
+            <div class="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-accent/10 dark:bg-accent/20 mb-6 group overflow-hidden">
+                {% if app_login_logo_url %}
+                <img src="{{ app_login_logo_url }}" alt="Logo" class="w-full h-full object-contain">
+                {% else %}
                 <i data-lucide="shield-check" class="w-8 h-8 text-accent animate-[pulse_2s_cubic-bezier(0.4,0,0.6,1)_infinite]"></i>
+                {% endif %}
             </div>
-            <h1 class="text-3xl font-bold tracking-tight text-neutral-900 dark:text-white">Welcome Back</h1>
-            <p class="text-neutral-500 dark:text-neutral-400 mt-2">Sign in to your enterprise workspace</p>
+            <h1 class="text-3xl font-bold tracking-tight text-neutral-900 dark:text-white">{{ app_login_title }}</h1>
+            <p class="text-neutral-500 dark:text-neutral-400 mt-2">{{ app_login_subtitle }}</p>
         </div>
 
         <!-- Login Card -->
@@ -68,7 +72,7 @@
         <div class="mt-10 flex flex-col items-center gap-6">
 
             <p class="text-[10px] text-neutral-400 dark:text-neutral-500 text-center max-w-[320px] leading-relaxed opacity-60">
-                This system is for authorized use only. All activities are monitored and logged for security and compliance purposes.
+                {{ app_login_disclaimer }}
             </p>
         </div>
     </div>

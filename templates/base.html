@@ -3,7 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% block title %}Marketplace{% endblock %} - Agent Framework</title>
+    <title>{% block title %}Marketplace{% endblock %} - {{ app_name }}</title>
+    {% if app_favicon_url %}
+    <link rel="icon" href="{{ app_favicon_url }}">
+    {% endif %}
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Syne:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -20,7 +23,7 @@
                         mono: ['"IBM Plex Mono"', 'monospace'],
                     },
                     colors: {
-                        accent: { DEFAULT: '#0055FF', dark: '#3377FF' }
+                        accent: { DEFAULT: '{{ app_accent_color }}', dark: '{{ app_accent_color_dark }}' }
                     }
                 }
             }
@@ -52,7 +55,13 @@
 </head>
 <body class="bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-50 min-h-screen antialiased selection:bg-accent selection:text-white dark:selection:bg-accent-dark flex flex-col">
     <nav class="border-b border-neutral-200 dark:border-neutral-800 p-4 px-6 flex flex-wrap gap-4 justify-between items-center bg-white dark:bg-neutral-900 sticky top-0 z-40">
-        <a href="/" class="text-xl font-bold tracking-tight uppercase hover:text-accent dark:hover:text-accent-dark transition-colors">Agent Framework</a>
+        <a href="/" class="text-xl font-bold tracking-tight uppercase hover:text-accent dark:hover:text-accent-dark transition-colors flex items-center gap-2">
+            {% if app_logo_url %}
+            <img src="{{ app_logo_url }}" alt="{{ app_name }} Logo" class="h-8 w-auto">
+            {% else %}
+            {{ app_name }}
+            {% endif %}
+        </a>
         <div class="space-x-4 md:space-x-6 text-sm font-bold font-mono tracking-wide flex items-center flex-wrap">
         {% if user %}
             <a href="/agents" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/agents' %}text-accent dark:text-accent-dark{% endif %}">Agents</a>
@@ -108,7 +117,7 @@
     </main>
     
     <footer class="border-t border-neutral-200 dark:border-neutral-800 py-6 text-center text-sm font-mono text-neutral-500 mt-12 bg-white dark:bg-neutral-900">
-        Trellis Agent Platform
+        {{ app_name }}
     </footer>
 
     <!-- Global Loading Overlay -->

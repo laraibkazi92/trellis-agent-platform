@@ -1,4 +1,5 @@
 import os
+import re
 from fastapi.templating import Jinja2Templates
 from authlib.integrations.starlette_client import OAuth
 from core.auth import IdentityManager
@@ -14,7 +15,26 @@ def admin_context(request):
     from core.auth import is_admin
     return {"is_admin": is_admin(request)}
 
-templates = Jinja2Templates(directory=templates_dir, context_processors=[admin_context])
+def _validate_hex_color(color: str, default: str) -> str:
+    color = color.strip()
+    if re.match(r"^#(?:[0-9a-fA-F]{3}){1,2}$", color):
+        return color
+    return default
+
+def whitelabel_context(request):
+    return {
+        "app_name": os.getenv("APP_NAME", "Agent Framework").strip(),
+        "app_favicon_url": os.getenv("APP_FAVICON_URL", "").strip(),
+        "app_logo_url": os.getenv("APP_LOGO_URL", "").strip(),
+        "app_login_logo_url": os.getenv("APP_LOGIN_LOGO_URL", "").strip(),
+        "app_login_title": os.getenv("APP_LOGIN_TITLE", "Welcome Back").strip(),
+        "app_login_subtitle": os.getenv("APP_LOGIN_SUBTITLE", "Sign in to your enterprise workspace").strip(),
+        "app_login_disclaimer": os.getenv("APP_LOGIN_DISCLAIMER", "This system is for authorized use only. All activities are monitored and logged for security and compliance purposes.").strip(),
+        "app_accent_color": _validate_hex_color(os.getenv("APP_ACCENT_COLOR", "#0055FF"), "#0055FF"),
+        "app_accent_color_dark": _validate_hex_color(os.getenv("APP_ACCENT_COLOR_DARK", "#3377FF"), "#3377FF"),
+    }
+
+templates = Jinja2Templates(directory=templates_dir, context_processors=[admin_context, whitelabel_context])
 
 # OAuth setup
 OIDC_CLIENT_ID = os.getenv("OIDC_CLIENT_ID")
