@@ -48,9 +48,9 @@
             
             {% if is_admin and not tool.is_mcp %}
             <span class="text-neutral-200 dark:text-neutral-800">|</span>
-            <a href="/editor/tool/{{ tool.name }}" class="text-[10px] font-bold uppercase tracking-widest font-mono text-neutral-500 hover:text-accent dark:hover:text-accent-dark transition-colors">
+            <button onclick="document.getElementById('edit-{{ loop.index }}').classList.remove('hidden')" class="text-[10px] font-bold uppercase tracking-widest font-mono text-neutral-500 hover:text-accent dark:hover:text-accent-dark transition-colors">
                 Edit
-            </a>
+            </button>
             {% endif %}
         </div>
     </div>
@@ -163,13 +163,69 @@
             <!-- Modal Footer -->
             <div class="p-6 border-t border-neutral-100 dark:border-neutral-800 bg-neutral-50/30 dark:bg-neutral-950/30 flex justify-end">
                 {% if is_admin and not tool.is_mcp %}
-                <a href="/editor/tool/{{ tool.name }}" class="bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 px-6 py-2 text-xs font-bold uppercase tracking-widest hover:bg-accent dark:hover:bg-accent-dark dark:hover:text-white transition-colors font-mono">
+                <button onclick="document.getElementById('details-{{ loop.index }}').classList.add('hidden'); document.getElementById('edit-{{ loop.index }}').classList.remove('hidden')" class="bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 px-6 py-2 text-xs font-bold uppercase tracking-widest hover:bg-accent dark:hover:bg-accent-dark dark:hover:text-white transition-colors font-mono">
                     Edit Configuration
-                </a>
+                </button>
                 {% endif %}
             </div>
         </div>
     </div>
+
+    {% if is_admin and not tool.is_mcp %}
+    <!-- Edit Modal -->
+    <div id="edit-{{ loop.index }}" class="hidden fixed inset-0 bg-neutral-950/90 z-50 flex items-center justify-center p-4 backdrop-blur-sm">
+        <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 max-w-2xl w-full shadow-2xl flex flex-col">
+            <form method="POST" action="/editor/tool/{{ tool.name }}">
+                <!-- Modal Header -->
+                <div class="p-8 border-b border-neutral-100 dark:border-neutral-800 flex justify-between items-start bg-neutral-50/50 dark:bg-neutral-950/50">
+                    <div>
+                        <span class="font-mono text-[10px] font-bold border border-accent/30 text-accent dark:border-accent-dark/30 dark:text-accent-dark px-2 py-0.5 uppercase tracking-[0.2em]">
+                            Edit Configuration
+                        </span>
+                        <h3 class="text-3xl font-bold tracking-tight mt-4">{{ tool.name }}</h3>
+                    </div>
+                    <button type="button" onclick="document.getElementById('edit-{{ loop.index }}').classList.add('hidden')" class="text-neutral-400 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors uppercase text-xs font-mono font-bold tracking-widest">
+                        Close [X]
+                    </button>
+                </div>
+
+                <!-- Modal Content -->
+                <div class="p-8 space-y-6">
+                    <div>
+                        <label class="block text-xs font-bold uppercase tracking-widest text-neutral-500 mb-2 font-mono">Description</label>
+                        <textarea name="description" rows="3" class="w-full bg-white dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 px-4 py-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors">{{ tool.description }}</textarea>
+                    </div>
+                    
+                    <div class="grid grid-cols-2 gap-6">
+                        <div>
+                            <label class="block text-xs font-bold uppercase tracking-widest text-neutral-500 mb-2 font-mono">Runtime</label>
+                            <input type="text" name="runtime" value="{{ tool.runtime }}" class="w-full bg-white dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 px-4 py-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-bold uppercase tracking-widest text-neutral-500 mb-2 font-mono">Version</label>
+                            <input type="text" name="version" value="{{ tool.version }}" class="w-full bg-white dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 px-4 py-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors">
+                        </div>
+                    </div>
+                    
+                    <div>
+                        <label class="block text-xs font-bold uppercase tracking-widest text-neutral-500 mb-2 font-mono">Entrypoint</label>
+                        <input type="text" name="entrypoint" value="{{ tool.entrypoint }}" class="w-full bg-white dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 px-4 py-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors">
+                    </div>
+                </div>
+
+                <!-- Modal Footer -->
+                <div class="p-6 border-t border-neutral-100 dark:border-neutral-800 bg-neutral-50/30 dark:bg-neutral-950/30 flex justify-end gap-4">
+                    <button type="button" onclick="document.getElementById('edit-{{ loop.index }}').classList.add('hidden')" class="text-xs font-bold uppercase tracking-widest text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors font-mono px-4">
+                        Cancel
+                    </button>
+                    <button type="submit" class="bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 px-6 py-2 text-xs font-bold uppercase tracking-widest hover:bg-accent dark:hover:bg-accent-dark dark:hover:text-white transition-colors font-mono">
+                        Save Changes
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+    {% endif %}
     {% endfor %}
 </div>
 
