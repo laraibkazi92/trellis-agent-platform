@@ -43,6 +43,8 @@ def sync_agent(identity_mgr, agent_dir, name=None):
             skills = f.read()
         identity_mgr.save_agent_skills(name, skills)
         print(f"  Saved skills for agent: {name}")
+        
+    return name
 
 def main():
     identity_mgr = IdentityManager(
@@ -50,16 +52,29 @@ def main():
         port=int(os.getenv("ETCD_PORT", 2379))
     )
     
+    # 1. Fetch current items from etcd
+    existing_agents = set(identity_mgr._get_all_configs_by_prefix("/registry/agents/").keys())
+    existing_tools = set(identity_mgr._get_all_configs_by_prefix("/registry/tools/").keys())
+    existing_mcps = set(identity_mgr._get_all_configs_by_prefix("/registry/mcps/").keys())
+    
+    seen_agents = set()
+    seen_tools = set()
+    seen_mcps = set()
+    
     print("Syncing agents to etcd...")
     if AGENTS_DIR.exists():
         for agent_dir in AGENTS_DIR.iterdir():
             if not agent_dir.is_dir() or agent_dir.name == "supervisor":
                 continue
-            sync_agent(identity_mgr, agent_dir)
+            name = sync_agent(identity_mgr, agent_dir)
+            if name:
+                seen_agents.add(name)
     
     print("\nSyncing supervisor to etcd...")
     if SUPERVISOR_DIR.exists():
-        sync_agent(identity_mgr, SUPERVISOR_DIR, name="supervisor")
+        name = sync_agent(identity_mgr, SUPERVISOR_DIR, name="supervisor")
+        if name:
+            seen_agents.add(name)
 
     print("\nSyncing tools to etcd...")
     if TOOLS_DIR.exists():
@@ -79,8 +94,10 @@ def main():
                 rel_path = tool_dir.relative_to(BASE_DIR)
                 config["rel_path"] = str(rel_path)
                 
-                identity_mgr.save_tool_config(config["name"], config)
-                print(f"  Saved config for tool: {config['name']}")
+                name = config["name"]
+                identity_mgr.save_tool_config(name, config)
+                seen_tools.add(name)
+                print(f"  Saved config for tool: {name}")
 
     print("\nSyncing MCPs to etcd...")
     if MCPS_DIR.exists():
@@ -95,8 +112,26 @@ def main():
                 if not config.get("name"):
                     config["name"] = mcp_dir.name
                 
-                identity_mgr.save_mcp_config(config["name"], config)
-                print(f"  Saved config for MCP: {config['name']}")
+                name = config["name"]
+                identity_mgr.save_mcp_config(name, config)
+                seen_mcps.add(name)
+                print(f"  Saved config for MCP: {name}")
+
+    # 2. Prune obsolete items
+    print("\nPruning obsolete entries from etcd...")
+    
+    for agent in existing_agents - seen_agents:
+        print(f"  Deleting obsolete agent: {agent}")
+        identity_mgr.client.delete(f"/registry/agents/{agent}/config")
+        identity_mgr.client.delete(f"/registry/agents/{agent}/skills")
+        
+    for tool in existing_tools - seen_tools:
+        print(f"  Deleting obsolete tool: {tool}")
+        identity_mgr.client.delete(f"/registry/tools/{tool}/config")
+        
+    for mcp in existing_mcps - seen_mcps:
+        print(f"  Deleting obsolete MCP: {mcp}")
+        identity_mgr.client.delete(f"/registry/mcps/{mcp}/config")
 
     print("\nSync complete.")
 
