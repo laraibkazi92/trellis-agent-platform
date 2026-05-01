@@ -1,0 +1,226 @@
+{% extends "base.html" %}
+
+{% block title %}Background Agents{% endblock %}
+
+{% block content %}
+<script src="https://unpkg.com/cronstrue@latest/dist/cronstrue.min.js"></script>
+
+<div class="mb-8">
+    <h1 class="text-3xl font-bold font-mono tracking-tight uppercase">Background Agents</h1>
+    <p class="text-neutral-500 dark:text-neutral-400 mt-2">Manage and monitor your event-driven and scheduled background agents.</p>
+</div>
+
+<!-- Queue Observability -->
+<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-12">
+    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 p-4 shadow-sm flex flex-col justify-between">
+        <h3 class="text-sm font-bold font-mono text-neutral-500 uppercase tracking-widest mb-2">Pending</h3>
+        <p class="text-3xl font-bold font-mono text-blue-500">{{ queue.pending|length }}</p>
+    </div>
+    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 p-4 shadow-sm flex flex-col justify-between">
+        <h3 class="text-sm font-bold font-mono text-neutral-500 uppercase tracking-widest mb-2">Processing</h3>
+        <p class="text-3xl font-bold font-mono text-amber-500">{{ queue.processing|length }}</p>
+    </div>
+    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 p-4 shadow-sm flex flex-col justify-between">
+        <h3 class="text-sm font-bold font-mono text-neutral-500 uppercase tracking-widest mb-2">Failed</h3>
+        <p class="text-3xl font-bold font-mono text-red-500">{{ queue.failed|length }}</p>
+    </div>
+    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 p-4 shadow-sm flex flex-col justify-between">
+        <h3 class="text-sm font-bold font-mono text-neutral-500 uppercase tracking-widest mb-2">Completed</h3>
+        <p class="text-3xl font-bold font-mono text-green-500">{{ queue.completed|length }}</p>
+    </div>
+</div>
+
+<div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 shadow-sm overflow-hidden mb-12">
+    <div class="overflow-x-auto">
+        <table class="w-full text-left border-collapse">
+            <thead>
+                <tr class="bg-neutral-50 dark:bg-neutral-950 border-b border-neutral-200 dark:border-neutral-800">
+                    <th class="p-4 font-mono text-xs uppercase tracking-widest text-neutral-500 font-bold">Agent Name</th>
+                    <th class="p-4 font-mono text-xs uppercase tracking-widest text-neutral-500 font-bold">Trigger Type</th>
+                    <th class="p-4 font-mono text-xs uppercase tracking-widest text-neutral-500 font-bold">Configuration</th>
+                    <th class="p-4 font-mono text-xs uppercase tracking-widest text-neutral-500 font-bold">Status</th>
+                    <th class="p-4 font-mono text-xs uppercase tracking-widest text-neutral-500 font-bold text-right">Actions</th>
+                </tr>
+            </thead>
+            <tbody class="divide-y divide-neutral-200 dark:divide-neutral-800">
+                {% for agent in background_agents %}
+                <tr class="hover:bg-neutral-50/50 dark:hover:bg-neutral-800/50 transition-colors">
+                    <td class="p-4">
+                        <div class="flex items-center gap-2">
+                            <i data-lucide="bot" class="w-5 h-5 text-accent dark:text-accent-dark"></i>
+                            <span class="font-bold text-neutral-900 dark:text-white">{{ agent.name }}</span>
+                        </div>
+                    </td>
+                    <td class="p-4">
+                        {% set trigger_type = agent.config.get('trigger', {}).get('type', 'None') %}
+                        <span class="inline-flex items-center px-2 py-1 rounded text-xs font-mono font-bold uppercase tracking-wider
+                            {% if trigger_type == 'cron' %}bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400
+                            {% elif trigger_type == 'webhook' %}bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400
+                            {% else %}bg-neutral-100 text-neutral-700 dark:bg-neutral-800 dark:text-neutral-400{% endif %}">
+                            {{ trigger_type }}
+                        </span>
+                    </td>
+                    <td class="p-4 font-mono text-sm text-neutral-600 dark:text-neutral-400">
+                        {% if trigger_type == 'cron' %}
+                            <div class="flex flex-col gap-1">
+                                <span class="font-bold">{{ agent.config.get('trigger', {}).get('expression', '* * * * *') }}</span>
+                                <span class="text-xs text-neutral-500 cron-readable">{{ agent.config.get('trigger', {}).get('expression', '* * * * *') }}</span>
+                            </div>
+                        {% elif trigger_type == 'webhook' %}
+                            <div class="flex flex-col gap-1">
+                                <span>Provider: <span class="font-bold text-neutral-800 dark:text-neutral-200">{{ agent.config.get('trigger', {}).get('provider', 'generic') }}</span></span>
+                                <span>URL: <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded text-xs">/webhooks/{{ agent.name }}</code></span>
+                            </div>
+                        {% else %}
+                            Not configured
+                        {% endif %}
+                    </td>
+                    <td class="p-4">
+                        <span class="inline-flex items-center gap-1.5 px-2 py-1 rounded text-xs font-mono font-bold uppercase tracking-wider 
+                            {% if agent.status == 'active' %}bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400
+                            {% else %}bg-neutral-100 text-neutral-700 dark:bg-neutral-800 dark:text-neutral-400{% endif %}">
+                            <span class="w-1.5 h-1.5 rounded-full {% if agent.status == 'active' %}bg-emerald-500{% else %}bg-neutral-500{% endif %}"></span>
+                            {{ agent.status }}
+                        </span>
+                    </td>
+                    <td class="p-4 text-right">
+                        <button onclick="openConfigModal('{{ agent.name }}', '{{ trigger_type }}')" class="text-accent hover:text-accent-dark dark:text-accent-dark dark:hover:text-accent transition-colors text-sm font-bold font-mono uppercase tracking-wide flex items-center justify-end gap-1 w-full">
+                            <i data-lucide="settings-2" class="w-4 h-4"></i> Configure
+                        </button>
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="5" class="p-8 text-center text-neutral-500 font-mono text-sm">No background agents found.</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!-- Modal -->
+<div id="config-modal" class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 hidden items-center justify-center">
+    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 shadow-xl w-full max-w-lg overflow-hidden flex flex-col">
+        <div class="p-6 border-b border-neutral-200 dark:border-neutral-800 flex justify-between items-center bg-neutral-50 dark:bg-neutral-950">
+            <h2 class="text-xl font-bold font-mono tracking-tight uppercase flex items-center gap-2">
+                <i data-lucide="settings-2" class="w-5 h-5 text-accent dark:text-accent-dark"></i>
+                Configure Trigger
+            </h2>
+            <button onclick="closeConfigModal()" class="text-neutral-500 hover:text-neutral-900 dark:hover:text-white transition-colors">
+                <i data-lucide="x" class="w-5 h-5"></i>
+            </button>
+        </div>
+        
+        <div class="p-6 overflow-y-auto">
+            <form id="config-form" method="POST" action="/background-agents/config" class="space-y-6">
+                <input type="hidden" name="agent_name" id="modal-agent-name">
+                
+                <div>
+                    <label class="block text-sm font-bold font-mono text-neutral-700 dark:text-neutral-300 mb-2 uppercase tracking-wide">Trigger Type</label>
+                    <select name="trigger_type" id="modal-trigger-type" onchange="toggleTriggerFields()" class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
+                        <option value="none">None</option>
+                        <option value="cron">Cron (Scheduled)</option>
+                        <option value="webhook">Webhook (Event-Driven)</option>
+                    </select>
+                </div>
+
+                <div id="cron-fields" class="hidden space-y-4">
+                    <div>
+                        <label class="block text-sm font-bold font-mono text-neutral-700 dark:text-neutral-300 mb-2 uppercase tracking-wide">Cron Expression</label>
+                        <input type="text" name="cron_expression" id="modal-cron-expr" placeholder="* * * * *" class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
+                        <p class="mt-2 text-xs text-neutral-500" id="cron-preview">Every minute</p>
+                    </div>
+                </div>
+
+                <div id="webhook-fields" class="hidden space-y-4">
+                    <div>
+                        <label class="block text-sm font-bold font-mono text-neutral-700 dark:text-neutral-300 mb-2 uppercase tracking-wide">Provider</label>
+                        <select name="webhook_provider" id="modal-webhook-provider" class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
+                            <option value="generic">Generic HMAC (SHA-256)</option>
+                            <option value="github">GitHub</option>
+                            <option value="issues">Issues</option>
+                            <option value="slack">Slack</option>
+                            <option value="support">Support</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-bold font-mono text-neutral-700 dark:text-neutral-300 mb-2 uppercase tracking-wide">Secret Key</label>
+                        <input type="password" name="webhook_secret" id="modal-webhook-secret" placeholder="Enter validation secret" class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
+                    </div>
+                </div>
+
+                <div class="pt-4 border-t border-neutral-200 dark:border-neutral-800 flex justify-end gap-3">
+                    <button type="button" onclick="closeConfigModal()" class="px-4 py-2 font-mono font-bold text-sm uppercase tracking-wide text-neutral-600 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-white transition-colors">
+                        Cancel
+                    </button>
+                    <button type="submit" onclick="showGlobalLoading('Saving Configuration...')" class="px-6 py-2 bg-accent hover:bg-accent-dark text-white font-mono font-bold text-sm uppercase tracking-wide transition-colors">
+                        Save Changes
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<script>
+    document.addEventListener('DOMContentLoaded', () => {
+        // Render cron readable strings
+        document.querySelectorAll('.cron-readable').forEach(el => {
+            try {
+                el.innerText = cronstrue.toString(el.innerText);
+            } catch (e) {
+                el.innerText = "Invalid cron expression";
+            }
+        });
+
+        // Live preview for cron input
+        const cronInput = document.getElementById('modal-cron-expr');
+        const cronPreview = document.getElementById('cron-preview');
+        if(cronInput) {
+            cronInput.addEventListener('input', (e) => {
+                try {
+                    cronPreview.innerText = cronstrue.toString(e.target.value);
+                    cronPreview.classList.remove('text-red-500');
+                    cronPreview.classList.add('text-emerald-500');
+                } catch (err) {
+                    cronPreview.innerText = "Invalid expression";
+                    cronPreview.classList.remove('text-emerald-500');
+                    cronPreview.classList.add('text-red-500');
+                }
+            });
+        }
+    });
+
+    function openConfigModal(agentName, currentTriggerType) {
+        document.getElementById('modal-agent-name').value = agentName;
+        document.getElementById('modal-trigger-type').value = currentTriggerType.toLowerCase();
+        toggleTriggerFields();
+        const modal = document.getElementById('config-modal');
+        modal.classList.remove('hidden');
+        modal.classList.add('flex');
+    }
+
+    function closeConfigModal() {
+        const modal = document.getElementById('config-modal');
+        modal.classList.add('hidden');
+        modal.classList.remove('flex');
+    }
+
+    function toggleTriggerFields() {
+        const type = document.getElementById('modal-trigger-type').value;
+        const cronFields = document.getElementById('cron-fields');
+        const webhookFields = document.getElementById('webhook-fields');
+
+        cronFields.classList.add('hidden');
+        webhookFields.classList.add('hidden');
+
+        if (type === 'cron') {
+            cronFields.classList.remove('hidden');
+        } else if (type === 'webhook') {
+            webhookFields.classList.remove('hidden');
+        }
+    }
+</script>
+
+{% endblock %}

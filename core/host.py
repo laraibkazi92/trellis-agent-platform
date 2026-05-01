@@ -16,9 +16,13 @@ from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart, Te
 from fastmcp import Client as FastMCPClient
 from core.models import AgentConfig
 from core.health import HealthMonitor
-from core.background.worker import worker_loop
+from core.background.worker import worker
+from core.background.scheduler import start_scheduler
+from core.background.webhooks import router as webhooks_router
 
 app = FastAPI(title="Universal Agent Host")
+app.include_router(webhooks_router)
+
 
 # CORS Setup
 DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
@@ -654,11 +658,13 @@ manager = AgentManager()
 @app.on_event("startup")
 async def startup_event():
     await manager.start()
-    asyncio.create_task(worker_loop())
+    asyncio.create_task(worker.start())
+    asyncio.create_task(start_scheduler())
 
 @app.on_event("shutdown")
 async def shutdown_event():
     await manager.stop()
+    worker.stop()
 
 @app.on_event("startup")
 async def log_startup():

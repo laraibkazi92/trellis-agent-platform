@@ -65,6 +65,7 @@
         <div class="space-x-4 md:space-x-6 text-sm font-bold font-mono tracking-wide flex items-center flex-wrap">
         {% if user %}
             <a href="/agents" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/agents' %}text-accent dark:text-accent-dark{% endif %}">Agents</a>
+            <a href="/background-agents" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/background-agents' %}text-accent dark:text-accent-dark{% endif %}">Background</a>
             <a href="/tools" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/tools' %}text-accent dark:text-accent-dark{% endif %}">Tools</a>
             <a href="/mcps" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/mcps' %}text-accent dark:text-accent-dark{% endif %}">MCPs</a>
             <a href="/status" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/status' %}text-accent dark:text-accent-dark{% endif %}">Status</a>

@@ -20,3 +20,4 @@ click
 python-dotenv
 markdown
 stamina
+apscheduler
