@@ -76,6 +76,10 @@ async def list_agents() -> List[Dict[str, str]]:
     
     for agent_name, agent_info in agents_data.items():
         config_data = await asyncio.to_thread(identity_mgr.get_agent_config, agent_name)
+        
+        if config_data and config_data.get("type") == "background":
+            continue
+            
         skills = await asyncio.to_thread(identity_mgr.get_agent_skills, agent_name)
         
         description = "No description available."

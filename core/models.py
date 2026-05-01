@@ -8,6 +8,7 @@ class AgentConfig(BaseModel):
     author: str = "Unknown"
     description: Optional[str] = None
     tags: List[str] = Field(default_factory=list)
+    type: Literal['standard', 'background'] = 'standard'
     model: str
     thinking_level: Literal['none', 'low', 'medium', 'high', 'n/a']
     a2a_access: List[str] = Field(default_factory=list, description="List of other agents this agent can call.")

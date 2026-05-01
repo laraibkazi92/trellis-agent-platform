@@ -14,11 +14,12 @@ from core.auth import IdentityManager
 
 BASE_DIR = Path(__file__).parent.parent
 AGENTS_DIR = BASE_DIR / "agents"
+BG_AGENTS_DIR = BASE_DIR / "background_agents"
 TOOLS_DIR = BASE_DIR / "tools"
 SUPERVISOR_DIR = BASE_DIR / "core" / "assets" / "supervisor"
 MCPS_DIR = BASE_DIR / "mcps"
 
-def sync_agent(identity_mgr, agent_dir, name=None):
+def sync_agent(identity_mgr, agent_dir, name=None, agent_type=None):
     if not name:
         name = agent_dir.name
         
@@ -34,6 +35,9 @@ def sync_agent(identity_mgr, agent_dir, name=None):
         
         if "allowed_tools" not in config:
             config["allowed_tools"] = []
+            
+        if agent_type:
+            config["type"] = agent_type
             
         identity_mgr.save_agent_config(name, config)
         print(f"  Saved config for agent: {name}")
@@ -67,6 +71,15 @@ def main():
             if not agent_dir.is_dir() or agent_dir.name == "supervisor":
                 continue
             name = sync_agent(identity_mgr, agent_dir)
+            if name:
+                seen_agents.add(name)
+                
+    print("\nSyncing background agents to etcd...")
+    if BG_AGENTS_DIR.exists():
+        for agent_dir in BG_AGENTS_DIR.iterdir():
+            if not agent_dir.is_dir():
+                continue
+            name = sync_agent(identity_mgr, agent_dir, agent_type="background")
             if name:
                 seen_agents.add(name)
     

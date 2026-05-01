@@ -4,6 +4,7 @@ import os
 import subprocess
 import asyncio
 import shutil
+import stamina
 from pathlib import Path
 from typing import Dict, Any
 from fastmcp import FastMCP
@@ -44,6 +45,10 @@ def load_tool_configs() -> Dict[str, tuple[ToolConfig, Path]]:
         print(f"Error loading tools from etcd: {e}")
     return configs
 
+class TransientToolError(Exception):
+    pass
+
+@stamina.retry(on=TransientToolError, attempts=3)
 async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Executes a tool as a subprocess and handles JSON stdin/stdout."""
     user_id = arguments.pop("__user_id", None)
@@ -108,11 +113,18 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
             print(f"Tool {config.name} stderr: {stderr.decode().strip()}")
 
         if process.returncode != 0:
-            error_msg = f"Tool exited with code {process.returncode}: {stderr.decode().strip()}"
+            stderr_str = stderr.decode().strip()
+            error_msg = f"Tool exited with code {process.returncode}: {stderr_str}"
             health_monitor.record_event("tool", config.name, is_success=False, error_details=error_msg)
+            
+            # Identify common transient network errors in stderr
+            transient_keywords = ["timeout", "connection refused", "econnrefused", "eof", "network is unreachable", "temporary failure"]
+            if any(keyword in stderr_str.lower() for keyword in transient_keywords):
+                raise TransientToolError(error_msg)
+                
             return {
                 "error": error_msg,
-                "stderr": stderr.decode().strip()
+                "stderr": stderr_str
             }
 
         try:
@@ -129,7 +141,9 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
     except asyncio.TimeoutError:
         error_msg = "Tool execution timed out."
         health_monitor.record_event("tool", config.name, is_success=False, error_details=error_msg)
-        return {"error": error_msg}
+        raise TransientToolError(error_msg)
+    except TransientToolError:
+        raise
     except Exception as e:
         error_msg = f"Failed to execute tool: {str(e)}"
         health_monitor.record_event("tool", config.name, is_success=False, error_details=error_msg)
@@ -184,6 +198,7 @@ def register_tools():
             
             code = f'''
 import typing
+import stamina
 
 async def {fn_name}({sig}):
     kwargs = locals()
@@ -194,9 +209,12 @@ async def {fn_name}({sig}):
                 filtered_kwargs[k] = str(v)
             else:
                 filtered_kwargs[k] = v
-    return await run_tool(c, d, filtered_kwargs)
+    try:
+        return await run_tool(c, d, filtered_kwargs)
+    except TransientToolError as e:
+        return {{"error": f"Tool failed after retries: {{str(e)}}"}}
 '''
-            loc = {'run_tool': run_tool, 'c': c, 'd': d}
+            loc = {'run_tool': run_tool, 'c': c, 'd': d, 'TransientToolError': TransientToolError}
             exec(code, loc, loc)
             handler = loc[fn_name]
             handler.__name__ = c.name

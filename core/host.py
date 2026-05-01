@@ -709,6 +709,9 @@ async def chat_completions(request: ChatRequest):
 
     if request.model not in manager.agents:
         raise HTTPException(status_code=404, detail=f"Agent '{request.model}' not found or disabled")
+        
+    if manager.configs[request.model].type == "background":
+        raise HTTPException(status_code=403, detail=f"Agent '{request.model}' is a background agent and cannot be called directly via Chat API.")
     
     # Check if agent is Offline
     agent_status = health_monitor.get_status("agent", request.model)

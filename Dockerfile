@@ -35,6 +35,7 @@ RUN cp $(python -c "import certifi; print(certifi.where())") /usr/local/share/ca
 # Copy the rest of the application code
 COPY core/ core/
 COPY agents/ agents/
+COPY background_agents/ background_agents/
 COPY tools/ tools/
 COPY templates/ templates/
 COPY scripts/ scripts/

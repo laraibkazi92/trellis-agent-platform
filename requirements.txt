@@ -19,3 +19,4 @@ structlog
 click
 python-dotenv
 markdown
+stamina
