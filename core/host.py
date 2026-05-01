@@ -16,6 +16,7 @@ from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart, Te
 from fastmcp import Client as FastMCPClient
 from core.models import AgentConfig
 from core.health import HealthMonitor
+from core.background.worker import worker_loop
 
 app = FastAPI(title="Universal Agent Host")
 
@@ -653,6 +654,7 @@ manager = AgentManager()
 @app.on_event("startup")
 async def startup_event():
     await manager.start()
+    asyncio.create_task(worker_loop())
 
 @app.on_event("shutdown")
 async def shutdown_event():
