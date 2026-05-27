@@ -20,4 +20,8 @@ click
 python-dotenv
 markdown
 stamina
-apscheduler
+granian
+taskiq[redis]
+taskiq-fastapi
+asyncache
+cachetools

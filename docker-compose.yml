@@ -17,7 +17,7 @@ services:
       - ETCD_PORT=2379
     volumes:
       - health-data:/app/data
-    command: uvicorn core.host:app --host 0.0.0.0 --port 8000
+    command: granian --interface asgi core.host:app --host 0.0.0.0 --port 8000 --workers 4 --workers-max-rss 256 --workers-lifetime 3600
     depends_on:
       hub:
         condition: service_started
@@ -74,6 +74,41 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
+  redis:
+    image: redis:alpine
+    container_name: redis-server
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  taskiq-worker:
+    build: .
+    image: trellis-agent-platform:v2
+    container_name: taskiq-worker
+    env_file:
+      - .env
+    environment:
+      - HOST_URL=http://host:8000
+      - HUB_URL=http://hub:8001/mcp
+      - GOOGLE_API_KEY=${GEMINI_API_KEY}
+      - DEV_MODE=${DEV_MODE:-false}
+      - ETCD_HOST=etcd
+      - ETCD_PORT=2379
+      - REDIS_URL=redis://redis:6379/0
+    command: taskiq worker core.tasks:broker --workers 2
+    depends_on:
+      etcd:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
 
   ui:
     build: .
