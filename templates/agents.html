@@ -99,6 +99,7 @@
                     <pre class="text-xs text-red-600 font-mono overflow-auto max-h-32 mb-4">{{ agent.health.last_error }}</pre>
                     {% endif %}
                     <form method="POST" action="/reset-health/agent/{{ agent.name }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                         <button type="submit" class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 text-xs font-bold uppercase rounded">Reset Health Status</button>
                     </form>
                 </div>

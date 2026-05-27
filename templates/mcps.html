@@ -138,6 +138,7 @@
         </div>
         
         <form action="/mcps" method="POST" class="flex flex-col flex-grow overflow-hidden">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <div class="p-6 overflow-y-auto space-y-6">
                 <div>
                     <label class="block text-xs font-bold font-mono uppercase text-neutral-500 mb-2">Name *</label>
@@ -148,7 +149,8 @@
                     <label class="block text-xs font-bold font-mono uppercase text-neutral-500 mb-2">Transport</label>
                     <select name="transport" class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:border-accent dark:focus:border-accent-dark focus:outline-none transition-colors appearance-none">
                         <option value="stdio">stdio</option>
-                        <option value="sse">http/sse</option>
+                        <option value="http">http (Streamable HTTP)</option>
+                        <option value="sse">sse (Legacy)</option>
                     </select>
                 </div>
                 

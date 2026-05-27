@@ -16,7 +16,7 @@ from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart, TextPart
 
 from fastmcp import Client as FastMCPClient
-from fastmcp.client import StdioTransport, SSETransport
+from fastmcp.client import StdioTransport, SSETransport, StreamableHttpTransport
 
 from core.auth import AuthMiddleware, IdentityManager, user_id_var
 from core.models import AgentConfig, MCPConfig
@@ -106,6 +106,8 @@ async def get_external_mcp_client(mcp_name: str, user_id: str) -> FastMCPClient:
         full_env = os.environ.copy()
         full_env.update(env)
         transport = StdioTransport(command=config.command, args=config.args or [], env=full_env, keep_alive=True)
+    elif config.transport in ["http", "streamable-http"]:
+        transport = StreamableHttpTransport(url=config.command, headers=env)
     else:
         transport = SSETransport(url=config.command, headers=env)
     
@@ -139,6 +141,9 @@ async def discover_external_mcps():
             if config.transport == "stdio":
                 if not config.command: continue
                 transport = StdioTransport(command=config.command, args=config.args or [], env=config.env or {}, keep_alive=False)
+            elif config.transport in ["http", "streamable-http"]:
+                if not config.command: continue
+                transport = StreamableHttpTransport(url=config.command, headers=config.env or {})
             elif config.transport == "sse":
                 if not config.command: continue
                 transport = SSETransport(url=config.command, headers=config.env or {})

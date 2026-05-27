@@ -23,7 +23,7 @@ class MCPToolDefinition(BaseModel):
 class MCPConfig(BaseModel):
     """Configuration for an external MCP server, parsed from mcp.yaml or DB."""
     name: str
-    transport: Literal["stdio", "sse"] = "stdio"
+    transport: Literal["stdio", "sse", "http", "streamable-http"] = "stdio"
     command: Optional[str] = None
     args: Optional[List[str]] = Field(default_factory=list)
     env: Optional[Dict[str, str]] = Field(default_factory=dict)
