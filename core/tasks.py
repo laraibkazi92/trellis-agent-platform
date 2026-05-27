@@ -23,6 +23,52 @@ def get_identity_manager() -> IdentityManager:
         )
     return _identity_mgr
 
+from taskiq import TaskiqScheduler
+from taskiq.schedule_sources import LabelScheduleSource
+
+scheduler = TaskiqScheduler(
+    broker=broker,
+    sources=[LabelScheduleSource(broker)],
+)
+
+# We use a single heartbeat task that runs every minute to check ETCD for dynamic cron jobs
+import time
+from datetime import datetime
+
+@broker.task(schedule=[{"cron": "* * * * *"}])
+async def dynamic_cron_heartbeat():
+    """Runs every minute to trigger any dynamic background agents that have matching cron expressions."""
+    # We use pycron to evaluate cron expressions against the current time
+    import pycron
+    
+    identity_mgr = get_identity_manager()
+    agent_names = await asyncio.to_thread(identity_mgr.list_agents)
+    disabled_agents = identity_mgr.get_disabled_agents()
+    
+    now = datetime.now()
+    
+    for name in agent_names:
+        if name in disabled_agents:
+            continue
+            
+        config_data = await asyncio.to_thread(identity_mgr.get_agent_config, name)
+        if not config_data or config_data.get("type") != "background":
+            continue
+            
+        trigger = config_data.get("trigger")
+        if trigger and trigger.get("type") == "cron":
+            expr = trigger.get("expression")
+            if expr and pycron.is_now(expr, now):
+                print(f"Triggering background agent {name} via cron: {expr}")
+                # System prompt for cron runs
+                xml_payload = f"<event_payload><![CDATA[\nScheduled execution triggered at {now.isoformat()}\n]]></event_payload>"
+                
+                await run_background_agent.kiq(
+                    agent_name=name,
+                    prompt=xml_payload,
+                    user_id="cron"
+                )
+
 @broker.task
 async def run_background_agent(agent_name: str, prompt: str, user_id: str) -> str:
     """Executes an agent in the background as a Taskiq task."""
