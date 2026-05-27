@@ -6,7 +6,8 @@ import asyncio
 import shutil
 import stamina
 from pathlib import Path
-from typing import Dict, Any
+import typing
+from typing import Dict, Any, Optional
 from fastmcp import FastMCP
 from core.models import ToolConfig
 from core.auth import IdentityManager
@@ -92,7 +93,7 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
     try:
         env = os.environ.copy()
         if user_id:
-            secrets = identity_mgr.get_user_secrets(user_id)
+            secrets = identity_mgr.get_resolved_secrets(user_id)
             if secrets:
                 safe_secrets = {str(k): str(v) for k, v in secrets.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
                 env.update(safe_secrets)
@@ -172,53 +173,70 @@ def register_tools():
 
         # Use a closure to capture the current config and tool_dir
         def create_handler(c, d):
+            import inspect
+            
             sig_parts = []
-            string_fields = []
+            annotations = {}
+            params = []
+            
             if c.inputs:
                 for input_name, input_def in c.inputs.items():
                     input_type = input_def.get("type", "string")
-                    type_str = "str"
+                    py_type = str
                     if input_type == "string":
-                        type_str = "typing.Any"
-                        string_fields.append(input_name)
-                    elif input_type == "integer": type_str = "int"
-                    elif input_type == "boolean": type_str = "bool"
-                    elif input_type == "array": type_str = "list"
-                    elif input_type == "object": type_str = "dict"
+                        py_type = Any
+                    elif input_type == "integer": py_type = int
+                    elif input_type == "boolean": py_type = bool
+                    elif input_type == "array": py_type = list
+                    elif input_type == "object": py_type = dict
                     
                     is_req = input_def.get("required", False)
-                    if is_req:
-                        sig_parts.append(f"{input_name}: {type_str}")
-                    else:
-                        sig_parts.append(f"{input_name}: {type_str} = None")
-            
-            sig_parts.append("__user_id: typing.Optional[str] = None")
-            sig = ", ".join(sig_parts)
-            fn_name = f"handler_{c.name.replace('-', '_')}"
-            
-            code = f'''
-import typing
-import stamina
+                    default = inspect.Parameter.empty if is_req else None
+                    
+                    params.append(
+                        inspect.Parameter(
+                            input_name, 
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD, 
+                            annotation=py_type, 
+                            default=default
+                        )
+                    )
+                    annotations[input_name] = py_type
 
-async def {fn_name}({sig}):
-    kwargs = locals()
-    filtered_kwargs = {{}}
-    for k, v in kwargs.items():
-        if v is not None:
-            if k in {string_fields} and not isinstance(v, str):
-                filtered_kwargs[k] = str(v)
-            else:
-                filtered_kwargs[k] = v
-    try:
-        return await run_tool(c, d, filtered_kwargs)
-    except TransientToolError as e:
-        return {{"error": f"Tool failed after retries: {{str(e)}}"}}
-'''
-            loc = {'run_tool': run_tool, 'c': c, 'd': d, 'TransientToolError': TransientToolError}
-            exec(code, loc, loc)
-            handler = loc[fn_name]
-            handler.__name__ = c.name
+            # Add __user_id
+            params.append(
+                inspect.Parameter(
+                    "__user_id",
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    annotation=typing.Optional[str],
+                    default=None
+                )
+            )
+            annotations["__user_id"] = typing.Optional[str]
+            
+            async def handler(**kwargs):
+                filtered_kwargs = {}
+                for k, v in kwargs.items():
+                    if v is not None:
+                        # Ensure we stringify string inputs properly 
+                        if c.inputs and k in c.inputs:
+                            if c.inputs[k].get("type", "string") == "string" and not isinstance(v, str):
+                                filtered_kwargs[k] = str(v)
+                            else:
+                                filtered_kwargs[k] = v
+                        else:
+                            filtered_kwargs[k] = v
+                            
+                try:
+                    return await run_tool(c, d, filtered_kwargs)
+                except TransientToolError as e:
+                    return {"error": f"Tool failed after retries: {str(e)}"}
+            
+            handler.__signature__ = inspect.Signature(params)
+            handler.__annotations__ = annotations
+            handler.__name__ = c.name.replace('-', '_')
             handler.__doc__ = c.description
+            
             return handler
 
         mcp.tool(name=name, description=config.description)(create_handler(config, tool_dir))
