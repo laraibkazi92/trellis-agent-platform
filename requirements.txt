@@ -25,3 +25,4 @@ taskiq[redis]
 taskiq-fastapi
 asyncache
 cachetools
+pycron
