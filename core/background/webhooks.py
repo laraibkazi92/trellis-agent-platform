@@ -5,12 +5,11 @@ import logging
 from typing import Optional, Dict, Any, Callable
 from fastapi import APIRouter, Request, HTTPException, Depends
 from core.auth import IdentityManager
-from .queue import EtcdQueue
+from core.tasks import run_background_agent
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
-queue = EtcdQueue()
 
 def get_identity_mgr():
     from core.host import identity_mgr
@@ -26,30 +25,29 @@ def validate_github(payload_body: bytes, secret: str, request: Request) -> bool:
     return hmac.compare_digest(expected_signature, signature_header)
 
 def validate_issues(payload_body: bytes, secret: str, request: Request) -> bool:
-    # Example Issues HMAC validation (often custom or just a token in query/header)
-    # Issues usually uses x-hub-signature or standard HMAC. We will assume standard SHA-256.
     signature_header = request.headers.get("X-Hub-Signature")
     if not signature_header:
-        # Fallback to Authorization Bearer or custom token if required
         return False
+    
     hash_object = hmac.new(secret.encode('utf-8'), msg=payload_body, digestmod=hashlib.sha256)
-    expected_signature = "sha256=" + hash_object.hexdigest()
+    expected_signature = hash_object.hexdigest()
+    
+    # Issues sometimes includes the sha256= prefix and sometimes doesn't depending on the integration type
+    if signature_header.startswith("sha256="):
+        expected_signature = "sha256=" + expected_signature
+        
     return hmac.compare_digest(expected_signature, signature_header)
 
-def validate_slack(payload_body: bytes, secret: str, request: Request) -> bool:
-    slack_signature = request.headers.get("X-Slack-Signature")
-    slack_request_timestamp = request.headers.get("X-Slack-Request-Timestamp")
-    
-    if not slack_signature or not slack_request_timestamp:
-        return False
-        
-    basestring = f"v0:{slack_request_timestamp}:{payload_body.decode('utf-8')}"
-    my_signature = 'v0=' + hmac.new(secret.encode('utf-8'), basestring.encode('utf-8'), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(my_signature, slack_signature)
-
 def validate_notion(payload_body: bytes, secret: str, request: Request) -> bool:
-    # Placeholder for Notion. Let's assume generic SHA-256 HMAC for webhooks if they use one.
-    return validate_generic(payload_body, secret, request)
+    # Notion signature validation (commonly uses Notion-Signature header)
+    signature = request.headers.get("Notion-Signature")
+    if not signature:
+        # Fallback for third-party Notion webhook services
+        return validate_generic(payload_body, secret, request)
+        
+    hash_object = hmac.new(secret.encode('utf-8'), msg=payload_body, digestmod=hashlib.sha256)
+    expected_signature = hash_object.hexdigest()
+    return hmac.compare_digest(expected_signature, signature)
 
 def validate_support(payload_body: bytes, secret: str, request: Request) -> bool:
     # Support sends X-Support-Signature
@@ -73,6 +71,18 @@ def validate_generic(payload_body: bytes, secret: str, request: Request) -> bool
     elif signature.startswith("sha256="):
         expected_signature = "sha256=" + expected_signature
         
+    return hmac.compare_digest(expected_signature, signature)
+
+def validate_slack(payload_body: bytes, secret: str, request: Request) -> bool:
+    signature = request.headers.get("X-Slack-Signature")
+    timestamp = request.headers.get("X-Slack-Request-Timestamp")
+    if not signature or not timestamp:
+        return False
+    
+    # Slack signature requires concatenating version, timestamp, and body
+    sig_basestring = f"v0:{timestamp}:{payload_body.decode('utf-8')}".encode('utf-8')
+    hash_object = hmac.new(secret.encode('utf-8'), msg=sig_basestring, digestmod=hashlib.sha256)
+    expected_signature = f"v0={hash_object.hexdigest()}"
     return hmac.compare_digest(expected_signature, signature)
 
 VALIDATORS: Dict[str, Callable] = {
@@ -110,9 +120,7 @@ async def receive_webhook(agent_name: str, request: Request):
         env_var = secret_key[4:]
         actual_secret = os.environ.get(env_var)
     elif secret_key.startswith("secret:"):
-        # Placeholder for identity_mgr secure secret store resolution
-        # actual_secret = identity_mgr.get_secret(secret_key[7:])
-        pass
+        actual_secret = await asyncio.to_thread(identity_mgr.get_config, f"secrets/{secret_key[7:]}")
         
     if not actual_secret:
         raise HTTPException(status_code=500, detail="Webhook secret could not be resolved from environment")
@@ -137,17 +145,17 @@ async def receive_webhook(agent_name: str, request: Request):
         except json.JSONDecodeError:
             pass
             
-        xml_payload = f"<event_payload>\n{payload_str}\n</event_payload>"
+        # Sanitize by replacing CDATA end tags to prevent breakout
+        payload_str = payload_str.replace("]]>", "]]]]><![CDATA[>")
+        xml_payload = f"<event_payload><![CDATA[\n{payload_str}\n]]></event_payload>"
         
-        task_payload = {
-            "agent_name": agent_name,
-            "trigger_type": "webhook",
-            "provider": provider,
-            "prompt": xml_payload
-        }
-        
-        task_id = queue.push(task_payload)
-        return {"status": "accepted", "task_id": task_id}
+        # Queue task with Taskiq
+        kiq_msg = await run_background_agent.kiq(
+            agent_name=agent_name, 
+            prompt=xml_payload, 
+            user_id="webhook"  # Using a system user for webhook operations
+        )
+        return {"status": "accepted", "task_id": kiq_msg.task_id}
         
     except Exception as e:
         logger.error(f"Error processing webhook: {e}")
