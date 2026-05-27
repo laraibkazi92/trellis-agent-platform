@@ -20,6 +20,9 @@ async def discover_agents() -> List[Dict]:
             
         config = await asyncio.to_thread(identity_mgr.get_agent_config, name)
         if config:
+            if config.get("type") == "background":
+                continue
+                
             skills_content = await asyncio.to_thread(identity_mgr.get_agent_skills, name) or ""
             
             health = await asyncio.to_thread(identity_mgr.get_health_status, "agent", name)

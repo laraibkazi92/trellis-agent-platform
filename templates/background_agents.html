@@ -3,7 +3,126 @@
 {% block title %}Background Agents{% endblock %}
 
 {% block content %}
+
+    <style type="text/tailwindcss">
+        /* Select2 Custom Dark/Light Theme Overrides */
+        .select2-container--default .select2-selection--multiple,
+        .select2-container--default .select2-selection--single {
+            background-color: transparent !important;
+            border: 1px solid theme('colors.neutral.300') !important;
+            border-radius: 0 !important;
+            min-height: 46px !important;
+            padding-bottom: 0px !important;
+        }
+        .select2-container--default .select2-selection--single .select2-selection__rendered {
+            color: theme('colors.neutral.900') !important;
+            font-family: 'IBM Plex Mono', monospace;
+            line-height: 44px !important;
+            padding-left: 0.75rem !important;
+        }
+        .select2-container--default .select2-selection--single .select2-selection__arrow {
+            height: 44px !important;
+        }
+        .select2-container--default.select2-container--focus .select2-selection--multiple,
+        .select2-container--default.select2-container--focus .select2-selection--single {
+            border-color: theme('colors.accent.DEFAULT') !important;
+            box-shadow: 0 0 0 1px theme('colors.accent.DEFAULT');
+        }
+        .select2-container--default .select2-selection--multiple .select2-selection__choice {
+            background-color: theme('colors.neutral.100') !important;
+            border: 1px solid theme('colors.neutral.300') !important;
+            border-radius: 0 !important;
+            color: theme('colors.neutral.900') !important;
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.75rem;
+            padding: 4px 8px !important;
+            margin-top: 6px !important;
+            margin-left: 6px !important;
+            text-transform: uppercase;
+        }
+        .select2-container--default .select2-selection--multiple .select2-selection__choice__remove {
+            color: theme('colors.neutral.500') !important;
+            border-right: 1px solid theme('colors.neutral.300') !important;
+            padding-right: 6px !important;
+            margin-right: 6px !important;
+        }
+        .select2-dropdown {
+            border: 1px solid theme('colors.accent.DEFAULT') !important;
+            border-radius: 0 !important;
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.875rem;
+            z-index: 9999;
+        }
+        
+        @media (prefers-color-scheme: dark) {
+            .select2-container--default .select2-selection--multiple,
+            .select2-container--default .select2-selection--single {
+                border-color: theme('colors.neutral.700') !important;
+            }
+            .select2-container--default .select2-selection--single .select2-selection__rendered {
+                color: theme('colors.neutral.100') !important;
+            }
+            .select2-container--default.select2-container--focus .select2-selection--multiple,
+            .select2-container--default.select2-container--focus .select2-selection--single {
+                border-color: theme('colors.accent.dark') !important;
+                box-shadow: 0 0 0 1px theme('colors.accent.dark');
+            }
+            .select2-container--default .select2-selection--multiple .select2-selection__choice {
+                background-color: theme('colors.neutral.800') !important;
+                border-color: theme('colors.neutral.600') !important;
+                color: theme('colors.neutral.100') !important;
+            }
+            .select2-container--default .select2-selection--multiple .select2-selection__choice__remove {
+                color: theme('colors.neutral.400') !important;
+                border-right-color: theme('colors.neutral.600') !important;
+            }
+            .select2-container--default .select2-selection--multiple .select2-selection__choice__remove:hover {
+                background-color: theme('colors.red.900') !important;
+                color: theme('colors.red.100') !important;
+            }
+            .select2-dropdown {
+                background-color: theme('colors.neutral.900') !important;
+                border-color: theme('colors.neutral.700') !important;
+            }
+            .select2-container--default .select2-results__option[aria-selected=true] {
+                background-color: theme('colors.neutral.800') !important;
+            }
+            .select2-container--default .select2-results__option--highlighted[aria-selected] {
+                background-color: theme('colors.accent.dark') !important;
+                color: white !important;
+            }
+            .select2-search--dropdown .select2-search__field {
+                background-color: theme('colors.neutral.950') !important;
+                border: 1px solid theme('colors.neutral.700') !important;
+                color: theme('colors.neutral.100') !important;
+                font-family: 'IBM Plex Mono', monospace;
+            }
+        }
+    </style>
+
+<link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet" />
+<script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
 <script src="https://unpkg.com/cronstrue@latest/dist/cronstrue.min.js"></script>
+
+<script>
+    const agentConfigs = {
+        {% for agent in background_agents %}
+        "{{ agent.name }}": {
+            trigger_type: {{ (agent.config.get('trigger') or {}).get('type', 'none') | tojson | safe }},
+            cron_expression: {{ (agent.config.get('trigger') or {}).get('expression', '* * * * *') | tojson | safe }},
+            webhook_provider: {{ (agent.config.get('trigger') or {}).get('provider', 'generic') | tojson | safe }},
+            model: {{ agent.config.get('model', 'gemini-3-flash-preview') | tojson | safe }},
+            thinking_level: {{ agent.config.get('thinking_level', 'none') | tojson | safe }},
+            version: {{ agent.config.get('version', '') | tojson | safe }},
+            description: {{ agent.config.get('description', '') | tojson | safe }},
+            a2a_access: {{ agent.config.get('a2a_access', []) | tojson | safe }},
+            allowed_tools: {{ agent.config.get('allowed_tools', []) | tojson | safe }},
+            skills_content: {{ agent.skills | tojson | safe }}
+        }{% if not loop.last %},{% endif %}
+        {% endfor %}
+    };
+</script>
 
 <div class="mb-8">
     <h1 class="text-3xl font-bold font-mono tracking-tight uppercase">Background Agents</h1>
@@ -84,9 +203,11 @@
                         </span>
                     </td>
                     <td class="p-4 text-right">
-                        <button onclick="openConfigModal('{{ agent.name }}', '{{ trigger_type }}')" class="text-accent hover:text-accent-dark dark:text-accent-dark dark:hover:text-accent transition-colors text-sm font-bold font-mono uppercase tracking-wide flex items-center justify-end gap-1 w-full">
+                        {% if is_admin %}
+                        <button onclick="openConfigModal('{{ agent.name }}')" class="text-accent hover:text-accent-dark dark:text-accent-dark dark:hover:text-accent transition-colors text-sm font-bold font-mono uppercase tracking-wide flex items-center justify-end gap-1 w-full">
                             <i data-lucide="settings-2" class="w-4 h-4"></i> Configure
                         </button>
+                        {% endif %}
                     </td>
                 </tr>
                 {% else %}
@@ -99,58 +220,167 @@
     </div>
 </div>
 
+
 <!-- Modal -->
-<div id="config-modal" class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 hidden items-center justify-center">
-    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 shadow-xl w-full max-w-lg overflow-hidden flex flex-col">
-        <div class="p-6 border-b border-neutral-200 dark:border-neutral-800 flex justify-between items-center bg-neutral-50 dark:bg-neutral-950">
+<div id="config-modal" class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 hidden items-center justify-center p-4">
+    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 shadow-xl w-full max-w-4xl max-h-[90vh] flex flex-col">
+        <div class="p-6 border-b border-neutral-200 dark:border-neutral-800 flex justify-between items-center bg-neutral-50 dark:bg-neutral-950 flex-shrink-0">
             <h2 class="text-xl font-bold font-mono tracking-tight uppercase flex items-center gap-2">
                 <i data-lucide="settings-2" class="w-5 h-5 text-accent dark:text-accent-dark"></i>
-                Configure Trigger
+                Configure Agent
             </h2>
-            <button onclick="closeConfigModal()" class="text-neutral-500 hover:text-neutral-900 dark:hover:text-white transition-colors">
+            <button type="button" onclick="closeConfigModal()" class="text-neutral-500 hover:text-neutral-900 dark:hover:text-white transition-colors">
                 <i data-lucide="x" class="w-5 h-5"></i>
             </button>
         </div>
         
-        <div class="p-6 overflow-y-auto">
-            <form id="config-form" method="POST" action="/background-agents/config" class="space-y-6">
+        <div class="p-6 overflow-y-auto flex-grow">
+            <form id="config-form" method="POST" action="/background-agents/config" class="space-y-8">
                 <input type="hidden" name="agent_name" id="modal-agent-name">
                 
-                <div>
-                    <label class="block text-sm font-bold font-mono text-neutral-700 dark:text-neutral-300 mb-2 uppercase tracking-wide">Trigger Type</label>
-                    <select name="trigger_type" id="modal-trigger-type" onchange="toggleTriggerFields()" class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
-                        <option value="none">None</option>
-                        <option value="cron">Cron (Scheduled)</option>
-                        <option value="webhook">Webhook (Event-Driven)</option>
-                    </select>
+                <div class="border-b border-neutral-200 dark:border-neutral-800 pb-4">
+                    <h3 class="text-lg font-bold uppercase tracking-wider">Trigger Settings</h3>
                 </div>
-
-                <div id="cron-fields" class="hidden space-y-4">
+                
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                     <div>
-                        <label class="block text-sm font-bold font-mono text-neutral-700 dark:text-neutral-300 mb-2 uppercase tracking-wide">Cron Expression</label>
-                        <input type="text" name="cron_expression" id="modal-cron-expr" placeholder="* * * * *" class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
+                        <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">Trigger Type</label>
+                        <select name="trigger_type" id="modal-trigger-type" onchange="toggleTriggerFields()" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
+                            <option value="none">None</option>
+                            <option value="cron">Cron (Scheduled)</option>
+                            <option value="webhook">Webhook (Event-Driven)</option>
+                        </select>
+                    </div>
+
+                    <div id="cron-fields" class="hidden">
+                        <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">Cron Expression</label>
+                        <input type="text" name="cron_expression" id="modal-cron-expr" placeholder="* * * * *" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
                         <p class="mt-2 text-xs text-neutral-500" id="cron-preview">Every minute</p>
+                    </div>
+
+                    <div id="webhook-fields" class="hidden space-y-4 col-span-1 md:col-span-2">
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div>
+                                <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">Provider</label>
+                                <select name="webhook_provider" id="modal-webhook-provider" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
+                                    <option value="generic">Generic HMAC (SHA-256)</option>
+                                    <option value="github">GitHub</option>
+                                    <option value="issues">Issues</option>
+                                    <option value="slack">Slack</option>
+                                    <option value="support">Support</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">Secret Key</label>
+                                <input type="password" name="webhook_secret" id="modal-webhook-secret" placeholder="Enter validation secret" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
+                            </div>
+                        </div>
                     </div>
                 </div>
 
-                <div id="webhook-fields" class="hidden space-y-4">
+                {% if is_admin %}
+                <div class="border-b border-neutral-200 dark:border-neutral-800 pb-4 pt-4">
+                    <h3 class="text-lg font-bold uppercase tracking-wider">Properties</h3>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                     <div>
-                        <label class="block text-sm font-bold font-mono text-neutral-700 dark:text-neutral-300 mb-2 uppercase tracking-wide">Provider</label>
-                        <select name="webhook_provider" id="modal-webhook-provider" class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
-                            <option value="generic">Generic HMAC (SHA-256)</option>
-                            <option value="github">GitHub</option>
-                            <option value="issues">Issues</option>
-                            <option value="slack">Slack</option>
-                            <option value="support">Support</option>
+                        <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">Model Engine</label>
+                        <select name="model" id="modal-model" onchange="updateThinkingLevel()" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
+                            <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview</option>
+                            <option value="gemini-3-flash-preview">gemini-3-flash-preview</option>
+                            <option value="gemini-3.1-flash-lite-preview">gemini-3.1-flash-lite-preview</option>
+                            <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                            <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite</option>
+                            <option value="gemini-2.5-pro">gemini-2.5-pro</option>
                         </select>
                     </div>
                     <div>
-                        <label class="block text-sm font-bold font-mono text-neutral-700 dark:text-neutral-300 mb-2 uppercase tracking-wide">Secret Key</label>
-                        <input type="password" name="webhook_secret" id="modal-webhook-secret" placeholder="Enter validation secret" class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
+                        <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">Thinking Level</label>
+                        <select name="thinking_level" id="modal-thinking-level" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
+                            <option value="none">None (Disabled)</option>
+                            <option value="low">Low</option>
+                            <option value="medium">Medium</option>
+                            <option value="high">High</option>
+                            <option value="n/a" hidden>N/A</option>
+                        </select>
                     </div>
                 </div>
 
-                <div class="pt-4 border-t border-neutral-200 dark:border-neutral-800 flex justify-end gap-3">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div>
+                        <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">Version</label>
+                        <input type="text" name="version" id="modal-version" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">Description</label>
+                        <input type="text" name="description" id="modal-description" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
+                    </div>
+                </div>
+
+                <div class="pt-4">
+                    <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide flex justify-between items-end">
+                        Allowed MCP Tools
+                        <span class="font-normal text-[10px] bg-neutral-100 dark:bg-neutral-800 px-2 py-1 border border-neutral-200 dark:border-neutral-700 text-neutral-500">FILTER</span>
+                    </label>
+                    <input type="text" id="toolSearch" placeholder="Type to filter tools..." class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono mb-4 !border-b-0">
+                    <div class="border border-neutral-300 dark:border-neutral-700 p-4 max-h-64 overflow-y-auto bg-neutral-50 dark:bg-neutral-950/50" id="toolList">
+                        {% for tool in all_tools %}
+                        <div class="flex items-center mb-3 tool-item p-2 hover:bg-white dark:hover:bg-neutral-800 transition-colors border border-transparent hover:border-neutral-200 dark:hover:border-neutral-700 relative group">
+                            <input id="tool_{{ tool.name }}" name="allowed_tools" value="{{ tool.name }}" type="checkbox" class="modal-tool-checkbox h-4 w-4 text-accent border-neutral-300 dark:border-neutral-600 bg-white dark:bg-neutral-900 rounded-none focus:ring-accent focus:ring-offset-0 dark:focus:ring-offset-neutral-900">
+                            <label for="tool_{{ tool.name }}" class="ml-3 flex flex-col justify-center text-sm font-mono text-neutral-900 dark:text-neutral-100 tool-name-label cursor-pointer w-full overflow-hidden">
+                                <div class="flex items-center justify-between w-full">
+                                    <div class="flex items-center">
+                                        <span>{{ tool.name }}</span>
+                                        {% if tool.version %}
+                                            <span class="text-xs text-neutral-500 ml-2">v{{ tool.version }}</span>
+                                        {% endif %}
+                                    </div>
+                                    {% if tool.type == 'mcp' %}
+                                    <span class="text-[10px] bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200 px-2 py-0.5 ml-2 border border-blue-200 dark:border-blue-800 rounded-sm whitespace-nowrap flex-shrink-0">
+                                        MCP: {{ tool.source }}
+                                    </span>
+                                    {% else %}
+                                    <span class="text-[10px] bg-neutral-100 text-neutral-600 dark:bg-neutral-800 dark:text-neutral-400 px-2 py-0.5 ml-2 border border-neutral-200 dark:border-neutral-700 rounded-sm whitespace-nowrap flex-shrink-0">
+                                        Local Hub
+                                    </span>
+                                    {% endif %}
+                                </div>
+                                {% if tool.description %}
+                                <div class="text-xs text-neutral-500 dark:text-neutral-400 mt-1 truncate w-full tool-desc">
+                                    {{ tool.description }}
+                                </div>
+                                <!-- Custom Tooltip -->
+                                <div class="opacity-0 invisible group-[.is-truncated]:hover:opacity-100 group-[.is-truncated]:hover:visible transition-all duration-200 delay-500 absolute z-50 left-0 top-full mt-1 w-full bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 p-2 text-xs font-mono shadow-lg border border-neutral-800 dark:border-neutral-200 whitespace-normal break-words pointer-events-none">
+                                    {{ tool.description }}
+                                </div>
+                                {% endif %}
+                            </label>
+                        </div>
+                        {% else %}
+                        <div class="text-sm font-mono text-neutral-500 p-4 text-center border border-dashed border-neutral-300 dark:border-neutral-700">No tools registered in system.</div>
+                        {% endfor %}
+                    </div>
+                </div>
+                
+                <div class="pt-4">
+                    <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">A2A Access (Inter-Agent Comms)</label>
+                    <select name="a2a_access" id="modal-a2a-access" class="a2a-select w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent p-2.5 font-mono" multiple="multiple">
+                        {% for agent_name in all_agents %}
+                            {% if agent_name != 'supervisor' %}
+                            <option value="{{ agent_name }}">{{ agent_name }}</option>
+                            {% endif %}
+                        {% endfor %}
+                    </select>
+                </div>
+
+                <div class="pt-4">
+                    <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">Skills Payload (Markdown / System Prompt)</label>
+                    <textarea name="skills_content" id="modal-skills-content" rows="12" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono leading-relaxed"></textarea>
+                </div>
+                {% endif %}
+
+                <div class="pt-6 border-t border-neutral-200 dark:border-neutral-800 flex justify-end gap-3 sticky bottom-0 bg-white dark:bg-neutral-900">
                     <button type="button" onclick="closeConfigModal()" class="px-4 py-2 font-mono font-bold text-sm uppercase tracking-wide text-neutral-600 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-white transition-colors">
                         Cancel
                     </button>
@@ -192,10 +422,44 @@
         }
     });
 
-    function openConfigModal(agentName, currentTriggerType) {
+
+    function openConfigModal(agentName) {
         document.getElementById('modal-agent-name').value = agentName;
-        document.getElementById('modal-trigger-type').value = currentTriggerType.toLowerCase();
+        const conf = agentConfigs[agentName] || {};
+        
+        document.getElementById('modal-trigger-type').value = conf.trigger_type || 'none';
+        document.getElementById('modal-cron-expr').value = conf.cron_expression || '';
+        document.getElementById('modal-webhook-provider').value = conf.webhook_provider || 'generic';
         toggleTriggerFields();
+        
+        // Trigger preview update
+        if(document.getElementById('modal-cron-expr')) {
+            document.getElementById('modal-cron-expr').dispatchEvent(new Event('input'));
+        }
+
+        {% if is_admin %}
+        document.getElementById('modal-model').value = conf.model || 'gemini-3-flash-preview';
+        document.getElementById('modal-thinking-level').value = conf.thinking_level || 'none';
+        updateThinkingLevel();
+        
+        document.getElementById('modal-version').value = conf.version || '';
+        document.getElementById('modal-description').value = conf.description || '';
+        document.getElementById('modal-skills-content').value = conf.skills_content || '';
+        
+        // Allowed tools checkboxes
+        const allowed = conf.allowed_tools || [];
+        document.querySelectorAll('.modal-tool-checkbox').forEach(cb => {
+            cb.checked = allowed.includes(cb.value);
+        });
+        
+        // A2A access select2
+        const a2a = conf.a2a_access || [];
+        $('#modal-a2a-access').val(a2a).trigger('change');
+        
+        // Tool search init
+        $('#toolSearch').val('').trigger('input');
+        {% endif %}
+
         const modal = document.getElementById('config-modal');
         modal.classList.remove('hidden');
         modal.classList.add('flex');
@@ -212,15 +476,83 @@
         const cronFields = document.getElementById('cron-fields');
         const webhookFields = document.getElementById('webhook-fields');
 
-        cronFields.classList.add('hidden');
-        webhookFields.classList.add('hidden');
+        if(cronFields) cronFields.classList.add('hidden');
+        if(webhookFields) webhookFields.classList.add('hidden');
 
-        if (type === 'cron') {
+        if (type === 'cron' && cronFields) {
             cronFields.classList.remove('hidden');
-        } else if (type === 'webhook') {
+        } else if (type === 'webhook' && webhookFields) {
             webhookFields.classList.remove('hidden');
         }
     }
+
+    {% if is_admin %}
+    function updateThinkingLevel() {
+        var selectedModel = document.getElementById('modal-model').value;
+        var $thinkingSelect = $('#modal-thinking-level');
+        if(!$thinkingSelect.length) return;
+        var $noneOption = $thinkingSelect.find('option[value="none"]');
+        var $naOption = $thinkingSelect.find('option[value="n/a"]');
+        var currentVal = $thinkingSelect.val();
+
+        $thinkingSelect.prop('disabled', false);
+        $thinkingSelect.find('option').show();
+        if($noneOption.length) $noneOption.prop('disabled', false);
+        
+        if (!selectedModel) return;
+
+        if (selectedModel.includes('lite')) {
+            $thinkingSelect.prop('disabled', true);
+            $thinkingSelect.val('n/a');
+        } else if (selectedModel === 'gemini-2.5-pro') {
+            if($noneOption.length) {
+                $noneOption.hide();
+                $noneOption.prop('disabled', true);
+            }
+            if($naOption.length) $naOption.hide();
+            if (currentVal === 'none' || currentVal === 'n/a') {
+                $thinkingSelect.val('low');
+            }
+        } else {
+            if($naOption.length) $naOption.hide();
+            if (currentVal === 'n/a') {
+                $thinkingSelect.val('none');
+            }
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        if(typeof $ !== 'undefined') {
+            $('.a2a-select').select2({
+                placeholder: "SELECT AGENTS...",
+                width: '100%',
+                dropdownParent: $('#config-modal')
+            });
+
+            $('#toolSearch').on('input', function() {
+                var searchTerm = $(this).val().toLowerCase();
+                $('#toolList .tool-item').each(function() {
+                    var toolName = $(this).find('.tool-name-label').text().toLowerCase();
+                    if (toolName.indexOf(searchTerm) > -1) {
+                        $(this).show();
+                    } else {
+                        $(this).hide();
+                    }
+                });
+            });
+
+            $('.tool-item').on('mouseenter', function() {
+                var desc = $(this).find('.tool-desc')[0];
+                if (desc && desc.scrollWidth > desc.clientWidth) {
+                    $(this).addClass('is-truncated');
+                } else {
+                    $(this).removeClass('is-truncated');
+                }
+            });
+        }
+    });
+    {% endif %}
+
 </script>
 
 {% endblock %}

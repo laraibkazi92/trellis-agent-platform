@@ -67,6 +67,25 @@ class IdentityManager:
         self.client.put(f"/users/{user_id}/secrets", json.dumps(secrets_data))
 
     @retry_etcd()
+    def get_global_secrets(self) -> Dict[str, str]:
+        """Retrieve system-wide global secrets."""
+        value, _ = self.client.get("/config/framework/global_secrets")
+        if value:
+            return json.loads(value.decode('utf-8'))
+        return {}
+
+    @retry_etcd()
+    def save_global_secrets(self, secrets_data: Dict[str, str]) -> None:
+        """Save system-wide global secrets."""
+        self.client.put("/config/framework/global_secrets", json.dumps(secrets_data))
+
+    def get_resolved_secrets(self, user_id: str) -> Dict[str, str]:
+        """Retrieve user secrets merged with global secrets (global takes precedence)."""
+        user_secrets = self.get_user_secrets(user_id)
+        global_secrets = self.get_global_secrets()
+        return {**user_secrets, **global_secrets}
+
+    @retry_etcd()
     def create_key(self, user_id: str, key_name: str) -> str:
         """Create a new API key for a user."""
         api_key = f"tl_{secrets.token_urlsafe(32)}"
@@ -182,6 +201,26 @@ class IdentityManager:
     def set_disabled_agents(self, agents: List[str]) -> None:
         """Set the list of disabled agents."""
         self.set_config("disabled_agents", agents)
+
+    @retry_etcd()
+    def get_app_config(self) -> Dict[str, Any]:
+        """Retrieve the application configuration for whitelabeling."""
+        # Start with environment variables as defaults
+        config = {
+            "APP_NAME": os.getenv("APP_NAME", "Agent Framework"),
+            "APP_LOGO_URL": os.getenv("APP_LOGO_URL", ""),
+            "APP_FAVICON_URL": os.getenv("APP_FAVICON_URL", ""),
+            "APP_ACCENT_COLOR": os.getenv("APP_ACCENT_COLOR", "#0055FF"),
+            "APP_ACCENT_COLOR_DARK": os.getenv("APP_ACCENT_COLOR_DARK", "#3377FF"),
+        }
+        
+        # Try to override with etcd values if they exist
+        for key in config.keys():
+            etcd_val = self.get_config(f"app_{key.lower()}")
+            if etcd_val:
+                config[key] = etcd_val
+                
+        return config
 
     # --- Registry Methods for Agents and Tools ---
 
@@ -469,3 +508,12 @@ def is_admin(request: Request) -> bool:
         
     admin_users = [u.strip() for u in os.getenv("ADMIN_USERS", "").split(",") if u.strip()]
     return user.get("email") in admin_users
+
+def get_identity_mgr():
+    """Helper to get the global IdentityManager instance."""
+    from core.dependencies import identity_mgr
+    return identity_mgr
+
+async def get_current_user(request: Request):
+    """Helper to get the current user from the session."""
+    return request.session.get('user')

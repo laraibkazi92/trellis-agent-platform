@@ -35,8 +35,9 @@ async def secrets_page(request: Request):
                     required_secrets[secret_key] = []
                 required_secrets[secret_key].append(f"MCP: {name}")
                 
-    # 2. Get current user secrets
+    # 2. Get current user secrets and global secrets
     current_secrets = await asyncio.to_thread(identity_mgr.get_user_secrets, user_id)
+    global_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
     
     flash_msg = request.session.pop("flash_msg", None)
     
@@ -47,6 +48,7 @@ async def secrets_page(request: Request):
             "user": user,
             "required_secrets": required_secrets,
             "current_secrets": current_secrets,
+            "global_secrets": global_secrets,
             "flash_msg": flash_msg
         }
     )
@@ -63,8 +65,11 @@ async def save_secrets(request: Request):
     # We only want to save keys that the user actually submitted, but it's simpler
     # to update the existing dictionary so we don't wipe out secrets not currently displayed.
     current_secrets = await asyncio.to_thread(identity_mgr.get_user_secrets, user_id)
+    global_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
     
     for key, value in form.items():
+        if key in global_secrets:
+            continue # Skip updating if admin manages this
         if value.strip(): # only update if not empty
             current_secrets[key] = value.strip()
             

@@ -149,6 +149,75 @@ async def revoke_global_key(request: Request, key_id: str = Form(...)):
         
     return RedirectResponse(url='/admin', status_code=303)
 
+@router.get("/admin/secrets", response_class=HTMLResponse)
+async def admin_secrets_page(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    user = request.session.get('user')
+    
+    # Gather all required secrets across all tools/MCPs
+    tool_names = await asyncio.to_thread(identity_mgr.list_tools)
+    mcp_names = await asyncio.to_thread(identity_mgr.list_mcps)
+    required_secrets = {}
+    
+    for name in tool_names:
+        config = await asyncio.to_thread(identity_mgr.get_tool_config, name)
+        if config and config.get("secrets"):
+            for s in config.get("secrets", []):
+                if s not in required_secrets: required_secrets[s] = []
+                required_secrets[s].append(f"Tool: {name}")
+                
+    for name in mcp_names:
+        config = await asyncio.to_thread(identity_mgr.get_mcp_config, name)
+        if config and config.get("secrets"):
+            for s in config.get("secrets", []):
+                if s not in required_secrets: required_secrets[s] = []
+                required_secrets[s].append(f"MCP: {name}")
+
+    global_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
+    flash_msg = request.session.pop("flash_msg", None)
+
+    return templates.TemplateResponse(
+        request=request,
+        name="admin_secrets.html",
+        context={
+            "user": user,
+            "required_secrets": required_secrets,
+            "global_secrets": global_secrets,
+            "flash_msg": flash_msg
+        }
+    )
+
+@router.post("/admin/secrets")
+async def save_admin_secrets(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    form = await request.form()
+    current_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
+    
+    for key, value in form.items():
+        if value.strip(): # Set if not empty
+            current_secrets[key] = value.strip()
+            
+    await asyncio.to_thread(identity_mgr.save_global_secrets, current_secrets)
+    
+    request.session["flash_msg"] = "Global secrets saved successfully."
+    return RedirectResponse(url='/admin/secrets', status_code=303)
+
+@router.post("/admin/secrets/delete")
+async def delete_admin_secret(request: Request, secret_key: str = Form(...)):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+        
+    current_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
+    if secret_key in current_secrets:
+        del current_secrets[secret_key]
+        await asyncio.to_thread(identity_mgr.save_global_secrets, current_secrets)
+        request.session["flash_msg"] = f"Global secret '{secret_key}' removed."
+    return RedirectResponse(url='/admin/secrets', status_code=303)
+
 @router.get("/editor/{type}/{name}", response_class=HTMLResponse)
 async def editor_page(request: Request, type: str, name: str):
     fallback_url = '/agents' if type == 'agent' else '/tools'

@@ -1,15 +1,14 @@
 import json
 import asyncio
+import yaml
 from typing import Dict, Any, List
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
-from core.auth import get_current_user, get_identity_mgr
-from core.background.queue import EtcdQueue
+from core.auth import get_current_user
+from core.dependencies import templates, identity_mgr
+from core.routers.admin import sanitize_name, commit_to_github
 
 router = APIRouter(tags=["Background Agents"])
-templates = Jinja2Templates(directory="templates")
-queue = EtcdQueue()
 
 @router.get("/background-agents", response_class=HTMLResponse)
 async def background_agents_view(request: Request):
@@ -17,9 +16,6 @@ async def background_agents_view(request: Request):
     if not user:
         return RedirectResponse(url="/login")
         
-    identity_mgr = get_identity_mgr()
-    app_config = await asyncio.to_thread(identity_mgr.get_app_config)
-    
     agent_names = await asyncio.to_thread(identity_mgr.list_agents)
     disabled_agents = identity_mgr.get_disabled_agents()
     
@@ -28,51 +24,72 @@ async def background_agents_view(request: Request):
         config_data = await asyncio.to_thread(identity_mgr.get_agent_config, name)
         if config_data and config_data.get("type") == "background":
             status = "disabled" if name in disabled_agents else "active"
+            skills_content = await asyncio.to_thread(identity_mgr.get_agent_skills, name) or ""
             background_agents.append({
                 "name": name,
                 "config": config_data,
+                "skills": skills_content,
                 "status": status
             })
 
-    # Fetch Queue observability data
-    # (Since this is UI, let's fetch directly from etcd to get the live snapshot)
-    pending_tasks = []
-    processing_tasks = []
-    completed_tasks = []
-    failed_tasks = []
+    # Fetch all tools for configuration modal
+    all_tools_data = []
+    local_tool_configs = await asyncio.to_thread(identity_mgr.get_all_tool_configs)
+    mcp_configs = await asyncio.to_thread(identity_mgr.get_all_mcp_configs)
     
-    for val, meta in identity_mgr.client.get_prefix("/queue/pending/"):
-        pending_tasks.append({"id": meta.key.decode('utf-8').split('/')[-1], "payload": json.loads(val.decode('utf-8'))})
-    for val, meta in identity_mgr.client.get_prefix("/queue/processing/"):
-        processing_tasks.append({"id": meta.key.decode('utf-8').split('/')[-1], "payload": json.loads(val.decode('utf-8'))})
-    for val, meta in identity_mgr.client.get_prefix("/queue/completed/"):
-        # Just getting the last few completed
-        completed_tasks.append({"id": meta.key.decode('utf-8').split('/')[-1], "payload": json.loads(val.decode('utf-8'))})
-    for val, meta in identity_mgr.client.get_prefix("/queue/failed/"):
-        failed_tasks.append({"id": meta.key.decode('utf-8').split('/')[-1], "payload": json.loads(val.decode('utf-8'))})
+    for t_name, t_config in local_tool_configs.items():
+        all_tools_data.append({
+            "name": t_name, 
+            "type": "local", 
+            "source": "Hub",
+            "version": t_config.get("version", ""),
+            "description": t_config.get("description", "")
+        })
+        
+    for mcp_name, mcp_config in mcp_configs.items():
+        if mcp_config and "tools" in mcp_config:
+            for t in mcp_config["tools"]:
+                all_tools_data.append({
+                    "name": t.get("name", ""), 
+                    "type": "mcp", 
+                    "source": mcp_name,
+                    "version": t.get("version", ""),
+                    "description": t.get("description", "")
+                })
+                
+    all_tools_data.sort(key=lambda x: x["name"])
 
-    return templates.TemplateResponse("background_agents.html", {
-        "request": request,
-        "user": user,
-        "app_name": app_config.get("APP_NAME", "Marketplace"),
-        "app_logo_url": app_config.get("APP_LOGO_URL", ""),
-        "app_favicon_url": app_config.get("APP_FAVICON_URL", ""),
-        "app_accent_color": app_config.get("APP_ACCENT_COLOR", "#0ea5e9"),
-        "app_accent_color_dark": app_config.get("APP_ACCENT_COLOR_DARK", "#38bdf8"),
-        "background_agents": background_agents,
-        "queue": {
-            "pending": pending_tasks,
-            "processing": processing_tasks,
-            "completed": completed_tasks[-10:], # last 10
-            "failed": failed_tasks[-10:]
+    # Taskiq queue observability can be added here later.
+    # For now, returning empty sets to preserve UI template.
+    return templates.TemplateResponse(
+        request=request,
+        name="background_agents.html",
+        context={
+            "user": user,
+            "background_agents": background_agents,
+            "all_agents": agent_names,
+            "all_tools": all_tools_data,
+            "queue": {
+                "pending": [],
+                "processing": [],
+                "completed": [],
+                "failed": []
+            }
         }
-    })
+    )
+
+def is_admin(request: Request) -> bool:
+    # Need to reimplement this or import it correctly. 
+    # Wait, the old code had `is_admin(request)` but it was not imported. 
+    # Ah, let's just copy what the old code had or import it from core.routers.admin
+    from core.routers.admin import is_admin
+    return is_admin(request)
 
 @router.post("/background-agents/config")
 async def update_background_trigger(
     request: Request,
     agent_name: str = Form(...),
-    trigger_type: str = Form(...),
+    trigger_type: str = Form(None),
     cron_expression: str = Form(None),
     webhook_provider: str = Form(None),
     webhook_secret: str = Form(None)
@@ -81,18 +98,54 @@ async def update_background_trigger(
     if not user:
         return RedirectResponse(url="/login")
         
-    identity_mgr = get_identity_mgr()
-    config_data = await asyncio.to_thread(identity_mgr.get_agent_config, agent_name)
+    is_admin_user = is_admin(request)
+    safe_name = sanitize_name(agent_name)
+    if not safe_name:
+        request.session["flash_msg"] = "Invalid agent name parameter."
+        return RedirectResponse(url='/background-agents', status_code=303)
+        
+    config_data = await asyncio.to_thread(identity_mgr.get_agent_config, safe_name) or {"name": safe_name}
     
-    if config_data and config_data.get("type") == "background":
-        trigger = {"type": trigger_type}
-        if trigger_type == "cron" and cron_expression:
-            trigger["expression"] = cron_expression
-        elif trigger_type == "webhook":
-            trigger["provider"] = webhook_provider or "generic"
-            trigger["secret"] = webhook_secret or "secret"
+    # Trigger update (allowed for any authenticated user? Or only admin? Prompt says "we need to implement all the configuration options available, but ONLY for an admin user". So if non-admin can't configure trigger either, we should block them. Actually the user said "entire configure" should be hidden. So we block non-admins entirely).
+    if not is_admin_user:
+        request.session["flash_msg"] = "Unauthorized access."
+        return RedirectResponse(url='/background-agents', status_code=303)
+        
+    form = await request.form()
+    
+    if config_data.get("type") == "background":
+        if trigger_type and trigger_type != "none":
+            trigger = {"type": trigger_type}
+            if trigger_type == "cron" and cron_expression:
+                trigger["expression"] = cron_expression
+            elif trigger_type == "webhook":
+                trigger["provider"] = webhook_provider or "generic"
+                trigger["secret"] = webhook_secret or "secret"
+            config_data["trigger"] = trigger
+        elif trigger_type == "none" and "trigger" in config_data:
+            del config_data["trigger"]
+
+        config_data["model"] = form.get("model")
+        config_data["thinking_level"] = form.get("thinking_level")
+        
+        LITE_MODELS = {"gemini-3.1-flash-lite-preview", "gemini-2.5-flash-lite"}
+        if config_data.get("model") in LITE_MODELS:
+            config_data["thinking_level"] = "n/a"
             
-        config_data["trigger"] = trigger
-        await asyncio.to_thread(identity_mgr.save_agent_config, agent_name, config_data)
+        config_data["version"] = form.get("version")
+        config_data["description"] = form.get("description")
+        config_data["a2a_access"] = form.getlist("a2a_access")
+        config_data["allowed_tools"] = form.getlist("allowed_tools")
+        skills_content = form.get("skills_content", "")
+
+        await asyncio.to_thread(identity_mgr.save_agent_config, safe_name, config_data)
+        await asyncio.to_thread(identity_mgr.save_agent_skills, safe_name, skills_content)
+        
+        # Sync to GitHub
+        agent_dir = f"background_agents/{safe_name}"
+        yaml_content = yaml.dump(config_data, sort_keys=False)
+        
+        success_config = await commit_to_github(f"{agent_dir}/config.yaml", yaml_content, f"Update config for {safe_name}")
+        success_skills = await commit_to_github(f"{agent_dir}/skills.md", skills_content, f"Update skills for {safe_name}")
         
     return RedirectResponse(url="/background-agents", status_code=303)
