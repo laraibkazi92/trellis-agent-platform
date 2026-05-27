@@ -89,8 +89,12 @@ def _inject_secrets(env: Optional[Dict[str, str]], secrets: Optional[List[str]],
 _hub_client: Optional[FastMCPClient] = None
 _hub_tools_cache: List[Any] = []
 _external_mcp_tools: Dict[str, List[Any]] = {}
+_main_loop: Optional[asyncio.AbstractEventLoop] = None
+_watch_id: Any = None
 
-@cached(cache=TTLCache(maxsize=100, ttl=300))
+mcp_client_cache = TTLCache(maxsize=100, ttl=300)
+
+@cached(cache=mcp_client_cache)
 async def get_external_mcp_client(mcp_name: str, user_id: str) -> FastMCPClient:
     user_secrets = await asyncio.to_thread(identity_mgr.get_resolved_secrets, user_id)
     config_data = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
@@ -119,6 +123,8 @@ async def get_hub_client() -> FastMCPClient:
     return _hub_client
 
 async def discover_external_mcps():
+    global _external_mcp_tools
+    new_mcp_tools = {}
     mcp_names = await asyncio.to_thread(identity_mgr.list_mcps)
     for name in mcp_names:
         config_data = await asyncio.to_thread(identity_mgr.get_mcp_config, name)
@@ -126,7 +132,7 @@ async def discover_external_mcps():
         try:
             config = MCPConfig(**config_data)
             if config.tools:
-                _external_mcp_tools[name] = config.tools
+                new_mcp_tools[name] = config.tools
                 continue
 
             transport = None
@@ -142,13 +148,33 @@ async def discover_external_mcps():
             client = FastMCPClient(transport)
             async with client:
                 tools = await client.list_tools()
-                _external_mcp_tools[name] = tools
+                new_mcp_tools[name] = tools
         except Exception as e:
             print(f"Failed to discover tools for MCP '{name}': {e}")
+            
+    # Atomic swap
+    _external_mcp_tools = new_mcp_tools
+
+def on_mcp_change(event):
+    for ev in event.events:
+        key = ev.key.decode('utf-8')
+        parts = key.split('/')
+        if len(parts) >= 4:
+            mcp_name = parts[3]
+            # Invalidate specific cache keys
+            keys_to_delete = [k for k in mcp_client_cache.keys() if mcp_name in str(k)]
+            for k in keys_to_delete:
+                mcp_client_cache.pop(k, None)
+                
+    if _main_loop and not _main_loop.is_closed():
+        asyncio.run_coroutine_threadsafe(discover_external_mcps(), _main_loop)
 
 @app.on_event("startup")
 async def startup_event():
+    global _main_loop, _watch_id
     print("Worker starting up...")
+    _main_loop = asyncio.get_running_loop()
+    _watch_id = identity_mgr.client.add_watch_prefix_callback("/registry/mcps/", on_mcp_change)
     await get_hub_client()
     await discover_external_mcps()
     print("Worker startup complete.")
@@ -156,7 +182,9 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     print("Worker shutting down...")
-    global _hub_client
+    global _hub_client, _watch_id
+    if _watch_id:
+        identity_mgr.client.cancel_watch(_watch_id)
     if _hub_client:
         await _hub_client.__aexit__(None, None, None)
     # The asyncache TTL cache doesn't easily allow sweeping for async cleanup,

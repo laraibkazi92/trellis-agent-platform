@@ -138,13 +138,6 @@ async def receive_webhook(agent_name: str, request: Request):
         except UnicodeDecodeError:
             payload_str = "Invalid UTF-8 payload received"
 
-        try:
-            # Format nicely if it's JSON
-            json_obj = json.loads(payload_str)
-            payload_str = json.dumps(json_obj, indent=2)
-        except json.JSONDecodeError:
-            pass
-            
         # Sanitize by replacing CDATA end tags to prevent breakout
         payload_str = payload_str.replace("]]>", "]]]]><![CDATA[>")
         xml_payload = f"<event_payload><![CDATA[\n{payload_str}\n]]></event_payload>"
