@@ -1,4 +1,24 @@
 services:
+  # DB Sync Init Container
+  # Runs once at startup to sync agents/tools to etcd
+  db-sync:
+    build: .
+    image: trellis-agent-platform:v2
+    container_name: db-sync
+    environment:
+      - ETCD_HOST=etcd
+      - ETCD_PORT=2379
+      - PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+    volumes:
+      - ./workspace:/app/workspace
+      - ./core:/app/core
+      - ./scripts:/app/scripts
+    command: python scripts/sync_to_db.py
+    depends_on:
+      etcd:
+        condition: service_healthy
+    restart: "no"
+
   # Universal Agent Host (FastAPI + PydanticAI)
   # This is the main entry point for the agent fleet.
   host:
@@ -17,12 +37,18 @@ services:
       - ETCD_PORT=2379
     volumes:
       - health-data:/app/data
+      - ./workspace:/app/workspace
+      - ./core:/app/core
+      - ./scripts:/app/scripts
+      - ./templates:/app/templates
     command: granian --interface asgi core.host:app --host 0.0.0.0 --port 8000 --workers 4 --workers-max-rss 256 --workers-lifetime 3600
     depends_on:
       hub:
         condition: service_started
       etcd:
         condition: service_healthy
+      db-sync:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   # Polyglot Tool Hub (Internal MCP Server)
@@ -37,11 +63,17 @@ services:
     depends_on:
       etcd:
         condition: service_healthy
+      db-sync:
+        condition: service_completed_successfully
     environment:
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
     volumes:
       - health-data:/app/data
+      - ./workspace:/app/workspace
+      - ./core:/app/core
+      - ./scripts:/app/scripts
+      - ./templates:/app/templates
 
   # External Gateway MCP Server
   # Bridges external MCP clients to the internal agent fleet via the Host's HTTP API.
@@ -55,6 +87,11 @@ services:
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
+    volumes:
+      - ./workspace:/app/workspace
+      - ./core:/app/core
+      - ./scripts:/app/scripts
+      - ./templates:/app/templates
     command: python core/gateway.py
     depends_on:
       - host
@@ -101,12 +138,19 @@ services:
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
       - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./workspace:/app/workspace
+      - ./core:/app/core
+      - ./scripts:/app/scripts
+      - ./templates:/app/templates
     command: taskiq worker core.tasks:broker --workers 2
     depends_on:
       etcd:
         condition: service_healthy
       redis:
         condition: service_healthy
+      db-sync:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   taskiq-scheduler:
@@ -119,12 +163,19 @@ services:
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
       - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./workspace:/app/workspace
+      - ./core:/app/core
+      - ./scripts:/app/scripts
+      - ./templates:/app/templates
     command: taskiq scheduler core.tasks:scheduler
     depends_on:
       etcd:
         condition: service_healthy
       redis:
         condition: service_healthy
+      db-sync:
+        condition: service_completed_successfully
     restart: unless-stopped
 
 
@@ -142,9 +193,16 @@ services:
       - ADMIN_USERS=${ADMIN_USERS}
     volumes:
       - health-data:/app/data
+      - ./workspace:/app/workspace
+      - ./core:/app/core
+      - ./scripts:/app/scripts
+      - ./templates:/app/templates
     command: uvicorn core.ui:app --host 0.0.0.0 --port 8080
     depends_on:
-      - etcd
+      etcd:
+        condition: service_healthy
+      db-sync:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   nginx-gateway:

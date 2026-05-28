@@ -2,9 +2,9 @@ import asyncio
 from typing import Dict, List
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
-from core.dependencies import templates, identity_mgr
+from core.dependencies import templates, identity_mgr, CSRFRoute
 
-router = APIRouter()
+router = APIRouter(route_class=CSRFRoute)
 
 @router.get("/secrets", response_class=HTMLResponse)
 async def secrets_page(request: Request):

@@ -13,11 +13,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.auth import IdentityManager
 
 BASE_DIR = Path(__file__).parent.parent
-AGENTS_DIR = BASE_DIR / "agents"
-BG_AGENTS_DIR = BASE_DIR / "background_agents"
-TOOLS_DIR = BASE_DIR / "tools"
+WORKSPACE_DIR = BASE_DIR / "workspace"
+
+AGENTS_DIR = WORKSPACE_DIR / "agents"
+BG_AGENTS_DIR = WORKSPACE_DIR / "background_agents"
+TOOLS_DIR = WORKSPACE_DIR / "tools"
+MCPS_DIR = WORKSPACE_DIR / "mcps"
+
+# Supervisor is an internal core agent
 SUPERVISOR_DIR = BASE_DIR / "core" / "assets" / "supervisor"
-MCPS_DIR = BASE_DIR / "mcps"
 
 def sync_agent(identity_mgr, agent_dir, name=None, agent_type=None):
     if not name:

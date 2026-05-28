@@ -7,11 +7,11 @@ import httpx
 import asyncio
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
-from core.dependencies import templates
+from core.dependencies import templates, CSRFRoute
 from core.auth import IdentityManager
 from core.health import HealthMonitor
 
-router = APIRouter()
+router = APIRouter(route_class=CSRFRoute)
 
 identity_mgr = IdentityManager(
     host=os.getenv("ETCD_HOST", "127.0.0.1"),

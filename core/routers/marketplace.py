@@ -3,11 +3,11 @@ import json
 import asyncio
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
-from core.dependencies import templates, identity_mgr
+from core.dependencies import templates, identity_mgr, CSRFRoute
 from core.discovery import discover_agents, discover_tools
 from core.auth import is_admin
 
-router = APIRouter()
+router = APIRouter(route_class=CSRFRoute)
 
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request):

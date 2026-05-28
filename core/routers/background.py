@@ -5,7 +5,7 @@ from typing import Dict, Any, List
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from core.auth import get_current_user
-from core.dependencies import templates, identity_mgr
+from core.dependencies import templates, identity_mgr, CSRFRoute
 from core.routers.admin import sanitize_name, commit_to_github
 
 router = APIRouter(tags=["Background Agents"])

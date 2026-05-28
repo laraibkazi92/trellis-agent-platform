@@ -236,6 +236,7 @@
         
         <div class="p-6 overflow-y-auto flex-grow">
             <form id="config-form" method="POST" action="/background-agents/config" class="space-y-8">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <input type="hidden" name="agent_name" id="modal-agent-name">
                 
                 <div class="border-b border-neutral-200 dark:border-neutral-800 pb-4">

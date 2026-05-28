@@ -87,92 +87,58 @@ class IdentityManager:
 
     @retry_etcd()
     def create_key(self, user_id: str, key_name: str) -> str:
-        """Create a new API key for a user."""
+        """Create a new API key for a user (v2 hashed storage)."""
         api_key = f"tl_{secrets.token_urlsafe(32)}"
+        key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+        key_preview = api_key[:6] + "..." + api_key[-4:]
+        
         key_data = {
             "user_id": user_id,
             "name": key_name,
-            "key": api_key,
+            "key_preview": key_preview,
+            "key_hash": key_hash,
+            "version": "v2"
         }
-        self.client.put(f"/keys/{api_key}", json.dumps(key_data))
-        # Maintain a secondary index for fast retrieval by user
-        self.client.put(f"/user_keys/{user_id}/{api_key}", "1")
-        # Maintain a secondary index for fast revocation by hash
-        key_id = hashlib.sha256(api_key.encode()).hexdigest()
-        self.client.put(f"/key_ids/{key_id}", api_key)
+        
+        self.client.put(f"/keys_v2/{key_hash}", json.dumps(key_data))
+        self.client.put(f"/user_keys_v2/{user_id}/{key_hash}", "1")
         return api_key
 
     @retry_etcd()
     def list_keys(self, user_id: str) -> List[Dict]:
         """List all API keys for a user efficiently using secondary index."""
         keys = []
-        for value, metadata in self.client.get_prefix(f"/user_keys/{user_id}/"):
-            # metadata.key is like b'/user_keys/{user_id}/{api_key}'
-            key_path = metadata.key.decode('utf-8')
-            api_key = key_path.split('/')[-1]
-            
-            # Retrieve actual key data
-            key_data_raw, _ = self.client.get(f"/keys/{api_key}")
+        
+        for value, metadata in self.client.get_prefix(f"/user_keys_v2/{user_id}/"):
+            key_hash = metadata.key.decode('utf-8').split('/')[-1]
+            key_data_raw, _ = self.client.get(f"/keys_v2/{key_hash}")
             if key_data_raw:
                 try:
                     data = json.loads(key_data_raw.decode('utf-8'))
-                    # Mask the key to prevent HTML source leaks
-                    raw_key = data.get("key", api_key)
-                    if raw_key.startswith("tl_") and len(raw_key) > 8:
-                        data["key_masked"] = raw_key[:6] + "..." + raw_key[-4:]
-                    else:
-                        data["key_masked"] = "***"
-                    data["key_id"] = hashlib.sha256(raw_key.encode()).hexdigest()
-                    data.pop("key", None)
+                    data["key_masked"] = data.get("key_preview", "***")
+                    data["key_id"] = key_hash
                     keys.append(data)
                 except Exception as e:
-                    logger.warning(f"Failed to process key record for user {user_id}: {e}")
+                    logger.warning(f"Failed to process v2 key record for user {user_id}: {e}")
         return keys
-
-    @retry_etcd()
-    def delete_key(self, api_key: str) -> bool:
-        """Revoke an API key."""
-        # First retrieve the key to find the user_id
-        value, _ = self.client.get(f"/keys/{api_key}")
-        if value:
-            data = json.loads(value.decode('utf-8'))
-            user_id = data.get("user_id")
-            if user_id:
-                self.client.delete(f"/user_keys/{user_id}/{api_key}")
-        
-        key_id = hashlib.sha256(api_key.encode()).hexdigest()
-        self.client.delete(f"/key_ids/{key_id}")
-        
-        deleted = self.client.delete(f"/keys/{api_key}")
-        return deleted
 
     @retry_etcd()
     def delete_key_by_id(self, key_id: str) -> bool:
         """Revoke an API key using its SHA256 hash."""
-        # Try fast path first
-        value, _ = self.client.get(f"/key_ids/{key_id}")
+        value, _ = self.client.get(f"/keys_v2/{key_id}")
         if value:
-            raw_key = value.decode('utf-8')
-            return self.delete_key(raw_key)
-            
-        # Fallback to slow O(N) scan for older keys
-        for value, metadata in self.client.get_prefix("/keys/"):
-            if value:
-                try:
-                    data = json.loads(value.decode('utf-8'))
-                    raw_key = data.get("key")
-                    if not raw_key:
-                        raw_key = metadata.key.decode('utf-8').split('/')[-1]
-                    if hashlib.sha256(raw_key.encode()).hexdigest() == key_id:
-                        return self.delete_key(raw_key)
-                except Exception as e:
-                    logger.warning(f"Error checking key during deletion: {e}")
+            data = json.loads(value.decode('utf-8'))
+            user_id = data.get("user_id")
+            if user_id:
+                self.client.delete(f"/user_keys_v2/{user_id}/{key_id}")
+            return self.client.delete(f"/keys_v2/{key_id}")
         return False
 
     @retry_etcd()
     def validate_key(self, api_key: str) -> Optional[str]:
         """Validate an API key and return the associated user_id if valid."""
-        value, metadata = self.client.get(f"/keys/{api_key}")
+        key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+        value, _ = self.client.get(f"/keys_v2/{key_hash}")
         if value:
             data = json.loads(value.decode('utf-8'))
             return data.get("user_id")
@@ -393,22 +359,17 @@ class IdentityManager:
     def list_all_keys(self) -> List[Dict]:
         """List all API keys across the system."""
         keys = []
-        for value, metadata in self.client.get_prefix("/keys/"):
+        
+        for value, metadata in self.client.get_prefix("/keys_v2/"):
             if value:
                 try:
                     data = json.loads(value.decode('utf-8'))
-                    raw_key = data.get("key")
-                    if not raw_key:
-                        raw_key = metadata.key.decode('utf-8').split('/')[-1]
-                    if raw_key.startswith("tl_") and len(raw_key) > 8:
-                        data["key_masked"] = raw_key[:6] + "..." + raw_key[-4:]
-                    else:
-                        data["key_masked"] = "***"
-                    data["key_id"] = hashlib.sha256(raw_key.encode()).hexdigest()
-                    data.pop("key", None)
+                    key_hash = metadata.key.decode('utf-8').split('/')[-1]
+                    data["key_masked"] = data.get("key_preview", "***")
+                    data["key_id"] = key_hash
                     keys.append(data)
                 except Exception as e:
-                    logger.warning(f"Failed to decode key record: {e}")
+                    logger.warning(f"Failed to decode v2 key record: {e}")
         return keys
 
     @retry_etcd()

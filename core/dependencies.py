@@ -34,7 +34,38 @@ def whitelabel_context(request):
         "app_accent_color_dark": _validate_hex_color(os.getenv("APP_ACCENT_COLOR_DARK", "#3377FF"), "#3377FF"),
     }
 
-templates = Jinja2Templates(directory=templates_dir, context_processors=[admin_context, whitelabel_context])
+import secrets
+from typing import Optional
+from fastapi import Request
+from fastapi.responses import RedirectResponse
+from fastapi.routing import APIRoute
+
+def csrf_context(request: Request):
+    csrf_token = request.session.get("csrf_token")
+    if not csrf_token:
+        csrf_token = secrets.token_hex(32)
+        request.session["csrf_token"] = csrf_token
+    return {"csrf_token": csrf_token}
+
+class CSRFRoute(APIRoute):
+    def get_route_handler(self):
+        original_route_handler = super().get_route_handler()
+
+        async def custom_route_handler(request: Request):
+            if request.method == "POST":
+                content_type = request.headers.get("content-type", "")
+                if "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+                    form = await request.form()
+                    token = form.get("csrf_token")
+                    session_token = request.session.get("csrf_token")
+                    if not token or not session_token or token != session_token:
+                        request.session["flash_msg"] = "Invalid CSRF token. Please refresh and try again."
+                        return RedirectResponse(url=request.headers.get("referer", "/"), status_code=303)
+            
+            return await original_route_handler(request)
+        return custom_route_handler
+
+templates = Jinja2Templates(directory=templates_dir, context_processors=[admin_context, whitelabel_context, csrf_context])
 
 # OAuth setup
 OIDC_CLIENT_ID = os.getenv("OIDC_CLIENT_ID")
