@@ -77,9 +77,9 @@
             <a href="/docs" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path.startswith('/docs') %}text-accent dark:text-accent-dark{% endif %}">Docs</a>
         <span class="text-neutral-300 dark:text-neutral-700 hidden sm:inline">|</span>
         <div class="relative group inline-block">
-            <a href="/keys" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/keys' %}text-accent dark:text-accent-dark{% endif %}">API Keys</a>
+            <a href="/profile" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/profile' %}text-accent dark:text-accent-dark{% endif %}">Profile</a>
             <div class="absolute hidden group-hover:block w-48 top-full mt-2 left-1/2 -translate-x-1/2 bg-neutral-800 text-white text-xs p-2 rounded shadow-lg z-50 text-center font-sans normal-case tracking-normal">
-                API Keys used to authenticate to the Agent Framework via API, MCP etc
+                User details, usage metrics, and API Keys
             </div>
         </div>
         <div class="relative group inline-block">

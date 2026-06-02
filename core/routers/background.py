@@ -32,6 +32,7 @@ async def background_agents_view(request: Request):
                 "status": status
             })
 
+    all_mcps = await asyncio.to_thread(identity_mgr.list_mcps)
     # Fetch all tools for configuration modal
     all_tools_data = []
     local_tool_configs = await asyncio.to_thread(identity_mgr.get_all_tool_configs)
@@ -69,6 +70,7 @@ async def background_agents_view(request: Request):
             "background_agents": background_agents,
             "all_agents": agent_names,
             "all_tools": all_tools_data,
+            "all_mcps": all_mcps,
             "queue": {
                 "pending": [],
                 "processing": [],
@@ -136,6 +138,7 @@ async def update_background_trigger(
         config_data["description"] = form.get("description")
         config_data["a2a_access"] = form.getlist("a2a_access")
         config_data["allowed_tools"] = form.getlist("allowed_tools")
+        config_data["allowed_mcps"] = form.getlist("allowed_mcps")
         skills_content = form.get("skills_content", "")
 
         await asyncio.to_thread(identity_mgr.save_agent_config, safe_name, config_data)

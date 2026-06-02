@@ -280,7 +280,8 @@ async def editor_page(request: Request, type: str, name: str):
                 "config": config,
                 "skills_content": skills_content,
                 "all_agents": all_agents,
-                "all_tools": all_tools
+                "all_tools": all_tools,
+                "all_mcps": all_mcps
             }
         )
     elif type == "tool":
@@ -362,6 +363,7 @@ async def save_agent(request: Request, name: str):
     # Handle multiple a2a_access values
     config["a2a_access"] = form.getlist("a2a_access")
     config["allowed_tools"] = form.getlist("allowed_tools")
+    config["allowed_mcps"] = form.getlist("allowed_mcps")
     skills_content = form.get("skills_content", "")
     
     await asyncio.to_thread(identity_mgr.save_agent_config, safe_name, config)

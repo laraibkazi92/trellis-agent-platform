@@ -453,6 +453,11 @@
             cb.checked = allowed.includes(cb.value);
         });
         
+        const allowed_mcps = conf.allowed_mcps || [];
+        document.querySelectorAll('.modal-mcp-checkbox').forEach(cb => {
+            cb.checked = allowed_mcps.includes(cb.value);
+        });
+        
         // A2A access select2
         const a2a = conf.a2a_access || [];
         $('#modal-a2a-access').val(a2a).trigger('change');

@@ -344,6 +344,56 @@ class IdentityManager:
         self.client.put(f"/usage/{user_id}", json.dumps(current))
 
     @retry_etcd()
+    def get_user_agent_usage(self, user_id: str) -> Dict[str, Dict[str, int]]:
+        """Retrieve token usage per agent for a user."""
+        usage = {}
+        prefix = f"/usage/{user_id}/agents/"
+        for value, metadata in self.client.get_prefix(prefix):
+            if value:
+                agent_name = metadata.key.decode('utf-8')[len(prefix):]
+                usage[agent_name] = json.loads(value.decode('utf-8'))
+        return usage
+
+    @retry_etcd()
+    def record_agent_usage(self, user_id: str, agent_name: str, input_tokens: int, output_tokens: int) -> None:
+        """Increment token usage for a specific agent for a user."""
+        if not user_id or not agent_name:
+            return
+            
+        key = f"/usage/{user_id}/agents/{agent_name}"
+        value, _ = self.client.get(key)
+        current = json.loads(value.decode('utf-8')) if value else {"input_tokens": 0, "output_tokens": 0, "total_requests": 0}
+        
+        current["input_tokens"] += input_tokens
+        current["output_tokens"] += output_tokens
+        current["total_requests"] += 1
+        
+        self.client.put(key, json.dumps(current))
+
+    @retry_etcd()
+    def get_user_tool_usage(self, user_id: str) -> Dict[str, int]:
+        """Retrieve tool execution counts for a user."""
+        usage = {}
+        prefix = f"/usage/{user_id}/tools/"
+        for value, metadata in self.client.get_prefix(prefix):
+            if value:
+                tool_name = metadata.key.decode('utf-8')[len(prefix):]
+                usage[tool_name] = int(value.decode('utf-8'))
+        return usage
+
+    @retry_etcd()
+    def record_tool_usage(self, user_id: str, tool_name: str) -> None:
+        """Increment execution count for a specific tool for a user."""
+        if not user_id or not tool_name:
+            return
+            
+        key = f"/usage/{user_id}/tools/{tool_name}"
+        value, _ = self.client.get(key)
+        current = int(value.decode('utf-8')) if value else 0
+        
+        self.client.put(key, str(current + 1))
+
+    @retry_etcd()
     def list_all_users(self) -> List[Dict]:
         """List all user profiles."""
         users = []

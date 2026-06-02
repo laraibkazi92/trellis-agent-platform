@@ -237,6 +237,24 @@
                     </select>
                 </div>
                 
+
+                <div class="mb-8 pt-8 border-t border-neutral-200 dark:border-neutral-800">
+                    <label class="form-label flex justify-between items-end mb-4">
+                        Allowed MCP Servers
+                        <span class="font-normal text-[10px] text-neutral-500">DYNAMIC DISCOVERY</span>
+                    </label>
+                    <p class="text-xs text-neutral-500 mb-4 font-mono">Granting access to an entire MCP server automatically gives the agent access to every tool it exposes.</p>
+                    <div class="border border-neutral-300 dark:border-neutral-700 p-4 max-h-64 overflow-y-auto bg-neutral-50 dark:bg-neutral-950/50">
+                        {% for mcp_name in all_mcps %}
+                        <div class="flex items-center mb-3 p-2 hover:bg-white dark:hover:bg-neutral-800 transition-colors border border-transparent hover:border-neutral-200 dark:hover:border-neutral-700 relative group">
+                            <input id="mcp_{{ mcp_name }}" name="allowed_mcps" value="{{ mcp_name }}" type="checkbox" class="h-4 w-4 text-accent border-neutral-300 dark:border-neutral-600 bg-white dark:bg-neutral-900 rounded-none focus:ring-accent focus:ring-offset-0 dark:focus:ring-offset-neutral-900" {% if mcp_name in config.get('allowed_mcps', []) %}checked{% endif %}>
+                            <label for="mcp_{{ mcp_name }}" class="ml-3 flex flex-col justify-center text-sm font-mono text-neutral-900 dark:text-neutral-100 cursor-pointer w-full overflow-hidden">
+                                <span>{{ mcp_name }}</span>
+                            </label>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
                 <div class="mb-8 pt-8 border-t border-neutral-200 dark:border-neutral-800">
                     <label class="form-label flex justify-between items-end mb-4">
                         Allowed MCP Tools

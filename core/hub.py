@@ -53,6 +53,8 @@ class TransientToolError(Exception):
 async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Executes a tool as a subprocess and handles JSON stdin/stdout."""
     user_id = arguments.pop("__user_id", None)
+    if user_id:
+        asyncio.create_task(asyncio.to_thread(identity_mgr.record_tool_usage, user_id, config.name))
     
     entrypoint_path = (tool_dir / config.entrypoint).resolve()
     if not str(entrypoint_path).startswith(str(tool_dir)):

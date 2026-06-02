@@ -30,7 +30,7 @@ if not DEV_MODE:
     if missing:
         raise ValueError(f"Missing required environment variables for UI: {', '.join(missing)}")
 
-from core.routers import auth, marketplace, keys, admin, secrets, docs, status, background
+from core.routers import auth, marketplace, profile, admin, secrets, docs, status, background
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Marketplace UI", docs_url=None, redoc_url=None, openapi_url=None)
@@ -52,7 +52,7 @@ app.add_middleware(
 
 app.include_router(auth.router)
 app.include_router(marketplace.router)
-app.include_router(keys.router)
+app.include_router(profile.router)
 app.include_router(admin.router)
 app.include_router(secrets.router)
 app.include_router(docs.router)

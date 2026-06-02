@@ -237,10 +237,14 @@ async def _build_agent(agent_name: str) -> Agent:
     allowed_mcps = config.allowed_mcps or []
     for mcp_name, tools in _external_mcp_tools.items():
         if mcp_name in allowed_mcps:
-            for tool in tools: _register_external_mcp_tool(agent, mcp_name, tool)
+            for tool in tools:
+                _register_external_mcp_tool(agent, mcp_name, tool, prefixed_name=f"mcp__{mcp_name}__{tool.name}")
         else:
             for tool in tools:
-                if tool.name in allowed_tools: _register_external_mcp_tool(agent, mcp_name, tool)
+                prefixed_name = f"mcp__{mcp_name}__{tool.name}"
+                if prefixed_name in allowed_tools or tool.name in allowed_tools:
+                    name_to_use = prefixed_name if prefixed_name in allowed_tools else tool.name
+                    _register_external_mcp_tool(agent, mcp_name, tool, prefixed_name=name_to_use)
 
     # 3. A2A Tools
     if agent_name == "supervisor":
@@ -302,10 +306,11 @@ def _register_mcp_tool(agent: Agent, mcp_tool: Any):
         result = await client.call_tool(safe_mcp_tool.name, kwargs)
         return result.content
 
-    agent.tool(name=safe_mcp_tool.name, description=safe_mcp_tool.description)(tool_wrapper)
+    agent.tool(name=tool_name_for_agent, description=safe_mcp_tool.description)(tool_wrapper)
 
-def _register_external_mcp_tool(agent: Agent, mcp_name: str, mcp_tool: Any):
+def _register_external_mcp_tool(agent: Agent, mcp_name: str, mcp_tool: Any, prefixed_name: str = None):
     safe_mcp_tool = copy.deepcopy(mcp_tool) if hasattr(mcp_tool, "model_copy") else mcp_tool
+    tool_name_for_agent = prefixed_name or safe_mcp_tool.name
     
     async def tool_wrapper(ctx: RunContext[None], **kwargs: Any) -> Any:
         if health_monitor.get_status("tool", safe_mcp_tool.name).get("status") == "Offline":
@@ -317,7 +322,19 @@ def _register_external_mcp_tool(agent: Agent, mcp_name: str, mcp_tool: Any):
         result = await client.call_tool(safe_mcp_tool.name, kwargs)
         return result.content
 
-    agent.tool(name=safe_mcp_tool.name, description=safe_mcp_tool.description)(tool_wrapper)
+    input_schema = getattr(safe_mcp_tool, "inputSchema", None)
+    if input_schema:
+        from pydantic_ai.tools import Tool
+        tool_obj = Tool.from_schema(
+            function=tool_wrapper,
+            name=tool_name_for_agent,
+            description=safe_mcp_tool.description,
+            json_schema=input_schema,
+            takes_ctx=True
+        )
+        agent._function_toolset.add_tool(tool_obj)
+    else:
+        agent.tool(name=tool_name_for_agent, description=safe_mcp_tool.description)(tool_wrapper)
 
 @app.get("/health")
 async def health():
@@ -367,6 +384,7 @@ async def chat_completions(request: ChatRequest):
             u = result.usage()
             # Send usage to a background thread to not block return
             asyncio.create_task(asyncio.to_thread(identity_mgr.record_usage, user_id, u.request_tokens or 0, u.response_tokens or 0))
+            asyncio.create_task(asyncio.to_thread(identity_mgr.record_agent_usage, user_id, request.model, u.request_tokens or 0, u.response_tokens or 0))
         return {"choices": [{"message": {"role": "assistant", "content": result.output}}]}
     except Exception as e:
         health_monitor.record_event("agent", request.model, is_success=False, error_details=str(e))
