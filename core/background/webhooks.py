@@ -50,28 +50,42 @@ def validate_notion(payload_body: bytes, secret: str, request: Request) -> bool:
     return hmac.compare_digest(expected_signature, signature)
 
 def validate_support(payload_body: bytes, secret: str, request: Request) -> bool:
-    # Support sends X-Support-Signature
-    signature = request.headers.get("X-Support-Signature")
-    if not signature:
+    # Support does not natively support dynamic HMAC signing of webhook payloads.
+    # Instead, we validate via static token validation using the "Authorization: Bearer <token>"
+    # header (as configured in Support automation headers) or custom "X-Support-Signature".
+    token_header = request.headers.get("Authorization") or request.headers.get("X-Support-Signature")
+    if not token_header:
         return False
-    hash_object = hmac.new(secret.encode('utf-8'), msg=payload_body, digestmod=hashlib.sha256)
-    expected_signature = hash_object.hexdigest()
-    return hmac.compare_digest(expected_signature, signature)
+        
+    # Strip prefix if it exists in Authorization header (e.g. "Bearer ")
+    provided_token = token_header[7:] if token_header.startswith("Bearer ") else token_header
+    expected_token = secret[7:] if secret.startswith("Bearer ") else secret
+    
+    # Use compare_digest for secure constant-time comparison
+    return hmac.compare_digest(provided_token, expected_token)
 
 def validate_generic(payload_body: bytes, secret: str, request: Request) -> bool:
-    # Generic SHA-256 signature in Authorization or X-Signature header
-    signature = request.headers.get("X-Signature") or request.headers.get("Authorization")
-    if not signature:
+    # Generic SHA-256 signature or static token in Authorization or X-Signature header
+    signature_header = request.headers.get("X-Signature") or request.headers.get("Authorization")
+    if not signature_header:
         return False
-    hash_object = hmac.new(secret.encode('utf-8'), msg=payload_body, digestmod=hashlib.sha256)
-    expected_signature = hash_object.hexdigest()
-    # Strip prefix if it exists in Authorization header (e.g. Bearer )
-    if signature.startswith("Bearer "):
-        signature = signature[7:]
-    elif signature.startswith("sha256="):
-        expected_signature = "sha256=" + expected_signature
         
-    return hmac.compare_digest(expected_signature, signature)
+    # Clean the signature/token prefix if it exists (e.g. Bearer )
+    provided_token = signature_header[7:] if signature_header.startswith("Bearer ") else signature_header
+    
+    # 1. Try dynamic HMAC validation first for backwards compatibility
+    hash_object = hmac.new(secret.encode('utf-8'), msg=payload_body, digestmod=hashlib.sha256)
+    expected_hmac = hash_object.hexdigest()
+    
+    # Handle optional "sha256=" prefix if provider sends it
+    cmp_token = provided_token[7:] if provided_token.startswith("sha256=") else provided_token
+    
+    if hmac.compare_digest(cmp_token, expected_hmac):
+        return True
+        
+    # 2. Fall back to simple static token comparison for non-HMAC providers like Support
+    expected_token = secret[7:] if secret.startswith("Bearer ") else secret
+    return hmac.compare_digest(provided_token, expected_token)
 
 def validate_slack(payload_body: bytes, secret: str, request: Request) -> bool:
     signature = request.headers.get("X-Slack-Signature")

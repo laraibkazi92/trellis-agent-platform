@@ -97,21 +97,6 @@
                         <span class="text-sm font-mono font-bold bg-green-100 text-green-600 px-2 py-0.5 rounded border border-green-200 uppercase">Online</span>
                         {% endif %}
                     </div>
-                    <p class="text-neutral-500 dark:text-neutral-400 mt-4 font-mono text-sm max-w-3xl">
-                        {{ tool.description }}
-                    </p>
-                    {% if is_admin and tool.health.status != 'Online' %}
-                    <div class="mt-4 p-4 bg-red-50 border border-red-200 rounded">
-                        <h4 class="text-red-800 font-bold mb-2">Health Issues (Failures: {{ tool.health.consecutive_failures }})</h4>
-                        {% if tool.health.last_error %}
-                        <pre class="text-xs text-red-600 font-mono overflow-auto max-h-32 mb-4">{{ tool.health.last_error }}</pre>
-                        {% endif %}
-                        <form method="POST" action="/reset-health/tool/{{ tool.name }}">
-<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                            <button type="submit" class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 text-xs font-bold uppercase rounded">Reset Health Status</button>
-                        </form>
-                    </div>
-                    {% endif %}
                 </div>
                 <button onclick="document.getElementById('details-{{ loop.index }}').classList.add('hidden')" class="text-neutral-400 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors uppercase text-xs font-mono font-bold tracking-widest">
                     Close [X]
@@ -119,8 +104,32 @@
             </div>
 
             <!-- Modal Content -->
-            <div class="flex-grow overflow-y-auto p-8">
-                <div class="flex flex-col lg:flex-row gap-12">
+            <div class="flex-grow overflow-y-auto p-8 space-y-8">
+                <!-- Tool Description -->
+                <div class="bg-neutral-50/50 dark:bg-neutral-950/50 border border-neutral-100 dark:border-neutral-800 p-6">
+                    <div class="flex items-center gap-3 mb-4">
+                        <div class="w-1.5 h-5 bg-accent dark:bg-accent-dark"></div>
+                        <span class="text-xs font-bold text-neutral-400 dark:text-neutral-500 uppercase tracking-[0.3em] font-mono">Description</span>
+                    </div>
+                    <p class="whitespace-pre-wrap text-neutral-700 dark:text-neutral-300 font-mono text-sm leading-relaxed max-w-full overflow-x-auto">
+                        {{ tool.description }}
+                    </p>
+                </div>
+
+                {% if is_admin and tool.health.status != 'Online' %}
+                <div class="p-6 bg-red-50/10 border border-red-500/20 rounded-sm">
+                    <h4 class="text-red-500 font-bold font-mono text-sm mb-2 uppercase tracking-wider">Health Issues (Failures: {{ tool.health.consecutive_failures }})</h4>
+                    {% if tool.health.last_error %}
+                    <pre class="text-xs text-red-400 font-mono overflow-auto max-h-32 mb-4 bg-neutral-950/50 p-4 border border-neutral-800">{{ tool.health.last_error }}</pre>
+                    {% endif %}
+                    <form method="POST" action="/reset-health/tool/{{ tool.name }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <button type="submit" class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 text-xs font-bold font-mono uppercase tracking-wider">Reset Health Status</button>
+                    </form>
+                </div>
+                {% endif %}
+
+                <div class="flex flex-col lg:flex-row gap-12 pt-4 border-t border-neutral-100 dark:border-neutral-800">
                     <!-- Inputs Column -->
                     <div class="flex-1">
                         <div class="flex items-center gap-3 mb-6">
