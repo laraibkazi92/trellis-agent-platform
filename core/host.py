@@ -297,11 +297,13 @@ def _register_admin_tools(agent: Agent):
 
 def _register_mcp_tool(agent: Agent, mcp_tool: Any):
     safe_mcp_tool = copy.deepcopy(mcp_tool) if hasattr(mcp_tool, "model_copy") else mcp_tool
+    tool_name_for_agent = safe_mcp_tool.name
     
     async def tool_wrapper(ctx: RunContext[None], **kwargs: Any) -> Any:
         if health_monitor.get_status("tool", safe_mcp_tool.name).get("status") == "Offline":
             return "SYSTEM: Tool offline."
         kwargs["__user_id"] = user_id_var.get()
+        kwargs["__agent_name"] = agent.name
         client = await get_hub_client()
         result = await client.call_tool(safe_mcp_tool.name, kwargs)
         return result.content

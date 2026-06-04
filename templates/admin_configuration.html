@@ -63,11 +63,8 @@
                         </div>
                         
                         {% if item.is_global %}
-                        <button type="submit" 
-                                name="secret_key" 
-                                value="{{ item.key }}" 
-                                formaction="/admin/configuration/delete" 
-                                onclick="return confirm('Remove global override for {{ item.key }}? Users will fall back to their personal keys.');"
+                        <button type="button" 
+                                onclick="if (confirm('Remove global override for {{ item.key }}? Users will fall back to their personal keys.')) { document.getElementById('delete-secret-key').value = '{{ item.key }}'; document.getElementById('delete-override-form').submit(); }"
                                 class="text-xs text-red-500 hover:text-red-700 font-mono uppercase transition-colors">
                             Remove Override
                         </button>
@@ -125,6 +122,12 @@
         </form>
     </div>
 </div>
+
+<!-- Hidden dedicated form for deleting overrides -->
+<form id="delete-override-form" action="/admin/configuration/delete" method="POST" class="hidden">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="secret_key" id="delete-secret-key">
+</form>
 
 <script>
 document.addEventListener('DOMContentLoaded', function() {

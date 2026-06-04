@@ -9,7 +9,9 @@ from core.dependencies import templates, identity_mgr, CSRFRoute
 from core.routers.admin import sanitize_name, commit_to_github
 from core.discovery import get_agent_required_secrets, get_agent_required_variables
 
-router = APIRouter(tags=["Background Agents"])
+from datetime import datetime
+
+router = APIRouter(tags=["Background Agents"], route_class=CSRFRoute)
 
 @router.get("/background-agents", response_class=HTMLResponse)
 async def background_agents_view(request: Request):
@@ -164,6 +166,41 @@ async def configure_background_agent_secrets(request: Request, agent_name: str):
         await asyncio.to_thread(identity_mgr.save_user_variables, target_user_id, current_variables)
     
     request.session["flash_msg"] = f"Configuration and secrets saved for {agent_name} successfully."
+    return RedirectResponse(url='/background-agents', status_code=303)
+
+@router.post("/background-agents/{agent_name}/run")
+async def run_background_agent_manual(request: Request, agent_name: str):
+    user = await get_current_user(request)
+    if not user:
+        return RedirectResponse(url='/login')
+        
+    if not is_admin(request):
+        request.session["flash_msg"] = "Admin access required to run background agents."
+        return RedirectResponse(url='/background-agents', status_code=303)
+        
+    safe_name = sanitize_name(agent_name)
+    if not safe_name:
+        request.session["flash_msg"] = "Invalid agent name parameter."
+        return RedirectResponse(url='/background-agents', status_code=303)
+        
+    config = await asyncio.to_thread(identity_mgr.get_agent_config, safe_name)
+    if not config or config.get("type") != "background":
+        request.session["flash_msg"] = "Background agent not found."
+        return RedirectResponse(url='/background-agents', status_code=303)
+        
+    # Deferred import to prevent potential circular dependency during startup
+    from core.tasks import run_background_agent
+    
+    now = datetime.now()
+    xml_payload = f"<event_payload><![CDATA[\nManual execution triggered at {now.isoformat()}\n]]></event_payload>"
+    
+    await run_background_agent.kiq(
+        agent_name=safe_name,
+        prompt=xml_payload,
+        user_id=f"svc_agent_{safe_name}"
+    )
+    
+    request.session["flash_msg"] = f"Task for '{safe_name}' has been successfully enqueued for execution."
     return RedirectResponse(url='/background-agents', status_code=303)
 
 @router.post("/background-agents/config")

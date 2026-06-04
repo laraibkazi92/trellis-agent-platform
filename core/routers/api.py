@@ -12,7 +12,7 @@ async def get_tools_index(request: Request):
     if not user:
         return []
     tools = await discover_tools()
-    return [{"name": t.name, "description": t.description, "runtime": t.runtime} for t in tools]
+    return [{"name": t.get("name", ""), "description": t.get("description", ""), "runtime": t.get("runtime", "")} for t in tools]
 
 @router.get("/search-index/agents")
 async def get_agents_index(request: Request):
@@ -20,7 +20,7 @@ async def get_agents_index(request: Request):
     if not user:
         return []
     agents = await discover_agents(user_id=user.get('sub'), include_background=False)
-    return [{"name": a.name, "description": a.description, "author": a.author, "tags": a.tags} for a in agents]
+    return [{"name": a.get("name", ""), "description": a.get("description", ""), "author": a.get("author", ""), "tags": a.get("tags", [])} for a in agents]
 
 @router.get("/search-index/background-agents")
 async def get_background_agents_index(request: Request):

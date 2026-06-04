@@ -30,11 +30,18 @@ if not DEV_MODE:
     if missing:
         raise ValueError(f"Missing required environment variables for UI: {', '.join(missing)}")
 
-from core.routers import auth, marketplace, profile, admin, configuration, docs, status, background, api
+from core.routers import auth, marketplace, profile, admin, configuration, docs, status, background, api, reports
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(title="Marketplace UI", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
+
+# Ensure workspace/reports directory exists
+REPORTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "workspace", "reports")
+os.makedirs(REPORTS_DIR, exist_ok=True)
+
+app.mount("/reports/view", StaticFiles(directory=REPORTS_DIR), name="reports_static")
 
 cors_origins_str = os.getenv("CORS_ALLOWED_ORIGINS", "")
 if DEV_MODE:
@@ -59,3 +66,4 @@ app.include_router(docs.router)
 app.include_router(status.router)
 app.include_router(background.router)
 app.include_router(api.router)
+app.include_router(reports.router)

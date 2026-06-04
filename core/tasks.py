@@ -153,6 +153,7 @@ async def run_background_agent(agent_name: str, prompt: str, user_id: str) -> st
                     if health_monitor.get_status("tool", safe_tool.name).get("status") == "Offline":
                         return "SYSTEM: Tool offline."
                     kwargs["__user_id"] = user_id
+                    kwargs["__agent_name"] = agent.name
                     client = await get_hub_client()
                     result = await client.call_tool(safe_tool.name, kwargs)
                     return result.content

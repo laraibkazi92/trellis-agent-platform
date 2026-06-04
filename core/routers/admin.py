@@ -289,8 +289,12 @@ async def save_admin_configuration(request: Request):
                 current_secrets[key] = val_str
                 secrets_updated = True
         elif key in known_variables:
-            current_variables[key] = val_str
-            variables_updated = True
+            if val_str:
+                current_variables[key] = val_str
+                variables_updated = True
+            elif key in current_variables:
+                del current_variables[key]
+                variables_updated = True
             
     if secrets_updated:
         await asyncio.to_thread(identity_mgr.save_global_secrets, current_secrets)
