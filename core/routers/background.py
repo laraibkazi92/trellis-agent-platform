@@ -4,9 +4,10 @@ import yaml
 from typing import Dict, Any, List
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
-from core.auth import get_current_user
+from core.auth import get_current_user, is_admin
 from core.dependencies import templates, identity_mgr, CSRFRoute
 from core.routers.admin import sanitize_name, commit_to_github
+from core.discovery import get_agent_required_secrets, get_agent_required_variables
 
 router = APIRouter(tags=["Background Agents"])
 
@@ -18,6 +19,8 @@ async def background_agents_view(request: Request):
         
     agent_names = await asyncio.to_thread(identity_mgr.list_agents)
     disabled_agents = identity_mgr.get_disabled_agents()
+    global_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
+    global_variables = await asyncio.to_thread(identity_mgr.get_global_variables)
     
     background_agents = []
     for name in agent_names:
@@ -25,13 +28,43 @@ async def background_agents_view(request: Request):
         if config_data and config_data.get("type") == "background":
             status = "disabled" if name in disabled_agents else "active"
             skills_content = await asyncio.to_thread(identity_mgr.get_agent_skills, name) or ""
+            
+            required_secrets = await get_agent_required_secrets(config_data)
+            required_variables = await get_agent_required_variables(config_data)
+            is_configured = True
+            missing_secrets = []
+            missing_variables = []
+            
+            user_required_secrets = [s for s in required_secrets if s not in global_secrets]
+            user_required_variables = [s for s in required_variables if s not in global_variables]
+            
+            if user_required_secrets:
+                svc_secrets = await asyncio.to_thread(identity_mgr.get_user_secrets, f"svc_agent_{name}")
+                for s in user_required_secrets:
+                    if s not in svc_secrets:
+                        is_configured = False
+                        missing_secrets.append(s)
+                        
+            if user_required_variables:
+                svc_variables = await asyncio.to_thread(identity_mgr.get_user_variables, f"svc_agent_{name}")
+                for s in user_required_variables:
+                    if s not in svc_variables:
+                        is_configured = False
+                        missing_variables.append(s)
+            
             background_agents.append({
                 "name": name,
                 "config": config_data,
                 "skills": skills_content,
-                "status": status
+                "status": status,
+                "required_secrets": user_required_secrets,
+                "missing_secrets": missing_secrets,
+                "required_variables": user_required_variables,
+                "missing_variables": missing_variables,
+                "is_configured": is_configured
             })
 
+    background_agents.sort(key=lambda x: x["name"].lower())
     all_mcps = await asyncio.to_thread(identity_mgr.list_mcps)
     # Fetch all tools for configuration modal
     all_tools_data = []
@@ -71,6 +104,7 @@ async def background_agents_view(request: Request):
             "all_agents": agent_names,
             "all_tools": all_tools_data,
             "all_mcps": all_mcps,
+            "is_admin": is_admin(request),
             "queue": {
                 "pending": [],
                 "processing": [],
@@ -80,12 +114,57 @@ async def background_agents_view(request: Request):
         }
     )
 
-def is_admin(request: Request) -> bool:
-    # Need to reimplement this or import it correctly. 
-    # Wait, the old code had `is_admin(request)` but it was not imported. 
-    # Ah, let's just copy what the old code had or import it from core.routers.admin
-    from core.routers.admin import is_admin
-    return is_admin(request)
+@router.post("/background-agents/{agent_name}/configure-secrets")
+async def configure_background_agent_secrets(request: Request, agent_name: str):
+    user = await get_current_user(request)
+    if not user:
+        return RedirectResponse(url='/login')
+        
+    if not is_admin(request):
+        request.session["flash_msg"] = "Admin access required to configure background agents."
+        return RedirectResponse(url='/background-agents', status_code=303)
+        
+    form = await request.form()
+    
+    config = await asyncio.to_thread(identity_mgr.get_agent_config, agent_name)
+    if not config or config.get("type") != "background":
+        request.session["flash_msg"] = "Background agent not found."
+        return RedirectResponse(url='/background-agents', status_code=303)
+        
+    target_user_id = f"svc_agent_{agent_name}"
+        
+    current_secrets = await asyncio.to_thread(identity_mgr.get_user_secrets, target_user_id)
+    global_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
+    current_variables = await asyncio.to_thread(identity_mgr.get_user_variables, target_user_id)
+    global_variables = await asyncio.to_thread(identity_mgr.get_global_variables)
+    
+    required_secrets = await get_agent_required_secrets(config)
+    required_variables = await get_agent_required_variables(config)
+    
+    secrets_updated = False
+    variables_updated = False
+    
+    for key, value in form.items():
+        if key in ("csrf_token",):
+            continue
+        
+        val_str = str(value).strip()
+        
+        if key in required_secrets and key not in global_secrets:
+            if val_str:
+                current_secrets[key] = val_str
+                secrets_updated = True
+        elif key in required_variables and key not in global_variables:
+            current_variables[key] = val_str
+            variables_updated = True
+            
+    if secrets_updated:
+        await asyncio.to_thread(identity_mgr.save_user_secrets, target_user_id, current_secrets)
+    if variables_updated:
+        await asyncio.to_thread(identity_mgr.save_user_variables, target_user_id, current_variables)
+    
+    request.session["flash_msg"] = f"Configuration and secrets saved for {agent_name} successfully."
+    return RedirectResponse(url='/background-agents', status_code=303)
 
 @router.post("/background-agents/config")
 async def update_background_trigger(

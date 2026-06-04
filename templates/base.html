@@ -51,7 +51,110 @@
                 }, 2000);
             });
         }
+
+        class PaginatedGrid {
+            constructor(config) {
+                this.searchInput = config.searchInput;
+                this.items = config.items;
+                this.fuseInstance = config.fuseInstance;
+                this.itemsPerPage = config.itemsPerPage || 12;
+                this.paginationControls = config.paginationControls;
+                this.prevButton = config.prevButton;
+                this.nextButton = config.nextButton;
+                this.pageInfo = config.pageInfo;
+                this.datasetKey = config.datasetKey;
+
+                this.currentPage = 1;
+                this.filteredItems = [...this.items];
+
+                this.init();
+            }
+
+            init() {
+                if (this.prevButton && this.nextButton) {
+                    this.prevButton.addEventListener('click', () => {
+                        if (this.currentPage > 1) {
+                            this.currentPage--;
+                            this.update();
+                            window.scrollTo({ top: 0, behavior: 'smooth' });
+                        }
+                    });
+
+                    this.nextButton.addEventListener('click', () => {
+                        const totalPages = Math.ceil(this.filteredItems.length / this.itemsPerPage);
+                        if (this.currentPage < totalPages) {
+                            this.currentPage++;
+                            this.update();
+                            window.scrollTo({ top: 0, behavior: 'smooth' });
+                        }
+                    });
+                }
+
+                if (this.searchInput) {
+                    this.searchInput.addEventListener('input', (e) => {
+                        const query = e.target.value;
+                        if (!query) {
+                            this.filteredItems = [...this.items];
+                        } else {
+                            const results = this.fuseInstance.search(query);
+                            const matchedNames = new Set(results.map(r => r.item.name));
+                            this.filteredItems = this.items.filter(card => matchedNames.has(card.dataset[this.datasetKey]));
+                        }
+                        this.currentPage = 1;
+                        this.update();
+                    });
+                }
+
+                this.update();
+            }
+
+            update() {
+                const totalPages = Math.ceil(this.filteredItems.length / this.itemsPerPage);
+                
+                if (totalPages <= 1) {
+                    if (this.paginationControls) {
+                        this.paginationControls.classList.add('hidden');
+                        this.paginationControls.classList.remove('flex');
+                    }
+                } else {
+                    if (this.paginationControls) {
+                        this.paginationControls.classList.remove('hidden');
+                        this.paginationControls.classList.add('flex');
+                    }
+                }
+
+                if (this.currentPage > totalPages) this.currentPage = totalPages || 1;
+
+                if (this.pageInfo) {
+                    this.pageInfo.textContent = `Page ${this.currentPage} of ${totalPages || 1}`;
+                    this.pageInfo.setAttribute('aria-label', `Page ${this.currentPage} of ${totalPages || 1}`);
+                }
+                
+                if (this.prevButton && this.nextButton) {
+                    this.prevButton.disabled = this.currentPage === 1;
+                    this.nextButton.disabled = this.currentPage === totalPages || totalPages === 0;
+                    
+                    if (this.currentPage === 1) {
+                        this.prevButton.removeAttribute('aria-current');
+                    }
+                }
+
+                const startIndex = (this.currentPage - 1) * this.itemsPerPage;
+                const endIndex = startIndex + this.itemsPerPage;
+
+                this.items.forEach(item => {
+                    item.classList.add('is-hidden');
+                    item.style.display = ''; // Clear inline styles
+                });
+                this.filteredItems.slice(startIndex, endIndex).forEach(item => {
+                    item.classList.remove('is-hidden');
+                });
+            }
+        }
     </script>
+    <style>
+        .is-hidden { display: none !important; }
+    </style>
 </head>
 <body class="bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-50 min-h-screen antialiased selection:bg-accent selection:text-white dark:selection:bg-accent-dark flex flex-col">
     <nav class="border-b border-neutral-200 dark:border-neutral-800 p-4 px-6 flex flex-wrap gap-4 justify-between items-center bg-white dark:bg-neutral-900 sticky top-0 z-40">
@@ -83,9 +186,9 @@
             </div>
         </div>
         <div class="relative group inline-block">
-            <a href="/secrets" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/secrets' %}text-accent dark:text-accent-dark{% endif %}">Tool Secrets</a>
+            <a href="/configuration" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/configuration' %}text-accent dark:text-accent-dark{% endif %}">Configuration</a>
             <div class="absolute hidden group-hover:block w-56 top-full mt-2 left-1/2 -translate-x-1/2 bg-neutral-800 text-white text-xs p-2 rounded shadow-lg z-50 text-center font-sans normal-case tracking-normal">
-                Third-party credentials (e.g., Issues, Support etc.) securely stored for use by your Agents and Tools.
+                Third-party credentials and configuration variables securely stored for use by your Agents and Tools.
             </div>
         </div>
         <span class="text-neutral-300 dark:text-neutral-700 hidden sm:inline">|</span>
@@ -146,6 +249,16 @@
             overlay.classList.remove('hidden');
             overlay.classList.add('flex');
         }
+
+        // Close modals on Escape key press
+        document.addEventListener('keydown', function(event) {
+            if (event.key === 'Escape') {
+                const openModals = document.querySelectorAll('.fixed.inset-0.z-50:not(.hidden)');
+                openModals.forEach(modal => {
+                    modal.classList.add('hidden');
+                });
+            }
+        });
     </script>
 </body>
 </html>

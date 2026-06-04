@@ -28,6 +28,7 @@ class MCPConfig(BaseModel):
     args: Optional[List[str]] = Field(default_factory=list)
     env: Optional[Dict[str, str]] = Field(default_factory=dict)
     secrets: Optional[List[str]] = Field(default_factory=list, description="List of user secrets required by this MCP.")
+    variables: Optional[List[str]] = Field(default_factory=list, description="List of non-sensitive configuration variables required by this MCP.")
     tools: Optional[List[MCPToolDefinition]] = Field(default_factory=list, description="Optional statically defined tools to bypass dynamic discovery.")
 
 class ToolConfig(BaseModel):
@@ -40,3 +41,4 @@ class ToolConfig(BaseModel):
     inputs: Optional[Dict[str, Any]] = None
     outputs: Optional[Dict[str, Any]] = None
     secrets: Optional[List[str]] = Field(default_factory=list)
+    variables: Optional[List[str]] = Field(default_factory=list)

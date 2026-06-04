@@ -11,22 +11,19 @@
     </div>
 
     <!-- Tab Navigation -->
-    <div class="border-b border-neutral-200 dark:border-neutral-800 mb-6 font-mono text-sm tracking-wider uppercase flex overflow-x-auto">
-        <button onclick="switchTab('details')" id="tab-btn-details" class="px-6 py-3 border-b-2 font-bold transition-colors {% if active_tab == 'details' %}border-accent text-accent dark:border-accent-dark dark:text-accent-dark{% else %}border-transparent text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100{% endif %}">
-            Details
+    <div class="border-b border-neutral-200 dark:border-neutral-800 mb-6 font-mono text-sm tracking-wider uppercase flex overflow-x-auto" role="tablist">
+        <button role="tab" aria-controls="tab-content-details" aria-selected="{% if active_tab in ['details', 'metrics'] %}true{% else %}false{% endif %}" onclick="switchTab('details')" id="tab-btn-details" class="px-6 py-3 border-b-2 font-bold transition-colors {% if active_tab in ['details', 'metrics'] %}border-accent text-accent dark:border-accent-dark dark:text-accent-dark{% else %}border-transparent text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100{% endif %}">
+            Details & Metrics
         </button>
-        <button onclick="switchTab('metrics')" id="tab-btn-metrics" class="px-6 py-3 border-b-2 font-bold transition-colors {% if active_tab == 'metrics' %}border-accent text-accent dark:border-accent-dark dark:text-accent-dark{% else %}border-transparent text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100{% endif %}">
-            Metrics & Usage
-        </button>
-        <button onclick="switchTab('keys')" id="tab-btn-keys" class="px-6 py-3 border-b-2 font-bold transition-colors {% if active_tab == 'keys' %}border-accent text-accent dark:border-accent-dark dark:text-accent-dark{% else %}border-transparent text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100{% endif %}">
+        <button role="tab" aria-controls="tab-content-keys" aria-selected="{% if active_tab == 'keys' %}true{% else %}false{% endif %}" onclick="switchTab('keys')" id="tab-btn-keys" class="px-6 py-3 border-b-2 font-bold transition-colors {% if active_tab == 'keys' %}border-accent text-accent dark:border-accent-dark dark:text-accent-dark{% else %}border-transparent text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100{% endif %}">
             API Keys
         </button>
     </div>
 
     <!-- Tab Contents -->
     
-    <!-- Details Tab -->
-    <div id="tab-content-details" class="{% if active_tab != 'details' %}hidden{% endif %} space-y-6">
+    <!-- Details & Metrics Tab -->
+    <div role="tabpanel" aria-labelledby="tab-btn-details" id="tab-content-details" class="{% if active_tab not in ['details', 'metrics'] %}hidden{% endif %} space-y-6">
         <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 p-6">
             <h3 class="text-lg font-bold uppercase tracking-wider mb-4 border-b border-neutral-200 dark:border-neutral-800 pb-2">Profile Information</h3>
             <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -44,10 +41,7 @@
                 </div>
             </div>
         </div>
-    </div>
 
-    <!-- Metrics Tab -->
-    <div id="tab-content-metrics" class="{% if active_tab != 'metrics' %}hidden{% endif %} space-y-6">
         <!-- Summary Cards -->
         <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
             <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 p-4">
@@ -132,7 +126,7 @@
     </div>
 
     <!-- API Keys Tab -->
-    <div id="tab-content-keys" class="{% if active_tab != 'keys' %}hidden{% endif %} space-y-6">
+    <div role="tabpanel" aria-labelledby="tab-btn-keys" id="tab-content-keys" class="{% if active_tab != 'keys' %}hidden{% endif %} space-y-6">
         
         {% if generated_key %}
         <div class="border border-green-500 text-green-700 dark:text-green-400 px-6 py-5 mb-8 bg-green-50/50 dark:bg-green-900/10">
@@ -196,22 +190,32 @@
 
 <script>
     function switchTab(tabName) {
-        const tabs = ['details', 'metrics', 'keys'];
+        if (tabName === 'metrics') {
+            tabName = 'details';
+        }
+        
+        const tabs = ['details', 'keys'];
         
         tabs.forEach(t => {
             const btn = document.getElementById('tab-btn-' + t);
             const content = document.getElementById('tab-content-' + t);
+            const isActive = t === tabName;
             
-            if (t === tabName) {
-                // Activate
-                content.classList.remove('hidden');
-                btn.classList.add('border-accent', 'text-accent', 'dark:border-accent-dark', 'dark:text-accent-dark');
-                btn.classList.remove('border-transparent', 'text-neutral-500');
-            } else {
-                // Deactivate
-                content.classList.add('hidden');
-                btn.classList.remove('border-accent', 'text-accent', 'dark:border-accent-dark', 'dark:text-accent-dark');
-                btn.classList.add('border-transparent', 'text-neutral-500');
+            if (content) {
+                content.classList.toggle('hidden', !isActive);
+            }
+            if (btn) {
+                btn.setAttribute('aria-selected', isActive.toString());
+                
+                // Toggle active classes
+                btn.classList.toggle('border-accent', isActive);
+                btn.classList.toggle('text-accent', isActive);
+                btn.classList.toggle('dark:border-accent-dark', isActive);
+                btn.classList.toggle('dark:text-accent-dark', isActive);
+                
+                // Toggle inactive classes
+                btn.classList.toggle('border-transparent', !isActive);
+                btn.classList.toggle('text-neutral-500', !isActive);
             }
         });
 
@@ -224,7 +228,10 @@
     // Ensure active tab on load is correct
     document.addEventListener('DOMContentLoaded', () => {
         const urlParams = new URLSearchParams(window.location.search);
-        const activeTab = urlParams.get('tab') || '{{ active_tab }}' || 'details';
+        let activeTab = urlParams.get('tab') || '{{ active_tab }}' || 'details';
+        if (activeTab === 'metrics') {
+            activeTab = 'details';
+        }
         switchTab(activeTab);
     });
 </script>

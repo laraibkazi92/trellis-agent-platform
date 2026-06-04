@@ -124,9 +124,14 @@
     };
 </script>
 
-<div class="mb-8">
-    <h1 class="text-3xl font-bold font-mono tracking-tight uppercase">Background Agents</h1>
-    <p class="text-neutral-500 dark:text-neutral-400 mt-2">Manage and monitor your event-driven and scheduled background agents.</p>
+<div class="mb-8 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+    <div>
+        <h1 class="text-3xl font-bold font-mono tracking-tight uppercase">Background Agents</h1>
+        <p class="text-neutral-500 dark:text-neutral-400 mt-2">Manage and monitor your event-driven and scheduled background agents.</p>
+    </div>
+    <div class="relative w-full sm:w-72">
+        <input type="text" id="bg-agent-search" placeholder="Search..." class="w-full bg-white dark:bg-neutral-900 border border-neutral-300 dark:border-neutral-700 px-4 py-2 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 placeholder-neutral-500">
+    </div>
 </div>
 
 <!-- Queue Observability -->
@@ -149,79 +154,150 @@
     </div>
 </div>
 
-<div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 shadow-sm overflow-hidden mb-12">
-    <div class="overflow-x-auto">
-        <table class="w-full text-left border-collapse">
-            <thead>
-                <tr class="bg-neutral-50 dark:bg-neutral-950 border-b border-neutral-200 dark:border-neutral-800">
-                    <th class="p-4 font-mono text-xs uppercase tracking-widest text-neutral-500 font-bold">Agent Name</th>
-                    <th class="p-4 font-mono text-xs uppercase tracking-widest text-neutral-500 font-bold">Trigger Type</th>
-                    <th class="p-4 font-mono text-xs uppercase tracking-widest text-neutral-500 font-bold">Configuration</th>
-                    <th class="p-4 font-mono text-xs uppercase tracking-widest text-neutral-500 font-bold">Status</th>
-                    <th class="p-4 font-mono text-xs uppercase tracking-widest text-neutral-500 font-bold text-right">Actions</th>
-                </tr>
-            </thead>
-            <tbody class="divide-y divide-neutral-200 dark:divide-neutral-800">
-                {% for agent in background_agents %}
-                <tr class="hover:bg-neutral-50/50 dark:hover:bg-neutral-800/50 transition-colors">
-                    <td class="p-4">
-                        <div class="flex items-center gap-2">
-                            <i data-lucide="bot" class="w-5 h-5 text-accent dark:text-accent-dark"></i>
-                            <span class="font-bold text-neutral-900 dark:text-white">{{ agent.name }}</span>
-                        </div>
-                    </td>
-                    <td class="p-4">
-                        {% set trigger_type = agent.config.get('trigger', {}).get('type', 'None') %}
-                        <span class="inline-flex items-center px-2 py-1 rounded text-xs font-mono font-bold uppercase tracking-wider
-                            {% if trigger_type == 'cron' %}bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400
-                            {% elif trigger_type == 'webhook' %}bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400
-                            {% else %}bg-neutral-100 text-neutral-700 dark:bg-neutral-800 dark:text-neutral-400{% endif %}">
-                            {{ trigger_type }}
-                        </span>
-                    </td>
-                    <td class="p-4 font-mono text-sm text-neutral-600 dark:text-neutral-400">
-                        {% if trigger_type == 'cron' %}
-                            <div class="flex flex-col gap-1">
-                                <span class="font-bold">{{ agent.config.get('trigger', {}).get('expression', '* * * * *') }}</span>
-                                <span class="text-xs text-neutral-500 cron-readable">{{ agent.config.get('trigger', {}).get('expression', '* * * * *') }}</span>
-                            </div>
-                        {% elif trigger_type == 'webhook' %}
-                            <div class="flex flex-col gap-1">
-                                <span>Provider: <span class="font-bold text-neutral-800 dark:text-neutral-200">{{ agent.config.get('trigger', {}).get('provider', 'generic') }}</span></span>
-                                <span>URL: <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded text-xs">/webhooks/{{ agent.name }}</code></span>
-                            </div>
-                        {% else %}
-                            Not configured
-                        {% endif %}
-                    </td>
-                    <td class="p-4">
-                        <span class="inline-flex items-center gap-1.5 px-2 py-1 rounded text-xs font-mono font-bold uppercase tracking-wider 
-                            {% if agent.status == 'active' %}bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400
-                            {% else %}bg-neutral-100 text-neutral-700 dark:bg-neutral-800 dark:text-neutral-400{% endif %}">
-                            <span class="w-1.5 h-1.5 rounded-full {% if agent.status == 'active' %}bg-emerald-500{% else %}bg-neutral-500{% endif %}"></span>
-                            {{ agent.status }}
-                        </span>
-                    </td>
-                    <td class="p-4 text-right">
-                        {% if is_admin %}
-                        <button onclick="openConfigModal('{{ agent.name }}')" class="text-accent hover:text-accent-dark dark:text-accent-dark dark:hover:text-accent transition-colors text-sm font-bold font-mono uppercase tracking-wide flex items-center justify-end gap-1 w-full">
-                            <i data-lucide="settings-2" class="w-4 h-4"></i> Configure
-                        </button>
-                        {% endif %}
-                    </td>
-                </tr>
-                {% else %}
-                <tr>
-                    <td colspan="5" class="p-8 text-center text-neutral-500 font-mono text-sm">No background agents found.</td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
+<!-- Background Agents Grid -->
+<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-12" id="bg-agents-grid">
+    {% for agent in background_agents %}
+    <div class="agent-card border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 p-6 hover:border-accent dark:hover:border-accent-dark transition-colors flex flex-col" data-agent-name="{{ agent.name }}">
+        <div class="flex justify-between items-start mb-2">
+            <h3 class="text-xl font-bold font-mono uppercase tracking-wider flex items-center gap-2">
+                {{ agent.name }}
+            </h3>
+            {% if is_admin %}
+            <button onclick="openConfigModal('{{ agent.name }}')" class="font-mono text-xs font-bold border border-neutral-900 dark:border-neutral-100 text-neutral-900 dark:text-neutral-100 hover:bg-neutral-900 hover:text-white dark:hover:bg-neutral-100 dark:hover:text-neutral-900 px-2 py-1 uppercase tracking-wider transition-colors">Configure</button>
+            {% endif %}
+        </div>
+        
+        <div class="flex items-center gap-2 mb-4">
+            <span class="text-[10px] font-mono font-bold bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400 px-2 py-0.5 rounded border border-neutral-200 dark:border-neutral-700 uppercase">v{{ agent.config.get('version', '0.1.0') }}</span>
+            <span class="text-[10px] font-mono font-bold {% if agent.status == 'active' %}bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-300 border-emerald-200{% else %}bg-neutral-100 text-neutral-600 dark:bg-neutral-800 dark:text-neutral-400 border-neutral-200{% endif %} px-2 py-0.5 rounded border uppercase">{{ agent.status }}</span>
+            {% if not agent.is_configured %}
+            <span class="text-[10px] font-mono font-bold text-orange-500 border border-orange-500/30 bg-orange-50 dark:bg-orange-900/20 px-2 py-0.5 rounded uppercase flex items-center gap-1" title="Missing: {{ (agent.missing_secrets + agent.missing_variables) | join(', ') }}">
+                <i data-lucide="triangle-alert" class="w-3 h-3"></i> UNCONFIGURED
+            </span>
+            {% elif agent.required_secrets or agent.required_variables %}
+            <span class="text-[10px] font-mono font-bold text-emerald-500 border border-emerald-500/30 bg-emerald-50 dark:bg-emerald-900/20 px-2 py-0.5 rounded uppercase flex items-center gap-1">
+                <i data-lucide="check-circle" class="w-3 h-3"></i> CONFIGURED
+            </span>
+            {% endif %}
+        </div>
+        
+        <p class="text-sm text-neutral-600 dark:text-neutral-400 mb-6 flex-grow">{{ agent.config.get('description', '') }}</p>
+
+        <div class="border-t border-neutral-100 dark:border-neutral-800/60 pt-4 mt-auto space-y-3">
+            <div class="flex justify-start gap-2 items-center text-xs font-mono text-neutral-500">
+                <span class="uppercase">Trigger:</span>
+                <span class="font-bold text-neutral-800 dark:text-neutral-300">
+                    {% if agent.config.get('trigger', {}).get('type') == 'cron' %}
+                        CRON (<span class="cron-readable text-accent dark:text-accent-dark">{{ agent.config.get('trigger', {}).get('expression') }}</span>)
+                    {% elif agent.config.get('trigger', {}).get('type') == 'webhook' %}
+                        Webhook ({{ agent.config.get('trigger', {}).get('provider') | uppercase }})
+                    {% else %}
+                        None
+                    {% endif %}
+                </span>
+            </div>
+            
+            {% if agent.required_secrets or agent.required_variables %}
+            <button onclick="document.getElementById('configure-secrets-{{ agent.name }}').classList.remove('hidden')" class="w-full border {% if not agent.is_configured %}border-orange-500 text-orange-600 hover:bg-orange-500 hover:text-white dark:border-orange-500/50 dark:text-orange-400 dark:hover:bg-orange-600/20{% else %}border-neutral-300 dark:border-neutral-700 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800{% endif %} text-xs font-bold uppercase tracking-wider px-3 py-2 text-center transition-colors font-mono">
+                Configure Agent
+            </button>
+            {% endif %}
+        </div>
     </div>
+    {% else %}
+    <div class="col-span-full border border-dashed border-neutral-300 dark:border-neutral-700 p-8 text-center text-sm font-mono text-neutral-500">
+        No background agents found.
+    </div>
+    {% endfor %}
 </div>
 
+<!-- Pagination Controls -->
+<nav id="pagination-controls" class="flex justify-center items-center gap-4 mb-12 font-mono text-sm hidden" aria-label="Pagination">
+    <button id="prev-page" aria-label="Previous page" class="px-4 py-2 border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-neutral-600 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark disabled:opacity-50 disabled:cursor-not-allowed transition-colors uppercase font-bold tracking-wider">Prev</button>
+    <span id="page-info" aria-current="page" class="text-neutral-600 dark:text-neutral-400">Page 1 of 1</span>
+    <button id="next-page" aria-label="Next page" class="px-4 py-2 border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-neutral-600 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark disabled:opacity-50 disabled:cursor-not-allowed transition-colors uppercase font-bold tracking-wider">Next</button>
+</nav>
 
-<!-- Modal -->
+{% for agent in background_agents %}
+    {% if agent.required_secrets or agent.required_variables %}
+    <div id="configure-secrets-{{ agent.name }}" class="hidden fixed inset-0 bg-neutral-950/80 z-50 flex items-center justify-center p-4">
+        <div class="bg-neutral-100 dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 p-6 max-w-lg w-full shadow-2xl relative flex flex-col max-h-[90vh] overflow-y-auto">
+            <div class="flex justify-between items-center mb-6">
+                <h3 class="text-xl font-bold uppercase tracking-wider flex items-center gap-2">
+                    <i data-lucide="settings-2" class="w-5 h-5 text-accent dark:text-accent-dark"></i>
+                    Configure {{ agent.name }}
+                </h3>
+                <button onclick="document.getElementById('configure-secrets-{{ agent.name }}').classList.add('hidden')" class="text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 uppercase text-sm font-mono font-bold">Close [X]</button>
+            </div>
+            
+            <form method="POST" action="/background-agents/{{ agent.name }}/configure-secrets" class="flex flex-col gap-6">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <p class="text-sm text-neutral-600 dark:text-neutral-400 font-mono">
+                    Provide the required configuration variables and secrets for this background agent. These are stored securely in its isolated service account.
+                </p>
+                
+                <div class="space-y-4">
+                    {% if agent.required_variables %}
+                    <div class="space-y-4">
+                        <h4 class="text-xs font-bold uppercase tracking-wider text-neutral-500 font-mono border-b border-neutral-200 dark:border-neutral-800 pb-1">Configuration Variables</h4>
+                        {% for var in agent.required_variables %}
+                        <div>
+                            <div class="flex justify-between items-center mb-1">
+                                <label for="{{ var }}_{{ agent.name }}" class="block font-mono text-sm font-bold uppercase tracking-wide">
+                                    {{ var }}
+                                </label>
+                                {% if var in agent.missing_variables %}
+                                <span class="text-[10px] text-orange-500 font-mono uppercase tracking-widest font-bold">Required</span>
+                                {% else %}
+                                <span class="text-[10px] text-emerald-500 font-mono uppercase tracking-widest">Configured</span>
+                                {% endif %}
+                            </div>
+                            <input type="text" 
+                                   name="{{ var }}" 
+                                   id="{{ var }}_{{ agent.name }}"
+                                   value="{{ agent.current_variables.get(var, '') }}"
+                                   placeholder="Enter {{ var }}"
+                                   class="w-full bg-white dark:bg-[#0a0a0a] border border-neutral-300 dark:border-neutral-700 px-4 py-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 placeholder-neutral-400 dark:placeholder-neutral-600">
+                        </div>
+                        {% endfor %}
+                    </div>
+                    {% endif %}
+
+                    {% if agent.required_secrets %}
+                    <div class="space-y-4 pt-2">
+                        <h4 class="text-xs font-bold uppercase tracking-wider text-neutral-500 font-mono border-b border-neutral-200 dark:border-neutral-800 pb-1">Sensitive Secrets</h4>
+                        {% for secret in agent.required_secrets %}
+                        <div>
+                            <div class="flex justify-between items-center mb-1">
+                                <label for="{{ secret }}_{{ agent.name }}" class="block font-mono text-sm font-bold uppercase tracking-wide">
+                                    {{ secret }}
+                                </label>
+                                {% if secret in agent.missing_secrets %}
+                                <span class="text-[10px] text-orange-500 font-mono uppercase tracking-widest font-bold">Required</span>
+                                {% else %}
+                                <span class="text-[10px] text-emerald-500 font-mono uppercase tracking-widest">Configured</span>
+                                {% endif %}
+                            </div>
+                            <input type="password" 
+                                   name="{{ secret }}" 
+                                   id="{{ secret }}_{{ agent.name }}"
+                                   placeholder="{% if secret not in agent.missing_secrets %}******** (Leave blank to keep current){% else %}Enter {{ secret }}{% endif %}"
+                                   class="w-full bg-white dark:bg-[#0a0a0a] border border-neutral-300 dark:border-neutral-700 px-4 py-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 placeholder-neutral-400 dark:placeholder-neutral-600">
+                        </div>
+                        {% endfor %}
+                    </div>
+                    {% endif %}
+                </div>
+                
+                <button type="submit" class="bg-accent hover:bg-accent-dark text-white font-mono font-bold text-sm uppercase py-3 px-8 transition-colors mt-2">
+                    Save Configuration
+                </button>
+            </form>
+        </div>
+    </div>
+    {% endif %}
+{% endfor %}
+
 <div id="config-modal" class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 hidden items-center justify-center p-4">
     <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 shadow-xl w-full max-w-4xl max-h-[90vh] flex flex-col">
         <div class="p-6 border-b border-neutral-200 dark:border-neutral-800 flex justify-between items-center bg-neutral-50 dark:bg-neutral-950 flex-shrink-0">
@@ -423,6 +499,32 @@
         }
     });
 
+
+    document.addEventListener('DOMContentLoaded', async () => {
+        try {
+            const response = await fetch('/api/v1/search-index/background-agents');
+            const bgAgentsData = await response.json();
+            
+            const fuseBgAgents = new Fuse(bgAgentsData, {
+                keys: ['name', 'description'],
+                threshold: 0.3
+            });
+
+            const paginatedGrid = new PaginatedGrid({
+                searchInput: document.getElementById('bg-agent-search'),
+                items: Array.from(document.querySelectorAll('.agent-card')),
+                fuseInstance: fuseBgAgents,
+                itemsPerPage: 12,
+                paginationControls: document.getElementById('pagination-controls'),
+                prevButton: document.getElementById('prev-page'),
+                nextButton: document.getElementById('next-page'),
+                pageInfo: document.getElementById('page-info'),
+                datasetKey: 'agentName'
+            });
+        } catch (err) {
+            console.error("Failed to load search index:", err);
+        }
+    });
 
     function openConfigModal(agentName) {
         document.getElementById('modal-agent-name').value = agentName;

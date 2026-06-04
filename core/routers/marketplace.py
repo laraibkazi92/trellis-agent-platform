@@ -4,7 +4,7 @@ import asyncio
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import templates, identity_mgr, CSRFRoute
-from core.discovery import discover_agents, discover_tools
+from core.discovery import discover_agents, discover_tools, get_agent_required_secrets, get_agent_required_variables
 from core.auth import is_admin
 
 router = APIRouter(route_class=CSRFRoute)
@@ -15,7 +15,7 @@ async def index(request: Request):
     if not user:
         return RedirectResponse(url='/login')
         
-    agents = await discover_agents()
+    agents = await discover_agents(user_id=user.get('sub'))
     tools = await discover_tools()
     
     dev_mode = os.getenv("DEV_MODE", "false").lower() == "true"
@@ -41,7 +41,8 @@ async def agents(request: Request):
     if not user:
         return RedirectResponse(url='/login')
         
-    agents = await discover_agents()
+    admin_access = is_admin(request)
+    agents = await discover_agents(user_id=user.get('sub'), include_background=False)
     
     flash_msg = request.session.pop("flash_msg", None)
     
@@ -56,9 +57,67 @@ async def agents(request: Request):
             "agents": agents,
             "flash_msg": flash_msg,
             "public_host_url": public_host_url,
-            "public_mcp_url": public_mcp_url
+            "public_mcp_url": public_mcp_url,
+            "is_admin": admin_access
         }
     )
+
+@router.post("/agents/{agent_name}/configure")
+async def configure_agent_secrets(request: Request, agent_name: str):
+    user = request.session.get('user')
+    if not user:
+        return RedirectResponse(url='/login')
+        
+    form = await request.form()
+    
+    # Check if agent is background and if user is admin
+    config = await asyncio.to_thread(identity_mgr.get_agent_config, agent_name)
+    if not config:
+        request.session["flash_msg"] = "Agent not found."
+        return RedirectResponse(url='/agents', status_code=303)
+        
+    is_bg = config.get("type") == "background"
+    
+    if is_bg:
+        if not is_admin(request):
+            request.session["flash_msg"] = "Admin access required to configure background agents."
+            return RedirectResponse(url='/agents', status_code=303)
+        target_user_id = f"svc_agent_{agent_name}"
+    else:
+        target_user_id = user['sub']
+        
+    current_secrets = await asyncio.to_thread(identity_mgr.get_user_secrets, target_user_id)
+    global_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
+    current_variables = await asyncio.to_thread(identity_mgr.get_user_variables, target_user_id)
+    global_variables = await asyncio.to_thread(identity_mgr.get_global_variables)
+    
+    required_secrets = await get_agent_required_secrets(config)
+    required_variables = await get_agent_required_variables(config)
+    
+    secrets_updated = False
+    variables_updated = False
+    
+    for key, value in form.items():
+        if key in ("csrf_token",):
+            continue
+            
+        val_str = str(value).strip()
+        
+        if key in required_secrets and key not in global_secrets:
+            if val_str:
+                current_secrets[key] = val_str
+                secrets_updated = True
+        elif key in required_variables and key not in global_variables:
+            current_variables[key] = val_str
+            variables_updated = True
+            
+    if secrets_updated:
+        await asyncio.to_thread(identity_mgr.save_user_secrets, target_user_id, current_secrets)
+    if variables_updated:
+        await asyncio.to_thread(identity_mgr.save_user_variables, target_user_id, current_variables)
+    
+    request.session["flash_msg"] = f"Configuration and secrets saved for {agent_name} successfully."
+    return RedirectResponse(url='/agents', status_code=303)
 
 @router.get("/tools", response_class=HTMLResponse)
 async def tools(request: Request):

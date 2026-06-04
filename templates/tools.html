@@ -13,9 +13,9 @@
     </div>
 </div>
 
-<div class="flex flex-col gap-4 mb-20" id="tools-grid">
+<div class="flex flex-col gap-4 mb-8" id="tools-grid">
     {% for tool in tools %}
-    <div class="tool-card group border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 hover:border-accent dark:hover:border-accent-dark transition-all duration-300 flex flex-col md:flex-row md:items-center p-4 gap-6" data-tool-name="{{ tool.name }}">
+    <div class="tool-card group border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 hover:border-accent dark:hover:border-accent-dark transition-all duration-300 flex flex-col md:flex-row md:items-center p-4 gap-6" data-tool-name="{{ tool.name }}" data-modal-id="details-{{ loop.index }}">
         <!-- Status Indicator -->
         <div class="hidden md:block w-1 self-stretch {% if tool.health.status == 'Offline' %}bg-red-500{% elif tool.health.status == 'Degraded' %}bg-yellow-500{% else %}bg-green-500{% endif %} transition-colors"></div>
 
@@ -256,70 +256,65 @@
     {% endfor %}
 </div>
 
+<!-- Pagination Controls -->
+<nav id="pagination-controls" class="flex justify-center items-center gap-4 mb-20 font-mono text-sm hidden" aria-label="Pagination">
+    <button id="prev-page" aria-label="Previous page" class="px-4 py-2 border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-neutral-600 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark disabled:opacity-50 disabled:cursor-not-allowed transition-colors uppercase font-bold tracking-wider">Prev</button>
+    <span id="page-info" aria-current="page" class="text-neutral-600 dark:text-neutral-400">Page 1 of 1</span>
+    <button id="next-page" aria-label="Next page" class="px-4 py-2 border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-neutral-600 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark disabled:opacity-50 disabled:cursor-not-allowed transition-colors uppercase font-bold tracking-wider">Next</button>
+</nav>
+
 <script>
-    const toolsData = [
-        {% for tool in tools %}
-        {
-            "name": "{{ tool.name }}",
-            "description": "{{ tool.description|e }}",
-            "runtime": "{{ tool.runtime }}"
-        }{% if not loop.last %},{% endif %}
-        {% endfor %}
-    ];
-
-    const fuse = new Fuse(toolsData, {
-        keys: ['name', 'description', 'runtime'],
-        threshold: 0.3
-    });
-
-    const searchInput = document.getElementById('tool-search');
-    const toolCards = document.querySelectorAll('.tool-card');
-
-    searchInput.addEventListener('input', (e) => {
-        const query = e.target.value;
-        if (!query) {
-            toolCards.forEach(card => card.style.display = 'flex');
-            return;
-        }
-
-        const results = fuse.search(query);
-        const matchedNames = new Set(results.map(r => r.item.name));
-
-        toolCards.forEach(card => {
-            if (matchedNames.has(card.dataset.toolName)) {
-                card.style.display = 'flex';
-            } else {
-                card.style.display = 'none';
-            }
-        });
-    });
-
-    // Handle URL parameters for auto-searching and opening modals
-    window.addEventListener('DOMContentLoaded', () => {
-        const urlParams = new URLSearchParams(window.location.search);
-        const toolQuery = urlParams.get('tool');
-        
-        if (toolQuery) {
-            // Set the search input
-            searchInput.value = toolQuery;
+    document.addEventListener('DOMContentLoaded', async () => {
+        try {
+            const response = await fetch('/api/v1/search-index/tools');
+            const toolsData = await response.json();
             
-            // Trigger the input event to filter the list
-            searchInput.dispatchEvent(new Event('input'));
-            
-            // Look for the specific tool card and trigger the view details button
-            toolCards.forEach((card, index) => {
-                if (card.dataset.toolName === toolQuery) {
-                    const modalId = 'details-' + (index + 1); // loop.index starts at 1
-                    const modal = document.getElementById(modalId);
-                    if (modal) {
-                        modal.classList.remove('hidden');
-                    }
-                }
+            const fuse = new Fuse(toolsData, {
+                keys: ['name', 'description', 'runtime'],
+                threshold: 0.3
             });
+
+            const paginatedGrid = new PaginatedGrid({
+                searchInput: document.getElementById('tool-search'),
+                items: Array.from(document.querySelectorAll('.tool-card')),
+                fuseInstance: fuse,
+                itemsPerPage: 12,
+                paginationControls: document.getElementById('pagination-controls'),
+                prevButton: document.getElementById('prev-page'),
+                nextButton: document.getElementById('next-page'),
+                pageInfo: document.getElementById('page-info'),
+                datasetKey: 'toolName'
+            });
+
+            // Handle URL parameters for auto-searching and opening modals
+            const urlParams = new URLSearchParams(window.location.search);
+            const toolQuery = urlParams.get('tool');
             
-            // Clean up the URL without refreshing the page
-            const newUrl = window.location.protocol + "//" + window.location.host + window.location.pathname;
-            window.history.replaceState({path: newUrl}, '', newUrl);
+            if (toolQuery) {
+                // Set the search input
+                const searchInput = document.getElementById('tool-search');
+                searchInput.value = toolQuery;
+                
+                // Trigger the input event to filter the list
+                searchInput.dispatchEvent(new Event('input'));
+                
+                // Look for the specific tool card and trigger the view details button
+                paginatedGrid.items.forEach(card => {
+                    if (card.dataset.toolName === toolQuery) {
+                        const modalId = card.dataset.modalId;
+                        const modal = document.getElementById(modalId);
+                        if (modal) {
+                            modal.classList.remove('hidden');
+                        }
+                    }
+                });
+                
+                // Clean up the URL without refreshing the page
+                const newUrl = window.location.protocol + "//" + window.location.host + window.location.pathname;
+                window.history.replaceState({path: newUrl}, '', newUrl);
+            }
+        } catch (err) {
+            console.error("Failed to load search index:", err);
         }
     });
 </script>

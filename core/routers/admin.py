@@ -149,74 +149,175 @@ async def revoke_global_key(request: Request, key_id: str = Form(...)):
         
     return RedirectResponse(url='/admin', status_code=303)
 
-@router.get("/admin/secrets", response_class=HTMLResponse)
-async def admin_secrets_page(request: Request):
+@router.get("/admin/secrets")
+async def admin_secrets_redirect():
+    """Redirect legacy /admin/secrets URL to /admin/configuration."""
+    return RedirectResponse(url='/admin/configuration', status_code=301)
+
+@router.post("/admin/secrets")
+async def admin_secrets_post_redirect():
+    """Redirect legacy /admin/secrets POST to /admin/configuration."""
+    return RedirectResponse(url='/admin/configuration', status_code=307)
+
+@router.post("/admin/secrets/delete")
+async def admin_secrets_delete_redirect():
+    """Redirect legacy /admin/secrets/delete POST to /admin/configuration/delete."""
+    return RedirectResponse(url='/admin/configuration/delete', status_code=307)
+
+@router.get("/admin/configuration", response_class=HTMLResponse)
+async def admin_configuration_page(request: Request):
     if redirect := require_admin(request, '/admin'):
         return redirect
 
     user = request.session.get('user')
     
-    # Gather all required secrets across all tools/MCPs
+    # Gather all required secrets and variables across all tools/MCPs
     tool_names = await asyncio.to_thread(identity_mgr.list_tools)
     mcp_names = await asyncio.to_thread(identity_mgr.list_mcps)
     required_secrets = {}
+    required_variables = {}
     
     for name in tool_names:
         config = await asyncio.to_thread(identity_mgr.get_tool_config, name)
-        if config and config.get("secrets"):
-            for s in config.get("secrets", []):
-                if s not in required_secrets: required_secrets[s] = []
-                required_secrets[s].append(f"Tool: {name}")
+        if config:
+            if config.get("secrets"):
+                for s in config.get("secrets", []):
+                    if s not in required_secrets: required_secrets[s] = []
+                    required_secrets[s].append(f"Tool: {name}")
+            if config.get("variables"):
+                for v in config.get("variables", []):
+                    if v not in required_variables: required_variables[v] = []
+                    required_variables[v].append(f"Tool: {name}")
                 
     for name in mcp_names:
         config = await asyncio.to_thread(identity_mgr.get_mcp_config, name)
-        if config and config.get("secrets"):
-            for s in config.get("secrets", []):
-                if s not in required_secrets: required_secrets[s] = []
-                required_secrets[s].append(f"MCP: {name}")
+        if config:
+            if config.get("secrets"):
+                for s in config.get("secrets", []):
+                    if s not in required_secrets: required_secrets[s] = []
+                    required_secrets[s].append(f"MCP: {name}")
+            if config.get("variables"):
+                for v in config.get("variables", []):
+                    if v not in required_variables: required_variables[v] = []
+                    required_variables[v].append(f"MCP: {name}")
 
     global_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
+    global_variables = await asyncio.to_thread(identity_mgr.get_global_variables)
+    
+    items = []
+    
+    # Process variables
+    for var_key, tools in required_variables.items():
+        items.append({
+            "key": var_key,
+            "type": "variable",
+            "label": "Variable",
+            "tools": tools,
+            "is_global": var_key in global_variables,
+            "value": global_variables.get(var_key, ''),
+            "placeholder": f"Enter global {var_key}"
+        })
+        
+    # Process secrets
+    for secret_key, tools in required_secrets.items():
+        items.append({
+            "key": secret_key,
+            "type": "secret",
+            "label": "Secret",
+            "tools": tools,
+            "is_global": secret_key in global_secrets,
+            "value": "",
+            "placeholder": "******** (leave blank to keep current)" if secret_key in global_secrets else f"Enter global {secret_key}"
+        })
+        
+    items.sort(key=lambda x: x["key"].lower())
+    
     flash_msg = request.session.pop("flash_msg", None)
 
     return templates.TemplateResponse(
         request=request,
-        name="admin_secrets.html",
+        name="admin_configuration.html",
         context={
             "user": user,
-            "required_secrets": required_secrets,
-            "global_secrets": global_secrets,
+            "items": items,
             "flash_msg": flash_msg
         }
     )
 
-@router.post("/admin/secrets")
-async def save_admin_secrets(request: Request):
+@router.post("/admin/configuration")
+async def save_admin_configuration(request: Request):
     if redirect := require_admin(request, '/admin'):
         return redirect
 
     form = await request.form()
+    
+    tool_names = await asyncio.to_thread(identity_mgr.list_tools)
+    mcp_names = await asyncio.to_thread(identity_mgr.list_mcps)
+    known_secrets = set()
+    known_variables = set()
+    
+    for name in tool_names:
+        config = await asyncio.to_thread(identity_mgr.get_tool_config, name)
+        if config:
+            if config.get("secrets"):
+                known_secrets.update(config.get("secrets", []))
+            if config.get("variables"):
+                known_variables.update(config.get("variables", []))
+
+    for name in mcp_names:
+        config = await asyncio.to_thread(identity_mgr.get_mcp_config, name)
+        if config:
+            if config.get("secrets"):
+                known_secrets.update(config.get("secrets", []))
+            if config.get("variables"):
+                known_variables.update(config.get("variables", []))
+                
     current_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
+    current_variables = await asyncio.to_thread(identity_mgr.get_global_variables)
+    
+    secrets_updated = False
+    variables_updated = False
     
     for key, value in form.items():
-        if value.strip(): # Set if not empty
-            current_secrets[key] = value.strip()
+        if key in ("csrf_token",):
+            continue
             
-    await asyncio.to_thread(identity_mgr.save_global_secrets, current_secrets)
+        val_str = str(value).strip()
+        
+        if key in known_secrets:
+            if val_str: # only update secret if not empty
+                current_secrets[key] = val_str
+                secrets_updated = True
+        elif key in known_variables:
+            current_variables[key] = val_str
+            variables_updated = True
+            
+    if secrets_updated:
+        await asyncio.to_thread(identity_mgr.save_global_secrets, current_secrets)
+    if variables_updated:
+        await asyncio.to_thread(identity_mgr.save_global_variables, current_variables)
     
-    request.session["flash_msg"] = "Global secrets saved successfully."
-    return RedirectResponse(url='/admin/secrets', status_code=303)
+    request.session["flash_msg"] = "Global configurations and secrets saved successfully."
+    return RedirectResponse(url='/admin/configuration', status_code=303)
 
-@router.post("/admin/secrets/delete")
-async def delete_admin_secret(request: Request, secret_key: str = Form(...)):
+@router.post("/admin/configuration/delete")
+async def delete_admin_configuration_key(request: Request, secret_key: str = Form(...)):
     if redirect := require_admin(request, '/admin'):
         return redirect
         
     current_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
+    current_variables = await asyncio.to_thread(identity_mgr.get_global_variables)
+    
     if secret_key in current_secrets:
         del current_secrets[secret_key]
         await asyncio.to_thread(identity_mgr.save_global_secrets, current_secrets)
         request.session["flash_msg"] = f"Global secret '{secret_key}' removed."
-    return RedirectResponse(url='/admin/secrets', status_code=303)
+    elif secret_key in current_variables:
+        del current_variables[secret_key]
+        await asyncio.to_thread(identity_mgr.save_global_variables, current_variables)
+        request.session["flash_msg"] = f"Global variable '{secret_key}' removed."
+        
+    return RedirectResponse(url='/admin/configuration', status_code=303)
 
 @router.get("/editor/{type}/{name}", response_class=HTMLResponse)
 async def editor_page(request: Request, type: str, name: str):
@@ -265,6 +366,7 @@ async def editor_page(request: Request, type: str, name: str):
                     
         all_tools_data.sort(key=lambda x: x["name"])
         all_tools = all_tools_data
+        all_mcps = await asyncio.to_thread(identity_mgr.list_mcps)
         
         if not config:
             request.session["flash_msg"] = "Agent not found."

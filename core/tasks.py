@@ -2,11 +2,15 @@ import os
 import asyncio
 from typing import Dict, Any, Optional
 from taskiq_redis import ListQueueBroker
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 
-from core.models import AgentConfig
+from fastmcp import Client as FastMCPClient
+from fastmcp.client import StdioTransport, SSETransport, StreamableHttpTransport
+
+from core.models import AgentConfig, MCPConfig
 from core.auth import IdentityManager
+from core.health import HealthMonitor
 
 # Redis broker configuration
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -22,6 +26,28 @@ def get_identity_manager() -> IdentityManager:
             port=int(os.getenv("ETCD_PORT", 2379))
         )
     return _identity_mgr
+
+_health_monitor = None
+def get_health_monitor() -> HealthMonitor:
+    global _health_monitor
+    if _health_monitor is None:
+        _health_monitor = HealthMonitor(get_identity_manager())
+    return _health_monitor
+
+# --- Worker-level State for Tools ---
+_hub_client: Optional[FastMCPClient] = None
+_hub_tools_cache: list = []
+DEFAULT_HUB_URL = os.getenv("HUB_URL", "sse://localhost:8001/sse")
+
+async def get_hub_client() -> FastMCPClient:
+    global _hub_client, _hub_tools_cache
+    if _hub_client is None:
+        identity_mgr = get_identity_manager()
+        hub_url = identity_mgr.get_config("HUB_URL", DEFAULT_HUB_URL)
+        _hub_client = FastMCPClient(hub_url)
+        await _hub_client.__aenter__()
+        _hub_tools_cache = await _hub_client.list_tools()
+    return _hub_client
 
 from taskiq import TaskiqScheduler
 from taskiq.schedule_sources import LabelScheduleSource
@@ -66,7 +92,7 @@ async def dynamic_cron_heartbeat():
                 await run_background_agent.kiq(
                     agent_name=name,
                     prompt=xml_payload,
-                    user_id="cron"
+                    user_id=f"svc_agent_{name}"
                 )
 
 @broker.task
@@ -112,10 +138,28 @@ async def run_background_agent(agent_name: str, prompt: str, user_id: str) -> st
         retries=3
     )
     
-    # Note: A background agent typically doesn't need external interactive tool connections (like FastMCP via host) 
-    # unless specifically bridged. For now, it runs with core capabilities. If background tasks need tools,
-    # we would inject them here via direct Tool Hub connections or similar.
-    # Currently keeping simple as per refactor spec.
+    # 2.5 Inject Tools
+    import copy
+    health_monitor = get_health_monitor()
+    
+    # Register Hub Tools
+    if config.allowed_tools:
+        hub_client = await get_hub_client()
+        for tool in _hub_tools_cache:
+            if tool.name in config.allowed_tools:
+                safe_tool = copy.deepcopy(tool) if hasattr(tool, "model_copy") else tool
+                
+                async def tool_wrapper(ctx: RunContext[None], **kwargs: Any) -> Any:
+                    if health_monitor.get_status("tool", safe_tool.name).get("status") == "Offline":
+                        return "SYSTEM: Tool offline."
+                    kwargs["__user_id"] = user_id
+                    client = await get_hub_client()
+                    result = await client.call_tool(safe_tool.name, kwargs)
+                    return result.content
+                    
+                agent.tool(name=safe_tool.name, description=safe_tool.description)(tool_wrapper)
+
+    # Note: External MCP tools can be ported here similarly if background agents need them in the future.
     
     # 3. Execute the run
     try:

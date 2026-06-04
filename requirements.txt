@@ -27,3 +27,4 @@ taskiq-fastapi
 asyncache
 cachetools
 pycron
+cryptography

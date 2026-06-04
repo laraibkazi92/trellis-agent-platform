@@ -99,6 +99,11 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
             if secrets:
                 safe_secrets = {str(k): str(v) for k, v in secrets.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
                 env.update(safe_secrets)
+            
+            variables = identity_mgr.get_resolved_variables(user_id)
+            if variables:
+                safe_vars = {str(k): str(v) for k, v in variables.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
+                env.update(safe_vars)
 
         process = await asyncio.create_subprocess_exec(
             *cmd,

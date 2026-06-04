@@ -20,6 +20,34 @@ logger = logging.getLogger(__name__)
 auth_token_var = contextvars.ContextVar("auth_token", default=None)
 user_id_var = contextvars.ContextVar("user_id", default=None)
 
+def _get_encryption_key() -> bytes:
+    import base64
+    raw_key = os.getenv("ENCRYPTION_KEY") or os.getenv("SESSION_SECRET") or "fallback-static-development-secret-key-32-bytes"
+    hashed = hashlib.sha256(raw_key.encode('utf-8')).digest()
+    return base64.urlsafe_b64encode(hashed)
+
+def _encrypt_string(plaintext: str) -> str:
+    if not plaintext:
+        return plaintext
+    try:
+        from cryptography.fernet import Fernet
+        f = Fernet(_get_encryption_key())
+        return f.encrypt(plaintext.encode('utf-8')).decode('utf-8')
+    except Exception as e:
+        logger.error(f"Encryption failed: {e}")
+        return plaintext
+
+def _decrypt_string(ciphertext: str) -> str:
+    if not ciphertext:
+        return ciphertext
+    try:
+        from cryptography.fernet import Fernet
+        f = Fernet(_get_encryption_key())
+        return f.decrypt(ciphertext.encode('utf-8')).decode('utf-8')
+    except Exception:
+        # Fallback if the string was not encrypted or key is wrong
+        return ciphertext
+
 def retry_etcd(max_retries=10, delay=2):
     def decorator(func):
         @wraps(func)
@@ -58,32 +86,88 @@ class IdentityManager:
         """Retrieve user-specific secrets."""
         value, _ = self.client.get(f"/users/{user_id}/secrets")
         if value:
-            return json.loads(value.decode('utf-8'))
+            decoded = value.decode('utf-8')
+            decrypted = _decrypt_string(decoded)
+            try:
+                return json.loads(decrypted)
+            except Exception as e:
+                logger.error(f"Failed to parse user secrets JSON: {e}")
+                return {}
         return {}
 
     @retry_etcd()
     def save_user_secrets(self, user_id: str, secrets_data: Dict[str, str]) -> None:
-        """Save user-specific secrets."""
-        self.client.put(f"/users/{user_id}/secrets", json.dumps(secrets_data))
+        """Save user-specific secrets securely using encryption."""
+        serialized = json.dumps(secrets_data)
+        encrypted = _encrypt_string(serialized)
+        self.client.put(f"/users/{user_id}/secrets", encrypted)
 
     @retry_etcd()
     def get_global_secrets(self) -> Dict[str, str]:
         """Retrieve system-wide global secrets."""
         value, _ = self.client.get("/config/framework/global_secrets")
         if value:
-            return json.loads(value.decode('utf-8'))
+            decoded = value.decode('utf-8')
+            decrypted = _decrypt_string(decoded)
+            try:
+                return json.loads(decrypted)
+            except Exception as e:
+                logger.error(f"Failed to parse global secrets JSON: {e}")
+                return {}
         return {}
 
     @retry_etcd()
     def save_global_secrets(self, secrets_data: Dict[str, str]) -> None:
-        """Save system-wide global secrets."""
-        self.client.put("/config/framework/global_secrets", json.dumps(secrets_data))
+        """Save system-wide global secrets securely using encryption."""
+        serialized = json.dumps(secrets_data)
+        encrypted = _encrypt_string(serialized)
+        self.client.put("/config/framework/global_secrets", encrypted)
 
     def get_resolved_secrets(self, user_id: str) -> Dict[str, str]:
         """Retrieve user secrets merged with global secrets (global takes precedence)."""
         user_secrets = self.get_user_secrets(user_id)
         global_secrets = self.get_global_secrets()
         return {**user_secrets, **global_secrets}
+
+    @retry_etcd()
+    def get_user_variables(self, user_id: str) -> Dict[str, str]:
+        """Retrieve user-specific non-sensitive configuration variables."""
+        value, _ = self.client.get(f"/users/{user_id}/variables")
+        if value:
+            try:
+                return json.loads(value.decode('utf-8'))
+            except Exception as e:
+                logger.error(f"Failed to parse user variables JSON: {e}")
+                return {}
+        return {}
+
+    @retry_etcd()
+    def save_user_variables(self, user_id: str, variables_data: Dict[str, str]) -> None:
+        """Save user-specific non-sensitive configuration variables."""
+        self.client.put(f"/users/{user_id}/variables", json.dumps(variables_data))
+
+    @retry_etcd()
+    def get_global_variables(self) -> Dict[str, str]:
+        """Retrieve system-wide global non-sensitive configuration variables."""
+        value, _ = self.client.get("/config/framework/global_variables")
+        if value:
+            try:
+                return json.loads(value.decode('utf-8'))
+            except Exception as e:
+                logger.error(f"Failed to parse global variables JSON: {e}")
+                return {}
+        return {}
+
+    @retry_etcd()
+    def save_global_variables(self, variables_data: Dict[str, str]) -> None:
+        """Save system-wide global non-sensitive configuration variables."""
+        self.client.put("/config/framework/global_variables", json.dumps(variables_data))
+
+    def get_resolved_variables(self, user_id: str) -> Dict[str, str]:
+        """Retrieve user variables merged with global variables (global takes precedence)."""
+        user_variables = self.get_user_variables(user_id)
+        global_variables = self.get_global_variables()
+        return {**user_variables, **global_variables}
 
     @retry_etcd()
     def create_key(self, user_id: str, key_name: str) -> str:
