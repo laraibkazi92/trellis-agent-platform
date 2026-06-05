@@ -65,7 +65,14 @@ async def background_agents_view(request: Request):
                 "required_variables": user_required_variables,
                 "missing_variables": missing_variables,
                 "current_variables": svc_variables,
-                "is_configured": is_configured
+                "is_configured": is_configured,
+                "run_stats": {
+                    "pending": 0,
+                    "processing": 0,
+                    "failed": 0,
+                    "completed": 0
+                },
+                "is_running": False
             })
 
     background_agents.sort(key=lambda x: x["name"].lower())
@@ -111,6 +118,10 @@ async def background_agents_view(request: Request):
             state = run.get("state")
             if state in queue:
                 queue[state].append(run)
+                b_agent["run_stats"][state] += 1
+                
+        if b_agent["run_stats"]["processing"] > 0:
+            b_agent["is_running"] = True
 
     return templates.TemplateResponse(
         request=request,

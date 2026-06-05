@@ -9,53 +9,76 @@ identity_mgr = IdentityManager(
     port=int(os.getenv("ETCD_PORT", 2379))
 )
 
+def _resolve_requirements(req_data, is_background: bool) -> List[str]:
+    """Resolves requirements based on agent context (background vs standard)."""
+    if not req_data:
+        return []
+    if isinstance(req_data, list):
+        return req_data
+    if isinstance(req_data, dict):
+        result = list(req_data.get("general", []))
+        if is_background:
+            result.extend(req_data.get("background", []))
+        else:
+            result.extend(req_data.get("user", []))
+        return result
+    return []
+
 async def get_agent_required_secrets(config: Dict) -> List[str]:
     """Helper to determine all required secrets for an agent based on its tools/MCPs."""
     required = set()
+    is_background = config.get("type") == "background"
     
     allowed_tools = config.get("allowed_tools", [])
     for tool_name in allowed_tools:
         tool_config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
         if tool_config and tool_config.get("secrets"):
-            required.update(tool_config.get("secrets", []))
+            resolved = _resolve_requirements(tool_config.get("secrets"), is_background)
+            required.update(resolved)
         elif tool_name.startswith("mcp__"):
             parts = tool_name.split("__")
             if len(parts) >= 3:
                 mcp_name = parts[1]
                 mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
                 if mcp_config and mcp_config.get("secrets"):
-                    required.update(mcp_config.get("secrets", []))
+                    resolved = _resolve_requirements(mcp_config.get("secrets"), is_background)
+                    required.update(resolved)
             
     allowed_mcps = config.get("allowed_mcps", [])
     for mcp_name in allowed_mcps:
         mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
         if mcp_config and mcp_config.get("secrets"):
-            required.update(mcp_config.get("secrets", []))
+            resolved = _resolve_requirements(mcp_config.get("secrets"), is_background)
+            required.update(resolved)
             
     return sorted(list(required))
 
 async def get_agent_required_variables(config: Dict) -> List[str]:
     """Helper to determine all required non-sensitive variables for an agent based on its tools/MCPs."""
     required = set()
+    is_background = config.get("type") == "background"
     
     allowed_tools = config.get("allowed_tools", [])
     for tool_name in allowed_tools:
         tool_config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
         if tool_config and tool_config.get("variables"):
-            required.update(tool_config.get("variables", []))
+            resolved = _resolve_requirements(tool_config.get("variables"), is_background)
+            required.update(resolved)
         elif tool_name.startswith("mcp__"):
             parts = tool_name.split("__")
             if len(parts) >= 3:
                 mcp_name = parts[1]
                 mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
                 if mcp_config and mcp_config.get("variables"):
-                    required.update(mcp_config.get("variables", []))
+                    resolved = _resolve_requirements(mcp_config.get("variables"), is_background)
+                    required.update(resolved)
             
     allowed_mcps = config.get("allowed_mcps", [])
     for mcp_name in allowed_mcps:
         mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
         if mcp_config and mcp_config.get("variables"):
-            required.update(mcp_config.get("variables", []))
+            resolved = _resolve_requirements(mcp_config.get("variables"), is_background)
+            required.update(resolved)
             
     return sorted(list(required))
 

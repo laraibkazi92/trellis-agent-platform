@@ -105,6 +105,9 @@
 <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
 <script src="https://unpkg.com/cronstrue@latest/dist/cronstrue.min.js"></script>
 
+<!-- Auto-refresh mechanism -->
+<meta http-equiv="refresh" content="30">
+
 <script>
     const agentConfigs = {
         {% for agent in background_agents %}
@@ -155,71 +158,117 @@
 </div>
 
 <!-- Background Agents Grid -->
-<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-12" id="bg-agents-grid">
-    {% for agent in background_agents %}
-    <div class="agent-card border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 p-6 hover:border-accent dark:hover:border-accent-dark transition-colors flex flex-col" data-agent-name="{{ agent.name }}">
-        <div class="flex justify-between items-start mb-2">
-            <h3 class="text-xl font-bold font-mono uppercase tracking-wider flex items-center gap-2">
-                {{ agent.name }}
-            </h3>
-            {% if is_admin %}
-            <button onclick="openConfigModal('{{ agent.name }}')" class="font-mono text-xs font-bold border border-neutral-900 dark:border-neutral-100 text-neutral-900 dark:text-neutral-100 hover:bg-neutral-900 hover:text-white dark:hover:bg-neutral-100 dark:hover:text-neutral-900 px-2 py-1 uppercase tracking-wider transition-colors">Configure</button>
-            {% endif %}
-        </div>
-        
-        <div class="flex items-center gap-2 mb-4">
-            <span class="text-[10px] font-mono font-bold bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400 px-2 py-0.5 rounded border border-neutral-200 dark:border-neutral-700 uppercase">v{{ agent.config.get('version', '0.1.0') }}</span>
-            <span class="text-[10px] font-mono font-bold {% if agent.status == 'active' %}bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-300 border-emerald-200{% else %}bg-neutral-100 text-neutral-600 dark:bg-neutral-800 dark:text-neutral-400 border-neutral-200{% endif %} px-2 py-0.5 rounded border uppercase">{{ agent.status }}</span>
-            {% if not agent.is_configured %}
-            <span class="text-[10px] font-mono font-bold text-orange-500 border border-orange-500/30 bg-orange-50 dark:bg-orange-900/20 px-2 py-0.5 rounded uppercase flex items-center gap-1" title="Missing: {{ (agent.missing_secrets + agent.missing_variables) | join(', ') }}">
-                <i data-lucide="triangle-alert" class="w-3 h-3"></i> UNCONFIGURED
-            </span>
-            {% elif agent.required_secrets or agent.required_variables %}
-            <span class="text-[10px] font-mono font-bold text-emerald-500 border border-emerald-500/30 bg-emerald-50 dark:bg-emerald-900/20 px-2 py-0.5 rounded uppercase flex items-center gap-1">
-                <i data-lucide="check-circle" class="w-3 h-3"></i> CONFIGURED
-            </span>
-            {% endif %}
-        </div>
-        
-        <p class="text-sm text-neutral-600 dark:text-neutral-400 mb-6 flex-grow">{{ agent.config.get('description', '') }}</p>
+<div class="overflow-x-auto w-full mb-12 border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900" id="bg-agents-grid">
+    <table class="w-full text-left border-collapse">
+        <thead>
+            <tr class="border-b border-neutral-200 dark:border-neutral-800 bg-neutral-50 dark:bg-neutral-950 text-xs font-bold font-mono text-neutral-500 uppercase tracking-widest">
+                <th class="p-4 w-1/3">Agent</th>
+                <th class="p-4 w-1/6">Status</th>
+                <th class="p-4 w-1/6">Trigger</th>
+                <th class="p-4 w-1/6 text-center">Queue Stats</th>
+                <th class="p-4 w-1/6 text-right">Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for agent in background_agents %}
+            <tr class="agent-card border-b border-neutral-100 dark:border-neutral-800/60 hover:bg-neutral-50 dark:hover:bg-neutral-800/50 transition-colors" data-agent-name="{{ agent.name }}">
+                <td class="p-4 align-top">
+                    <div class="flex items-center gap-2 mb-1">
+                        <h3 class="text-base font-bold font-mono uppercase tracking-wider text-neutral-900 dark:text-neutral-100">
+                            {{ agent.name }}
+                        </h3>
+                        <span class="text-[10px] font-mono font-bold bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400 px-2 py-0.5 rounded border border-neutral-200 dark:border-neutral-700 uppercase">v{{ agent.config.get('version', '0.1.0') }}</span>
+                    </div>
+                    <p class="text-xs text-neutral-600 dark:text-neutral-400 max-w-sm truncate">{{ agent.config.get('description', '') }}</p>
+                </td>
+                
+                <td class="p-4 align-top">
+                    <div class="flex flex-col items-start gap-2">
+                        <span class="text-[10px] font-mono font-bold {% if agent.status == 'active' %}bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-300 border-emerald-200{% else %}bg-neutral-100 text-neutral-600 dark:bg-neutral-800 dark:text-neutral-400 border-neutral-200{% endif %} px-2 py-0.5 rounded border uppercase">
+                            {{ agent.status }}
+                        </span>
+                        
+                        {% if not agent.is_configured %}
+                        <span class="text-[10px] font-mono font-bold text-orange-500 border border-orange-500/30 bg-orange-50 dark:bg-orange-900/20 px-2 py-0.5 rounded uppercase flex items-center gap-1" title="Missing: {{ (agent.missing_secrets + agent.missing_variables) | join(', ') }}">
+                            <i data-lucide="triangle-alert" class="w-3 h-3"></i> UNCONFIGURED
+                        </span>
+                        {% elif agent.required_secrets or agent.required_variables %}
+                        <span class="text-[10px] font-mono font-bold text-emerald-500 border border-emerald-500/30 bg-emerald-50 dark:bg-emerald-900/20 px-2 py-0.5 rounded uppercase flex items-center gap-1">
+                            <i data-lucide="check-circle" class="w-3 h-3"></i> CONFIGURED
+                        </span>
+                        {% endif %}
 
-        <div class="border-t border-neutral-100 dark:border-neutral-800/60 pt-4 mt-auto space-y-3">
-            <div class="flex justify-start gap-2 items-center text-xs font-mono text-neutral-500">
-                <span class="uppercase">Trigger:</span>
-                <span class="font-bold text-neutral-800 dark:text-neutral-300">
+                        {% if agent.is_running %}
+                        <span class="text-[10px] font-mono font-bold text-green-500 border border-green-500/30 bg-green-50 dark:bg-green-900/20 px-2 py-0.5 rounded uppercase flex items-center gap-1 animate-pulse">
+                            <span class="w-2 h-2 rounded-full bg-green-500"></span> RUNNING
+                        </span>
+                        {% endif %}
+                    </div>
+                </td>
+                
+                <td class="p-4 align-top text-xs font-mono text-neutral-800 dark:text-neutral-300">
                     {% if agent.config.get('trigger', {}).get('type') == 'cron' %}
-                        CRON (<span class="cron-readable text-accent dark:text-accent-dark">{{ agent.config.get('trigger', {}).get('expression') }}</span>)
+                        <span class="font-bold text-neutral-500 uppercase">CRON:</span><br/>
+                        <span class="cron-readable text-accent dark:text-accent-dark">{{ agent.config.get('trigger', {}).get('expression') }}</span>
                     {% elif agent.config.get('trigger', {}).get('type') == 'webhook' %}
-                        Webhook ({{ agent.config.get('trigger', {}).get('provider') | uppercase }})
+                        <span class="font-bold text-neutral-500 uppercase">Webhook:</span><br/>
+                        <span class="text-accent dark:text-accent-dark">{{ agent.config.get('trigger', {}).get('provider') | uppercase }}</span>
                     {% else %}
-                        None
+                        <span class="text-neutral-400 dark:text-neutral-600">None</span>
                     {% endif %}
-                </span>
-            </div>
-            
-            {% if agent.required_secrets or agent.required_variables %}
-            <button onclick="document.getElementById('configure-secrets-{{ agent.name }}').classList.remove('hidden')" class="w-full border {% if not agent.is_configured %}border-orange-500 text-orange-600 hover:bg-orange-500 hover:text-white dark:border-orange-500/50 dark:text-orange-400 dark:hover:bg-orange-600/20{% else %}border-neutral-300 dark:border-neutral-700 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800{% endif %} text-xs font-bold uppercase tracking-wider px-3 py-2 text-center transition-colors font-mono">
-                Configure Agent
-            </button>
-            {% endif %}
-            
-            {% if agent.is_configured %}
-            {% if is_admin %}
-            <form method="POST" action="/background-agents/{{ agent.name }}/run" class="w-full" onsubmit="showGlobalLoading('Enqueueing Task...')">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                <button type="submit" class="w-full bg-accent hover:bg-accent-dark text-white text-xs font-bold uppercase tracking-wider px-3 py-2 text-center transition-colors font-mono flex items-center justify-center gap-2">
-                    <i data-lucide="play" class="w-3 h-3"></i> Run Now
-                </button>
-            </form>
-            {% endif %}
-            {% endif %}
-        </div>
-    </div>
-    {% else %}
-    <div class="col-span-full border border-dashed border-neutral-300 dark:border-neutral-700 p-8 text-center text-sm font-mono text-neutral-500">
-        No background agents found.
-    </div>
-    {% endfor %}
+                </td>
+
+                <td class="p-4 align-top">
+                    <div class="grid grid-cols-2 gap-2 text-[10px] font-mono font-bold w-fit mx-auto">
+                        <div class="flex items-center gap-1 text-blue-500" title="Pending">
+                            <i data-lucide="clock" class="w-3 h-3"></i> {{ agent.run_stats.pending }}
+                        </div>
+                        <div class="flex items-center gap-1 text-amber-500" title="Processing">
+                            <i data-lucide="loader" class="w-3 h-3"></i> {{ agent.run_stats.processing }}
+                        </div>
+                        <div class="flex items-center gap-1 text-red-500" title="Failed">
+                            <i data-lucide="x-circle" class="w-3 h-3"></i> {{ agent.run_stats.failed }}
+                        </div>
+                        <div class="flex items-center gap-1 text-green-500" title="Completed">
+                            <i data-lucide="check-circle-2" class="w-3 h-3"></i> {{ agent.run_stats.completed }}
+                        </div>
+                    </div>
+                </td>
+                
+                <td class="p-4 align-top text-right">
+                    <div class="flex flex-col items-end gap-2">
+                        {% if is_admin %}
+                        <button onclick="openConfigModal('{{ agent.name }}')" class="font-mono text-xs font-bold border border-neutral-300 dark:border-neutral-700 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 px-3 py-1.5 uppercase tracking-wider transition-colors w-full max-w-[140px]">Configure</button>
+                        {% endif %}
+                        
+                        {% if agent.required_secrets or agent.required_variables %}
+                        <button onclick="document.getElementById('configure-secrets-{{ agent.name }}').classList.remove('hidden')" class="font-mono text-xs font-bold border {% if not agent.is_configured %}border-orange-500 text-orange-600 hover:bg-orange-500 hover:text-white dark:border-orange-500/50 dark:text-orange-400 dark:hover:bg-orange-600/20{% else %}border-neutral-300 dark:border-neutral-700 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800{% endif %} px-3 py-1.5 uppercase tracking-wider transition-colors w-full max-w-[140px]">
+                            Secrets
+                        </button>
+                        {% endif %}
+
+                        {% if agent.is_configured %}
+                            {% if is_admin %}
+                            <form method="POST" action="/background-agents/{{ agent.name }}/run" class="w-full max-w-[140px]" onsubmit="showGlobalLoading('Enqueueing Task...')">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                                <button type="submit" class="w-full bg-accent hover:bg-accent-dark text-white text-xs font-bold uppercase tracking-wider px-3 py-1.5 transition-colors font-mono flex items-center justify-center gap-2">
+                                    <i data-lucide="play" class="w-3 h-3"></i> Run Now
+                                </button>
+                            </form>
+                            {% endif %}
+                        {% endif %}
+                    </div>
+                </td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="5" class="p-8 text-center text-sm font-mono text-neutral-500 border border-dashed border-neutral-300 dark:border-neutral-700">
+                    No background agents found.
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
 </div>
 
 <!-- Pagination Controls -->

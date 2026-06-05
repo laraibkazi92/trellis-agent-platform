@@ -62,12 +62,15 @@ services:
     command: python core/hub.py
     restart: unless-stopped
     privileged: true
+    env_file:
+      - .env
     depends_on:
       etcd:
         condition: service_healthy
       db-sync:
         condition: service_completed_successfully
     environment:
+      - DEV_MODE=${DEV_MODE:-false}
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
       - HOST_URL=http://host:8000

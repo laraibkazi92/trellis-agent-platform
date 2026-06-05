@@ -50,7 +50,11 @@ The `tool.yaml` file defines the tools in a directory. It can be a single object
     *   `description`: What the argument represents.
     *   `required`: `true` or `false`.
 *   **`outputs`** *(object)*: Schema of the JSON returned via `stdout`.
-*   **`secrets`** *(array of strings)*: (Optional) List of environment variable names the tool needs (e.g., `ISSUES_API_TOKEN`). The framework injects these into the tool's environment at runtime.
+*   **`secrets`** *(array of strings or object)*: (Optional) List of environment variable names the tool needs (e.g., `ISSUES_API_TOKEN`). You can either provide a simple array of strings, or use a nested object structure for context-aware requirements:
+    *   `general`: Secrets required across all agent contexts.
+    *   `background`: Secrets required *only* when called by a background agent.
+    *   `user`: Secrets required *only* when called by a standard/human-facing agent.
+*   **`variables`** *(array of strings or object)*: (Optional) Same format as `secrets`, but for non-sensitive configuration variables.
 
 ### Example `tool.yaml`
 
@@ -72,8 +76,16 @@ The `tool.yaml` file defines the tools in a directory. It can be a single object
       description: Whether to include issue comments.
       required: false
   secrets:
-    - ISSUES_EMAIL
-    - ISSUES_API_TOKEN
+    background:
+      - ISSUES_CLIENT_SECRET
+    user:
+      - ISSUES_API_TOKEN
+  variables:
+    background:
+      - ISSUES_CLIENT_ID
+    user:
+      - ISSUES_EMAIL
+      - ISSUES_URL
   outputs:
     issues:
       type: array

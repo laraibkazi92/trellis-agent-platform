@@ -4,7 +4,7 @@ import asyncio
 import copy
 from urllib.parse import urlparse
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Union
 
 from asyncache import cached
 from cachetools import TTLCache
@@ -71,9 +71,11 @@ def _get_model_settings(model_name: str, thinking_level: str) -> Optional[Google
         return GoogleModelSettings(google_thinking_config={"thinking_level": thinking_level.lower(), "include_thoughts": False})
     return None
 
-def _inject_secrets(env: Optional[Dict[str, str]], secrets: Optional[List[str]], user_secrets: Dict[str, str]) -> Dict[str, str]:
+def _inject_secrets(env: Optional[Dict[str, str]], secrets_req: Optional[Union[List[str], Dict[str, List[str]]]], user_secrets: Dict[str, str], is_background: bool) -> Dict[str, str]:
+    from core.discovery import _resolve_requirements
     env_copy = env.copy() if env else {}
-    for req_secret in (secrets or []):
+    req_list = _resolve_requirements(secrets_req, is_background)
+    for req_secret in req_list:
         val = user_secrets.get(req_secret)
         if val:
             interpolated = False
@@ -93,7 +95,8 @@ async def get_external_mcp_client(mcp_name: str, user_id: str) -> FastMCPClient:
     if not config_data: raise Exception(f"MCP config '{mcp_name}' not found")
     config = MCPConfig(**config_data)
     
-    env = _inject_secrets(config.env, config.secrets, user_secrets)
+    is_background = user_id.startswith("svc_agent_")
+    env = _inject_secrets(config.env, config.secrets, user_secrets, is_background)
     if config.transport == "stdio":
         full_env = os.environ.copy()
         full_env.update(env)
