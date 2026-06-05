@@ -15,6 +15,11 @@ from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from fastmcp import Client as FastMCPClient
 from fastmcp.client import StdioTransport, SSETransport, StreamableHttpTransport
 
+from subagents_pydantic_ai import SubAgentCapability, SubAgentConfig
+from pydantic_ai_backends import ConsoleCapability, LocalBackend
+from pydantic_ai_shields import CostTracking, ToolGuard
+from pydantic_ai_rlm import create_rlm_toolset
+
 from core.auth import IdentityManager, user_id_var
 from core.models import AgentConfig, MCPConfig
 from core.health import HealthMonitor
@@ -148,13 +153,6 @@ async def discover_external_mcps():
             
     _external_mcp_tools = new_mcp_tools
 
-def _register_a2a_tool(agent: Agent, target_agent_name: str):
-    async def a2a_tool_wrapper(ctx: RunContext[None], prompt: str) -> str:
-        target_agent = await build_agent(target_agent_name)
-        result = await target_agent.run(prompt)
-        return result.output
-    agent.tool(name=f"call_{target_agent_name}", description=f"Call the {target_agent_name} agent.")(a2a_tool_wrapper)
-
 def _register_mcp_tool(agent: Agent, mcp_tool: Any):
     safe_mcp_tool = copy.deepcopy(mcp_tool) if hasattr(mcp_tool, "model_copy") else mcp_tool
     tool_name_for_agent = safe_mcp_tool.name
@@ -229,42 +227,85 @@ async def build_agent(agent_name: str) -> Agent:
     model = GoogleModel(config.model)
     model_settings = _get_model_settings(config.model, config.thinking_level)
     
-    agent = Agent(model, system_prompt=system_prompt, name=config.name, model_settings=model_settings, retries=3)
+    capabilities = []
+    toolsets = []
     
-    # 1. Hub Tools
+    # 1. Observability
+    capabilities.append(CostTracking(budget_usd=None))
+    
+    # 2. RLM
+    if config.tags and "rlm" in config.tags:
+        toolsets.append(create_rlm_toolset(sub_model=model))
+        
+    # 3. File Execution Standardizing
     allowed_tools = config.allowed_tools or []
-    hub_client = await get_hub_client()
-    for tool in _hub_tools_cache:
-        if tool.name in allowed_tools:
-            _register_mcp_tool(agent, tool)
-
-    # 2. External MCP Tools
-    await discover_external_mcps()
-    allowed_mcps = config.allowed_mcps or []
-    for mcp_name, tools in _external_mcp_tools.items():
-        if mcp_name in allowed_mcps:
-            for tool in tools:
-                _register_external_mcp_tool(agent, mcp_name, tool, prefixed_name=f"mcp__{mcp_name}__{tool.name}")
-        else:
-            for tool in tools:
-                prefixed_name = f"mcp__{mcp_name}__{tool.name}"
-                if prefixed_name in allowed_tools or tool.name in allowed_tools:
-                    name_to_use = prefixed_name if prefixed_name in allowed_tools else tool.name
-                    _register_external_mcp_tool(agent, mcp_name, tool, prefixed_name=name_to_use)
-
-    # 3. A2A Tools
+    console_tool_names = ["ls", "read_file", "write_file", "edit_file", "glob", "grep", "execute"]
+    allowed_console_tools = [t for t in console_tool_names if t in allowed_tools]
+    
+    if allowed_console_tools:
+        capabilities.append(ConsoleCapability(backend=LocalBackend(root_dir="/workspace", enable_execute=("execute" in allowed_console_tools))))
+        blocked_console_tools = [t for t in console_tool_names if t not in allowed_tools]
+        if blocked_console_tools:
+            capabilities.append(ToolGuard(blocked=blocked_console_tools))
+            
+    # 4. A2A Delegation
+    subagent_configs = []
     if agent_name == "supervisor":
-        # Supervisor can call anyone except background agents
         all_agents = await asyncio.to_thread(identity_mgr.list_agents)
         for target in all_agents:
             if target != "supervisor":
                 target_cfg = await asyncio.to_thread(identity_mgr.get_agent_config, target)
                 if target_cfg and target_cfg.get("type") != "background":
-                    _register_a2a_tool(agent, target)
-        _register_admin_tools(agent)
+                    target_instructions = await asyncio.to_thread(identity_mgr.get_agent_skills, target)
+                    subagent_configs.append(SubAgentConfig(
+                        name=target,
+                        description=target_cfg.get("description", f"Call the {target} agent"),
+                        instructions=target_instructions or ""
+                    ))
     else:
         for target in config.a2a_access or []:
-            _register_a2a_tool(agent, target)
+            target_cfg = await asyncio.to_thread(identity_mgr.get_agent_config, target)
+            if target_cfg:
+                target_instructions = await asyncio.to_thread(identity_mgr.get_agent_skills, target)
+                subagent_configs.append(SubAgentConfig(
+                    name=target,
+                    description=target_cfg.get("description", f"Call the {target} agent"),
+                    instructions=target_instructions or ""
+                ))
+
+    if subagent_configs:
+        capabilities.append(SubAgentCapability(subagents=subagent_configs, default_model=config.model))
+
+    agent = Agent(
+        model, 
+        system_prompt=system_prompt, 
+        name=config.name, 
+        model_settings=model_settings, 
+        retries=3,
+        capabilities=capabilities,
+        toolsets=toolsets
+    )
+    
+    # 5. Hub Tools (skipping native console tools)
+    hub_client = await get_hub_client()
+    for tool in _hub_tools_cache:
+        if tool.name in allowed_tools and tool.name not in console_tool_names:
+            _register_mcp_tool(agent, tool)
+
+    # 6. External MCP Tools
+    await discover_external_mcps()
+    allowed_mcps = config.allowed_mcps or []
+    for mcp_name, tools in _external_mcp_tools.items():
+        for tool in tools:
+            prefixed_name = f"mcp__{mcp_name}__{tool.name}"
+            # Register if the entire MCP is allowed, OR if the specific tool (by prefixed or base name) is allowed.
+            if mcp_name in allowed_mcps or prefixed_name in allowed_tools or tool.name in allowed_tools:
+                name_to_use = prefixed_name if (mcp_name not in allowed_mcps and prefixed_name in allowed_tools) else tool.name
+                _register_external_mcp_tool(agent, mcp_name, tool, prefixed_name=name_to_use)
+
+    # 7. Admin Tools
+    if agent_name == "supervisor":
+        _register_admin_tools(agent)
             
     return agent
 

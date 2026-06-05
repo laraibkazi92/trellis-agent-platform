@@ -23,7 +23,8 @@
 ## ⚠️ Critical Gotchas & Rules
 - **Tool Protocol**: Tools MUST use `stdin` for JSON arguments and `stdout` for JSON results. Use wrappers for existing scripts.
 - **Flat over Nested**: Tools should live as standalone scripts in their directory. Avoid `src/`, `main.py`, or complex package structures within a tool directory.
-- **Shared Logic**: If logic must be shared across multiple scripts in a tool suite, use a simple `lib/` directory within that tool's folder.
+- **Shared Logic (Tool level)**: If logic must be shared across multiple scripts in a tool suite, use a simple `lib/` directory within that tool's folder.
+- **Shared Logic (Workspace level)**: If logic must be shared across multiple completely separate tool suites (e.g. `tickets` and `issues-service`), extract it to `workspace/shared/` and dynamically insert the workspace root into `sys.path`.
 - **Drop-in Ready**: A tool directory should be self-contained and movable with minimal changes.
 - **Multi-Tool Support**: A single directory can host multiple tools; `tool.yaml` should be a list of configurations.
 - **Logical Porting**: When porting external skills (e.g. from Claude Code), preserve all business logic/formatting but translate shell commands into framework tool calls.

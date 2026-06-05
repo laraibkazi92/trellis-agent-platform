@@ -94,7 +94,8 @@ echo '{"issues_keys": ["OPS-123"]}' | ISSUES_API_TOKEN=your_token python tools/t
 ### Best Practices
 
 *   **Flat over Nested**: Keep your tool folder self-contained. Avoid complex packaging.
-*   **Shared Logic**: If scripts in a tool suite share code, place it in a `lib/` subdirectory within the tool's folder.
+*   **Shared Logic (Tool level)**: If scripts in a tool suite share code, place it in a `lib/` subdirectory within the tool's folder.
+*   **Shared Logic (Workspace level)**: If logic must be shared across multiple completely separate tool suites, extract it to `workspace/shared/` and dynamically insert the workspace root into `sys.path`.
 *   **Secrets**: Never hardcode API keys in scripts. Define them in `tool.yaml`'s `secrets` array and access them via environment variables (e.g., `os.getenv('ISSUES_API_TOKEN')`).
 
 ---

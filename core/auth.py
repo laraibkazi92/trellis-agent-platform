@@ -22,7 +22,14 @@ user_id_var = contextvars.ContextVar("user_id", default=None)
 
 def _get_encryption_key() -> bytes:
     import base64
-    raw_key = os.getenv("ENCRYPTION_KEY") or os.getenv("SESSION_SECRET") or "fallback-static-development-secret-key-32-bytes"
+    raw_key = os.getenv("ENCRYPTION_KEY") or os.getenv("SESSION_SECRET")
+    if not raw_key:
+        dev_mode = os.getenv("DEV_MODE", "false").lower() == "true"
+        if dev_mode:
+            logger.warning("Using insecure static encryption key. Do not use in production.")
+            raw_key = "fallback-static-development-secret-key-32-bytes"
+        else:
+            raise ValueError("Critical Security Error: ENCRYPTION_KEY or SESSION_SECRET must be set in the environment for production.")
     hashed = hashlib.sha256(raw_key.encode('utf-8')).digest()
     return base64.urlsafe_b64encode(hashed)
 
@@ -227,6 +234,26 @@ class IdentityManager:
             data = json.loads(value.decode('utf-8'))
             return data.get("user_id")
         return None
+
+    def generate_execution_token(self, user_id: str) -> str:
+        """Generate a short-lived execution token for a background agent."""
+        from itsdangerous import URLSafeTimedSerializer
+        serializer = URLSafeTimedSerializer(_get_encryption_key())
+        return "exec_" + serializer.dumps({"user_id": user_id})
+
+    def validate_execution_token(self, token: str) -> Optional[str]:
+        """Validate a short-lived execution token and return user_id."""
+        from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+        if not token.startswith("exec_"):
+            return None
+        token_body = token[5:]
+        serializer = URLSafeTimedSerializer(_get_encryption_key())
+        try:
+            # 5 minutes expiration
+            data = serializer.loads(token_body, max_age=300)
+            return data.get("user_id")
+        except (BadSignature, SignatureExpired):
+            return None
 
     @retry_etcd()
     def get_config(self, key: str, default: Any = None) -> Any:
@@ -591,9 +618,12 @@ class AuthMiddleware:
                 
                 token = auth_header.split(" ")[1]
                 try:
-                    user_id = await asyncio.to_thread(self.identity_mgr.validate_key, token)
+                    if token.startswith("exec_"):
+                        user_id = await asyncio.to_thread(self.identity_mgr.validate_execution_token, token)
+                    else:
+                        user_id = await asyncio.to_thread(self.identity_mgr.validate_key, token)
                 except Exception as e:
-                    logger.error(f"Error validating key: {e}")
+                    logger.error(f"Error validating key or token: {e}")
                     user_id = None
                 
                 if not user_id:

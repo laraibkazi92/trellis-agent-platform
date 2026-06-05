@@ -35,13 +35,16 @@ def load_tool_configs() -> Dict[str, tuple[ToolConfig, Path]]:
         for name in tool_names:
             data = identity_mgr.get_tool_config(name)
             if data and "rel_path" in data:
-                rel_path = data.pop("rel_path")
-                config = ToolConfig(**data)
-                tool_dir = (BASE_DIR / rel_path).resolve()
-                if not str(tool_dir).startswith(str(BASE_DIR.resolve())):
-                    print(f"Error: Tool directory {tool_dir} is outside BASE_DIR {BASE_DIR}")
-                    continue
-                configs[config.name] = (config, tool_dir)
+                try:
+                    rel_path = data.pop("rel_path")
+                    config = ToolConfig(**data)
+                    tool_dir = (BASE_DIR / rel_path).resolve()
+                    if not str(tool_dir).startswith(str(BASE_DIR.resolve())):
+                        print(f"Error: Tool directory {tool_dir} is outside BASE_DIR {BASE_DIR}")
+                        continue
+                    configs[config.name] = (config, tool_dir)
+                except Exception as e:
+                    print(f"Error loading tool {name}: {e}")
     except Exception as e:
         print(f"Error loading tools from etcd: {e}")
     return configs
@@ -107,6 +110,11 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
             if variables:
                 safe_vars = {str(k): str(v) for k, v in variables.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
                 env.update(safe_vars)
+
+            # Auto-inject framework loopback capabilities
+            env["FRAMEWORK_EXECUTION_TOKEN"] = identity_mgr.generate_execution_token(user_id)
+            framework_url = identity_mgr.get_config("HOST_URL", os.getenv("HOST_URL", "http://localhost:8000"))
+            env["FRAMEWORK_API_URL"] = framework_url
 
         process = await asyncio.create_subprocess_exec(
             *cmd,

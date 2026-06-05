@@ -70,6 +70,7 @@ services:
     environment:
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
+      - HOST_URL=http://host:8000
     volumes:
       - health-data:/app/data
       - ./workspace:/app/workspace

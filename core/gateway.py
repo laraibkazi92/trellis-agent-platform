@@ -7,8 +7,9 @@ from typing import Dict, List
 import uvicorn
 import aiofiles
 from fastmcp import FastMCP
-from core.auth import AuthMiddleware, IdentityManager, auth_token_var
+from core.auth import AuthMiddleware, IdentityManager, auth_token_var, user_id_var
 from fastapi.middleware.cors import CORSMiddleware
+from core.discovery import discover_agents
 
 # Initialize FastMCP server with host and port
 mcp = FastMCP("Agent Gateway")
@@ -59,6 +60,15 @@ async def get_agent_description(config: dict, skills_path: Path) -> str:
 @mcp.tool()
 async def list_agents() -> List[Dict[str, str]]:
     """List all available agents and their descriptions."""
+    user_id = user_id_var.get()
+    
+    # Get configuration status for agents based on the current user
+    try:
+        discovered_agents = await discover_agents(user_id=user_id)
+        configured_agent_names = {a["name"] for a in discovered_agents if a.get("is_configured", False)}
+    except Exception as e:
+        print(f"Error checking agent configurations: {e}")
+        configured_agent_names = set()
     
     try:
         async with httpx.AsyncClient() as client:
@@ -75,6 +85,9 @@ async def list_agents() -> List[Dict[str, str]]:
     agents = []
     
     for agent_name, agent_info in agents_data.items():
+        if agent_name != "supervisor" and agent_name not in configured_agent_names:
+            continue
+            
         config_data = await asyncio.to_thread(identity_mgr.get_agent_config, agent_name)
         
         if config_data and config_data.get("type") == "background":
@@ -109,6 +122,17 @@ async def list_agents() -> List[Dict[str, str]]:
 async def use_agent(agent_name: str, prompt: str) -> str:
     """Call a specific agent with a prompt."""
     token = auth_token_var.get()
+    user_id = user_id_var.get()
+    
+    if agent_name != "supervisor":
+        try:
+            discovered_agents = await discover_agents(user_id=user_id)
+            configured_agent_names = {a["name"] for a in discovered_agents if a.get("is_configured", False)}
+            if agent_name not in configured_agent_names:
+                return f"SYSTEM: The agent '{agent_name}' requires configuration before it can be used. Please complete its setup in the UI."
+        except Exception as e:
+            print(f"Error checking agent configuration for '{agent_name}': {e}")
+            
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"

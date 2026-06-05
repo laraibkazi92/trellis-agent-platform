@@ -28,3 +28,7 @@ asyncache
 cachetools
 pycron
 cryptography
+subagents-pydantic-ai
+pydantic-ai-backend[console]
+pydantic-ai-shields
+pydantic-ai-rlm
