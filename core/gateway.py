@@ -9,7 +9,7 @@ import aiofiles
 from fastmcp import FastMCP
 from core.auth import AuthMiddleware, IdentityManager, auth_token_var, user_id_var
 from fastapi.middleware.cors import CORSMiddleware
-from core.discovery import discover_agents
+from core.discovery import discover_agents, is_agent_configured
 
 # Initialize FastMCP server with host and port
 mcp = FastMCP("Agent Gateway")
@@ -62,13 +62,12 @@ async def list_agents() -> List[Dict[str, str]]:
     """List all available agents and their descriptions."""
     user_id = user_id_var.get()
     
-    # Get configuration status for agents based on the current user
     try:
         discovered_agents = await discover_agents(user_id=user_id)
-        configured_agent_names = {a["name"] for a in discovered_agents if a.get("is_configured", False)}
+        agent_lookup = {a["name"]: a for a in discovered_agents}
     except Exception as e:
         print(f"Error checking agent configurations: {e}")
-        configured_agent_names = set()
+        return [{"name": "Error", "description": f"Failed to verify agent configurations: {e}"}]
     
     try:
         async with httpx.AsyncClient() as client:
@@ -85,20 +84,28 @@ async def list_agents() -> List[Dict[str, str]]:
     agents = []
     
     for agent_name, agent_info in agents_data.items():
-        if agent_name != "supervisor" and agent_name not in configured_agent_names:
+        if agent_name == "supervisor":
+            description = "Intelligent routing agent."
+            status = agent_info.get("status", "Online")
+            if status == "Offline":
+                description += " [STATUS: OFFLINE]"
+            agents.append({"name": agent_name, "description": description})
+            continue
+
+        agent_dict = agent_lookup.get(agent_name)
+        if not agent_dict:
             continue
             
-        config_data = await asyncio.to_thread(identity_mgr.get_agent_config, agent_name)
-        
-        if config_data and config_data.get("type") == "background":
+        if agent_dict.get("type") == "background":
             continue
             
-        skills = await asyncio.to_thread(identity_mgr.get_agent_skills, agent_name)
+        if not agent_dict.get("is_configured", False):
+            continue
+            
+        description = agent_dict.get("description") or "No description available."
         
-        description = "No description available."
-        if config_data and "description" in config_data:
-            description = config_data["description"]
-        elif skills:
+        if not description or description == "No description available.":
+            skills = agent_dict.get("skills", "")
             paragraphs = [p.strip() for p in skills.split("\n\n") if p.strip() and not p.strip().startswith("#")]
             if paragraphs:
                 description = paragraphs[0]
@@ -126,12 +133,12 @@ async def use_agent(agent_name: str, prompt: str) -> str:
     
     if agent_name != "supervisor":
         try:
-            discovered_agents = await discover_agents(user_id=user_id)
-            configured_agent_names = {a["name"] for a in discovered_agents if a.get("is_configured", False)}
-            if agent_name not in configured_agent_names:
+            configured = await is_agent_configured(agent_name, user_id)
+            if not configured:
                 return f"SYSTEM: The agent '{agent_name}' requires configuration before it can be used. Please complete its setup in the UI."
         except Exception as e:
             print(f"Error checking agent configuration for '{agent_name}': {e}")
+            return f"SYSTEM: Error checking agent configuration for '{agent_name}': {e}"
             
     headers = {}
     if token:

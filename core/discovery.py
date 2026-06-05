@@ -59,6 +59,58 @@ async def get_agent_required_variables(config: Dict) -> List[str]:
             
     return sorted(list(required))
 
+async def is_agent_configured(agent_name: str, user_id: str) -> bool:
+    """Fast check to determine if a specific agent is configured for a user."""
+    if agent_name == "supervisor":
+        return True
+        
+    config = await asyncio.to_thread(identity_mgr.get_agent_config, agent_name)
+    if not config:
+        return False
+        
+    is_background = config.get("type") == "background"
+    
+    required_secrets = await get_agent_required_secrets(config)
+    required_variables = await get_agent_required_variables(config)
+    
+    if not required_secrets and not required_variables:
+        return True
+        
+    global_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
+    global_variables = await asyncio.to_thread(identity_mgr.get_global_variables)
+    
+    user_required_secrets = [s for s in required_secrets if s not in global_secrets]
+    user_required_variables = [s for s in required_variables if s not in global_variables]
+    
+    if not user_required_secrets and not user_required_variables:
+        return True
+        
+    if is_background:
+        svc_secrets = await asyncio.to_thread(identity_mgr.get_user_secrets, f"svc_agent_{agent_name}")
+        svc_variables = await asyncio.to_thread(identity_mgr.get_user_variables, f"svc_agent_{agent_name}")
+        
+        for req in user_required_secrets:
+            if req not in svc_secrets:
+                return False
+        for req in user_required_variables:
+            if req not in svc_variables:
+                return False
+    else:
+        if not user_id:
+            return False
+            
+        human_user_secrets = await asyncio.to_thread(identity_mgr.get_user_secrets, user_id)
+        human_user_variables = await asyncio.to_thread(identity_mgr.get_user_variables, user_id)
+        
+        for req in user_required_secrets:
+            if req not in human_user_secrets:
+                return False
+        for req in user_required_variables:
+            if req not in human_user_variables:
+                return False
+                
+    return True
+
 async def discover_agents(user_id: Optional[str] = None, include_background: bool = False) -> List[Dict]:
     """Scan etcd registry for agents."""
     agents = []
