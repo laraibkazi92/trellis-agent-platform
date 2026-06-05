@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+
+{% block title %}Reports - {{ agent_name }}{% endblock %}
+
+{% block content %}
+<style>
+    @keyframes table-entrance {
+        from { opacity: 0; transform: translateY(10px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+    .data-table-container {
+        animation: table-entrance 0.4s ease-out forwards;
+    }
+    
+    /* Cyber table styling */
+    .cyber-table th {
+        position: sticky;
+        top: 0;
+        background-color: #111418;
+        border-bottom: 1px solid #262626; /* neutral-800 */
+        z-index: 10;
+    }
+    .cyber-table tr {
+        border-bottom: 1px solid #1f2937; /* neutral-800/50 approx */
+        transition: background-color 0.15s ease;
+    }
+    .cyber-table tr:hover {
+        background-color: rgba(255, 255, 255, 0.02);
+    }
+</style>
+
+<div class="flex flex-col gap-6">
+    <!-- Breadcrumb Header -->
+    <div class="flex justify-between items-end border-b border-neutral-800 pb-4">
+        <div>
+            <nav class="flex items-center gap-2 text-sm font-mono text-neutral-500 mb-2">
+                <a href="/reports" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase">Reports</a>
+                <span>/</span>
+                <span class="text-neutral-300 uppercase">{{ agent_name }}</span>
+            </nav>
+            <h2 class="text-3xl font-bold uppercase tracking-widest font-sans text-neutral-100 flex items-center gap-3">
+                <svg class="w-8 h-8 text-accent dark:text-accent-dark" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                    <path stroke-linecap="square" stroke-linejoin="miter" stroke-width="1.5" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"></path>
+                </svg>
+                {{ agent_name }}
+            </h2>
+        </div>
+        <div class="text-right">
+            <span class="text-xs font-mono uppercase text-neutral-500 block mb-1">Total Reports</span>
+            <span class="text-lg font-mono text-neutral-200">{{ reports_count }}</span>
+        </div>
+    </div>
+
+    <!-- Data Table -->
+    {% if reports %}
+    <div class="data-table-container border border-neutral-800 bg-[#0B0D10] overflow-x-auto overflow-y-auto max-h-[70vh]">
+        <table class="w-full text-left border-collapse cyber-table relative">
+            <thead>
+                <tr>
+                    <th class="py-3 px-4 text-xs font-mono uppercase tracking-widest text-neutral-400 font-normal w-1/2">Filename</th>
+                    <th class="py-3 px-4 text-xs font-mono uppercase tracking-widest text-neutral-400 font-normal w-1/6">Size</th>
+                    <th class="py-3 px-4 text-xs font-mono uppercase tracking-widest text-neutral-400 font-normal w-1/6">Modified</th>
+                    <th class="py-3 px-4 text-xs font-mono uppercase tracking-widest text-neutral-400 font-normal text-right w-1/6">Actions</th>
+                </tr>
+            </thead>
+            <tbody class="text-sm font-mono text-neutral-300">
+                {% for report in reports %}
+                <tr>
+                    <td class="py-3 px-4">
+                        <div class="flex items-center gap-2">
+                            <svg class="w-4 h-4 text-neutral-500 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                <path stroke-linecap="square" stroke-linejoin="miter" stroke-width="1.5" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"></path>
+                            </svg>
+                            <span class="truncate block max-w-md" title="{{ report.name }}">{{ report.name }}</span>
+                        </div>
+                    </td>
+                    <td class="py-3 px-4 text-neutral-400">{{ report.size }}</td>
+                    <td class="py-3 px-4 text-neutral-400">{{ report.modified }}</td>
+                    <td class="py-3 px-4 text-right">
+                        <div class="flex items-center justify-end gap-4">
+                            <a href="/reports/view/{{ report.path }}" target="_blank" class="text-xs font-bold text-accent dark:text-accent-dark hover:underline uppercase tracking-wider flex items-center gap-1 transition-colors" title="Open Report">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="square" stroke-linejoin="miter" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
+                                <span class="sr-only lg:not-sr-only">Open</span>
+                            </a>
+                            
+                            {% if is_admin %}
+                            <form method="POST" action="/reports/delete" class="m-0 flex" onsubmit="return confirm('Delete this report? This cannot be undone.');">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                                <input type="hidden" name="path" value="{{ report.path }}">
+                                <input type="hidden" name="agent_name" value="{{ agent_name }}">
+                                <button type="submit" class="text-xs font-bold text-red-500 hover:text-red-400 uppercase tracking-wider flex items-center gap-1 transition-colors" title="Delete Report">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="square" stroke-linejoin="miter" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                                    <span class="sr-only lg:not-sr-only">Delete</span>
+                                </button>
+                            </form>
+                            {% endif %}
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    
+    {% if total_pages > 1 %}
+    <div class="flex justify-between items-center mt-4 border-t border-neutral-800 pt-4">
+        <div class="text-xs font-mono text-neutral-500">
+            Page <span class="text-neutral-300">{{ page }}</span> of <span class="text-neutral-300">{{ total_pages }}</span>
+        </div>
+        <div class="flex items-center gap-2">
+            {% if has_prev %}
+            <a href="?page={{ page - 1 }}&limit={{ limit }}" class="px-3 py-1 border border-neutral-800 bg-[#0B0D10] text-xs font-mono text-neutral-300 hover:text-accent hover:border-accent transition-colors">Previous</a>
+            {% else %}
+            <span class="px-3 py-1 border border-neutral-800/50 bg-[#0B0D10]/50 text-xs font-mono text-neutral-600 cursor-not-allowed">Previous</span>
+            {% endif %}
+            
+            {% if has_next %}
+            <a href="?page={{ page + 1 }}&limit={{ limit }}" class="px-3 py-1 border border-neutral-800 bg-[#0B0D10] text-xs font-mono text-neutral-300 hover:text-accent hover:border-accent transition-colors">Next</a>
+            {% else %}
+            <span class="px-3 py-1 border border-neutral-800/50 bg-[#0B0D10]/50 text-xs font-mono text-neutral-600 cursor-not-allowed">Next</span>
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
+    
+    {% else %}
+    <div class="bg-[#0B0D10] border border-neutral-800 p-12 text-center flex flex-col items-center justify-center min-h-[300px]">
+        <svg class="w-16 h-16 text-neutral-700 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="square" stroke-linejoin="miter" stroke-width="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+        <h3 class="text-xl font-bold font-sans text-neutral-400 uppercase tracking-wider mb-2">No Reports Found</h3>
+        <p class="text-sm text-neutral-600 font-mono">This agent directory is empty or contains no HTML reports.</p>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

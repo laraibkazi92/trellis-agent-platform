@@ -55,6 +55,8 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
     user_id = arguments.pop("__user_id", None)
     if user_id:
         asyncio.create_task(asyncio.to_thread(identity_mgr.record_tool_usage, user_id, config.name))
+        if user_id.startswith("svc_agent_"):
+            arguments["__agent_name"] = user_id[len("svc_agent_"):]
     
     entrypoint_path = (tool_dir / config.entrypoint).resolve()
     if not str(entrypoint_path).startswith(str(tool_dir)):
@@ -81,6 +83,7 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
     bwrap_cmd = [
         "bwrap",
         "--ro-bind", "/", "/",
+        "--bind", "/app/workspace", "/app/workspace",
         "--dev", "/dev",
         "--proc", "/proc",
         "--tmpfs", "/tmp",
@@ -137,6 +140,14 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
 
         try:
             result = json.loads(stdout.decode())
+            # Global Safety Net: Safely truncate tool outputs exceeding 24k tokens (96,000 characters)
+            stringified = json.dumps(result)
+            if len(stringified) > 96000:
+                print(f"Warning: Tool {config.name} output size ({len(stringified)} chars) exceeded safety limit of 96000 chars. Truncating...")
+                result = {
+                    "error": f"Global Safety Net: The tool '{config.name}' output exceeded the 24k token limit (96,000 characters). Output was safely truncated to prevent model context crashes.",
+                    "partial_data_preview": stringified[:90000] + "... [TRUNCATED DUE TO SAFETY LIMITS]"
+                }
             # A valid JSON output with an 'error' key is considered a User-Scoped Failure,
             # which does NOT trip the global circuit breaker. We count it as a success for global health.
             health_monitor.record_event("tool", config.name, is_success=True)

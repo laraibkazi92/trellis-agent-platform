@@ -514,6 +514,50 @@ class IdentityManager:
             user["is_banned"] = is_banned
             self.upsert_user(user_id, user)
 
+    @retry_etcd()
+    def record_agent_run_state(self, agent_name: str, run_id: str, state: str, metadata: Dict) -> None:
+        """Record or update the state of an agent execution run in etcd."""
+        from datetime import datetime, timezone
+        key = f"/runs/{agent_name}/{run_id}"
+        record = {
+            "run_id": run_id,
+            "agent_name": agent_name,
+            "state": state,  # pending, processing, completed, failed
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "metadata": metadata
+        }
+        # To support updating existing records, fetch and merge if it already exists
+        value, _ = self.client.get(key)
+        if value:
+            try:
+                existing = json.loads(value.decode('utf-8'))
+                existing.update(record)
+                if "created_at" not in existing:
+                    existing["created_at"] = existing.get("timestamp")
+                existing["updated_at"] = record["timestamp"]
+                record = existing
+            except Exception:
+                pass
+        else:
+            record["created_at"] = record["timestamp"]
+            record["updated_at"] = record["timestamp"]
+            
+        self.client.put(key, json.dumps(record))
+
+    @retry_etcd()
+    def get_agent_runs(self, agent_name: str) -> List[Dict]:
+        """Retrieve all runs for a specific agent, sorted by timestamp descending."""
+        runs = []
+        prefix = f"/runs/{agent_name}/"
+        for value, metadata in self.client.get_prefix(prefix):
+            if value:
+                try:
+                    runs.append(json.loads(value.decode('utf-8')))
+                except Exception as e:
+                    logger.warning(f"Failed to decode agent run record: {e}")
+        runs.sort(key=lambda x: x.get("updated_at", x.get("timestamp", "")), reverse=True)
+        return runs
+
 class AuthMiddleware:
     def __init__(self, app, identity_mgr: IdentityManager):
         self.app = app

@@ -35,6 +35,8 @@ services:
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
+      - REDIS_URL=redis://redis:6379/0
+      - TZ=UTC
     volumes:
       - health-data:/app/data
       - ./workspace:/app/workspace
@@ -138,6 +140,7 @@ services:
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
       - REDIS_URL=redis://redis:6379/0
+      - TZ=UTC
     volumes:
       - ./workspace:/app/workspace
       - ./core:/app/core
@@ -163,6 +166,7 @@ services:
       - ETCD_HOST=etcd
       - ETCD_PORT=2379
       - REDIS_URL=redis://redis:6379/0
+      - TZ=UTC
     volumes:
       - ./workspace:/app/workspace
       - ./core:/app/core
@@ -191,6 +195,8 @@ services:
       - DEV_MODE=${DEV_MODE:-false}
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
       - ADMIN_USERS=${ADMIN_USERS}
+      - REDIS_URL=redis://redis:6379/0
+      - TZ=UTC
     volumes:
       - health-data:/app/data
       - ./workspace:/app/workspace

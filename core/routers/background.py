@@ -40,6 +40,8 @@ async def background_agents_view(request: Request):
             user_required_secrets = [s for s in required_secrets if s not in global_secrets]
             user_required_variables = [s for s in required_variables if s not in global_variables]
             
+            svc_variables = await asyncio.to_thread(identity_mgr.get_user_variables, f"svc_agent_{name}")
+            
             if user_required_secrets:
                 svc_secrets = await asyncio.to_thread(identity_mgr.get_user_secrets, f"svc_agent_{name}")
                 for s in user_required_secrets:
@@ -48,7 +50,6 @@ async def background_agents_view(request: Request):
                         missing_secrets.append(s)
                         
             if user_required_variables:
-                svc_variables = await asyncio.to_thread(identity_mgr.get_user_variables, f"svc_agent_{name}")
                 for s in user_required_variables:
                     if s not in svc_variables:
                         is_configured = False
@@ -63,6 +64,7 @@ async def background_agents_view(request: Request):
                 "missing_secrets": missing_secrets,
                 "required_variables": user_required_variables,
                 "missing_variables": missing_variables,
+                "current_variables": svc_variables,
                 "is_configured": is_configured
             })
 
@@ -95,8 +97,21 @@ async def background_agents_view(request: Request):
                 
     all_tools_data.sort(key=lambda x: x["name"])
 
-    # Taskiq queue observability can be added here later.
-    # For now, returning empty sets to preserve UI template.
+    # Taskiq queue observability
+    queue = {
+        "pending": [],
+        "processing": [],
+        "completed": [],
+        "failed": []
+    }
+    for b_agent in background_agents:
+        b_name = b_agent["name"]
+        agent_runs = await asyncio.to_thread(identity_mgr.get_agent_runs, b_name)
+        for run in agent_runs:
+            state = run.get("state")
+            if state in queue:
+                queue[state].append(run)
+
     return templates.TemplateResponse(
         request=request,
         name="background_agents.html",
@@ -107,12 +122,7 @@ async def background_agents_view(request: Request):
             "all_tools": all_tools_data,
             "all_mcps": all_mcps,
             "is_admin": is_admin(request),
-            "queue": {
-                "pending": [],
-                "processing": [],
-                "completed": [],
-                "failed": []
-            }
+            "queue": queue
         }
     )
 
@@ -194,11 +204,22 @@ async def run_background_agent_manual(request: Request, agent_name: str):
     now = datetime.now()
     xml_payload = f"<event_payload><![CDATA[\nManual execution triggered at {now.isoformat()}\n]]></event_payload>"
     
-    await run_background_agent.kiq(
+    task = await run_background_agent.kiq(
         agent_name=safe_name,
         prompt=xml_payload,
         user_id=f"svc_agent_{safe_name}"
     )
+    
+    try:
+        await asyncio.to_thread(
+            identity_mgr.record_agent_run_state,
+            safe_name,
+            task.task_id,
+            "pending",
+            {"prompt": xml_payload, "user_id": f"svc_agent_{safe_name}"}
+        )
+    except Exception as e:
+        print(f"Failed to record pending state for {safe_name}: {e}")
     
     request.session["flash_msg"] = f"Task for '{safe_name}' has been successfully enqueued for execution."
     return RedirectResponse(url='/background-agents', status_code=303)
