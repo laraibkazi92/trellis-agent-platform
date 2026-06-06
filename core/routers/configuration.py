@@ -33,13 +33,30 @@ async def configuration_page(request: Request):
     for name in tool_names:
         config = await asyncio.to_thread(identity_mgr.get_tool_config, name)
         if config:
-            if config.get("secrets"):
-                for secret_key in config.get("secrets", []):
+            secrets_data = config.get("secrets", [])
+            if isinstance(secrets_data, dict):
+                secrets_list = []
+                for v in secrets_data.values():
+                    if isinstance(v, list): secrets_list.extend(v)
+            else:
+                secrets_list = secrets_data
+
+            if secrets_list:
+                for secret_key in secrets_list:
                     if secret_key not in required_secrets:
                         required_secrets[secret_key] = []
                     required_secrets[secret_key].append(f"Tool: {name}")
-            if config.get("variables"):
-                for var_key in config.get("variables", []):
+
+            vars_data = config.get("variables", [])
+            if isinstance(vars_data, dict):
+                vars_list = []
+                for v in vars_data.values():
+                    if isinstance(v, list): vars_list.extend(v)
+            else:
+                vars_list = vars_data
+
+            if vars_list:
+                for var_key in vars_list:
                     if var_key not in required_variables:
                         required_variables[var_key] = []
                     required_variables[var_key].append(f"Tool: {name}")
@@ -47,13 +64,30 @@ async def configuration_page(request: Request):
     for name in mcp_names:
         config = await asyncio.to_thread(identity_mgr.get_mcp_config, name)
         if config:
-            if config.get("secrets"):
-                for secret_key in config.get("secrets", []):
+            secrets_data = config.get("secrets", [])
+            if isinstance(secrets_data, dict):
+                secrets_list = []
+                for v in secrets_data.values():
+                    if isinstance(v, list): secrets_list.extend(v)
+            else:
+                secrets_list = secrets_data
+
+            if secrets_list:
+                for secret_key in secrets_list:
                     if secret_key not in required_secrets:
                         required_secrets[secret_key] = []
                     required_secrets[secret_key].append(f"MCP: {name}")
-            if config.get("variables"):
-                for var_key in config.get("variables", []):
+
+            vars_data = config.get("variables", [])
+            if isinstance(vars_data, dict):
+                vars_list = []
+                for v in vars_data.values():
+                    if isinstance(v, list): vars_list.extend(v)
+            else:
+                vars_list = vars_data
+
+            if vars_list:
+                for var_key in vars_list:
                     if var_key not in required_variables:
                         required_variables[var_key] = []
                     required_variables[var_key].append(f"MCP: {name}")
@@ -125,18 +159,36 @@ async def save_configuration(request: Request):
     for name in tool_names:
         config = await asyncio.to_thread(identity_mgr.get_tool_config, name)
         if config:
-            if config.get("secrets"):
-                known_secrets.update(config.get("secrets", []))
-            if config.get("variables"):
-                known_variables.update(config.get("variables", []))
+            secrets_data = config.get("secrets", [])
+            if isinstance(secrets_data, dict):
+                for v in secrets_data.values():
+                    if isinstance(v, list): known_secrets.update(v)
+            elif isinstance(secrets_data, list):
+                known_secrets.update(secrets_data)
+
+            vars_data = config.get("variables", [])
+            if isinstance(vars_data, dict):
+                for v in vars_data.values():
+                    if isinstance(v, list): known_variables.update(v)
+            elif isinstance(vars_data, list):
+                known_variables.update(vars_data)
 
     for name in mcp_names:
         config = await asyncio.to_thread(identity_mgr.get_mcp_config, name)
         if config:
-            if config.get("secrets"):
-                known_secrets.update(config.get("secrets", []))
-            if config.get("variables"):
-                known_variables.update(config.get("variables", []))
+            secrets_data = config.get("secrets", [])
+            if isinstance(secrets_data, dict):
+                for v in secrets_data.values():
+                    if isinstance(v, list): known_secrets.update(v)
+            elif isinstance(secrets_data, list):
+                known_secrets.update(secrets_data)
+
+            vars_data = config.get("variables", [])
+            if isinstance(vars_data, dict):
+                for v in vars_data.values():
+                    if isinstance(v, list): known_variables.update(v)
+            elif isinstance(vars_data, list):
+                known_variables.update(vars_data)
     
     current_secrets = await asyncio.to_thread(identity_mgr.get_user_secrets, user_id)
     global_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)

@@ -16,14 +16,14 @@ BASE_DIR = Path(__file__).parent.parent
 WORKSPACE_DIR = BASE_DIR / "workspace"
 
 AGENTS_DIR = WORKSPACE_DIR / "agents"
-BG_AGENTS_DIR = WORKSPACE_DIR / "background_agents"
+WORKFLOWS_DIR = WORKSPACE_DIR / "workflows"
 TOOLS_DIR = WORKSPACE_DIR / "tools"
 MCPS_DIR = WORKSPACE_DIR / "mcps"
 
 # Supervisor is an internal core agent
 SUPERVISOR_DIR = BASE_DIR / "core" / "assets" / "supervisor"
 
-def sync_agent(identity_mgr, agent_dir, name=None, agent_type=None):
+def sync_agent(identity_mgr, agent_dir, name=None, default_type=None):
     if not name:
         name = agent_dir.name
         
@@ -40,11 +40,19 @@ def sync_agent(identity_mgr, agent_dir, name=None, agent_type=None):
         if "allowed_tools" not in config:
             config["allowed_tools"] = []
             
-        if agent_type:
-            config["type"] = agent_type
+        if not config.get("type") and default_type:
+            config["type"] = default_type
+            
+        # For script types, we need the rel_path so the engine knows where to run it
+        try:
+            rel_path = agent_dir.relative_to(BASE_DIR)
+            config["rel_path"] = str(rel_path)
+        except ValueError:
+            # If agent_dir is outside BASE_DIR, just use the absolute path or ignore
+            pass
             
         identity_mgr.save_agent_config(name, config)
-        print(f"  Saved config for agent: {name}")
+        print(f"  Saved config for agent: {name} (Type: {config.get('type')})")
         
     if skills_path.exists():
         with open(skills_path, "r") as f:
@@ -78,12 +86,12 @@ def main():
             if name:
                 seen_agents.add(name)
                 
-    print("\nSyncing background agents to etcd...")
-    if BG_AGENTS_DIR.exists():
-        for agent_dir in BG_AGENTS_DIR.iterdir():
+    print("\nSyncing workflows to etcd...")
+    if WORKFLOWS_DIR.exists():
+        for agent_dir in WORKFLOWS_DIR.iterdir():
             if not agent_dir.is_dir():
                 continue
-            name = sync_agent(identity_mgr, agent_dir, agent_type="background")
+            name = sync_agent(identity_mgr, agent_dir, default_type="agent")
             if name:
                 seen_agents.add(name)
     

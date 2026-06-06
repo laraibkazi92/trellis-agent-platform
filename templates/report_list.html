@@ -83,6 +83,11 @@
                                 <span class="sr-only lg:not-sr-only">Open</span>
                             </a>
                             
+                            <a href="/reports/download/{{ report.path }}" class="text-xs font-bold text-accent dark:text-accent-dark hover:underline uppercase tracking-wider flex items-center gap-1 transition-colors" title="Download Report">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="square" stroke-linejoin="miter" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                                <span class="sr-only lg:not-sr-only">Download</span>
+                            </a>
+                            
                             {% if is_admin %}
                             <form method="POST" action="/reports/delete" class="m-0 flex" onsubmit="return confirm('Delete this report? This cannot be undone.');">
                                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

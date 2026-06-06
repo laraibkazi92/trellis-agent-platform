@@ -3,7 +3,7 @@ import datetime
 import math
 from pathlib import Path
 from fastapi import APIRouter, Request, Form, Query
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse
 from fastapi.concurrency import run_in_threadpool
 import logging
 
@@ -241,7 +241,7 @@ async def delete_report(request: Request):
         
     # Strict path traversal protection
     target_path = (REPORTS_DIR / report_path).resolve()
-    if not str(target_path).startswith(str(REPORTS_DIR)):
+    if not target_path.is_relative_to(REPORTS_DIR):
         request.session["flash_msg"] = "Security Block: Invalid target path."
         return RedirectResponse(url=redirect_url, status_code=303)
         
@@ -255,3 +255,25 @@ async def delete_report(request: Request):
         request.session["flash_msg"] = "Error: Report file not found."
         
     return RedirectResponse(url=redirect_url, status_code=303)
+
+@router.get("/download/{report_path:path}", response_class=FileResponse)
+async def download_report(request: Request, report_path: str):
+    user = request.session.get('user')
+    if not user:
+        return RedirectResponse(url='/login', status_code=303)
+        
+    target_path = (REPORTS_DIR / report_path).resolve()
+    if not target_path.is_relative_to(REPORTS_DIR):
+        request.session["flash_msg"] = "Security Block: Invalid target path."
+        return RedirectResponse(url='/reports', status_code=303)
+        
+    if target_path.exists() and target_path.is_file():
+        return FileResponse(
+            path=target_path, 
+            filename=target_path.name, 
+            media_type="text/html",
+            headers={"Content-Disposition": f"attachment; filename={target_path.name}"}
+        )
+    else:
+        request.session["flash_msg"] = "Error: Report file not found."
+        return RedirectResponse(url='/reports', status_code=303)

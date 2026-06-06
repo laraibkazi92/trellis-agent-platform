@@ -30,7 +30,7 @@ if not DEV_MODE:
     if missing:
         raise ValueError(f"Missing required environment variables for UI: {', '.join(missing)}")
 
-from core.routers import auth, marketplace, profile, admin, configuration, docs, status, background, api, reports
+from core.routers import auth, marketplace, profile, admin, configuration, docs, status, workflows, api, reports
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -64,6 +64,6 @@ app.include_router(admin.router)
 app.include_router(configuration.router)
 app.include_router(docs.router)
 app.include_router(status.router)
-app.include_router(background.router)
+app.include_router(workflows.router)
 app.include_router(api.router)
 app.include_router(reports.router)

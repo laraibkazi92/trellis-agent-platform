@@ -1,5 +1,7 @@
 import os
 import asyncio
+import subprocess
+from pathlib import Path
 from typing import Dict, Any, Optional, List
 from taskiq_redis import ListQueueBroker
 from pydantic_ai import Agent
@@ -11,6 +13,8 @@ from core.agent_factory import (
     get_health_monitor,
     get_hub_client,
 )
+
+RESTRICTED_ENV_VARS = {"PATH", "PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "BASH_ENV", "ENV", "HOSTALIASES"}
 
 # Redis broker configuration
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -45,22 +49,29 @@ async def dynamic_cron_heartbeat():
             continue
             
         config_data = await asyncio.to_thread(identity_mgr.get_agent_config, name)
-        if not config_data or config_data.get("type") != "background":
+        if not config_data or config_data.get("type") not in ("agent", "script"):
             continue
             
         trigger = config_data.get("trigger")
         if trigger and trigger.get("type") == "cron":
             expr = trigger.get("expression")
             if expr and pycron.is_now(expr, now):
-                print(f"Triggering background agent {name} via cron: {expr}")
+                print(f"Triggering background workflow {name} via cron: {expr}")
                 # System prompt for cron runs
                 xml_payload = f"<event_payload><![CDATA[\nScheduled execution triggered at {now.isoformat()}\n]]></event_payload>"
                 
-                task = await run_background_agent.kiq(
-                    agent_name=name,
-                    prompt=xml_payload,
-                    user_id=f"svc_agent_{name}"
-                )
+                if config_data.get("type") == "script":
+                    task = await run_background_script.kiq(
+                        agent_name=name,
+                        prompt=xml_payload,
+                        user_id=f"svc_agent_{name}"
+                    )
+                else:
+                    task = await run_background_agent.kiq(
+                        agent_name=name,
+                        prompt=xml_payload,
+                        user_id=f"svc_agent_{name}"
+                    )
                 try:
                     await asyncio.to_thread(
                         identity_mgr.record_agent_run_state,
@@ -71,6 +82,138 @@ async def dynamic_cron_heartbeat():
                     )
                 except Exception as e:
                     print(f"Failed to record pending state for {name}: {e}")
+
+@broker.task
+async def run_background_script(
+    agent_name: str,
+    prompt: str,
+    user_id: str,
+    context: Context = TaskiqDepends(),
+) -> str:
+    """Executes a script in the background as a Taskiq task."""
+    token = user_id_var.set(user_id)
+    task_id = context.message.task_id if (context and context.message) else "unknown"
+    try:
+        identity_mgr = get_identity_manager()
+        
+        try:
+            await asyncio.to_thread(
+                identity_mgr.record_agent_run_state,
+                agent_name,
+                task_id,
+                "processing",
+                {"prompt": prompt, "user_id": user_id}
+            )
+        except Exception as err:
+            print(f"Failed to record processing state for {agent_name} run {task_id}: {err}")
+            
+        config_data = await asyncio.to_thread(identity_mgr.get_agent_config, agent_name)
+        if not config_data:
+            raise ValueError(f"Workflow '{agent_name}' configuration not found in etcd.")
+            
+        disabled_agents = identity_mgr.get_disabled_agents()
+        if agent_name in disabled_agents:
+            raise ValueError(f"Workflow '{agent_name}' is currently disabled.")
+        
+        # Prepare execution environment
+        base_dir = Path(__file__).parent.parent
+        rel_path = config_data.get("rel_path")
+        if not rel_path:
+            raise ValueError(f"Workflow '{agent_name}' is missing rel_path configuration.")
+            
+        script_dir = (base_dir / rel_path).resolve()
+        entrypoint = config_data.get("entrypoint")
+        if not entrypoint:
+            raise ValueError(f"Workflow '{agent_name}' is missing entrypoint configuration.")
+            
+        entrypoint_path = (script_dir / entrypoint).resolve()
+        
+        if not str(entrypoint_path).startswith(str(script_dir)) or not entrypoint_path.is_file():
+            raise ValueError(f"Invalid entrypoint {entrypoint_path}")
+
+        runtime = config_data.get("runtime", "python")
+        if runtime == "python":
+            cmd = ["python", str(entrypoint_path)]
+        elif runtime == "node":
+            cmd = ["node", str(entrypoint_path)]
+        elif runtime == "bash":
+            cmd = ["bash", str(entrypoint_path)]
+        else:
+            cmd = [str(entrypoint_path)]
+
+        env = os.environ.copy()
+        secrets = identity_mgr.get_resolved_secrets(user_id)
+        if secrets:
+            safe_secrets = {str(k): str(v) for k, v in secrets.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
+            env.update(safe_secrets)
+            
+        variables = identity_mgr.get_resolved_variables(user_id)
+        if variables:
+            safe_vars = {str(k): str(v) for k, v in variables.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
+            env.update(safe_vars)
+
+        env["FRAMEWORK_EXECUTION_TOKEN"] = identity_mgr.generate_execution_token(user_id)
+        framework_url = identity_mgr.get_config("HOST_URL", os.getenv("HOST_URL", "http://localhost:8000"))
+        env["FRAMEWORK_API_URL"] = framework_url
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(script_dir),
+            env=env
+        )
+
+        input_data = prompt.encode() if prompt else b""
+        stdout, stderr = await process.communicate(input=input_data)
+        
+        output_str = ""
+        if stdout:
+            output_str += stdout.decode()
+        if stderr:
+            output_str += "\n" + stderr.decode()
+
+        if process.returncode != 0:
+            raise RuntimeError(f"Script exited with status {process.returncode}:\n{output_str}")
+
+        try:
+            await asyncio.to_thread(
+                identity_mgr.record_agent_run_state,
+                agent_name,
+                task_id,
+                "completed",
+                {
+                    "prompt": prompt,
+                    "user_id": user_id,
+                    "output": output_str.strip()
+                }
+            )
+        except Exception as err:
+            print(f"Failed to record completed state for {agent_name} run {task_id}: {err}")
+                    
+        return output_str.strip()
+        
+    except Exception as e:
+        print(f"Error running background script '{agent_name}': {e}")
+        try:
+            await asyncio.to_thread(
+                identity_mgr.record_agent_run_state,
+                agent_name,
+                task_id,
+                "failed",
+                {
+                    "prompt": prompt,
+                    "user_id": user_id,
+                    "error": str(e)
+                }
+            )
+        except Exception as err:
+            print(f"Failed to record failed state for {agent_name} run {task_id}: {err}")
+        raise
+    finally:
+        user_id_var.reset(token)
+
 
 @broker.task
 async def run_background_agent(
