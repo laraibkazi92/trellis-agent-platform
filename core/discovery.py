@@ -27,7 +27,7 @@ def _resolve_requirements(req_data, is_background: bool) -> List[str]:
 async def get_agent_required_secrets(config: Dict) -> List[str]:
     """Helper to determine all required secrets for an agent based on its tools/MCPs."""
     required = set()
-    is_background = config.get("type") == "background"
+    is_background = config.get("type") in ("agent", "script")
     
     allowed_tools = config.get("allowed_tools", [])
     for tool_name in allowed_tools:
@@ -56,7 +56,7 @@ async def get_agent_required_secrets(config: Dict) -> List[str]:
 async def get_agent_required_variables(config: Dict) -> List[str]:
     """Helper to determine all required non-sensitive variables for an agent based on its tools/MCPs."""
     required = set()
-    is_background = config.get("type") == "background"
+    is_background = config.get("type") in ("agent", "script")
     
     allowed_tools = config.get("allowed_tools", [])
     for tool_name in allowed_tools:
@@ -91,7 +91,7 @@ async def is_agent_configured(agent_name: str, user_id: str) -> bool:
     if not config:
         return False
         
-    is_background = config.get("type") == "background"
+    is_background = config.get("type") in ("agent", "script")
     
     required_secrets = await get_agent_required_secrets(config)
     required_variables = await get_agent_required_variables(config)
@@ -156,7 +156,7 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
             
         config = await asyncio.to_thread(identity_mgr.get_agent_config, name)
         if config:
-            is_background = config.get("type") == "background"
+            is_background = config.get("type") in ("agent", "script")
             
             if is_background and not include_background:
                 continue
