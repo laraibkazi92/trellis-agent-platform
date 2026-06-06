@@ -13,24 +13,24 @@ BASE_DIR = Path(__file__).parent.parent.parent
 async def read_docs_index():
     return RedirectResponse(url="/docs/agents")
 
+DOC_MAP = {
+    "agents": ("DOCS_AGENTS.md", "Agent Developer Guide"),
+    "tools": ("DOCS_TOOLS.md", "Tool Developer Guide"),
+    "builder": ("DOCS_AGENT_BUILDER.md", "Agent Builder Guide"),
+    "mcp": ("DOCS_MCP.md", "MCP Server Guide"),
+    "workflows": ("DOCS_WORKFLOWS.md", "Background Workflows Guide"),
+}
+
 @router.get("/{doc_type}", response_class=HTMLResponse)
 async def read_doc(request: Request, doc_type: str):
     user = request.session.get('user')
     
-    if doc_type == "agents":
-        file_path = BASE_DIR / "DOCS_AGENTS.md"
-        title = "Agent Developer Guide"
-    elif doc_type == "tools":
-        file_path = BASE_DIR / "DOCS_TOOLS.md"
-        title = "Tool Developer Guide"
-    elif doc_type == "builder":
-        file_path = BASE_DIR / "DOCS_AGENT_BUILDER.md"
-        title = "Agent Builder Guide"
-    elif doc_type == "mcp":
-        file_path = BASE_DIR / "DOCS_MCP.md"
-        title = "MCP Server Guide"
-    else:
+    doc_info = DOC_MAP.get(doc_type)
+    if not doc_info:
         return HTMLResponse(content="Documentation not found", status_code=404)
+        
+    file_path = BASE_DIR / doc_info[0]
+    title = doc_info[1]
 
     if not file_path.exists():
         return HTMLResponse(content="Documentation file not found on server", status_code=404)
