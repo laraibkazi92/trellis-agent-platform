@@ -78,12 +78,12 @@ class IdentityManager:
     @retry_etcd()
     def upsert_user(self, user_id: str, profile: Dict) -> None:
         """Create or update a user profile."""
-        self.client.put(f"/users/{user_id}", json.dumps(profile))
+        self.client.put(f"/users/profiles/{user_id}", json.dumps(profile))
         
     @retry_etcd()
     def get_user(self, user_id: str) -> Optional[Dict]:
         """Retrieve a user profile."""
-        value, metadata = self.client.get(f"/users/{user_id}")
+        value, metadata = self.client.get(f"/users/profiles/{user_id}")
         if value:
             return json.loads(value.decode('utf-8'))
         return None
@@ -91,7 +91,7 @@ class IdentityManager:
     @retry_etcd()
     def get_user_secrets(self, user_id: str) -> Dict[str, str]:
         """Retrieve user-specific secrets."""
-        value, _ = self.client.get(f"/users/{user_id}/secrets")
+        value, _ = self.client.get(f"/users/secrets/{user_id}")
         if value:
             decoded = value.decode('utf-8')
             decrypted = _decrypt_string(decoded)
@@ -107,7 +107,7 @@ class IdentityManager:
         """Save user-specific secrets securely using encryption."""
         serialized = json.dumps(secrets_data)
         encrypted = _encrypt_string(serialized)
-        self.client.put(f"/users/{user_id}/secrets", encrypted)
+        self.client.put(f"/users/secrets/{user_id}", encrypted)
 
     @retry_etcd()
     def get_global_secrets(self) -> Dict[str, str]:
@@ -139,7 +139,7 @@ class IdentityManager:
     @retry_etcd()
     def get_user_variables(self, user_id: str) -> Dict[str, str]:
         """Retrieve user-specific non-sensitive configuration variables."""
-        value, _ = self.client.get(f"/users/{user_id}/variables")
+        value, _ = self.client.get(f"/users/variables/{user_id}")
         if value:
             try:
                 return json.loads(value.decode('utf-8'))
@@ -151,7 +151,7 @@ class IdentityManager:
     @retry_etcd()
     def save_user_variables(self, user_id: str, variables_data: Dict[str, str]) -> None:
         """Save user-specific non-sensitive configuration variables."""
-        self.client.put(f"/users/{user_id}/variables", json.dumps(variables_data))
+        self.client.put(f"/users/variables/{user_id}", json.dumps(variables_data))
 
     @retry_etcd()
     def get_global_variables(self) -> Dict[str, str]:
@@ -508,7 +508,7 @@ class IdentityManager:
     def list_all_users(self) -> List[Dict]:
         """List all user profiles."""
         users = []
-        for value, _ in self.client.get_prefix("/users/"):
+        for value, _ in self.client.get_prefix("/users/profiles/"):
             if value:
                 try:
                     users.append(json.loads(value.decode('utf-8')))
