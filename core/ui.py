@@ -43,11 +43,6 @@ os.makedirs(REPORTS_DIR, exist_ok=True)
 
 app.mount("/reports/view", StaticFiles(directory=REPORTS_DIR), name="reports_static")
 
-# Mount general static files
-STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
-os.makedirs(STATIC_DIR, exist_ok=True)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
 cors_origins_str = os.getenv("CORS_ALLOWED_ORIGINS", "")
 if DEV_MODE:
     allow_origins = ["*"]
