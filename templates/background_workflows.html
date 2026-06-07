@@ -200,7 +200,16 @@
                 <td class="p-4 align-top text-xs font-mono text-neutral-800 dark:text-neutral-300">
                     {% if agent.config.get('trigger', {}).get('type') == 'cron' %}
                         <span class="font-bold text-neutral-500 uppercase">CRON:</span><br/>
-                        <span class="cron-readable text-accent dark:text-accent-dark">{{ agent.config.get('trigger', {}).get('expression') }}</span>
+                        {% set cron_expr = agent.config.get('trigger', {}).get('expression') %}
+                        {% if cron_expr is string %}
+                            <span class="cron-readable text-accent dark:text-accent-dark">{{ cron_expr }}</span>
+                        {% elif cron_expr is iterable and cron_expr is not string %}
+                            {% for expr in cron_expr %}
+                                <span class="cron-readable text-accent dark:text-accent-dark">{{ expr }}</span>{% if not loop.last %}<br/>{% endif %}
+                            {% endfor %}
+                        {% else %}
+                            <span class="cron-readable text-accent dark:text-accent-dark">{{ cron_expr }}</span>
+                        {% endif %}
                     {% elif agent.config.get('trigger', {}).get('type') == 'webhook' %}
                         <span class="font-bold text-neutral-500 uppercase">Webhook:</span><br/>
                         <span class="text-accent dark:text-accent-dark">{{ agent.config.get('trigger', {}).get('provider') | uppercase }}</span>
@@ -378,8 +387,12 @@
                     </div>
 
                     <div id="cron-fields-{{ agent.name }}" class="hidden">
-                        <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">Cron Expression</label>
-                        <input type="text" name="cron_expression" id="modal-cron-expr-{{ agent.name }}" placeholder="* * * * *" value="{{ agent.config.get('trigger', {}).get('expression', '') }}" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
+                        <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">Cron Expression <span class="lowercase font-normal text-[10px] bg-neutral-100 dark:bg-neutral-800 px-1 py-0.5 border border-neutral-200 dark:border-neutral-700 text-neutral-500">separate multiple with |</span></label>
+                        {% set cron_val = agent.config.get('trigger', {}).get('expression', '') %}
+                        {% if cron_val is iterable and cron_val is not string %}
+                            {% set cron_val = cron_val | join(' | ') %}
+                        {% endif %}
+                        <input type="text" name="cron_expression" id="modal-cron-expr-{{ agent.name }}" placeholder="* * * * *" value="{{ cron_val }}" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
                         <p class="mt-2 text-xs text-neutral-500" id="cron-preview-{{ agent.name }}">Every minute</p>
                     </div>
 
@@ -574,7 +587,10 @@
             if(cronPreview) {
                 cronInput.addEventListener('input', (e) => {
                     try {
-                        cronPreview.innerText = cronstrue.toString(e.target.value);
+                        const parts = e.target.value.split('|').map(p => p.trim()).filter(p => p);
+                        if (parts.length === 0) throw new Error("Empty");
+                        const previews = parts.map(p => cronstrue.toString(p));
+                        cronPreview.innerText = previews.join(' AND ');
                         cronPreview.classList.remove('text-red-500');
                         cronPreview.classList.add('text-emerald-500');
                     } catch (err) {

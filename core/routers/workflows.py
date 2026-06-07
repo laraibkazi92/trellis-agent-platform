@@ -307,7 +307,8 @@ async def update_background_trigger(request: Request):
     if validated_data.trigger_type and validated_data.trigger_type != "none":
         trigger = {"type": validated_data.trigger_type}
         if validated_data.trigger_type == "cron" and validated_data.cron_expression:
-            trigger["expression"] = validated_data.cron_expression
+            parts = [p.strip() for p in validated_data.cron_expression.split('|') if p.strip()]
+            trigger["expression"] = parts if len(parts) > 1 else (parts[0] if parts else "")
         elif validated_data.trigger_type == "webhook":
             trigger["provider"] = validated_data.webhook_provider or "generic"
             trigger["secret"] = validated_data.webhook_secret or "secret"
