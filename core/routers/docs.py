@@ -14,11 +14,11 @@ async def read_docs_index():
     return RedirectResponse(url="/docs/agents")
 
 DOC_MAP = {
-    "agents": ("DOCS_AGENTS.md", "Agent Developer Guide"),
-    "tools": ("DOCS_TOOLS.md", "Tool Developer Guide"),
-    "builder": ("DOCS_AGENT_BUILDER.md", "Agent Builder Guide"),
-    "mcp": ("DOCS_MCP.md", "MCP Server Guide"),
-    "workflows": ("DOCS_WORKFLOWS.md", "Background Workflows Guide"),
+    "agents": ("docs/agents.md", "Agent Developer Guide"),
+    "tools": ("docs/tools.md", "Tool Developer Guide"),
+    "builder": ("docs/agent_builder.md", "Agent Builder Guide"),
+    "mcp": ("docs/mcp.md", "MCP Server Guide"),
+    "workflows": ("docs/workflows.md", "Background Workflows Guide"),
 }
 
 @router.get("/{doc_type}", response_class=HTMLResponse)

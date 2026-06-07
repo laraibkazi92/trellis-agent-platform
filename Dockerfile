@@ -36,7 +36,7 @@ RUN cp $(python -c "import certifi; print(certifi.where())") /usr/local/share/ca
 COPY core/ core/
 COPY templates/ templates/
 COPY scripts/ scripts/
-COPY DOCS_*.md ./
+COPY docs/ docs/
 
 # Set PYTHONPATH to the root so core imports work
 ENV PYTHONPATH=/app
