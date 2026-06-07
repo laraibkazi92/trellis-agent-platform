@@ -13,6 +13,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/fuse.js/dist/fuse.min.js"></script>
+    <script src="/static/js/main.js"></script>
     <script>
         tailwind.config = {
             darkMode: 'media',
@@ -28,129 +29,6 @@
                 }
             }
         }
-
-        function copyToClipboard(button, textSelector) {
-            const container = button.closest('.group');
-            const targetElement = container.querySelector(textSelector);
-            const textToCopy = targetElement.textContent || targetElement.innerText;
-            
-            navigator.clipboard.writeText(textToCopy.trim()).then(() => {
-                const originalText = button.innerText;
-                button.innerText = 'COPIED!';
-                button.classList.add('!text-green-500', '!border-green-500');
-                
-                setTimeout(() => {
-                    button.innerText = originalText;
-                    button.classList.remove('!text-green-500', '!border-green-500');
-                }, 2000);
-            }).catch(err => {
-                console.error('Failed to copy: ', err);
-                button.innerText = 'ERROR';
-                setTimeout(() => {
-                    button.innerText = 'COPY';
-                }, 2000);
-            });
-        }
-
-        class PaginatedGrid {
-            constructor(config) {
-                this.searchInput = config.searchInput;
-                this.items = config.items;
-                this.fuseInstance = config.fuseInstance;
-                this.itemsPerPage = config.itemsPerPage || 12;
-                this.paginationControls = config.paginationControls;
-                this.prevButton = config.prevButton;
-                this.nextButton = config.nextButton;
-                this.pageInfo = config.pageInfo;
-                this.datasetKey = config.datasetKey;
-
-                this.currentPage = 1;
-                this.filteredItems = [...this.items];
-
-                this.init();
-            }
-
-            init() {
-                if (this.prevButton && this.nextButton) {
-                    this.prevButton.addEventListener('click', () => {
-                        if (this.currentPage > 1) {
-                            this.currentPage--;
-                            this.update();
-                            window.scrollTo({ top: 0, behavior: 'smooth' });
-                        }
-                    });
-
-                    this.nextButton.addEventListener('click', () => {
-                        const totalPages = Math.ceil(this.filteredItems.length / this.itemsPerPage);
-                        if (this.currentPage < totalPages) {
-                            this.currentPage++;
-                            this.update();
-                            window.scrollTo({ top: 0, behavior: 'smooth' });
-                        }
-                    });
-                }
-
-                if (this.searchInput) {
-                    this.searchInput.addEventListener('input', (e) => {
-                        const query = e.target.value;
-                        if (!query) {
-                            this.filteredItems = [...this.items];
-                        } else {
-                            const results = this.fuseInstance.search(query);
-                            const matchedNames = new Set(results.map(r => r.item.name));
-                            this.filteredItems = this.items.filter(card => matchedNames.has(card.dataset[this.datasetKey]));
-                        }
-                        this.currentPage = 1;
-                        this.update();
-                    });
-                }
-
-                this.update();
-            }
-
-            update() {
-                const totalPages = Math.ceil(this.filteredItems.length / this.itemsPerPage);
-                
-                if (totalPages <= 1) {
-                    if (this.paginationControls) {
-                        this.paginationControls.classList.add('hidden');
-                        this.paginationControls.classList.remove('flex');
-                    }
-                } else {
-                    if (this.paginationControls) {
-                        this.paginationControls.classList.remove('hidden');
-                        this.paginationControls.classList.add('flex');
-                    }
-                }
-
-                if (this.currentPage > totalPages) this.currentPage = totalPages || 1;
-
-                if (this.pageInfo) {
-                    this.pageInfo.textContent = `Page ${this.currentPage} of ${totalPages || 1}`;
-                    this.pageInfo.setAttribute('aria-label', `Page ${this.currentPage} of ${totalPages || 1}`);
-                }
-                
-                if (this.prevButton && this.nextButton) {
-                    this.prevButton.disabled = this.currentPage === 1;
-                    this.nextButton.disabled = this.currentPage === totalPages || totalPages === 0;
-                    
-                    if (this.currentPage === 1) {
-                        this.prevButton.removeAttribute('aria-current');
-                    }
-                }
-
-                const startIndex = (this.currentPage - 1) * this.itemsPerPage;
-                const endIndex = startIndex + this.itemsPerPage;
-
-                this.items.forEach(item => {
-                    item.classList.add('is-hidden');
-                    item.style.display = ''; // Clear inline styles
-                });
-                this.filteredItems.slice(startIndex, endIndex).forEach(item => {
-                    item.classList.remove('is-hidden');
-                });
-            }
-        }
     </script>
     <style>
         .is-hidden { display: none !important; }
@@ -158,12 +36,13 @@
 </head>
 <body class="bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-50 min-h-screen antialiased selection:bg-accent selection:text-white dark:selection:bg-accent-dark flex flex-col">
     <nav class="border-b border-neutral-200 dark:border-neutral-800 p-4 px-6 flex flex-wrap gap-4 justify-between items-center bg-white dark:bg-neutral-900 sticky top-0 z-40">
-        <a href="/" class="text-xl font-bold tracking-tight uppercase hover:text-accent dark:hover:text-accent-dark transition-colors flex items-center gap-2">
+        <a href="/" class="text-xl font-bold tracking-tight uppercase hover:text-accent dark:hover:text-accent-dark transition-colors flex items-baseline gap-2">
             {% if app_logo_url %}
             <img src="{{ app_logo_url }}" alt="{{ app_name }} Logo" class="h-8 w-auto">
             {% else %}
             {{ app_name }}
             {% endif %}
+            <span class="text-sm text-blue-600 dark:text-blue-400 normal-case font-medium tracking-normal">Agent Framework</span>
         </a>
         <div class="space-x-4 md:space-x-6 text-sm font-bold font-mono tracking-wide flex items-center flex-wrap">
         {% if user %}
@@ -178,27 +57,27 @@
             <a href="/status" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/status' %}text-accent dark:text-accent-dark{% endif %}">Status</a>
             <span class="text-neutral-300 dark:text-neutral-700 hidden sm:inline">|</span>
             <a href="/reports" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/reports' %}text-accent dark:text-accent-dark{% endif %}">Reports</a>
-            <span class="text-neutral-300 dark:text-neutral-700 hidden sm:inline">|</span>
-            <a href="/docs" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path.startswith('/docs') %}text-accent dark:text-accent-dark{% endif %}">Docs</a>
-        <span class="text-neutral-300 dark:text-neutral-700 hidden sm:inline">|</span>
-        <div class="relative group inline-block">
-            <a href="/profile" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/profile' %}text-accent dark:text-accent-dark{% endif %}">Profile</a>
-            <div class="absolute hidden group-hover:block w-48 top-full mt-2 left-1/2 -translate-x-1/2 bg-neutral-800 text-white text-xs p-2 rounded shadow-lg z-50 text-center font-sans normal-case tracking-normal">
-                User details, usage metrics, and API Keys
-            </div>
-        </div>
-        <div class="relative group inline-block">
+            <div class="relative group inline-block">
             <a href="/configuration" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase {% if request.url.path == '/configuration' %}text-accent dark:text-accent-dark{% endif %}">Configuration</a>
             <div class="absolute hidden group-hover:block w-56 top-full mt-2 left-1/2 -translate-x-1/2 bg-neutral-800 text-white text-xs p-2 rounded shadow-lg z-50 text-center font-sans normal-case tracking-normal">
                 Third-party credentials and configuration variables securely stored for use by your Agents and Tools.
             </div>
         </div>
         <span class="text-neutral-300 dark:text-neutral-700 hidden sm:inline">|</span>
-        {% if is_admin %}
-        <a href="/admin" class="text-emerald-600 dark:text-emerald-400 hover:text-emerald-700 dark:hover:text-emerald-300 transition-colors uppercase {% if request.url.path == '/admin' %}text-emerald-700 dark:text-emerald-300{% endif %}">Admin</a>
-        {% endif %}
-        <span class="text-neutral-500 dark:text-neutral-400 hidden sm:inline">{{ user.name }}</span>
-        <a href="/logout" onclick="showGlobalLoading('Signing out...')" class="text-red-600 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300 transition-colors uppercase">Logout</a>
+        <div class="relative inline-block text-left" id="user-menu-container">
+            <button type="button" class="flex items-center gap-2 hover:text-accent dark:hover:text-accent-dark transition-colors cursor-pointer" id="user-menu-button" aria-expanded="false" aria-haspopup="true">
+                <span class="text-neutral-500 dark:text-neutral-400 font-mono text-sm uppercase font-bold">{{ user.name }}</span>
+                <i data-lucide="chevron-down" class="w-4 h-4 text-neutral-500"></i>
+            </button>
+            <div id="user-dropdown" class="origin-top-right absolute right-0 mt-2 w-48 rounded shadow-lg bg-white dark:bg-neutral-800 ring-1 ring-black ring-opacity-5 focus:outline-none hidden z-50 py-1 font-mono">
+                <a href="/docs" class="block px-4 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700 uppercase transition-colors">Documentation</a>
+                <a href="/profile" class="block px-4 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700 uppercase transition-colors">Profile</a>
+                {% if is_admin %}
+                <a href="/admin" class="block px-4 py-2 text-sm text-emerald-600 dark:text-emerald-400 hover:bg-neutral-100 dark:hover:bg-neutral-700 uppercase transition-colors">Admin</a>
+                {% endif %}
+                <a href="/logout" onclick="showGlobalLoading('Signing out...')" class="block px-4 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-neutral-100 dark:hover:bg-neutral-700 uppercase transition-colors border-t border-neutral-200 dark:border-neutral-700 mt-1">Logout</a>
+            </div>
+        </div>
             {% else %}
             <a href="/login" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase">Login</a>
             {% endif %}
@@ -227,7 +106,7 @@
         {% block content %}{% endblock %}
     </main>
     
-    <footer class="border-t border-neutral-200 dark:border-neutral-800 py-6 text-center text-sm font-mono text-neutral-500 mt-12 bg-white dark:bg-neutral-900">
+    <footer class="border-t border-neutral-200 dark:border-neutral-800 py-2 text-center text-sm font-mono text-neutral-500 mt-auto bg-white dark:bg-neutral-900">
         {{ app_name }}
     </footer>
 
@@ -238,29 +117,5 @@
             <p id="global-loading-text" class="text-sm font-mono uppercase tracking-widest text-accent animate-pulse">Processing...</p>
         </div>
     </div>
-
-    <script>
-        lucide.createIcons();
-
-        function showGlobalLoading(message) {
-            const overlay = document.getElementById('global-loading-overlay');
-            const textElement = document.getElementById('global-loading-text');
-            if (message) {
-                textElement.innerText = message;
-            }
-            overlay.classList.remove('hidden');
-            overlay.classList.add('flex');
-        }
-
-        // Close modals on Escape key press
-        document.addEventListener('keydown', function(event) {
-            if (event.key === 'Escape') {
-                const openModals = document.querySelectorAll('.fixed.inset-0.z-50:not(.hidden)');
-                openModals.forEach(modal => {
-                    modal.classList.add('hidden');
-                });
-            }
-        });
-    </script>
 </body>
 </html>
