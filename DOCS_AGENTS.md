@@ -1,6 +1,6 @@
 # Developer Guide: Building Agents
 
-This guide provides essential information for developers to build, configure, and deploy agents within the **Trellis Agent Platform**.
+This guide provides essential information for developers to build, configure, and deploy agents within **Trellis**.
 
 ## 🤖 Agent Architecture
 
@@ -67,7 +67,7 @@ The `skills.md` file contains the system instructions for the agent. This is pas
 
 ## 🔄 Synchronizing Changes
 
-The Trellis Agent Platform uses `etcd` as its central state registry. After you create or edit an agent's files, you **must** synchronize the local files to the registry so the host picks them up.
+The Trellis framework uses `etcd` as its central state registry. After you create or edit an agent's files, you **must** synchronize the local files to the registry so the host picks them up.
 
 Run this command from the project root:
 

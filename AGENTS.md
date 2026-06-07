@@ -1,4 +1,4 @@
-# trellis-agent-platform: LLM Agent Context & Dev Guide
+# Trellis: LLM Agent Context & Dev Guide
 
 ## 🏗 Architecture & Stack
 - **Stack**: Python 3.12, FastAPI, PydanticAI (LLM routing), FastMCP (Tooling), etcd3 (State/Registry).

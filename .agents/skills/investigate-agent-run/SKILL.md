@@ -1,9 +1,9 @@
 ---
 name: investigate-agent-run
-description: Use this skill when asked to investigate, track, debug, or verify the run status of a background agent or task within the `trellis-agent-platform`.
+description: Use this skill when asked to investigate, track, debug, or verify the run status of a background agent or task within Trellis.
 ---
 ## Architecture Context
-The `trellis-agent-platform` uses a distributed architecture to run agents:
+The Trellis framework uses a distributed architecture to run agents:
 - **`etcd-server`**: Central state registry holding agent states, run histories, and tool configurations.
 - **`agent-host`**: Orchestrates agent logic using PydanticAI.
 - **`taskiq-worker`**: Executes background agents and jobs.

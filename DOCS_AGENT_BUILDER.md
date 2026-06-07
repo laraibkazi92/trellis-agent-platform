@@ -1,6 +1,6 @@
 # Developer Guide: Using the Agent Builder (Meta-Agent)
 
-The **Agent Builder** is a specialized meta-agent within the Trellis Agent Platform. It acts as the Framework Architect, designed to help you rapidly scale the framework by porting external logic—such as existing Claude Code skills, standalone scripts, or READMEs—into production-grade, framework-compatible assets.
+The **Agent Builder** is a specialized meta-agent within Trellis. It acts as the Framework Architect, designed to help you rapidly scale the framework by porting external logic—such as existing Claude Code skills, standalone scripts, or READMEs—into production-grade, framework-compatible assets.
 
 ## 🤖 What does it do?
 
@@ -49,7 +49,7 @@ The Agent Builder is strictly instructed to use **Logical "As-Is" Porting**:
 
 ## ⚠️ Important: Post-Generation Steps
 
-Because the Trellis Agent Platform uses `etcd` as its central state registry, newly scaffolded files on your filesystem are not immediately available to the framework.
+Because Trellis uses `etcd` as its central state registry, newly scaffolded files on your filesystem are not immediately available to the framework.
 
 **After the Agent Builder confirms it has finished generating the files, you MUST run the synchronization script:**
 

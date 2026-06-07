@@ -23,7 +23,7 @@ def _validate_hex_color(color: str, default: str) -> str:
 
 def whitelabel_context(request):
     return {
-        "app_name": os.getenv("APP_NAME", "Agent Framework").strip(),
+        "app_name": os.getenv("APP_NAME", "Trellis").strip(),
         "app_favicon_url": os.getenv("APP_FAVICON_URL", "").strip(),
         "app_logo_url": os.getenv("APP_LOGO_URL", "").strip(),
         "app_login_logo_url": os.getenv("APP_LOGIN_LOGO_URL", "").strip(),

@@ -1,6 +1,6 @@
 # Developer Guide: Building Tools
 
-This guide provides detailed instructions on how to build, configure, and register tools within the **Trellis Agent Platform**. Tools are external functions that agents can call to interact with APIs, databases, or the local environment.
+This guide provides detailed instructions on how to build, configure, and register tools within **Trellis**. Tools are external functions that agents can call to interact with APIs, databases, or the local environment.
 
 ## 🛠 Tool Architecture
 

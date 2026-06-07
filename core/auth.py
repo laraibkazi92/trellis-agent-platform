@@ -284,7 +284,7 @@ class IdentityManager:
         """Retrieve the application configuration for whitelabeling."""
         # Start with environment variables as defaults
         config = {
-            "APP_NAME": os.getenv("APP_NAME", "Agent Framework"),
+            "APP_NAME": os.getenv("APP_NAME", "Trellis"),
             "APP_LOGO_URL": os.getenv("APP_LOGO_URL", ""),
             "APP_FAVICON_URL": os.getenv("APP_FAVICON_URL", ""),
             "APP_ACCENT_COLOR": os.getenv("APP_ACCENT_COLOR", "#0055FF"),

@@ -1,6 +1,6 @@
 # MCP Server Guide
 
-Model Context Protocol (MCP) servers expand the capabilities of agents within the `trellis-agent-platform` by providing standard interfaces to external tools and data sources. 
+Model Context Protocol (MCP) servers expand the capabilities of agents within `Trellis` by providing standard interfaces to external tools and data sources. 
 
 This guide explains how to register external MCP servers so they are natively available to your agents.
 
@@ -9,7 +9,7 @@ This guide explains how to register external MCP servers so they are natively av
 All MCP servers are configured in the `mcps/` directory at the root of the project. Each server should have its own directory containing an `mcp.yaml` file.
 
 ```text
-trellis-agent-platform/
+Trellis/
 └── mcps/
     └── logs/
         └── mcp.yaml

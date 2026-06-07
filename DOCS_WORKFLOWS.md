@@ -1,6 +1,6 @@
 # Developer Guide: Background Workflows
 
-This guide provides essential information for building, configuring, and deploying asynchronous background tasks within the **Trellis Agent Platform**.
+This guide provides essential information for building, configuring, and deploying asynchronous background tasks within **Trellis**.
 
 ## 🔄 Background Workflows Overview
 

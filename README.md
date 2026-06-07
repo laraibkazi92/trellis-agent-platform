@@ -1,4 +1,4 @@
-# Trellis Agent Platform
+# Trellis: Agent Framework
 
 A scalable, multi-agent orchestration framework built with FastAPI, PydanticAI, FastMCP, and etcd. It provides an OpenAI-compatible gateway, dynamic tool execution, and an external MCP gateway for seamless integration with clients like Claude Desktop.
 
