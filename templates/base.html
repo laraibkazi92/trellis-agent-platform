@@ -194,7 +194,7 @@
             <div id="user-dropdown" class="origin-top-right absolute right-0 mt-2 w-48 rounded shadow-lg bg-white dark:bg-neutral-800 ring-1 ring-black ring-opacity-5 focus:outline-none hidden z-50 py-1 font-mono">
                 <a href="/docs" class="block px-4 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700 uppercase transition-colors">Documentation</a>
                 <a href="/profile" class="block px-4 py-2 text-sm text-neutral-700 dark:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-700 uppercase transition-colors">Profile</a>
-                {% if is_admin %}
+                {% if user.is_admin %}
                 <a href="/admin" class="block px-4 py-2 text-sm text-emerald-600 dark:text-emerald-400 hover:bg-neutral-100 dark:hover:bg-neutral-700 uppercase transition-colors">Admin</a>
                 {% endif %}
                 <a href="/logout" onclick="showGlobalLoading('Signing out...')" class="block px-4 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-neutral-100 dark:hover:bg-neutral-700 uppercase transition-colors border-t border-neutral-200 dark:border-neutral-700 mt-1">Logout</a>
