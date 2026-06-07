@@ -31,12 +31,11 @@ scheduler = TaskiqScheduler(
 # We use a single heartbeat task that runs every minute to check ETCD for dynamic cron jobs
 import time
 from datetime import datetime
+import pycron
 
 @broker.task(schedule=[{"cron": "* * * * *"}])
 async def dynamic_cron_heartbeat():
     """Runs every minute to trigger any dynamic background agents that have matching cron expressions."""
-    # We use pycron to evaluate cron expressions against the current time
-    import pycron
     
     identity_mgr = get_identity_manager()
     agent_names = await asyncio.to_thread(identity_mgr.list_agents)
@@ -54,34 +53,38 @@ async def dynamic_cron_heartbeat():
             
         trigger = config_data.get("trigger")
         if trigger and trigger.get("type") == "cron":
-            expr = trigger.get("expression")
-            if expr and pycron.is_now(expr, now):
-                print(f"Triggering background workflow {name} via cron: {expr}")
-                # System prompt for cron runs
-                xml_payload = f"<event_payload><![CDATA[\nScheduled execution triggered at {now.isoformat()}\n]]></event_payload>"
-                
-                if config_data.get("type") == "script":
-                    task = await run_background_script.kiq(
-                        agent_name=name,
-                        prompt=xml_payload,
-                        user_id=f"svc_agent_{name}"
-                    )
-                else:
-                    task = await run_background_agent.kiq(
-                        agent_name=name,
-                        prompt=xml_payload,
-                        user_id=f"svc_agent_{name}"
-                    )
-                try:
-                    await asyncio.to_thread(
-                        identity_mgr.record_agent_run_state,
-                        name,
-                        task.task_id,
-                        "pending",
-                        {"prompt": xml_payload, "user_id": f"svc_agent_{name}"}
-                    )
-                except Exception as e:
-                    print(f"Failed to record pending state for {name}: {e}")
+            expr_data = trigger.get("expression")
+            expressions = expr_data if isinstance(expr_data, list) else [expr_data]
+            
+            for expr in expressions:
+                if expr and pycron.is_now(expr, now):
+                    print(f"Triggering background workflow {name} via cron: {expr}")
+                    # System prompt for cron runs
+                    xml_payload = f"<event_payload><![CDATA[\nScheduled execution triggered at {now.isoformat()}\n]]></event_payload>"
+                    
+                    if config_data.get("type") == "script":
+                        task = await run_background_script.kiq(
+                            agent_name=name,
+                            prompt=xml_payload,
+                            user_id=f"svc_agent_{name}"
+                        )
+                    else:
+                        task = await run_background_agent.kiq(
+                            agent_name=name,
+                            prompt=xml_payload,
+                            user_id=f"svc_agent_{name}"
+                        )
+                    try:
+                        await asyncio.to_thread(
+                            identity_mgr.record_agent_run_state,
+                            name,
+                            task.task_id,
+                            "pending",
+                            {"prompt": xml_payload, "user_id": f"svc_agent_{name}"}
+                        )
+                    except Exception as e:
+                        print(f"Failed to record pending state for {name}: {e}")
+                    break
 
 @broker.task
 async def run_background_script(
