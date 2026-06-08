@@ -48,7 +48,7 @@ async def dynamic_cron_heartbeat():
             continue
             
         config_data = await asyncio.to_thread(identity_mgr.get_agent_config, name)
-        if not config_data or config_data.get("type") not in ("agent", "script"):
+        if not config_data or config_data.get("type") not in ("background_agent", "background_script"):
             continue
             
         trigger = config_data.get("trigger")
@@ -62,17 +62,19 @@ async def dynamic_cron_heartbeat():
                     # System prompt for cron runs
                     xml_payload = f"<event_payload><![CDATA[\nScheduled execution triggered at {now.isoformat()}\n]]></event_payload>"
                     
-                    if config_data.get("type") == "script":
+                    agent_identity = Identity(id=name, type=IdentityType.WORKFLOW)
+                    
+                    if config_data.get("type") == "background_script":
                         task = await run_background_script.kiq(
                             agent_name=name,
                             prompt=xml_payload,
-                            user_id=f"svc_agent_{name}"
+                            user_id=agent_identity.to_legacy_string()
                         )
                     else:
                         task = await run_background_agent.kiq(
                             agent_name=name,
                             prompt=xml_payload,
-                            user_id=f"svc_agent_{name}"
+                            user_id=agent_identity.to_legacy_string()
                         )
                     try:
                         await asyncio.to_thread(
@@ -80,7 +82,7 @@ async def dynamic_cron_heartbeat():
                             name,
                             task.task_id,
                             "pending",
-                            {"prompt": xml_payload, "user_id": f"svc_agent_{name}"}
+                            {"prompt": xml_payload, "user_id": agent_identity.to_legacy_string()}
                         )
                     except Exception as e:
                         print(f"Failed to record pending state for {name}: {e}")
@@ -100,6 +102,14 @@ async def run_background_script(
         identity_mgr = get_identity_manager()
         
         try:
+            # Check for cancellation before processing
+            runs = await asyncio.to_thread(identity_mgr.get_agent_runs, agent_name)
+            run_record = next((r for r in runs if r.get("run_id") == task_id), None)
+            
+            if run_record and run_record.get("state") == "cancelled":
+                print(f"Task {task_id} for {agent_name} was cancelled before processing. Aborting.")
+                return "Cancelled before execution."
+
             await asyncio.to_thread(
                 identity_mgr.record_agent_run_state,
                 agent_name,
@@ -136,7 +146,8 @@ async def run_background_script(
 
         runtime = config_data.get("runtime", "python")
         if runtime == "python":
-            cmd = ["python", str(entrypoint_path)]
+            import sys
+            cmd = [sys.executable, str(entrypoint_path)]
         elif runtime == "node":
             cmd = ["node", str(entrypoint_path)]
         elif runtime == "bash":
@@ -145,13 +156,20 @@ async def run_background_script(
             cmd = [str(entrypoint_path)]
 
         env = os.environ.copy()
-        secrets = identity_mgr.get_resolved_secrets(user_id)
-        if secrets:
+        from core.discovery import _resolve_requirements
+        is_background = user_id.startswith("svc_agent_")
+        
+        # Scoped Secret Injection
+        secret_keys = _resolve_requirements(config_data.get("secrets"), is_background)
+        if secret_keys:
+            secrets = identity_mgr.get_resolved_config(user_id, "secrets", keys=secret_keys)
             safe_secrets = {str(k): str(v) for k, v in secrets.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
             env.update(safe_secrets)
             
-        variables = identity_mgr.get_resolved_variables(user_id)
-        if variables:
+        # Scoped Variable Injection
+        variable_keys = _resolve_requirements(config_data.get("variables"), is_background)
+        if variable_keys:
+            variables = identity_mgr.get_resolved_config(user_id, "variables", keys=variable_keys)
             safe_vars = {str(k): str(v) for k, v in variables.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
             env.update(safe_vars)
 
@@ -234,6 +252,14 @@ async def run_background_agent(
         
         # Record processing state
         try:
+            # Check for cancellation before processing
+            runs = await asyncio.to_thread(identity_mgr.get_agent_runs, agent_name)
+            run_record = next((r for r in runs if r.get("run_id") == task_id), None)
+            
+            if run_record and run_record.get("state") == "cancelled":
+                print(f"Task {task_id} for {agent_name} was cancelled before processing. Aborting.")
+                return "Cancelled before execution."
+
             await asyncio.to_thread(
                 identity_mgr.record_agent_run_state,
                 agent_name,

@@ -7,8 +7,11 @@ import contextvars
 import asyncio
 import hashlib
 import os
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 from functools import wraps
+import warnings
+
+from core.models import Identity, IdentityType
 
 import etcd3
 from fastapi import Request, HTTPException
@@ -74,7 +77,79 @@ def retry_etcd(max_retries=10, delay=2):
 class IdentityManager:
     def __init__(self, host: str = "127.0.0.1", port: int = 2379):
         self.client = etcd3.client(host=host, port=port)
-    
+
+    @retry_etcd()
+    def _get_kv(self, path: str, decrypt: bool = False) -> Optional[Any]:
+        """Base method to fetch and optionally decrypt/parse a KV pair."""
+        value, _ = self.client.get(path)
+        if value:
+            decoded = value.decode('utf-8')
+            try:
+                if decrypt:
+                    decoded = _decrypt_string(decoded)
+                return json.loads(decoded)
+            except Exception as e:
+                logger.error(f"Failed to parse KV at {path}: {e}")
+                return None
+        return None
+
+    @retry_etcd()
+    def _set_kv(self, path: str, value: Any, encrypt: bool = False) -> None:
+        """Base method to serialized and optionally encrypt/store a KV pair."""
+        serialized = json.dumps(value)
+        if encrypt:
+            serialized = _encrypt_string(serialized)
+        self.client.put(path, serialized)
+
+    def get_identity_config(self, identity: Union[Identity, str], category: str, keys: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        Enterprise-grade config resolver.
+        Fetches secrets or variables for any identity (User, Agent, System).
+        """
+        if isinstance(identity, str):
+            identity = Identity.from_string(identity)
+        
+        path = identity.get_etcd_path(category)
+        decrypt = (category == "secrets")
+        
+        config = self._get_kv(path, decrypt=decrypt) or {}
+        
+        if keys:
+            return {k: v for k, v in config.items() if k in keys}
+        return config
+
+    def save_identity_config(self, identity: Union[Identity, str], category: str, data: Dict[str, Any]) -> None:
+        """Saves secrets or variables for an identity."""
+        if isinstance(identity, str):
+            identity = Identity.from_string(identity)
+            
+        path = identity.get_etcd_path(category)
+        encrypt = (category == "secrets")
+        self._set_kv(path, data, encrypt=encrypt)
+
+    def get_resolved_config(self, identity: Union[Identity, str], category: str, keys: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        Resolves config by merging Global (System) config with Identity config.
+        Identity config takes precedence.
+        """
+        if isinstance(identity, str):
+            identity = Identity.from_string(identity)
+            
+        system_identity = Identity(id="system", type=IdentityType.SYSTEM)
+        
+        # Don't merge if we are already asking for system config
+        if identity.type == IdentityType.SYSTEM:
+            return self.get_identity_config(identity, category, keys)
+            
+        system_config = self.get_identity_config(system_identity, category)
+        identity_config = self.get_identity_config(identity, category)
+        
+        resolved = {**system_config, **identity_config}
+        
+        if keys:
+            return {k: v for k, v in resolved.items() if k in keys}
+        return resolved
+
     @retry_etcd()
     def upsert_user(self, user_id: str, profile: Dict) -> None:
         """Create or update a user profile."""
@@ -88,93 +163,59 @@ class IdentityManager:
             return json.loads(value.decode('utf-8'))
         return None
 
-    @retry_etcd()
     def get_user_secrets(self, user_id: str) -> Dict[str, str]:
-        """Retrieve user-specific secrets."""
-        value, _ = self.client.get(f"/users/secrets/{user_id}")
-        if value:
-            decoded = value.decode('utf-8')
-            decrypted = _decrypt_string(decoded)
-            try:
-                return json.loads(decrypted)
-            except Exception as e:
-                logger.error(f"Failed to parse user secrets JSON: {e}")
-                return {}
-        return {}
+        """Retrieve user-specific secrets. @deprecated: Use get_identity_config"""
+        warnings.warn("get_user_secrets is deprecated, use get_identity_config", DeprecationWarning, stacklevel=2)
+        return self._get_kv(f"/users/secrets/{user_id}", decrypt=True) or {}
 
-    @retry_etcd()
     def save_user_secrets(self, user_id: str, secrets_data: Dict[str, str]) -> None:
-        """Save user-specific secrets securely using encryption."""
-        serialized = json.dumps(secrets_data)
-        encrypted = _encrypt_string(serialized)
-        self.client.put(f"/users/secrets/{user_id}", encrypted)
+        """Save user-specific secrets securely using encryption. @deprecated: Use save_identity_config"""
+        warnings.warn("save_user_secrets is deprecated, use save_identity_config", DeprecationWarning, stacklevel=2)
+        self._set_kv(f"/users/secrets/{user_id}", secrets_data, encrypt=True)
 
-    @retry_etcd()
     def get_global_secrets(self) -> Dict[str, str]:
-        """Retrieve system-wide global secrets."""
-        value, _ = self.client.get("/config/framework/global_secrets")
-        if value:
-            decoded = value.decode('utf-8')
-            decrypted = _decrypt_string(decoded)
-            try:
-                return json.loads(decrypted)
-            except Exception as e:
-                logger.error(f"Failed to parse global secrets JSON: {e}")
-                return {}
-        return {}
+        """Retrieve system-wide global secrets. @deprecated: Use get_identity_config"""
+        warnings.warn("get_global_secrets is deprecated, use get_identity_config", DeprecationWarning, stacklevel=2)
+        return self._get_kv("/config/framework/global_secrets", decrypt=True) or {}
 
-    @retry_etcd()
     def save_global_secrets(self, secrets_data: Dict[str, str]) -> None:
-        """Save system-wide global secrets securely using encryption."""
-        serialized = json.dumps(secrets_data)
-        encrypted = _encrypt_string(serialized)
-        self.client.put("/config/framework/global_secrets", encrypted)
+        """Save system-wide global secrets securely using encryption. @deprecated: Use save_identity_config"""
+        warnings.warn("save_global_secrets is deprecated, use save_identity_config", DeprecationWarning, stacklevel=2)
+        self._set_kv("/config/framework/global_secrets", secrets_data, encrypt=True)
 
     def get_resolved_secrets(self, user_id: str) -> Dict[str, str]:
-        """Retrieve user secrets merged with global secrets (global takes precedence)."""
+        """Retrieve user secrets merged with global secrets (user takes precedence). @deprecated: Use get_resolved_config"""
+        warnings.warn("get_resolved_secrets is deprecated, use get_resolved_config", DeprecationWarning, stacklevel=2)
         user_secrets = self.get_user_secrets(user_id)
         global_secrets = self.get_global_secrets()
-        return {**user_secrets, **global_secrets}
+        return {**global_secrets, **user_secrets}
 
-    @retry_etcd()
     def get_user_variables(self, user_id: str) -> Dict[str, str]:
-        """Retrieve user-specific non-sensitive configuration variables."""
-        value, _ = self.client.get(f"/users/variables/{user_id}")
-        if value:
-            try:
-                return json.loads(value.decode('utf-8'))
-            except Exception as e:
-                logger.error(f"Failed to parse user variables JSON: {e}")
-                return {}
-        return {}
+        """Retrieve user-specific non-sensitive configuration variables. @deprecated: Use get_identity_config"""
+        warnings.warn("get_user_variables is deprecated, use get_identity_config", DeprecationWarning, stacklevel=2)
+        return self._get_kv(f"/users/variables/{user_id}") or {}
 
-    @retry_etcd()
     def save_user_variables(self, user_id: str, variables_data: Dict[str, str]) -> None:
-        """Save user-specific non-sensitive configuration variables."""
-        self.client.put(f"/users/variables/{user_id}", json.dumps(variables_data))
+        """Save user-specific non-sensitive configuration variables. @deprecated: Use save_identity_config"""
+        warnings.warn("save_user_variables is deprecated, use save_identity_config", DeprecationWarning, stacklevel=2)
+        self._set_kv(f"/users/variables/{user_id}", variables_data)
 
-    @retry_etcd()
     def get_global_variables(self) -> Dict[str, str]:
-        """Retrieve system-wide global non-sensitive configuration variables."""
-        value, _ = self.client.get("/config/framework/global_variables")
-        if value:
-            try:
-                return json.loads(value.decode('utf-8'))
-            except Exception as e:
-                logger.error(f"Failed to parse global variables JSON: {e}")
-                return {}
-        return {}
+        """Retrieve system-wide global non-sensitive configuration variables. @deprecated: Use get_identity_config"""
+        warnings.warn("get_global_variables is deprecated, use get_identity_config", DeprecationWarning, stacklevel=2)
+        return self._get_kv("/config/framework/global_variables") or {}
 
-    @retry_etcd()
     def save_global_variables(self, variables_data: Dict[str, str]) -> None:
-        """Save system-wide global non-sensitive configuration variables."""
-        self.client.put("/config/framework/global_variables", json.dumps(variables_data))
+        """Save system-wide global non-sensitive configuration variables. @deprecated: Use save_identity_config"""
+        warnings.warn("save_global_variables is deprecated, use save_identity_config", DeprecationWarning, stacklevel=2)
+        self._set_kv("/config/framework/global_variables", variables_data)
 
     def get_resolved_variables(self, user_id: str) -> Dict[str, str]:
-        """Retrieve user variables merged with global variables (global takes precedence)."""
+        """Retrieve user variables merged with global variables (user takes precedence). @deprecated: Use get_resolved_config"""
+        warnings.warn("get_resolved_variables is deprecated, use get_resolved_config", DeprecationWarning, stacklevel=2)
         user_variables = self.get_user_variables(user_id)
         global_variables = self.get_global_variables()
-        return {**user_variables, **global_variables}
+        return {**global_variables, **user_variables}
 
     @retry_etcd()
     def create_key(self, user_id: str, key_name: str) -> str:

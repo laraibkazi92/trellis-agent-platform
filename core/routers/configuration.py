@@ -3,6 +3,7 @@ from typing import Dict, List
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import templates, identity_mgr, CSRFRoute
+from core.models import Identity, IdentityType
 
 router = APIRouter(route_class=CSRFRoute)
 
@@ -35,9 +36,7 @@ async def configuration_page(request: Request):
         if config:
             secrets_data = config.get("secrets", [])
             if isinstance(secrets_data, dict):
-                secrets_list = []
-                for v in secrets_data.values():
-                    if isinstance(v, list): secrets_list.extend(v)
+                secrets_list = list(secrets_data.get("general", [])) + list(secrets_data.get("user", []))
             else:
                 secrets_list = secrets_data
 
@@ -49,9 +48,7 @@ async def configuration_page(request: Request):
 
             vars_data = config.get("variables", [])
             if isinstance(vars_data, dict):
-                vars_list = []
-                for v in vars_data.values():
-                    if isinstance(v, list): vars_list.extend(v)
+                vars_list = list(vars_data.get("general", [])) + list(vars_data.get("user", []))
             else:
                 vars_list = vars_data
 
@@ -66,9 +63,7 @@ async def configuration_page(request: Request):
         if config:
             secrets_data = config.get("secrets", [])
             if isinstance(secrets_data, dict):
-                secrets_list = []
-                for v in secrets_data.values():
-                    if isinstance(v, list): secrets_list.extend(v)
+                secrets_list = list(secrets_data.get("general", [])) + list(secrets_data.get("user", []))
             else:
                 secrets_list = secrets_data
 
@@ -80,9 +75,7 @@ async def configuration_page(request: Request):
 
             vars_data = config.get("variables", [])
             if isinstance(vars_data, dict):
-                vars_list = []
-                for v in vars_data.values():
-                    if isinstance(v, list): vars_list.extend(v)
+                vars_list = list(vars_data.get("general", [])) + list(vars_data.get("user", []))
             else:
                 vars_list = vars_data
 
@@ -93,10 +86,13 @@ async def configuration_page(request: Request):
                     required_variables[var_key].append(f"MCP: {name}")
                 
     # 2. Get current user/global secrets and variables
-    current_secrets = await asyncio.to_thread(identity_mgr.get_user_secrets, user_id)
-    global_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
-    current_variables = await asyncio.to_thread(identity_mgr.get_user_variables, user_id)
-    global_variables = await asyncio.to_thread(identity_mgr.get_global_variables)
+    user_identity = Identity.from_string(user_id)
+    system_identity = Identity(id="system", type=IdentityType.SYSTEM)
+
+    current_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, user_identity, "secrets")
+    global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
+    current_variables = await asyncio.to_thread(identity_mgr.get_identity_config, user_identity, "variables")
+    global_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
     
     # 3. Compile unified configuration items (filtering out system-wide overridden globals)
     items = []
@@ -161,15 +157,15 @@ async def save_configuration(request: Request):
         if config:
             secrets_data = config.get("secrets", [])
             if isinstance(secrets_data, dict):
-                for v in secrets_data.values():
-                    if isinstance(v, list): known_secrets.update(v)
+                known_secrets.update(secrets_data.get("general", []))
+                known_secrets.update(secrets_data.get("user", []))
             elif isinstance(secrets_data, list):
                 known_secrets.update(secrets_data)
 
             vars_data = config.get("variables", [])
             if isinstance(vars_data, dict):
-                for v in vars_data.values():
-                    if isinstance(v, list): known_variables.update(v)
+                known_variables.update(vars_data.get("general", []))
+                known_variables.update(vars_data.get("user", []))
             elif isinstance(vars_data, list):
                 known_variables.update(vars_data)
 
@@ -178,22 +174,25 @@ async def save_configuration(request: Request):
         if config:
             secrets_data = config.get("secrets", [])
             if isinstance(secrets_data, dict):
-                for v in secrets_data.values():
-                    if isinstance(v, list): known_secrets.update(v)
+                known_secrets.update(secrets_data.get("general", []))
+                known_secrets.update(secrets_data.get("user", []))
             elif isinstance(secrets_data, list):
                 known_secrets.update(secrets_data)
 
             vars_data = config.get("variables", [])
             if isinstance(vars_data, dict):
-                for v in vars_data.values():
-                    if isinstance(v, list): known_variables.update(v)
+                known_variables.update(vars_data.get("general", []))
+                known_variables.update(vars_data.get("user", []))
             elif isinstance(vars_data, list):
                 known_variables.update(vars_data)
     
-    current_secrets = await asyncio.to_thread(identity_mgr.get_user_secrets, user_id)
-    global_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
-    current_variables = await asyncio.to_thread(identity_mgr.get_user_variables, user_id)
-    global_variables = await asyncio.to_thread(identity_mgr.get_global_variables)
+    user_identity = Identity.from_string(user_id)
+    system_identity = Identity(id="system", type=IdentityType.SYSTEM)
+
+    current_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, user_identity, "secrets")
+    global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
+    current_variables = await asyncio.to_thread(identity_mgr.get_identity_config, user_identity, "variables")
+    global_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
     
     secrets_updated = False
     variables_updated = False
@@ -215,9 +214,9 @@ async def save_configuration(request: Request):
             variables_updated = True
             
     if secrets_updated:
-        await asyncio.to_thread(identity_mgr.save_user_secrets, user_id, current_secrets)
+        await asyncio.to_thread(identity_mgr.save_identity_config, user_identity, "secrets", current_secrets)
     if variables_updated:
-        await asyncio.to_thread(identity_mgr.save_user_variables, user_id, current_variables)
+        await asyncio.to_thread(identity_mgr.save_identity_config, user_identity, "variables", current_variables)
     
     request.session["flash_msg"] = "Settings and configuration saved successfully."
     return RedirectResponse(url='/configuration', status_code=303)

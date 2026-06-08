@@ -132,7 +132,7 @@ async def chat_completions(request: ChatRequest):
 
     cfg_data = await asyncio.to_thread(identity_mgr.get_agent_config, request.model)
     if not cfg_data: raise HTTPException(status_code=404, detail="Agent not found")
-    if cfg_data.get("type") == "background":
+    if cfg_data.get("type") in ("background_agent", "background_script"):
         raise HTTPException(status_code=403, detail="Background agents cannot be called directly.")
 
     if health_monitor.get_status("agent", request.model).get("status") == "Offline":

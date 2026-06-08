@@ -166,8 +166,8 @@
                             {{ agent.name }}
                         </h3>
                         <span class="text-[10px] font-mono font-bold bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400 px-2 py-0.5 rounded border border-neutral-200 dark:border-neutral-700 uppercase">v{{ agent.config.get('version', '0.1.0') }}</span>
-                        <span class="px-2 py-0.5 text-[10px] font-mono font-bold uppercase tracking-wider rounded border {% if agent.config.get('type') == 'script' %}border-blue-500/30 text-blue-600 bg-blue-50 dark:bg-blue-900/20 dark:text-blue-400{% else %}border-purple-500/30 text-purple-600 bg-purple-50 dark:bg-purple-900/20 dark:text-purple-400{% endif %}">
-                            {{ agent.config.get('type', 'agent') }}
+                        <span class="px-2 py-0.5 text-[10px] font-mono font-bold uppercase tracking-wider rounded border {% if agent.config.get('type') == 'background_script' %}border-blue-500/30 text-blue-600 bg-blue-50 dark:bg-blue-900/20 dark:text-blue-400{% else %}border-purple-500/30 text-purple-600 bg-purple-50 dark:bg-purple-900/20 dark:text-purple-400{% endif %}">
+                            {{ agent.config.get('type', 'background_agent') }}
                         </span>
                     </div>
                     <p class="text-xs text-neutral-600 dark:text-neutral-400 max-w-sm truncate">{{ agent.config.get('description', '') }}</p>
@@ -235,6 +235,8 @@
                     <div class="flex flex-col items-end gap-2">
                         {% if is_admin %}
                         <button onclick="openConfigModal('{{ agent.name }}')" class="font-mono text-xs font-bold border border-neutral-300 dark:border-neutral-700 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 px-3 py-1.5 uppercase tracking-wider transition-colors w-full max-w-[140px]">Configure</button>
+                        
+                        <button onclick="openQueueModal('{{ agent.name }}')" class="font-mono text-xs font-bold border border-neutral-300 dark:border-neutral-700 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 px-3 py-1.5 uppercase tracking-wider transition-colors w-full max-w-[140px]">Queue</button>
                         {% endif %}
                         
                         {% if agent.required_secrets or agent.required_variables %}
@@ -417,7 +419,7 @@
                 </div>
 
                 {% if is_admin %}
-                {% if agent.config.get("type") == "agent" %}
+                {% if agent.config.get("type") == "background_agent" %}
                 <div id="agent-specific-fields-{{ agent.name }}">
                     <div class="border-b border-neutral-200 dark:border-neutral-800 pb-4 pt-4">
                         <h3 class="text-lg font-bold uppercase tracking-wider">Properties</h3>
@@ -520,7 +522,7 @@
                     </div>
                 </div>
 
-                {% elif agent.config.get("type") == "script" %}
+                {% elif agent.config.get("type") == "background_script" %}
                 <div id="script-specific-fields-{{ agent.name }}">
                     <div class="border-b border-neutral-200 dark:border-neutral-800 pb-4 pt-4">
                         <h3 class="text-lg font-bold uppercase tracking-wider">Script Details</h3>
@@ -569,6 +571,132 @@
 </div>
 
 {% endfor %}
+
+{% for agent in workflows_list %}
+<!-- Queue Modal for {{ agent.name }} -->
+<div id="queue-modal-{{ agent.name }}" class="fixed inset-0 bg-neutral-900/50 backdrop-blur-sm z-50 hidden flex items-center justify-center">
+    <div class="bg-white dark:bg-neutral-900 w-full max-w-5xl max-h-[80vh] flex flex-col shadow-2xl border border-neutral-200 dark:border-neutral-800 relative">
+        <div class="flex justify-between items-center p-6 border-b border-neutral-200 dark:border-neutral-800">
+            <h2 class="text-xl font-mono font-bold uppercase tracking-widest text-neutral-900 dark:text-white">Run Queue: {{ agent.name }}</h2>
+            <button type="button" onclick="closeQueueModal('{{ agent.name }}')" class="text-neutral-500 hover:text-neutral-900 dark:hover:text-white transition-colors">
+                <i data-lucide="x" class="w-6 h-6"></i>
+            </button>
+        </div>
+        
+        <div class="p-6 overflow-y-auto bg-neutral-50 dark:bg-neutral-950 flex-grow">
+            <h3 class="font-mono font-bold text-sm text-neutral-500 uppercase tracking-widest mb-4">Pending & Processing Runs</h3>
+            
+            {% set active_runs = [] %}
+            {% for run in queue.pending %}
+                {% if run.agent_name == agent.name %}{% set _ = active_runs.append(run) %}{% endif %}
+            {% endfor %}
+            {% for run in queue.processing %}
+                {% if run.agent_name == agent.name %}{% set _ = active_runs.append(run) %}{% endif %}
+            {% endfor %}
+            
+            {% if active_runs %}
+            <div class="overflow-x-auto border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 mb-8">
+                <table class="w-full text-left border-collapse">
+                    <thead>
+                        <tr class="border-b border-neutral-200 dark:border-neutral-800 bg-neutral-50 dark:bg-neutral-950 text-xs font-bold font-mono text-neutral-500 uppercase tracking-widest">
+                            <th class="p-3">Run ID</th>
+                            <th class="p-3">State</th>
+                            <th class="p-3">Started At</th>
+                            <th class="p-3 text-right">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody class="text-sm font-mono divide-y divide-neutral-200 dark:divide-neutral-800">
+                        {% for run in active_runs %}
+                        <tr class="hover:bg-neutral-50 dark:hover:bg-neutral-800/50 transition-colors">
+                            <td class="p-3 text-neutral-700 dark:text-neutral-300 font-bold truncate max-w-[200px]" title="{{ run.run_id }}">{{ run.run_id }}</td>
+                            <td class="p-3">
+                                {% if run.state == 'pending' %}
+                                <span class="text-blue-500 bg-blue-50 dark:bg-blue-900/20 px-2 py-0.5 rounded border border-blue-500/30">PENDING</span>
+                                {% else %}
+                                <span class="text-amber-500 bg-amber-50 dark:bg-amber-900/20 px-2 py-0.5 rounded border border-amber-500/30">PROCESSING</span>
+                                {% endif %}
+                            </td>
+                            <td class="p-3 text-neutral-500">{{ run.timestamp }}</td>
+                            <td class="p-3 text-right">
+                                <form method="POST" action="/workflows/{{ agent.name }}/runs/{{ run.run_id }}/cancel" class="inline-block" onsubmit="showGlobalLoading('Cancelling Run...')">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                                    <button type="submit" class="text-red-500 hover:text-white border border-red-500 hover:bg-red-500 px-3 py-1 uppercase text-xs font-bold transition-colors">Cancel</button>
+                                </form>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <div class="p-8 text-center text-neutral-500 font-mono text-sm border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 mb-8">
+                No active runs in the queue.
+            </div>
+            {% endif %}
+            
+            <h3 class="font-mono font-bold text-sm text-neutral-500 uppercase tracking-widest mb-4 mt-8">Recent Completed/Failed</h3>
+            
+            {% set finished_runs = [] %}
+            {% for run in queue.failed %}
+                {% if run.agent_name == agent.name %}{% set _ = finished_runs.append(run) %}{% endif %}
+            {% endfor %}
+            {% for run in queue.completed %}
+                {% if run.agent_name == agent.name %}{% set _ = finished_runs.append(run) %}{% endif %}
+            {% endfor %}
+            
+            {% if finished_runs %}
+            <div class="overflow-x-auto border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900">
+                <table class="w-full text-left border-collapse">
+                    <thead>
+                        <tr class="border-b border-neutral-200 dark:border-neutral-800 bg-neutral-50 dark:bg-neutral-950 text-xs font-bold font-mono text-neutral-500 uppercase tracking-widest">
+                            <th class="p-3">Run ID</th>
+                            <th class="p-3">State</th>
+                            <th class="p-3">Timestamp</th>
+                            <th class="p-3">Details</th>
+                        </tr>
+                    </thead>
+                    <tbody class="text-sm font-mono divide-y divide-neutral-200 dark:divide-neutral-800">
+                        {% for run in finished_runs[:10] %}
+                        <tr class="hover:bg-neutral-50 dark:hover:bg-neutral-800/50 transition-colors">
+                            <td class="p-3 text-neutral-700 dark:text-neutral-300 font-bold truncate max-w-[200px]" title="{{ run.run_id }}">{{ run.run_id }}</td>
+                            <td class="p-3">
+                                {% if run.state == 'failed' %}
+                                <span class="text-red-500 bg-red-50 dark:bg-red-900/20 px-2 py-0.5 rounded border border-red-500/30">FAILED</span>
+                                {% elif run.state == 'cancelled' %}
+                                <span class="text-neutral-500 bg-neutral-100 dark:bg-neutral-800 px-2 py-0.5 rounded border border-neutral-500/30">CANCELLED</span>
+                                {% else %}
+                                <span class="text-green-500 bg-green-50 dark:bg-green-900/20 px-2 py-0.5 rounded border border-green-500/30">COMPLETED</span>
+                                {% endif %}
+                            </td>
+                            <td class="p-3 text-neutral-500">{{ run.timestamp }}</td>
+                            <td class="p-3 text-neutral-500 text-xs truncate max-w-[300px]">
+                                {% if run.state == 'failed' %}
+                                    {{ run.metadata.get('error', 'Unknown error') }}
+                                {% else %}
+                                    {{ run.metadata.get('output', 'No output')[:100] }}...
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <div class="p-8 text-center text-neutral-500 font-mono text-sm border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900">
+                No recent run history.
+            </div>
+            {% endif %}
+            
+        </div>
+        <div class="p-6 border-t border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 flex justify-end">
+            <button type="button" onclick="closeQueueModal('{{ agent.name }}')" class="px-4 py-2 bg-neutral-100 dark:bg-neutral-800 hover:bg-neutral-200 dark:hover:bg-neutral-700 font-mono font-bold text-sm uppercase tracking-wide text-neutral-900 dark:text-white transition-colors">
+                Close
+            </button>
+        </div>
+    </div>
+</div>
+{% endfor %}
+
 <script>
     document.addEventListener('DOMContentLoaded', () => {
         // Render cron readable strings
@@ -671,6 +799,20 @@
         const modal = document.getElementById('config-modal-' + agentName);
         modal.classList.add('hidden');
         modal.classList.remove('flex');
+    }
+
+    function openQueueModal(agentName) {
+        const modal = document.getElementById(`queue-modal-${agentName}`);
+        if (modal) {
+            modal.classList.remove('hidden');
+        }
+    }
+    
+    function closeQueueModal(agentName) {
+        const modal = document.getElementById(`queue-modal-${agentName}`);
+        if (modal) {
+            modal.classList.add('hidden');
+        }
     }
 
     function toggleTriggerFields(agentName) {

@@ -8,9 +8,16 @@
 - **`core/ui.py`** (Port 8080): Dashboard UI.
 - **`etcd`** (Port 2379): Central registry for users, API keys, agent configs, and framework state.
 
+
+## 🤖 Agent Types
+- **`user_agent`**: Interactive, user-facing agents that engage in conversational workflows.
+- **`background_agent`**: Autonomous agents that run asynchronously (e.g., triggered by cron or webhooks) to perform background tasks.
+- **`background_script`**: Lightweight, standalone scripts executing specific procedural tasks in the background.
+
 ## 📂 Key Directories
 - `core/`: Service implementations, routers, and auth (`core/auth.py` -> `IdentityManager`).
-- `agents/`: Agent definitions (requires `config.yaml` and `skills.md`).
+- `agents/`: User-facing agent definitions (`user_agent`) (requires `config.yaml` and `skills.md`).
+- `workspace/workflows/`: Background workflows containing `background_agent` and `background_script` definitions.
 - `tools/`: Tool logic. Each directory requires a `tool.yaml` (list of tool objects) and entrypoint wrappers.
 - `scripts/`: Operational utilities (e.g., `sync_to_db.py`).
 

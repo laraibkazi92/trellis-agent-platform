@@ -6,3 +6,5 @@ test_*.py
 ./*.pngdata/
 
 .git_local_credentials
+
+workspace/reports/

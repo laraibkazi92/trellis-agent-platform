@@ -6,6 +6,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import templates, identity_mgr, CSRFRoute
 from core.discovery import discover_agents, discover_tools, get_agent_required_secrets, get_agent_required_variables
 from core.auth import is_admin
+from core.models import Identity, IdentityType
 
 router = APIRouter(route_class=CSRFRoute)
 
@@ -76,20 +77,22 @@ async def configure_agent_secrets(request: Request, agent_name: str):
         request.session["flash_msg"] = "Agent not found."
         return RedirectResponse(url='/agents', status_code=303)
         
-    is_bg = config.get("type") == "background"
+    is_bg = config.get("type") in ("background_agent", "background_script")
     
     if is_bg:
         if not is_admin(request):
             request.session["flash_msg"] = "Admin access required to configure background agents."
             return RedirectResponse(url='/agents', status_code=303)
-        target_user_id = f"svc_agent_{agent_name}"
+        identity = Identity(id=agent_name, type=IdentityType.WORKFLOW)
     else:
-        target_user_id = user['sub']
+        identity = Identity.from_string(user['sub'])
         
-    current_secrets = await asyncio.to_thread(identity_mgr.get_user_secrets, target_user_id)
-    global_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
-    current_variables = await asyncio.to_thread(identity_mgr.get_user_variables, target_user_id)
-    global_variables = await asyncio.to_thread(identity_mgr.get_global_variables)
+    system_identity = Identity(id="system", type=IdentityType.SYSTEM)
+
+    current_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "secrets")
+    current_variables = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "variables")
+    global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
+    global_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
     
     required_secrets = await get_agent_required_secrets(config)
     required_variables = await get_agent_required_variables(config)
@@ -112,9 +115,9 @@ async def configure_agent_secrets(request: Request, agent_name: str):
             variables_updated = True
             
     if secrets_updated:
-        await asyncio.to_thread(identity_mgr.save_user_secrets, target_user_id, current_secrets)
+        await asyncio.to_thread(identity_mgr.save_identity_config, identity, "secrets", current_secrets)
     if variables_updated:
-        await asyncio.to_thread(identity_mgr.save_user_variables, target_user_id, current_variables)
+        await asyncio.to_thread(identity_mgr.save_identity_config, identity, "variables", current_variables)
     
     request.session["flash_msg"] = f"Configuration and secrets saved for {agent_name} successfully."
     return RedirectResponse(url='/agents', status_code=303)

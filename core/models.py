@@ -1,5 +1,37 @@
 from pydantic import BaseModel, Field
 from typing import List, Optional, Literal, Dict, Any, Union
+from enum import Enum
+
+class IdentityType(str, Enum):
+    USER = "user"
+    WORKFLOW = "workflow"
+    SYSTEM = "system"
+
+class Identity(BaseModel):
+    id: str
+    type: IdentityType
+
+    @classmethod
+    def from_string(cls, id_str: str) -> "Identity":
+        """
+        Parses an identity string into an Identity object.
+        Handles legacy 'svc_agent_' prefixes by mapping them to IdentityType.WORKFLOW.
+        """
+        if id_str.startswith("svc_agent_"):
+            return cls(id=id_str.replace("svc_agent_", ""), type=IdentityType.WORKFLOW)
+        if id_str == "system":
+            return cls(id="system", type=IdentityType.SYSTEM)
+        return cls(id=id_str, type=IdentityType.USER)
+
+    def to_legacy_string(self) -> str:
+        """Returns the legacy string representation (e.g. adding 'svc_agent_' prefix)."""
+        if self.type == IdentityType.WORKFLOW:
+            return f"svc_agent_{self.id}"
+        return self.id
+
+    def get_etcd_path(self, category: str) -> str:
+        """Returns the structured etcd path: /identities/{type}/{id}/{category}"""
+        return f"/identities/{self.type.value}/{self.id}/{category}"
 
 class AgentConfig(BaseModel):
     """Configuration for an Agent, parsed from config.yaml."""
@@ -8,9 +40,9 @@ class AgentConfig(BaseModel):
     author: str = "Unknown"
     description: Optional[str] = None
     tags: List[str] = Field(default_factory=list)
-    type: Literal['standard', 'background'] = 'standard'
-    model: str
-    thinking_level: Literal['none', 'low', 'medium', 'high', 'n/a']
+    type: Literal['user_agent', 'background_agent', 'background_script'] = 'user_agent'
+    model: Optional[str] = None
+    thinking_level: Optional[Literal['none', 'low', 'medium', 'high', 'n/a']] = None
     a2a_access: List[str] = Field(default_factory=list, description="List of other agents this agent can call.")
     allowed_tools: List[str] = Field(default_factory=list, description="List of MCP tools this agent is allowed to use.")
     allowed_mcps: List[str] = Field(default_factory=list, description="List of MCP servers this agent is allowed to connect to.")

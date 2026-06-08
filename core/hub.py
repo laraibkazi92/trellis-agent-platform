@@ -101,13 +101,20 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
     try:
         env = os.environ.copy()
         if user_id:
-            secrets = identity_mgr.get_resolved_secrets(user_id)
-            if secrets:
+            from core.discovery import _resolve_requirements
+            is_background = user_id.startswith("svc_agent_")
+            
+            # Scoped Secret Injection
+            secret_keys = _resolve_requirements(config.secrets, is_background)
+            if secret_keys:
+                secrets = identity_mgr.get_resolved_config(user_id, "secrets", keys=secret_keys)
                 safe_secrets = {str(k): str(v) for k, v in secrets.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
                 env.update(safe_secrets)
             
-            variables = identity_mgr.get_resolved_variables(user_id)
-            if variables:
+            # Scoped Variable Injection
+            variable_keys = _resolve_requirements(config.variables, is_background)
+            if variable_keys:
+                variables = identity_mgr.get_resolved_config(user_id, "variables", keys=variable_keys)
                 safe_vars = {str(k): str(v) for k, v in variables.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
                 env.update(safe_vars)
 
@@ -241,6 +248,7 @@ def register_tools():
             annotations["__user_id"] = typing.Optional[str]
             
             async def handler(**kwargs):
+                print("RECEIVED KWARGS:", kwargs, flush=True)
                 filtered_kwargs = {}
                 for k, v in kwargs.items():
                     if v is not None:

@@ -22,8 +22,8 @@ async def get_agents_index(request: Request):
     agents = await discover_agents(user_id=user.get('sub'), include_background=False)
     return [{"name": a.get("name", ""), "description": a.get("description", ""), "author": a.get("author", ""), "tags": a.get("tags", [])} for a in agents]
 
-@router.get("/search-index/background-agents")
-async def get_background_agents_index(request: Request):
+@router.get("/search-index/workflows")
+async def get_workflows_index(request: Request):
     user = request.session.get('user')
     if not user:
         return []
@@ -31,7 +31,7 @@ async def get_background_agents_index(request: Request):
     result = []
     for name in agent_names:
         config = await asyncio.to_thread(identity_mgr.get_agent_config, name)
-        if config and config.get("type") == "background":
+        if config and config.get("type") in ("background_agent", "background_script"):
             result.append({
                 "name": name,
                 "description": config.get("description", "")

@@ -1,3 +1,10 @@
+x-common-env: &common-env
+  ETCD_HOST: etcd
+  ETCD_PORT: 2379
+  PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
+  DEV_MODE: ${DEV_MODE:-false}
+  TZ: UTC
+
 services:
   # DB Sync Init Container
   # Runs once at startup to sync agents/tools to etcd
@@ -6,9 +13,7 @@ services:
     image: trellis-agent-platform:v2
     container_name: db-sync
     environment:
-      - ETCD_HOST=etcd
-      - ETCD_PORT=2379
-      - PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+      <<: *common-env
     volumes:
       - ./workspace:/app/workspace
       - ./core:/app/core
@@ -28,22 +33,19 @@ services:
     env_file:
       - .env
     environment:
-      - HOST_URL=http://host:8000
-      - HUB_URL=http://hub:8001/mcp
-      - GOOGLE_API_KEY=${GEMINI_API_KEY}
-      - DEV_MODE=${DEV_MODE:-false}
-      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
-      - ETCD_HOST=etcd
-      - ETCD_PORT=2379
-      - REDIS_URL=redis://redis:6379/0
-      - TZ=UTC
+      <<: *common-env
+      HOST_URL: http://host:8000
+      HUB_URL: http://hub:8001/mcp
+      GOOGLE_API_KEY: ${GEMINI_API_KEY}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      REDIS_URL: redis://redis:6379/0
     volumes:
       - health-data:/app/data
       - ./workspace:/app/workspace
       - ./core:/app/core
       - ./scripts:/app/scripts
       - ./templates:/app/templates
-    command: granian --interface asgi core.host:app --host 0.0.0.0 --port 8000 --workers 4 --workers-max-rss 256 --workers-lifetime 3600
+    command: granian --interface asgi core.host:app --host 0.0.0.0 --port 8000 --workers 2 --runtime-threads 2 --workers-max-rss 256 --workers-lifetime 3600
     depends_on:
       hub:
         condition: service_started
@@ -70,10 +72,8 @@ services:
       db-sync:
         condition: service_completed_successfully
     environment:
-      - DEV_MODE=${DEV_MODE:-false}
-      - ETCD_HOST=etcd
-      - ETCD_PORT=2379
-      - HOST_URL=http://host:8000
+      <<: *common-env
+      HOST_URL: http://host:8000
     volumes:
       - health-data:/app/data
       - ./workspace:/app/workspace
@@ -88,11 +88,9 @@ services:
     image: trellis-agent-platform:v2
     container_name: agent-gateway
     environment:
-      - HOST_URL=http://host:8000
-      - DEV_MODE=${DEV_MODE:-false}
-      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
-      - ETCD_HOST=etcd
-      - ETCD_PORT=2379
+      <<: *common-env
+      HOST_URL: http://host:8000
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
     volumes:
       - ./workspace:/app/workspace
       - ./core:/app/core
@@ -137,14 +135,11 @@ services:
     env_file:
       - .env
     environment:
-      - HOST_URL=http://host:8000
-      - HUB_URL=http://hub:8001/mcp
-      - GOOGLE_API_KEY=${GEMINI_API_KEY}
-      - DEV_MODE=${DEV_MODE:-false}
-      - ETCD_HOST=etcd
-      - ETCD_PORT=2379
-      - REDIS_URL=redis://redis:6379/0
-      - TZ=UTC
+      <<: *common-env
+      HOST_URL: http://host:8000
+      HUB_URL: http://hub:8001/mcp
+      GOOGLE_API_KEY: ${GEMINI_API_KEY}
+      REDIS_URL: redis://redis:6379/0
     volumes:
       - ./workspace:/app/workspace
       - ./core:/app/core
@@ -167,10 +162,8 @@ services:
     env_file:
       - .env
     environment:
-      - ETCD_HOST=etcd
-      - ETCD_PORT=2379
-      - REDIS_URL=redis://redis:6379/0
-      - TZ=UTC
+      <<: *common-env
+      REDIS_URL: redis://redis:6379/0
     volumes:
       - ./workspace:/app/workspace
       - ./core:/app/core
@@ -194,13 +187,10 @@ services:
     env_file:
       - .env
     environment:
-      - ETCD_HOST=etcd
-      - ETCD_PORT=2379
-      - DEV_MODE=${DEV_MODE:-false}
-      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
-      - ADMIN_USERS=${ADMIN_USERS}
-      - REDIS_URL=redis://redis:6379/0
-      - TZ=UTC
+      <<: *common-env
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      ADMIN_USERS: ${ADMIN_USERS}
+      REDIS_URL: redis://redis:6379/0
     volumes:
       - health-data:/app/data
       - ./workspace:/app/workspace

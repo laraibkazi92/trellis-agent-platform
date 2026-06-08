@@ -96,7 +96,7 @@ async def list_agents() -> List[Dict[str, str]]:
         if not agent_dict:
             continue
             
-        if agent_dict.get("type") == "background":
+        if agent_dict.get("type") in ("background_agent", "background_script"):
             continue
             
         if not agent_dict.get("is_configured", False):

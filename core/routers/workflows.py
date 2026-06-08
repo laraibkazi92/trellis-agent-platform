@@ -9,6 +9,7 @@ from core.auth import get_current_user, is_admin
 from core.dependencies import templates, identity_mgr, CSRFRoute
 from core.routers.admin import sanitize_name, commit_to_github
 from core.discovery import get_agent_required_secrets, get_agent_required_variables
+from core.models import Identity, IdentityType
 
 from datetime import datetime
 
@@ -41,59 +42,63 @@ async def workflows_view(request: Request):
         
     agent_names = await asyncio.to_thread(identity_mgr.list_agents)
     disabled_agents = identity_mgr.get_disabled_agents()
-    global_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
-    global_variables = await asyncio.to_thread(identity_mgr.get_global_variables)
+    system_identity = Identity(id="system", type=IdentityType.SYSTEM)
+    global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
+    global_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
     
     workflows_list = []
     for name in agent_names:
         config_data = await asyncio.to_thread(identity_mgr.get_agent_config, name)
-        if config_data and config_data.get("type") in ("agent", "script"):
-            status = "disabled" if name in disabled_agents else "active"
-            skills_content = await asyncio.to_thread(identity_mgr.get_agent_skills, name) or ""
-            
+        if config_data and config_data.get("type") in ("background_agent", "background_script"):
+            # Determine configuration status
             required_secrets = await get_agent_required_secrets(config_data)
             required_variables = await get_agent_required_variables(config_data)
+            
             is_configured = True
             missing_secrets = []
             missing_variables = []
             
+            # We filter out globals from required
             user_required_secrets = [s for s in required_secrets if s not in global_secrets]
             user_required_variables = [s for s in required_variables if s not in global_variables]
             
-            svc_variables = await asyncio.to_thread(identity_mgr.get_user_variables, f"svc_agent_{name}")
-            
+            agent_identity = Identity(id=name, type=IdentityType.WORKFLOW)
+            current_config_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, agent_identity, "secrets")
+            current_config_variables = await asyncio.to_thread(identity_mgr.get_identity_config, agent_identity, "variables")
+
             if user_required_secrets:
-                svc_secrets = await asyncio.to_thread(identity_mgr.get_user_secrets, f"svc_agent_{name}")
                 for s in user_required_secrets:
-                    if s not in svc_secrets:
+                    if s not in current_config_secrets:
                         is_configured = False
                         missing_secrets.append(s)
-                        
+            
             if user_required_variables:
-                for s in user_required_variables:
-                    if s not in svc_variables:
+                for v in user_required_variables:
+                    if v not in current_config_variables:
                         is_configured = False
-                        missing_variables.append(s)
+                        missing_variables.append(v)
             
             workflows_list.append({
                 "name": name,
                 "config": config_data,
-                "skills": skills_content,
-                "status": status,
-                "required_secrets": user_required_secrets,
-                "missing_secrets": missing_secrets,
-                "required_variables": user_required_variables,
-                "missing_variables": missing_variables,
-                "current_variables": svc_variables,
+                "status": "disabled" if name in disabled_agents else "active",
+                "description": config_data.get("description", ""),
+                "trigger": config_data.get("trigger", {}),
                 "is_configured": is_configured,
+                "required_secrets": user_required_secrets,
+                "required_variables": user_required_variables,
+                "missing_secrets": missing_secrets,
+                "missing_variables": missing_variables,
+                "current_variables": current_config_variables,
+                "is_running": False,
                 "run_stats": {
                     "pending": 0,
                     "processing": 0,
-                    "failed": 0,
-                    "completed": 0
-                },
-                "is_running": False
+                    "completed": 0,
+                    "failed": 0
+                }
             })
+
 
     workflows_list.sort(key=lambda x: x["name"].lower())
     all_mcps = await asyncio.to_thread(identity_mgr.list_mcps)
@@ -163,23 +168,20 @@ async def configure_background_agent_secrets(request: Request, agent_name: str):
     if not user:
         return RedirectResponse(url='/login')
         
-    if not is_admin(request):
-        request.session["flash_msg"] = "Admin access required to configure workflows."
-        return RedirectResponse(url='/workflows', status_code=303)
-        
     form = await request.form()
     
     config = await asyncio.to_thread(identity_mgr.get_agent_config, agent_name)
-    if not config or config.get("type") not in ("agent", "script"):
-        request.session["flash_msg"] = "Workflow not found."
+    if not config:
+        request.session["flash_msg"] = f"Agent {agent_name} not found."
         return RedirectResponse(url='/workflows', status_code=303)
         
-    target_user_id = f"svc_agent_{agent_name}"
-        
-    current_secrets = await asyncio.to_thread(identity_mgr.get_user_secrets, target_user_id)
-    global_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
-    current_variables = await asyncio.to_thread(identity_mgr.get_user_variables, target_user_id)
-    global_variables = await asyncio.to_thread(identity_mgr.get_global_variables)
+    agent_identity = Identity(id=agent_name, type=IdentityType.WORKFLOW)
+    system_identity = Identity(id="system", type=IdentityType.SYSTEM)
+
+    current_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, agent_identity, "secrets")
+    current_variables = await asyncio.to_thread(identity_mgr.get_identity_config, agent_identity, "variables")
+    global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
+    global_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
     
     required_secrets = await get_agent_required_secrets(config)
     required_variables = await get_agent_required_variables(config)
@@ -190,26 +192,77 @@ async def configure_background_agent_secrets(request: Request, agent_name: str):
     for key, value in form.items():
         if key in ("csrf_token",):
             continue
-        
+            
         val_str = str(value).strip()
         
         if key in required_secrets and key not in global_secrets:
-            if val_str:
+            if val_str: # only update secret if not empty
                 current_secrets[key] = val_str
                 secrets_updated = True
         elif key in required_variables and key not in global_variables:
             current_variables[key] = val_str
             variables_updated = True
-            
+                
     if secrets_updated:
-        await asyncio.to_thread(identity_mgr.save_user_secrets, target_user_id, current_secrets)
+        await asyncio.to_thread(identity_mgr.save_identity_config, agent_identity, "secrets", current_secrets)
     if variables_updated:
-        await asyncio.to_thread(identity_mgr.save_user_variables, target_user_id, current_variables)
+        await asyncio.to_thread(identity_mgr.save_identity_config, agent_identity, "variables", current_variables)
     
-    request.session["flash_msg"] = f"Configuration and secrets saved for {agent_name} successfully."
+    request.session["flash_msg"] = f"Configuration for {agent_name} saved successfully."
+    return RedirectResponse(url='/workflows', status_code=303)
+
+@router.post("/workflows/{agent_name}/runs/{run_id}/cancel")
+async def cancel_background_run(request: Request, agent_name: str, run_id: str):
+    user = await get_current_user(request)
+    if not user:
+        return RedirectResponse(url='/login')
+        
+    if not is_admin(request):
+        request.session["flash_msg"] = "Admin access required to cancel workflows."
+        return RedirectResponse(url='/workflows', status_code=303)
+
+    safe_name = sanitize_name(agent_name)
+    if not safe_name:
+        request.session["flash_msg"] = "Invalid agent name parameter."
+        return RedirectResponse(url='/workflows', status_code=303)
+        
+    try:
+        # Get current run state
+        runs = await asyncio.to_thread(identity_mgr.get_agent_runs, safe_name)
+        run_record = next((r for r in runs if r.get("run_id") == run_id), None)
+        
+        if not run_record:
+            request.session["flash_msg"] = f"Run {run_id} not found."
+            return RedirectResponse(url='/workflows', status_code=303)
+            
+        current_state = run_record.get("state")
+        
+        # Only allow cancelling if pending or processing
+        if current_state not in ("pending", "processing"):
+            request.session["flash_msg"] = f"Cannot cancel run in state: {current_state}."
+            return RedirectResponse(url='/workflows', status_code=303)
+            
+        metadata = run_record.get("metadata", {})
+        metadata["cancelled_by"] = user.id
+        metadata["cancelled_at"] = datetime.now().isoformat()
+        
+        await asyncio.to_thread(
+            identity_mgr.record_agent_run_state,
+            safe_name,
+            run_id,
+            "cancelled",
+            metadata
+        )
+        
+        request.session["flash_msg"] = f"Run {run_id} for '{safe_name}' has been cancelled."
+    except Exception as e:
+        print(f"Error cancelling run: {e}")
+        request.session["flash_msg"] = f"Failed to cancel run: {str(e)}"
+        
     return RedirectResponse(url='/workflows', status_code=303)
 
 @router.post("/workflows/{agent_name}/run")
+
 async def run_background_agent_manual(request: Request, agent_name: str):
     user = await get_current_user(request)
     if not user:
@@ -225,7 +278,7 @@ async def run_background_agent_manual(request: Request, agent_name: str):
         return RedirectResponse(url='/workflows', status_code=303)
         
     config = await asyncio.to_thread(identity_mgr.get_agent_config, safe_name)
-    if not config or config.get("type") not in ("agent", "script"):
+    if not config or config.get("type") not in ("background_agent", "background_script"):
         request.session["flash_msg"] = "Workflow not found."
         return RedirectResponse(url='/workflows', status_code=303)
         
@@ -235,17 +288,19 @@ async def run_background_agent_manual(request: Request, agent_name: str):
     now = datetime.now()
     xml_payload = f"<event_payload><![CDATA[\nManual execution triggered at {now.isoformat()}\n]]></event_payload>"
     
-    if config.get("type") == "script":
+    agent_identity = Identity(id=safe_name, type=IdentityType.WORKFLOW)
+    
+    if config.get("type") == "background_script":
         task = await run_background_script.kiq(
             agent_name=safe_name,
             prompt=xml_payload,
-            user_id=f"svc_agent_{safe_name}"
+            user_id=agent_identity.to_legacy_string()
         )
     else:
         task = await run_background_agent.kiq(
             agent_name=safe_name,
             prompt=xml_payload,
-            user_id=f"svc_agent_{safe_name}"
+            user_id=agent_identity.to_legacy_string()
         )
     
     try:
@@ -254,7 +309,7 @@ async def run_background_agent_manual(request: Request, agent_name: str):
             safe_name,
             task.task_id,
             "pending",
-            {"prompt": xml_payload, "user_id": f"svc_agent_{safe_name}"}
+            {"prompt": xml_payload, "user_id": agent_identity.to_legacy_string()}
         )
     except Exception as e:
         print(f"Failed to record pending state for {safe_name}: {e}")
@@ -281,9 +336,9 @@ async def update_background_trigger(request: Request):
         return RedirectResponse(url='/workflows', status_code=303)
         
     config_data = await asyncio.to_thread(identity_mgr.get_agent_config, safe_name) or {"name": safe_name}
-    workflow_type = config_data.get("type", "agent")
+    workflow_type = config_data.get("type", "background_agent")
     
-    if workflow_type not in ("agent", "script"):
+    if workflow_type not in ("background_agent", "background_script"):
         return RedirectResponse(url="/workflows", status_code=303)
 
     # Extract form data into a dictionary for Pydantic
@@ -295,7 +350,7 @@ async def update_background_trigger(request: Request):
             form_dict[key] = form.get(key)
             
     try:
-        if workflow_type == "script":
+        if workflow_type == "background_script":
             validated_data = ScriptUpdateModel(**form_dict)
         else:
             validated_data = AgentUpdateModel(**form_dict)
@@ -318,7 +373,7 @@ async def update_background_trigger(request: Request):
 
     skills_content = ""
     # Process Agent-specific Settings
-    if workflow_type == "agent":
+    if workflow_type == "background_agent":
         config_data["model"] = validated_data.model
         config_data["thinking_level"] = validated_data.thinking_level
         
@@ -342,7 +397,7 @@ async def update_background_trigger(request: Request):
     yaml_content = yaml.dump(config_data, sort_keys=False)
     
     success_config = await commit_to_github(f"{agent_dir}/config.yaml", yaml_content, f"Update config for {safe_name}")
-    if workflow_type == "agent":
+    if workflow_type == "background_agent":
         success_skills = await commit_to_github(f"{agent_dir}/skills.md", skills_content, f"Update skills for {safe_name}")
         
     return RedirectResponse(url="/workflows", status_code=303)

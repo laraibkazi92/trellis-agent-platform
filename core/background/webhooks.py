@@ -114,7 +114,7 @@ async def receive_webhook(agent_name: str, request: Request):
     import asyncio
     config_data = await asyncio.to_thread(identity_mgr.get_agent_config, agent_name)
     
-    if not config_data or config_data.get("type") != "background":
+    if not config_data or config_data.get("type") not in ("background_agent", "background_script"):
         raise HTTPException(status_code=404, detail="Background agent not found")
         
     trigger = config_data.get("trigger")

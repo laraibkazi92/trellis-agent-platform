@@ -2,6 +2,7 @@ import os
 import asyncio
 from typing import List, Dict, Optional
 from core.auth import IdentityManager
+from core.models import Identity, IdentityType
 
 # Initialize IdentityManager locally for discovery purposes
 identity_mgr = IdentityManager(
@@ -27,7 +28,7 @@ def _resolve_requirements(req_data, is_background: bool) -> List[str]:
 async def get_agent_required_secrets(config: Dict) -> List[str]:
     """Helper to determine all required secrets for an agent based on its tools/MCPs."""
     required = set()
-    is_background = config.get("type") in ("agent", "script")
+    is_background = config.get("type") in ("background_agent", "background_script")
     
     allowed_tools = config.get("allowed_tools", [])
     for tool_name in allowed_tools:
@@ -56,7 +57,7 @@ async def get_agent_required_secrets(config: Dict) -> List[str]:
 async def get_agent_required_variables(config: Dict) -> List[str]:
     """Helper to determine all required non-sensitive variables for an agent based on its tools/MCPs."""
     required = set()
-    is_background = config.get("type") in ("agent", "script")
+    is_background = config.get("type") in ("background_agent", "background_script")
     
     allowed_tools = config.get("allowed_tools", [])
     for tool_name in allowed_tools:
@@ -91,7 +92,7 @@ async def is_agent_configured(agent_name: str, user_id: str) -> bool:
     if not config:
         return False
         
-    is_background = config.get("type") in ("agent", "script")
+    is_background = config.get("type") in ("background_agent", "background_script")
     
     required_secrets = await get_agent_required_secrets(config)
     required_variables = await get_agent_required_variables(config)
@@ -99,8 +100,9 @@ async def is_agent_configured(agent_name: str, user_id: str) -> bool:
     if not required_secrets and not required_variables:
         return True
         
-    global_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
-    global_variables = await asyncio.to_thread(identity_mgr.get_global_variables)
+    system_identity = Identity(id="system", type=IdentityType.SYSTEM)
+    global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
+    global_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
     
     user_required_secrets = [s for s in required_secrets if s not in global_secrets]
     user_required_variables = [s for s in required_variables if s not in global_variables]
@@ -108,29 +110,17 @@ async def is_agent_configured(agent_name: str, user_id: str) -> bool:
     if not user_required_secrets and not user_required_variables:
         return True
         
-    if is_background:
-        svc_secrets = await asyncio.to_thread(identity_mgr.get_user_secrets, f"svc_agent_{agent_name}")
-        svc_variables = await asyncio.to_thread(identity_mgr.get_user_variables, f"svc_agent_{agent_name}")
-        
-        for req in user_required_secrets:
-            if req not in svc_secrets:
-                return False
-        for req in user_required_variables:
-            if req not in svc_variables:
-                return False
-    else:
-        if not user_id:
+    identity = Identity.from_string(user_id) if not is_background else Identity(id=agent_name, type=IdentityType.WORKFLOW)
+    
+    ident_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "secrets")
+    ident_variables = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "variables")
+    
+    for req in user_required_secrets:
+        if req not in ident_secrets:
             return False
-            
-        human_user_secrets = await asyncio.to_thread(identity_mgr.get_user_secrets, user_id)
-        human_user_variables = await asyncio.to_thread(identity_mgr.get_user_variables, user_id)
-        
-        for req in user_required_secrets:
-            if req not in human_user_secrets:
-                return False
-        for req in user_required_variables:
-            if req not in human_user_variables:
-                return False
+    for req in user_required_variables:
+        if req not in ident_variables:
+            return False
                 
     return True
 
@@ -139,16 +129,18 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
     agents = []
     agent_names = await asyncio.to_thread(identity_mgr.list_agents)
     
+    system_identity = Identity(id="system", type=IdentityType.SYSTEM)
     # Cache global secrets and variables once per discovery
-    global_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
-    global_variables = await asyncio.to_thread(identity_mgr.get_global_variables)
+    global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
+    global_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
     
     # If a user is provided, pre-fetch their secrets and variables for standard agents
     human_user_secrets = {}
     human_user_variables = {}
     if user_id:
-        human_user_secrets = await asyncio.to_thread(identity_mgr.get_user_secrets, user_id)
-        human_user_variables = await asyncio.to_thread(identity_mgr.get_user_variables, user_id)
+        user_identity = Identity.from_string(user_id)
+        human_user_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, user_identity, "secrets")
+        human_user_variables = await asyncio.to_thread(identity_mgr.get_identity_config, user_identity, "variables")
     
     for name in agent_names:
         if name == "supervisor":
@@ -156,7 +148,7 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
             
         config = await asyncio.to_thread(identity_mgr.get_agent_config, name)
         if config:
-            is_background = config.get("type") in ("agent", "script")
+            is_background = config.get("type") in ("background_agent", "background_script")
             
             if is_background and not include_background:
                 continue
@@ -176,45 +168,30 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
             user_required_secrets = [s for s in required_secrets if s not in global_secrets]
             user_required_variables = [s for s in required_variables if s not in global_variables]
             
-            if user_required_secrets:
-                if is_background:
-                    # Check background service account
-                    svc_secrets = await asyncio.to_thread(identity_mgr.get_user_secrets, f"svc_agent_{name}")
-                    for req in user_required_secrets:
-                        if req not in svc_secrets:
-                            is_configured = False
-                            missing_secrets.append(req)
-                else:
-                    # Check human user account
-                    if not user_id:
-                        is_configured = False
-                        missing_secrets = user_required_secrets
-                    else:
-                        for req in user_required_secrets:
-                            if req not in human_user_secrets:
-                                  is_configured = False
-                                  missing_secrets.append(req)
-                                  
-            if user_required_variables:
-                if is_background:
-                    svc_variables = await asyncio.to_thread(identity_mgr.get_user_variables, f"svc_agent_{name}")
-                    for req in user_required_variables:
-                        if req not in svc_variables:
-                            is_configured = False
-                            missing_variables.append(req)
-                else:
-                    if not user_id:
-                        is_configured = False
-                        missing_variables = user_required_variables
-                    else:
-                        for req in user_required_variables:
-                            if req not in human_user_variables:
-                                is_configured = False
-                                missing_variables.append(req)
+            current_config_secrets = {}
+            current_config_variables = {}
+
+            if is_background:
+                agent_identity = Identity(id=name, type=IdentityType.WORKFLOW)
+                current_config_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, agent_identity, "secrets")
+                current_config_variables = await asyncio.to_thread(identity_mgr.get_identity_config, agent_identity, "variables")
+            else:
+                current_config_secrets = human_user_secrets
+                current_config_variables = human_user_variables
+
+            for req in user_required_secrets:
+                if req not in current_config_secrets:
+                    is_configured = False
+                    missing_secrets.append(req)
+            
+            for req in user_required_variables:
+                if req not in current_config_variables:
+                    is_configured = False
+                    missing_variables.append(req)
             
             agents.append({
                 "name": config.get("name", name),
-                "type": config.get("type", "standard"),
+                "type": config.get("type", "user_agent"),
                 "author": config.get("author", "Unknown"),
                 "description": config.get("description", ""),
                 "tags": config.get("tags", []),
@@ -230,8 +207,9 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
                 "is_configured": is_configured,
                 "missing_secrets": missing_secrets,
                 "missing_variables": missing_variables,
-                "current_variables": human_user_variables if not is_background else svc_variables
+                "current_variables": current_config_variables
              })
+
     agents.sort(key=lambda x: x["name"].lower())
     return agents
 

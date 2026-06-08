@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import templates, CSRFRoute
 from core.auth import IdentityManager
 from core.health import HealthMonitor
+from core.models import Identity, IdentityType
 
 router = APIRouter(route_class=CSRFRoute)
 
@@ -182,10 +183,7 @@ async def admin_configuration_page(request: Request):
         if config:
             secrets_data = config.get("secrets", [])
             if isinstance(secrets_data, dict):
-                secrets_list = []
-                for v in secrets_data.values():
-                    if isinstance(v, list):
-                        secrets_list.extend(v)
+                secrets_list = list(secrets_data.get("general", [])) + list(secrets_data.get("user", []))
             else:
                 secrets_list = secrets_data
 
@@ -196,10 +194,7 @@ async def admin_configuration_page(request: Request):
 
             vars_data = config.get("variables", [])
             if isinstance(vars_data, dict):
-                vars_list = []
-                for v in vars_data.values():
-                    if isinstance(v, list):
-                        vars_list.extend(v)
+                vars_list = list(vars_data.get("general", [])) + list(vars_data.get("user", []))
             else:
                 vars_list = vars_data
 
@@ -213,10 +208,7 @@ async def admin_configuration_page(request: Request):
         if config:
             secrets_data = config.get("secrets", [])
             if isinstance(secrets_data, dict):
-                secrets_list = []
-                for v in secrets_data.values():
-                    if isinstance(v, list):
-                        secrets_list.extend(v)
+                secrets_list = list(secrets_data.get("general", [])) + list(secrets_data.get("user", []))
             else:
                 secrets_list = secrets_data
 
@@ -227,10 +219,7 @@ async def admin_configuration_page(request: Request):
 
             vars_data = config.get("variables", [])
             if isinstance(vars_data, dict):
-                vars_list = []
-                for v in vars_data.values():
-                    if isinstance(v, list):
-                        vars_list.extend(v)
+                vars_list = list(vars_data.get("general", [])) + list(vars_data.get("user", []))
             else:
                 vars_list = vars_data
 
@@ -239,8 +228,9 @@ async def admin_configuration_page(request: Request):
                     if v not in required_variables: required_variables[v] = []
                     required_variables[v].append(f"MCP: {name}")
 
-    global_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
-    global_variables = await asyncio.to_thread(identity_mgr.get_global_variables)
+    system_identity = Identity(id="system", type=IdentityType.SYSTEM)
+    global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
+    global_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
     
     items = []
     
@@ -299,15 +289,15 @@ async def save_admin_configuration(request: Request):
         if config:
             secrets_data = config.get("secrets", [])
             if isinstance(secrets_data, dict):
-                for v in secrets_data.values():
-                    if isinstance(v, list): known_secrets.update(v)
+                known_secrets.update(secrets_data.get("general", []))
+                known_secrets.update(secrets_data.get("user", []))
             elif isinstance(secrets_data, list):
                 known_secrets.update(secrets_data)
 
             vars_data = config.get("variables", [])
             if isinstance(vars_data, dict):
-                for v in vars_data.values():
-                    if isinstance(v, list): known_variables.update(v)
+                known_variables.update(vars_data.get("general", []))
+                known_variables.update(vars_data.get("user", []))
             elif isinstance(vars_data, list):
                 known_variables.update(vars_data)
 
@@ -316,20 +306,21 @@ async def save_admin_configuration(request: Request):
         if config:
             secrets_data = config.get("secrets", [])
             if isinstance(secrets_data, dict):
-                for v in secrets_data.values():
-                    if isinstance(v, list): known_secrets.update(v)
+                known_secrets.update(secrets_data.get("general", []))
+                known_secrets.update(secrets_data.get("user", []))
             elif isinstance(secrets_data, list):
                 known_secrets.update(secrets_data)
 
             vars_data = config.get("variables", [])
             if isinstance(vars_data, dict):
-                for v in vars_data.values():
-                    if isinstance(v, list): known_variables.update(v)
+                known_variables.update(vars_data.get("general", []))
+                known_variables.update(vars_data.get("user", []))
             elif isinstance(vars_data, list):
                 known_variables.update(vars_data)
                 
-    current_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
-    current_variables = await asyncio.to_thread(identity_mgr.get_global_variables)
+    system_identity = Identity(id="system", type=IdentityType.SYSTEM)
+    current_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
+    current_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
     
     secrets_updated = False
     variables_updated = False
@@ -353,9 +344,9 @@ async def save_admin_configuration(request: Request):
                 variables_updated = True
             
     if secrets_updated:
-        await asyncio.to_thread(identity_mgr.save_global_secrets, current_secrets)
+        await asyncio.to_thread(identity_mgr.save_identity_config, system_identity, "secrets", current_secrets)
     if variables_updated:
-        await asyncio.to_thread(identity_mgr.save_global_variables, current_variables)
+        await asyncio.to_thread(identity_mgr.save_identity_config, system_identity, "variables", current_variables)
     
     request.session["flash_msg"] = "Global configurations and secrets saved successfully."
     return RedirectResponse(url='/admin/configuration', status_code=303)
@@ -365,16 +356,17 @@ async def delete_admin_configuration_key(request: Request, secret_key: str = For
     if redirect := require_admin(request, '/admin'):
         return redirect
         
-    current_secrets = await asyncio.to_thread(identity_mgr.get_global_secrets)
-    current_variables = await asyncio.to_thread(identity_mgr.get_global_variables)
+    system_identity = Identity(id="system", type=IdentityType.SYSTEM)
+    current_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
+    current_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
     
     if secret_key in current_secrets:
         del current_secrets[secret_key]
-        await asyncio.to_thread(identity_mgr.save_global_secrets, current_secrets)
+        await asyncio.to_thread(identity_mgr.save_identity_config, system_identity, "secrets", current_secrets)
         request.session["flash_msg"] = f"Global secret '{secret_key}' removed."
     elif secret_key in current_variables:
         del current_variables[secret_key]
-        await asyncio.to_thread(identity_mgr.save_global_variables, current_variables)
+        await asyncio.to_thread(identity_mgr.save_identity_config, system_identity, "variables", current_variables)
         request.session["flash_msg"] = f"Global variable '{secret_key}' removed."
         
     return RedirectResponse(url='/admin/configuration', status_code=303)

@@ -82,7 +82,7 @@ def main():
         for agent_dir in AGENTS_DIR.iterdir():
             if not agent_dir.is_dir() or agent_dir.name == "supervisor":
                 continue
-            name = sync_agent(identity_mgr, agent_dir)
+            name = sync_agent(identity_mgr, agent_dir, default_type="user_agent")
             if name:
                 seen_agents.add(name)
                 
@@ -91,13 +91,13 @@ def main():
         for agent_dir in WORKFLOWS_DIR.iterdir():
             if not agent_dir.is_dir():
                 continue
-            name = sync_agent(identity_mgr, agent_dir, default_type="agent")
+            name = sync_agent(identity_mgr, agent_dir, default_type="background_agent")
             if name:
                 seen_agents.add(name)
     
     print("\nSyncing supervisor to etcd...")
     if SUPERVISOR_DIR.exists():
-        name = sync_agent(identity_mgr, SUPERVISOR_DIR, name="supervisor")
+        name = sync_agent(identity_mgr, SUPERVISOR_DIR, name="supervisor", default_type="user_agent")
         if name:
             seen_agents.add(name)
 

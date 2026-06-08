@@ -71,32 +71,52 @@ def _get_model_settings(model_name: str, thinking_level: str) -> Optional[Google
         return GoogleModelSettings(google_thinking_config={"thinking_level": thinking_level.lower(), "include_thoughts": False})
     return None
 
-def _inject_secrets(env: Optional[Dict[str, str]], secrets_req: Optional[Union[List[str], Dict[str, List[str]]]], user_secrets: Dict[str, str], is_background: bool) -> Dict[str, str]:
+def _inject_config(
+    env: Optional[Dict[str, str]], 
+    req_data: Optional[Union[List[str], Dict[str, List[str]]]], 
+    identity_mgr: IdentityManager,
+    user_id: str,
+    category: str,
+    is_background: bool
+) -> Dict[str, str]:
     from core.discovery import _resolve_requirements
     env_copy = env.copy() if env else {}
-    req_list = _resolve_requirements(secrets_req, is_background)
-    for req_secret in req_list:
-        val = user_secrets.get(req_secret)
+    req_list = _resolve_requirements(req_data, is_background)
+    
+    if not req_list:
+        return env_copy
+
+    # Scoped fetch for the required keys
+    resolved_data = identity_mgr.get_resolved_config(user_id, category, keys=req_list)
+    
+    for req_key in req_list:
+        val = resolved_data.get(req_key)
         if val:
+            # Handle interpolation if the value is used in existing env vars (e.g. command args in env)
             interpolated = False
             for k, v in env_copy.items():
-                if isinstance(v, str) and f"{{{req_secret}}}" in v:
-                    env_copy[k] = v.replace(f"{{{req_secret}}}", val)
+                if isinstance(v, str) and f"{{{req_key}}}" in v:
+                    env_copy[k] = v.replace(f"{{{req_key}}}", str(val))
                     interpolated = True
             if not interpolated:
-                env_copy[req_secret] = val
+                env_copy[req_key] = str(val)
     return env_copy
 
 @cached(cache=mcp_client_cache)
 async def get_external_mcp_client(mcp_name: str, user_id: str) -> FastMCPClient:
     identity_mgr = get_identity_manager()
-    user_secrets = await asyncio.to_thread(identity_mgr.get_resolved_secrets, user_id)
     config_data = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
     if not config_data: raise Exception(f"MCP config '{mcp_name}' not found")
     config = MCPConfig(**config_data)
     
     is_background = user_id.startswith("svc_agent_")
-    env = _inject_secrets(config.env, config.secrets, user_secrets, is_background)
+    
+    # Inject Secrets (Scoped)
+    env = _inject_config(config.env, config.secrets, identity_mgr, user_id, "secrets", is_background)
+    
+    # Inject Variables (Scoped)
+    env = _inject_config(env, config.variables, identity_mgr, user_id, "variables", is_background)
+
     if config.transport == "stdio":
         full_env = os.environ.copy()
         full_env.update(env)
@@ -258,7 +278,7 @@ async def build_agent(agent_name: str) -> Agent:
         for target in all_agents:
             if target != "supervisor":
                 target_cfg = await asyncio.to_thread(identity_mgr.get_agent_config, target)
-                if target_cfg and target_cfg.get("type") != "background":
+                if target_cfg and target_cfg.get("type") not in ("background_agent", "background_script"):
                     target_instructions = await asyncio.to_thread(identity_mgr.get_agent_skills, target)
                     subagent_configs.append(SubAgentConfig(
                         name=target,
@@ -323,7 +343,7 @@ def _register_admin_tools(agent: Agent):
         for name in names:
             if name == "supervisor": continue
             cfg = await asyncio.to_thread(identity_mgr.get_agent_config, name)
-            if cfg and cfg.get("type") != "background":
+            if cfg and cfg.get("type") not in ("background_agent", "background_script"):
                 agents_info.append({"name": name, "description": cfg.get("description", ""), "status": "disabled" if name in disabled else "active"})
         return agents_info
 
