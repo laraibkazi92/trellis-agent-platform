@@ -2,6 +2,7 @@ import os
 import yaml
 import asyncio
 import copy
+import time
 from urllib.parse import urlparse
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Union
@@ -144,7 +145,6 @@ async def get_hub_client() -> FastMCPClient:
 
 async def discover_external_mcps(force: bool = False):
     global _external_mcp_tools, _last_discovery_time
-    import time
     
     now = time.time()
     if not force and (now - _last_discovery_time) < DISCOVERY_CACHE_TTL and _external_mcp_tools:
