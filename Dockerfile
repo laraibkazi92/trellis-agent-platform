@@ -24,6 +24,10 @@ RUN npm install -g tsx
 # Set the working directory
 WORKDIR /app
 
+# Point Python HTTP clients to the OS-level trust store
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
 # Copy requirements and install Python dependencies
 COPY requirements.txt .
 RUN uv pip install --system --no-cache -r requirements.txt && uv pip install --system --upgrade certifi
