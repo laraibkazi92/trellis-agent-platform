@@ -156,18 +156,17 @@ async def run_background_script(
             cmd = [str(entrypoint_path)]
 
         env = os.environ.copy()
-        from core.discovery import _resolve_requirements
-        is_background = user_id.startswith("svc_agent_")
+        from core.discovery import get_agent_required_secrets, get_agent_required_variables
         
-        # Scoped Secret Injection
-        secret_keys = _resolve_requirements(config_data.get("secrets"), is_background)
+        # Scoped Secret Injection (Aggregated from config + allowed tools/mcps)
+        secret_keys = await get_agent_required_secrets(config_data)
         if secret_keys:
             secrets = identity_mgr.get_resolved_config(user_id, "secrets", keys=secret_keys)
             safe_secrets = {str(k): str(v) for k, v in secrets.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
             env.update(safe_secrets)
             
-        # Scoped Variable Injection
-        variable_keys = _resolve_requirements(config_data.get("variables"), is_background)
+        # Scoped Variable Injection (Aggregated from config + allowed tools/mcps)
+        variable_keys = await get_agent_required_variables(config_data)
         if variable_keys:
             variables = identity_mgr.get_resolved_config(user_id, "variables", keys=variable_keys)
             safe_vars = {str(k): str(v) for k, v in variables.items() if str(k).upper() not in RESTRICTED_ENV_VARS}

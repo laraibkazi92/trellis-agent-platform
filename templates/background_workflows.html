@@ -106,7 +106,20 @@
 <script src="https://unpkg.com/cronstrue@latest/dist/cronstrue.min.js"></script>
 
 <!-- Auto-refresh mechanism -->
-<meta http-equiv="refresh" content="30">
+<script>
+    // Smart auto-refresh: only reload if no modals are open and user isn't typing
+    setInterval(() => {
+        const anyModalOpen = document.querySelectorAll('.fixed.inset-0:not(.hidden)').length > 0;
+        const isTyping = document.activeElement && 
+                        (document.activeElement.tagName === 'INPUT' || 
+                         document.activeElement.tagName === 'TEXTAREA' ||
+                         document.activeElement.isContentEditable);
+        
+        if (!anyModalOpen && !isTyping) {
+            window.location.reload();
+        }
+    }, 30000);
+</script>
 
 <script>
     // agentConfigs removed

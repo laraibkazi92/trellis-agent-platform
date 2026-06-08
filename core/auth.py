@@ -13,7 +13,7 @@ import warnings
 
 from core.models import Identity, IdentityType
 
-import pyetcd
+import etcd3
 from fastapi import Request, HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
@@ -76,7 +76,7 @@ def retry_etcd(max_retries=10, delay=2):
 
 class IdentityManager:
     def __init__(self, host: str = "127.0.0.1", port: int = 2379):
-        self.client = pyetcd.client(host=host, port=port)
+        self.client = etcd3.client(host=host, port=port)
 
     @retry_etcd()
     def _get_kv(self, path: str, decrypt: bool = False) -> Optional[Any]:

@@ -26,10 +26,15 @@ def _resolve_requirements(req_data, is_background: bool) -> List[str]:
     return []
 
 async def get_agent_required_secrets(config: Dict) -> List[str]:
-    """Helper to determine all required secrets for an agent based on its tools/MCPs."""
+    """Helper to determine all required secrets for an agent based on its config, tools, and MCPs."""
     required = set()
     is_background = config.get("type") in ("background_agent", "background_script")
     
+    # 1. Include secrets explicitly declared in agent/workflow config
+    if config.get("secrets"):
+        required.update(_resolve_requirements(config.get("secrets"), is_background))
+        
+    # 2. Aggregate secrets from allowed tools
     allowed_tools = config.get("allowed_tools", [])
     for tool_name in allowed_tools:
         tool_config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
@@ -55,10 +60,15 @@ async def get_agent_required_secrets(config: Dict) -> List[str]:
     return sorted(list(required))
 
 async def get_agent_required_variables(config: Dict) -> List[str]:
-    """Helper to determine all required non-sensitive variables for an agent based on its tools/MCPs."""
+    """Helper to determine all required non-sensitive variables for an agent based on its config, tools, and MCPs."""
     required = set()
     is_background = config.get("type") in ("background_agent", "background_script")
     
+    # 1. Include variables explicitly declared in agent/workflow config
+    if config.get("variables"):
+        required.update(_resolve_requirements(config.get("variables"), is_background))
+
+    # 2. Aggregate variables from allowed tools
     allowed_tools = config.get("allowed_tools", [])
     for tool_name in allowed_tools:
         tool_config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
@@ -171,6 +181,13 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
         required_secrets = set()
         required_variables = set()
         
+        # 1. Include requirements from agent/workflow config
+        if config.get("secrets"):
+            required_secrets.update(_resolve_requirements(config.get("secrets"), is_background))
+        if config.get("variables"):
+            required_variables.update(_resolve_requirements(config.get("variables"), is_background))
+
+        # 2. Aggregate requirements from allowed tools
         allowed_tools = config.get("allowed_tools", [])
         for tool_name in allowed_tools:
             tool_config = all_tool_configs.get(tool_name)
