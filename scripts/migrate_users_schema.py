@@ -1,9 +1,8 @@
 import os
-import etcd3
+import pyetcd
 
-def migrate():
-    print("Connecting to etcd...")
-    client = etcd3.client(
+def migrate_users():
+    client = pyetcd.client(
         host=os.getenv("ETCD_HOST", "127.0.0.1"),
         port=int(os.getenv("ETCD_PORT", 2379))
     )
@@ -58,4 +57,4 @@ def migrate():
     print(f"Migration complete. {migrated_count} records migrated.")
 
 if __name__ == "__main__":
-    migrate()
+    migrate_users()

@@ -1,7 +1,7 @@
 # Trellis: LLM Agent Context & Dev Guide
 
 ## 🏗 Architecture & Stack
-- **Stack**: Python 3.12, FastAPI, PydanticAI (LLM routing), FastMCP (Tooling), etcd3 (State/Registry).
+- **Stack**: Python 3.12, FastAPI, PydanticAI (LLM routing), FastMCP (Tooling), etcd-sdk-python (State/Registry).
 - **`core/host.py`** (Port 8000): Universal Agent Host. FastAPI + PydanticAI. Orchestrates LLM agents.
 - **`core/hub.py`** (Port 8001): Polyglot Tool Hub. FastMCP server executing local tools (Python, Go, TS).
 - **`core/gateway.py`** (Port 8002): External MCP Gateway. Exposes agents to external MCP clients via the `/mcp` endpoint.

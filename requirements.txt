@@ -7,7 +7,7 @@ mcp[all]
 fastmcp
 uvicorn
 httpx
-etcd3
+etcd-sdk-python
 authlib
 python3-saml
 aiofiles

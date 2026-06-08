@@ -1,7 +1,6 @@
 import os
 import sys
 
-# Protocol Buffers implementation fix for etcd3
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 
 import yaml
