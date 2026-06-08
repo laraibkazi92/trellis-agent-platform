@@ -3,7 +3,6 @@ import json
 import logging
 
 # Set env before imports
-os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 
 from core.auth import IdentityManager
 from core.models import Identity, IdentityType

@@ -1,7 +1,6 @@
 import os
 import sys
 
-os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 
 import yaml
 from pathlib import Path

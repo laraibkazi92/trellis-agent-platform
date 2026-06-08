@@ -1,7 +1,6 @@
 import os
 
 # SET THIS BEFORE ANY OTHER IMPORTS
-os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 os.environ["DEV_MODE"] = "true"
 
 import json
