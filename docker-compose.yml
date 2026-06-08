@@ -45,7 +45,7 @@ services:
       - ./core:/app/core
       - ./scripts:/app/scripts
       - ./templates:/app/templates
-    command: granian --interface asgi core.host:app --host 0.0.0.0 --port 8000 --workers 2 --runtime-threads 2 --workers-max-rss 256 --workers-lifetime 3600
+    command: granian --interface asgi core.host:app --host 0.0.0.0 --port 8000 --workers 2 --runtime-threads 1 --workers-max-rss 256 --workers-lifetime 3600
     depends_on:
       hub:
         condition: service_started

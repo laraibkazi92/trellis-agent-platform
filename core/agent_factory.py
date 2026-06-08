@@ -28,6 +28,8 @@ from core.health import HealthMonitor
 _hub_client: Optional[FastMCPClient] = None
 _hub_tools_cache: List[Any] = []
 _external_mcp_tools: Dict[str, List[Any]] = {}
+_last_discovery_time: float = 0
+DISCOVERY_CACHE_TTL = 60 # Cache discovery for 60 seconds
 
 mcp_client_cache = TTLCache(maxsize=100, ttl=300)
 
@@ -140,8 +142,14 @@ async def get_hub_client() -> FastMCPClient:
         _hub_tools_cache = await _hub_client.list_tools()
     return _hub_client
 
-async def discover_external_mcps():
-    global _external_mcp_tools
+async def discover_external_mcps(force: bool = False):
+    global _external_mcp_tools, _last_discovery_time
+    import time
+    
+    now = time.time()
+    if not force and (now - _last_discovery_time) < DISCOVERY_CACHE_TTL and _external_mcp_tools:
+        return
+
     new_mcp_tools = {}
     identity_mgr = get_identity_manager()
     mcp_names = await asyncio.to_thread(identity_mgr.list_mcps)
@@ -175,6 +183,7 @@ async def discover_external_mcps():
             print(f"Failed to discover tools for MCP '{name}': {e}")
             
     _external_mcp_tools = new_mcp_tools
+    _last_discovery_time = now
 
 def _register_mcp_tool(agent: Agent, mcp_tool: Any):
     safe_mcp_tool = copy.deepcopy(mcp_tool) if hasattr(mcp_tool, "model_copy") else mcp_tool
@@ -234,6 +243,11 @@ def _register_external_mcp_tool(agent: Agent, mcp_name: str, mcp_tool: Any, pref
 
 async def build_agent(agent_name: str) -> Agent:
     identity_mgr = get_identity_manager()
+    
+    # Use bulk fetching where possible within build_agent if appropriate
+    # but build_agent is usually called for ONE agent.
+    # However, discover_external_mcps IS now cached globally.
+    
     if agent_name == "supervisor":
         config_data = await asyncio.to_thread(identity_mgr.get_agent_config, "supervisor")
         system_prompt = await asyncio.to_thread(identity_mgr.get_agent_skills, "supervisor")
@@ -315,7 +329,7 @@ async def build_agent(agent_name: str) -> Agent:
         if tool.name in allowed_tools and tool.name not in console_tool_names:
             _register_mcp_tool(agent, tool)
 
-    # 6. External MCP Tools
+    # 6. External MCP Tools (This is now CACHED globally)
     await discover_external_mcps()
     allowed_mcps = config.allowed_mcps or []
     for mcp_name, tools in _external_mcp_tools.items():

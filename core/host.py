@@ -109,16 +109,21 @@ async def shutdown_event():
 @app.get("/health")
 async def health():
     disabled = identity_mgr.get_disabled_agents()
-    names = await asyncio.to_thread(identity_mgr.list_agents)
+    configs = await asyncio.to_thread(identity_mgr.get_all_agent_configs)
+    agent_healths = await asyncio.to_thread(identity_mgr.get_all_health_statuses, "agent")
+    tool_healths = await asyncio.to_thread(identity_mgr.get_all_health_statuses, "tool")
+    
     agents_status = {}
-    for name in names:
+    for name, cfg in configs.items():
         if name == "supervisor" or name in disabled: continue
-        cfg = await asyncio.to_thread(identity_mgr.get_agent_config, name)
-        if not cfg: continue
-        offline_tools = [t for t in cfg.get("allowed_tools", []) if health_monitor.get_status("tool", t).get("status") == "Offline"]
-        agent_global_status = health_monitor.get_status("agent", name)
+        
+        # Check tool status from the pre-fetched tool_healths
+        offline_tools = [t for t in cfg.get("allowed_tools", []) if tool_healths.get(t, {}).get("status") == "Offline"]
+        
+        agent_global_status = agent_healths.get(name, {})
         status_str = "Offline" if agent_global_status.get("status") == "Offline" else ("Degraded" if offline_tools else "Online")
         agents_status[name] = {"status": status_str, "offline_tools": offline_tools, "agent_error": agent_global_status.get("last_error")}
+    
     return {"status": "healthy", "agents": agents_status, "agents_disabled": disabled, "hub_connected": _hub_client is not None}
 
 @app.post("/v1/chat/completions")

@@ -72,11 +72,15 @@ def generate_30_day_timeline(events, current_status):
 
 @router.get("/status", response_class=HTMLResponse)
 async def status_page(request: Request, user=Depends(require_auth)):
+    from core.discovery import discover_agents, discover_tools
     agents = await discover_agents()
     tools = await discover_tools()
     
     total_entities = len(agents) + len(tools)
     offline_count = 0
+    
+    # Pre-fetch all health events in bulk if possible? 
+    # For now, let's keep it but ensure discover_agents was optimized.
     
     for agent in agents:
         agent_name = agent["name"]

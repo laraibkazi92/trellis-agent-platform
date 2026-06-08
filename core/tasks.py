@@ -25,7 +25,7 @@ from taskiq.schedule_sources import LabelScheduleSource
 
 scheduler = TaskiqScheduler(
     broker=broker,
-    sources=[LabelScheduleSource(broker)],
+    sources=[LabelScheduleSource(broker, refresh_delay=30)],
 )
 
 # We use a single heartbeat task that runs every minute to check ETCD for dynamic cron jobs

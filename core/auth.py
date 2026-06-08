@@ -583,6 +583,40 @@ class IdentityManager:
             self.upsert_user(user_id, user)
 
     @retry_etcd()
+    def get_all_agent_configs(self) -> Dict[str, Dict]:
+        """Fetch all agent configurations in a single prefix call."""
+        return self._get_all_configs_by_prefix("/registry/agents/")
+
+    @retry_etcd()
+    def get_all_agent_skills(self) -> Dict[str, str]:
+        """Fetch all agent skills in a single prefix call."""
+        skills = {}
+        prefix = "/registry/agents/"
+        for value, metadata in self.client.get_prefix(prefix):
+            key_str = metadata.key.decode('utf-8')
+            if key_str.startswith(prefix) and key_str.endswith("/skills") and value:
+                rest = key_str[len(prefix):]
+                name = rest.split('/')[0]
+                if name:
+                    skills[name] = value.decode('utf-8')
+        return skills
+
+    @retry_etcd()
+    def get_all_health_statuses(self, entity_type: str) -> Dict[str, Dict]:
+        """Fetch all health statuses for a given type in a single prefix call."""
+        statuses = {}
+        prefix = f"/health/{entity_type}/"
+        for value, metadata in self.client.get_prefix(prefix):
+            key_str = metadata.key.decode('utf-8')
+            if key_str.startswith(prefix) and value:
+                name = key_str[len(prefix):]
+                try:
+                    statuses[name] = json.loads(value.decode('utf-8'))
+                except json.JSONDecodeError:
+                    pass
+        return statuses
+
+    @retry_etcd()
     def record_agent_run_state(self, agent_name: str, run_id: str, state: str, metadata: Dict) -> None:
         """Record or update the state of an agent execution run in etcd."""
         from datetime import datetime, timezone
