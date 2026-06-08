@@ -104,6 +104,8 @@ if HAS_GITHUB_AUTH:
         }
     )
 
+ALLOWED_DOMAINS = [d.strip().lower() for d in os.getenv("ALLOWED_DOMAINS", "").split(",") if d.strip()]
+
 identity_mgr = IdentityManager(
     host=os.getenv("ETCD_HOST", "127.0.0.1"),
     port=int(os.getenv("ETCD_PORT", 2379))

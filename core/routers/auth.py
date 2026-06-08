@@ -2,7 +2,7 @@ import os
 import asyncio
 from fastapi import APIRouter, Request, Depends
 from fastapi.responses import HTMLResponse, RedirectResponse
-from core.dependencies import oauth, identity_mgr, HAS_GITHUB_AUTH, HAS_OIDC_AUTH, templates
+from core.dependencies import oauth, identity_mgr, HAS_GITHUB_AUTH, HAS_OIDC_AUTH, templates, ALLOWED_DOMAINS
 
 def require_auth(request: Request):
     user = request.session.get('user')
@@ -15,8 +15,17 @@ router = APIRouter()
 
 DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
 
+def is_domain_allowed(email: str) -> bool:
+    if not ALLOWED_DOMAINS:
+        return True
+    if not email:
+        return False
+    domain = email.split('@')[-1].lower()
+    return domain in ALLOWED_DOMAINS
+
 @router.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
+    flash_msg = request.session.pop("flash_msg", None)
     return templates.TemplateResponse(
         request=request,
         name="login.html", 
@@ -24,7 +33,8 @@ async def login_page(request: Request):
             "request": request,
             "has_github": HAS_GITHUB_AUTH,
             "has_oidc": HAS_OIDC_AUTH,
-            "dev_mode": DEV_MODE
+            "dev_mode": DEV_MODE,
+            "flash_msg": flash_msg
         }
     )
 
@@ -53,6 +63,11 @@ async def auth_callback(request: Request):
     token = await oauth.oidc.authorize_access_token(request)
     user = token.get('userinfo')
     if user:
+        email = user.get('email')
+        if not is_domain_allowed(email):
+            request.session["flash_msg"] = f"Domain '{email.split('@')[-1]}' is not authorized."
+            return RedirectResponse(url='/login')
+
         # Ensure name is not None for UI display
         if not user.get('name'):
             user['name'] = user.get('email') or user.get('preferred_username') or user.get('sub')
@@ -94,6 +109,12 @@ async def auth_github_callback(request: Request):
             primary_email = next((email['email'] for email in emails if email['primary']), None)
             if primary_email:
                 userinfo['email'] = primary_email
+
+        email = userinfo.get('email')
+        if not is_domain_allowed(email):
+            domain_str = email.split('@')[-1] if email else "unknown"
+            request.session["flash_msg"] = f"Domain '{domain_str}' is not authorized."
+            return RedirectResponse(url='/login')
 
         request.session['user'] = userinfo
         # Upsert user to etcd
