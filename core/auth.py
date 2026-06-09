@@ -311,14 +311,33 @@ class IdentityManager:
 
     @retry_etcd()
     def get_disabled_agents(self) -> List[str]:
-        """Retrieve the list of disabled agents."""
-        disabled = self.get_config("disabled_agents", [])
-        return disabled
+        """Retrieve the list of disabled agents (Legacy: maps to standard agents)."""
+        return self.get_disabled_standard_agents()
 
     @retry_etcd()
     def set_disabled_agents(self, agents: List[str]) -> None:
-        """Set the list of disabled agents."""
-        self.set_config("disabled_agents", agents)
+        """Set the list of disabled agents (Legacy: maps to standard agents)."""
+        self.set_disabled_standard_agents(agents)
+
+    @retry_etcd()
+    def get_disabled_standard_agents(self) -> List[str]:
+        """Retrieve the list of disabled standard agents."""
+        return self.get_config("disabled_standard_agents", [])
+
+    @retry_etcd()
+    def set_disabled_standard_agents(self, agents: List[str]) -> None:
+        """Set the list of disabled standard agents."""
+        self.set_config("disabled_standard_agents", agents)
+
+    @retry_etcd()
+    def get_disabled_workflows(self) -> List[str]:
+        """Retrieve the list of disabled workflows."""
+        return self.get_config("disabled_workflows", [])
+
+    @retry_etcd()
+    def set_disabled_workflows(self, workflows: List[str]) -> None:
+        """Set the list of disabled workflows."""
+        self.set_config("disabled_workflows", workflows)
 
     @retry_etcd()
     def get_app_config(self) -> Dict[str, Any]:

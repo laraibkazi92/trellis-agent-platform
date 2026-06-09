@@ -351,7 +351,7 @@ def _register_admin_tools(agent: Agent):
     
     @agent.tool_plain(name="list_agents", description="List all available specialized agents.")
     async def list_agents() -> List[Dict[str, str]]:
-        disabled = identity_mgr.get_disabled_agents()
+        disabled = identity_mgr.get_disabled_standard_agents()
         agents_info = []
         names = await asyncio.to_thread(identity_mgr.list_agents)
         for name in names:
@@ -363,13 +363,26 @@ def _register_admin_tools(agent: Agent):
 
     @agent.tool_plain(name="manage_agent", description="Enable, disable or reload an agent.")
     async def manage_agent(name: str, action: str) -> str:
-        disabled = identity_mgr.get_disabled_agents()
+        cfg = await asyncio.to_thread(identity_mgr.get_agent_config, name)
+        is_workflow = cfg and cfg.get("type") in ("background_agent", "background_script")
+        
+        if is_workflow:
+            disabled = identity_mgr.get_disabled_workflows()
+        else:
+            disabled = identity_mgr.get_disabled_standard_agents()
+
         if action == "disable" and name not in disabled:
             disabled.append(name)
-            identity_mgr.set_disabled_agents(disabled)
+            if is_workflow:
+                identity_mgr.set_disabled_workflows(disabled)
+            else:
+                identity_mgr.set_disabled_standard_agents(disabled)
             return f"Agent {name} disabled."
         elif action in ("enable", "reload") and name in disabled:
             disabled.remove(name)
-            identity_mgr.set_disabled_agents(disabled)
+            if is_workflow:
+                identity_mgr.set_disabled_workflows(disabled)
+            else:
+                identity_mgr.set_disabled_standard_agents(disabled)
             return f"Agent {name} enabled."
         return f"Action {action} applied to {name}."

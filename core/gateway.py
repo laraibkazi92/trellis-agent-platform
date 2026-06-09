@@ -82,8 +82,12 @@ async def list_agents() -> List[Dict[str, str]]:
         return [{"name": "Error", "description": f"Host API unreachable ({str(e)})"}]
 
     agents = []
+    disabled_agents = identity_mgr.get_disabled_standard_agents()
     
     for agent_name, agent_info in agents_data.items():
+        if agent_name in disabled_agents:
+            continue
+            
         if agent_name == "supervisor":
             description = "Intelligent routing agent."
             status = agent_info.get("status", "Online")

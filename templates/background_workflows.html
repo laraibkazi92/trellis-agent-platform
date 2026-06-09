@@ -188,7 +188,7 @@
                 
                 <td class="p-4 align-top">
                     <div class="flex flex-col items-start gap-2">
-                        <span class="text-[10px] font-mono font-bold {% if agent.status == 'active' %}bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-300 border-emerald-200{% else %}bg-neutral-100 text-neutral-600 dark:bg-neutral-800 dark:text-neutral-400 border-neutral-200{% endif %} px-2 py-0.5 rounded border uppercase">
+                        <span class="text-[10px] font-mono font-bold {% if agent.is_disabled %}bg-neutral-100 text-neutral-500 dark:bg-neutral-800 dark:text-neutral-500 border-neutral-200{% elif agent.status == 'active' %}bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-300 border-emerald-200{% else %}bg-neutral-100 text-neutral-600 dark:bg-neutral-800 dark:text-neutral-400 border-neutral-200{% endif %} px-2 py-0.5 rounded border uppercase">
                             {{ agent.status }}
                         </span>
                         
@@ -247,6 +247,13 @@
                 <td class="p-4 align-top text-right">
                     <div class="flex flex-col items-end gap-2">
                         {% if is_admin %}
+                        <form method="POST" action="/workflows/{{ agent.name }}/toggle-status" class="w-full max-w-[140px]">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                            <button type="submit" class="w-full font-mono text-xs font-bold border {% if agent.is_disabled %}border-emerald-600 text-emerald-600 hover:bg-emerald-600 hover:text-white{% else %}border-red-600 text-red-600 hover:bg-red-600 hover:text-white{% endif %} px-3 py-1.5 uppercase tracking-wider transition-colors">
+                                {% if agent.is_disabled %}Enable{% else %}Disable{% endif %}
+                            </button>
+                        </form>
+
                         <button onclick="openConfigModal('{{ agent.name }}')" class="font-mono text-xs font-bold border border-neutral-300 dark:border-neutral-700 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 px-3 py-1.5 uppercase tracking-wider transition-colors w-full max-w-[140px]">Configure</button>
                         
                         <button onclick="openQueueModal('{{ agent.name }}')" class="font-mono text-xs font-bold border border-neutral-300 dark:border-neutral-700 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 px-3 py-1.5 uppercase tracking-wider transition-colors w-full max-w-[140px]">Queue</button>

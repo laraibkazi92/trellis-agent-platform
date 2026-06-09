@@ -40,12 +40,12 @@ async def dynamic_cron_heartbeat():
     
     identity_mgr = get_identity_manager()
     agent_names = await asyncio.to_thread(identity_mgr.list_agents)
-    disabled_agents = identity_mgr.get_disabled_agents()
+    disabled_workflows = identity_mgr.get_disabled_workflows()
     
     now = datetime.now()
     
     for name in agent_names:
-        if name in disabled_agents:
+        if name in disabled_workflows:
             continue
             
         config_data = await asyncio.to_thread(identity_mgr.get_agent_config, name)
@@ -125,8 +125,8 @@ async def run_background_script(
         if not config_data:
             raise ValueError(f"Workflow '{agent_name}' configuration not found in etcd.")
             
-        disabled_agents = identity_mgr.get_disabled_agents()
-        if agent_name in disabled_agents:
+        disabled_workflows = identity_mgr.get_disabled_workflows()
+        if agent_name in disabled_workflows:
             raise ValueError(f"Workflow '{agent_name}' is currently disabled.")
         
         # Prepare execution environment
@@ -276,8 +276,8 @@ async def run_background_agent(
             raise ValueError(f"Agent '{agent_name}' configuration not found in etcd.")
             
         # Check if agent is disabled
-        disabled_agents = identity_mgr.get_disabled_agents()
-        if agent_name in disabled_agents:
+        disabled_workflows = identity_mgr.get_disabled_workflows()
+        if agent_name in disabled_workflows:
             raise ValueError(f"Agent '{agent_name}' is currently disabled.")
         
         # 2. Build the PydanticAI Agent with full parity (Hub, MCP, A2A)

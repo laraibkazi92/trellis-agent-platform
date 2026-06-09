@@ -44,7 +44,12 @@ async def agents(request: Request):
         
     admin_access = is_admin(request)
     agents = await discover_agents(user_id=user.get('sub'), include_background=False)
+    disabled_agents = identity_mgr.get_disabled_standard_agents()
     
+    # Enrich agents with disabled status
+    for agent in agents:
+        agent["is_disabled"] = agent["name"] in disabled_agents
+
     flash_msg = request.session.pop("flash_msg", None)
     
     public_host_url = os.getenv("PUBLIC_HOST_URL", "http://localhost:8000")
@@ -120,6 +125,24 @@ async def configure_agent_secrets(request: Request, agent_name: str):
         await asyncio.to_thread(identity_mgr.save_identity_config, identity, "variables", current_variables)
     
     request.session["flash_msg"] = f"Configuration and secrets saved for {agent_name} successfully."
+    return RedirectResponse(url='/agents', status_code=303)
+
+@router.post("/agents/{agent_name}/toggle-status")
+async def toggle_agent_status(request: Request, agent_name: str):
+    if not is_admin(request):
+        request.session["flash_msg"] = "Unauthorized access."
+        return RedirectResponse(url='/agents', status_code=303)
+        
+    disabled = identity_mgr.get_disabled_standard_agents()
+    if agent_name in disabled:
+        disabled.remove(agent_name)
+        action = "enabled"
+    else:
+        disabled.append(agent_name)
+        action = "disabled"
+        
+    identity_mgr.set_disabled_standard_agents(disabled)
+    request.session["flash_msg"] = f"Agent '{agent_name}' {action} successfully."
     return RedirectResponse(url='/agents', status_code=303)
 
 @router.get("/tools", response_class=HTMLResponse)

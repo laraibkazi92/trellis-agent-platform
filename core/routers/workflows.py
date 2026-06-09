@@ -41,7 +41,7 @@ async def workflows_view(request: Request):
         return RedirectResponse(url="/login")
         
     agent_names = await asyncio.to_thread(identity_mgr.list_agents)
-    disabled_agents = identity_mgr.get_disabled_agents()
+    disabled_workflows = identity_mgr.get_disabled_workflows()
     system_identity = Identity(id="system", type=IdentityType.SYSTEM)
     global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
     global_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
@@ -81,7 +81,8 @@ async def workflows_view(request: Request):
             workflows_list.append({
                 "name": name,
                 "config": config_data,
-                "status": "disabled" if name in disabled_agents else "active",
+                "status": "Disabled by Admin" if name in disabled_workflows else "active",
+                "is_disabled": name in disabled_workflows,
                 "description": config_data.get("description", ""),
                 "trigger": config_data.get("trigger", {}),
                 "is_configured": is_configured,
@@ -315,6 +316,24 @@ async def run_background_agent_manual(request: Request, agent_name: str):
         print(f"Failed to record pending state for {safe_name}: {e}")
     
     request.session["flash_msg"] = f"Task for '{safe_name}' has been successfully enqueued for execution."
+    return RedirectResponse(url='/workflows', status_code=303)
+
+@router.post("/workflows/{agent_name}/toggle-status")
+async def toggle_workflow_status(request: Request, agent_name: str):
+    if not is_admin(request):
+        request.session["flash_msg"] = "Unauthorized access."
+        return RedirectResponse(url='/workflows', status_code=303)
+        
+    disabled = identity_mgr.get_disabled_workflows()
+    if agent_name in disabled:
+        disabled.remove(agent_name)
+        action = "enabled"
+    else:
+        disabled.append(agent_name)
+        action = "disabled"
+        
+    identity_mgr.set_disabled_workflows(disabled)
+    request.session["flash_msg"] = f"Workflow '{agent_name}' {action} successfully."
     return RedirectResponse(url='/workflows', status_code=303)
 
 @router.post("/workflows/config")

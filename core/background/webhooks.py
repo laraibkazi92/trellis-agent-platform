@@ -117,6 +117,10 @@ async def receive_webhook(agent_name: str, request: Request):
     if not config_data or config_data.get("type") not in ("background_agent", "background_script"):
         raise HTTPException(status_code=404, detail="Background agent not found")
         
+    disabled_workflows = identity_mgr.get_disabled_workflows()
+    if agent_name in disabled_workflows:
+        raise HTTPException(status_code=403, detail="Workflow disabled by admin")
+        
     trigger = config_data.get("trigger")
     if not trigger or trigger.get("type") != "webhook":
         raise HTTPException(status_code=400, detail="Agent is not configured for webhooks")

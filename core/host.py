@@ -108,7 +108,7 @@ async def shutdown_event():
 
 @app.get("/health")
 async def health():
-    disabled = identity_mgr.get_disabled_agents()
+    disabled = identity_mgr.get_disabled_standard_agents()
     configs = await asyncio.to_thread(identity_mgr.get_all_agent_configs)
     agent_healths = await asyncio.to_thread(identity_mgr.get_all_health_statuses, "agent")
     tool_healths = await asyncio.to_thread(identity_mgr.get_all_health_statuses, "tool")
@@ -131,7 +131,7 @@ async def chat_completions(request: ChatRequest):
     if not request.messages or request.messages[-1].role != "user":
         raise HTTPException(status_code=400, detail="Invalid messages")
 
-    disabled = identity_mgr.get_disabled_agents()
+    disabled = identity_mgr.get_disabled_standard_agents()
     if request.model in disabled:
         raise HTTPException(status_code=404, detail="Agent disabled")
 
