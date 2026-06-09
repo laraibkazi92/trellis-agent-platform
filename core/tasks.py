@@ -7,6 +7,7 @@ from taskiq_redis import ListQueueBroker
 from pydantic_ai import Agent
 
 from core.auth import user_id_var
+from core.models import Identity, IdentityType
 from core.agent_factory import (
     build_agent,
     get_identity_manager,

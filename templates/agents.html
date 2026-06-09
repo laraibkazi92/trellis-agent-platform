@@ -121,20 +121,33 @@
         <p class="text-sm text-neutral-600 dark:text-neutral-400 mb-6 flex-grow">{{ agent.description }}</p>
         
         <div class="flex flex-col gap-2 mt-auto">
-            {% if agent.required_secrets or agent.required_variables %}
-            <button onclick="document.getElementById('configure-{{ agent.name }}').classList.remove('hidden')" class="w-full border {% if not agent.is_configured %}border-orange-500 text-orange-600 hover:bg-orange-500 hover:text-white dark:border-orange-500/50 dark:text-orange-400 dark:hover:bg-orange-600/20{% else %}border-neutral-300 dark:border-neutral-700 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800{% endif %} text-sm font-bold uppercase tracking-wider px-4 py-2 text-center transition-colors font-mono">Configure Agent</button>
+            {% if agent.required_secrets or agent.required_variables or is_admin %}
+            <button onclick="document.getElementById('configure-{{ agent.name }}').classList.remove('hidden')" class="w-full border {% if not agent.is_configured and (agent.required_secrets or agent.required_variables) %}border-orange-500 text-orange-600 hover:bg-orange-500 hover:text-white dark:border-orange-500/50 dark:text-orange-400 dark:hover:bg-orange-600/20{% else %}border-neutral-300 dark:border-neutral-700 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800{% endif %} text-sm font-bold uppercase tracking-wider px-4 py-2 text-center transition-colors font-mono">Configure Agent</button>
             {% endif %}
             <button onclick="document.getElementById('connect-{{ agent.name }}').classList.remove('hidden')" class="w-full border border-accent text-accent hover:bg-accent hover:text-white dark:border-accent-dark dark:text-accent-dark dark:hover:bg-accent-dark dark:hover:text-white text-sm font-bold uppercase tracking-wider px-4 py-2 text-center transition-colors font-mono">Connection Details</button>
         </div>
     </div>
     
-    {% if agent.required_secrets or agent.required_variables %}
+    {% if agent.required_secrets or agent.required_variables or is_admin %}
     <div id="configure-{{ agent.name }}" class="hidden fixed inset-0 bg-neutral-950/80 z-50 flex items-center justify-center p-4">
         <div class="bg-neutral-100 dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 p-6 max-w-lg w-full shadow-2xl relative flex flex-col max-h-[90vh] overflow-y-auto">
             <div class="flex justify-between items-center mb-6">
                 <h3 class="text-xl font-bold uppercase tracking-wider">Configure {{ agent.name }}</h3>
                 <button onclick="document.getElementById('configure-{{ agent.name }}').classList.add('hidden')" class="text-neutral-500 hover:text-neutral-900 dark:hover:text-neutral-100 uppercase text-sm font-mono font-bold">Close [X]</button>
             </div>
+            
+            {% if is_admin and agent.health.status != 'Online' %}
+            <div class="p-4 bg-red-50 border border-red-200 rounded mb-6">
+                <h4 class="text-red-800 font-bold mb-2">Health Issues (Failures: {{ agent.health.consecutive_failures }})</h4>
+                {% if agent.health.last_error %}
+                <pre class="text-xs text-red-600 font-mono overflow-auto max-h-32 mb-4">{{ agent.health.last_error }}</pre>
+                {% endif %}
+                <form method="POST" action="/reset-health/agent/{{ agent.name }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <button type="submit" class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 text-xs font-bold uppercase rounded">Reset Health Status</button>
+                </form>
+            </div>
+            {% endif %}
             
             <form method="POST" action="/agents/{{ agent.name }}/configure" class="flex flex-col gap-6">
                 <div class="border border-neutral-200 dark:border-neutral-800 bg-neutral-50 dark:bg-[#0c0c0c] p-4 text-xs font-mono leading-relaxed relative overflow-hidden rounded-sm">
@@ -221,18 +234,6 @@
             </div>
             
             <div class="flex flex-col gap-8 flex-grow min-h-0">
-                {% if is_admin and agent.health.status != 'Online' %}
-                <div class="p-4 bg-red-50 border border-red-200 rounded">
-                    <h4 class="text-red-800 font-bold mb-2">Health Issues (Failures: {{ agent.health.consecutive_failures }})</h4>
-                    {% if agent.health.last_error %}
-                    <pre class="text-xs text-red-600 font-mono overflow-auto max-h-32 mb-4">{{ agent.health.last_error }}</pre>
-                    {% endif %}
-                    <form method="POST" action="/reset-health/agent/{{ agent.name }}">
-<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                        <button type="submit" class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 text-xs font-bold uppercase rounded">Reset Health Status</button>
-                    </form>
-                </div>
-                {% endif %}
                 <div class="flex flex-col">
                     <h4 class="font-bold mb-4 uppercase text-sm border-b border-neutral-200 dark:border-neutral-800 pb-2">OpenAI API Compatible</h4>
                     <div class="relative group">
