@@ -23,7 +23,7 @@ health_monitor = HealthMonitor(identity_mgr)
 GITHUB_REPO = os.getenv("GITHUB_REPO", "") # e.g. user/repo
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
-async def commit_to_github(path: str, content: str, message: str) -> bool:
+async def commit_to_github(path: str, content: str, message: str, client: httpx.AsyncClient = None) -> bool:
     """Commits a file change to GitHub. Returns True on success, False on failure."""
     if not GITHUB_REPO or not GITHUB_TOKEN:
         print("GitHub integration not configured. Skipping commit.")
@@ -37,25 +37,33 @@ async def commit_to_github(path: str, content: str, message: str) -> bool:
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
     
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            # Get file SHA if it exists
-            sha = None
+        if client:
             get_resp = await client.get(url, headers=headers)
-            if get_resp.status_code == 200:
-                sha = get_resp.json().get("sha")
-                
-            data = {
-                "message": f"{message} [skip ci]",
-                "content": base64.b64encode(content.encode()).decode()
-            }
-            if sha:
-                data["sha"] = sha
-                
+        else:
+            async with httpx.AsyncClient(timeout=10.0) as local_client:
+                get_resp = await local_client.get(url, headers=headers)
+
+        sha = None
+        if get_resp.status_code == 200:
+            sha = get_resp.json().get("sha")
+            
+        data = {
+            "message": f"{message} [skip ci]",
+            "content": base64.b64encode(content.encode()).decode()
+        }
+        if sha:
+            data["sha"] = sha
+            
+        if client:
             put_resp = await client.put(url, headers=headers, json=data)
-            if put_resp.status_code not in (200, 201):
-                print(f"Failed to commit to GitHub: {put_resp.text}")
-                return False
-            return True
+        else:
+            async with httpx.AsyncClient(timeout=10.0) as local_client:
+                put_resp = await local_client.put(url, headers=headers, json=data)
+                
+        if put_resp.status_code not in (200, 201):
+            print(f"Failed to commit to GitHub: {put_resp.text}")
+            return False
+        return True
     except Exception as e:
         print(f"Error during GitHub commit: {e}")
         return False
@@ -527,8 +535,10 @@ async def save_agent(request: Request, name: str):
     agent_dir = f"agents/{safe_name}" if safe_name != "supervisor" else "core/assets/supervisor"
     yaml_content = yaml.dump(config, sort_keys=False)
     
-    success_config = await commit_to_github(f"{agent_dir}/config.yaml", yaml_content, f"Update config for {safe_name}")
-    success_skills = await commit_to_github(f"{agent_dir}/skills.md", skills_content, f"Update skills for {safe_name}")
+    client = getattr(request.app.state, "http_client", None)
+    
+    success_config = await commit_to_github(f"{agent_dir}/config.yaml", yaml_content, f"Update config for {safe_name}", client=client)
+    success_skills = await commit_to_github(f"{agent_dir}/skills.md", skills_content, f"Update skills for {safe_name}", client=client)
     
     if GITHUB_REPO and GITHUB_TOKEN and (not success_config or not success_skills):
         request.session["flash_msg"] = f"Agent {safe_name} updated locally, but GitHub sync failed."
@@ -572,7 +582,8 @@ async def save_mcp(request: Request, name: str):
     
     # Sync to GitHub
     yaml_content = yaml.dump(config, sort_keys=False)
-    success = await commit_to_github(f"mcps/{safe_name}/mcp.yaml", yaml_content, f"Update config for MCP {safe_name}")
+    client = getattr(request.app.state, "http_client", None)
+    success = await commit_to_github(f"mcps/{safe_name}/mcp.yaml", yaml_content, f"Update config for MCP {safe_name}", client=client)
     
     if GITHUB_REPO and GITHUB_TOKEN and not success:
         request.session["flash_msg"] = f"MCP {safe_name} updated locally, but GitHub sync failed."
@@ -606,7 +617,8 @@ async def save_tool(request: Request, name: str):
     # 2. Sync to GitHub
     if config.get("rel_path"):
         yaml_content = yaml.dump({k:v for k,v in config.items() if k != "rel_path"}, sort_keys=False)
-        success = await commit_to_github(f"{config['rel_path']}/tool.yaml", yaml_content, f"Update config for {safe_name}")
+        client = getattr(request.app.state, "http_client", None)
+        success = await commit_to_github(f"{config['rel_path']}/tool.yaml", yaml_content, f"Update config for {safe_name}", client=client)
         
         if GITHUB_REPO and GITHUB_TOKEN and not success:
             request.session["flash_msg"] = f"Tool {safe_name} updated locally, but GitHub sync failed."

@@ -24,8 +24,14 @@
 ## 💻 Development Workflow
 - **Start/Rebuild**: `docker compose up -d --build`
 - **Registry Sync**: Use `python scripts/sync_to_db.py` to push filesystem changes to `etcd`.
-- **Scaling**: Use the `agent-builder` agent to scaffold new agents/tools from external sources.
 - **DB/Config access**: Use `IdentityManager` in `core/auth.py` for all etcd operations.
+
+## 📚 Developer Docs
+Full guides for consuming and building each framework component:
+- `docs/agents.md` — consuming agents via REST/MCP, building agent configs and skill prompts
+- `docs/tools.md` — wiring tools to agents, building tools with the stdin/stdout protocol
+- `docs/workflows.md` — triggering/monitoring workflows, building script and agent workflows
+- `docs/mcp.md` — registering external MCP servers
 
 ## ⚠️ Critical Gotchas & Rules
 - **Tool Protocol**: Tools MUST use `stdin` for JSON arguments and `stdout` for JSON results. Use wrappers for existing scripts.

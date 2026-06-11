@@ -16,7 +16,6 @@ async def read_docs_index():
 DOC_MAP = {
     "agents": ("docs/agents.md", "Agent Developer Guide"),
     "tools": ("docs/tools.md", "Tool Developer Guide"),
-    "builder": ("docs/agent_builder.md", "Agent Builder Guide"),
     "mcp": ("docs/mcp.md", "MCP Server Guide"),
     "workflows": ("docs/workflows.md", "Background Workflows Guide"),
 }

@@ -11,6 +11,8 @@ import copy
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import httpx
+from contextlib import asynccontextmanager
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart, TextPart
@@ -24,7 +26,26 @@ from core.health import HealthMonitor
 from core.background.webhooks import router as webhooks_router
 from core.tasks import run_background_agent
 
-app = FastAPI(title="Universal Agent Host (Stateless)")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _main_loop, _watch_id
+    print("Worker starting up...")
+    _main_loop = asyncio.get_running_loop()
+    app.state.http_client = httpx.AsyncClient(timeout=30.0)
+    _watch_id = identity_mgr.client.add_watch_prefix_callback("/registry/mcps/", on_mcp_change)
+    await get_hub_client()
+    await discover_external_mcps()
+    print("Worker startup complete.")
+    yield
+    print("Worker shutting down...")
+    if _watch_id:
+        identity_mgr.client.cancel_watch(_watch_id)
+    hub_client = await get_hub_client()
+    if hub_client:
+        await hub_client.__aexit__(None, None, None)
+    await app.state.http_client.aclose()
+
+app = FastAPI(title="Universal Agent Host (Stateless)", lifespan=lifespan)
 app.include_router(webhooks_router)
 
 # CORS Setup
@@ -85,26 +106,6 @@ def on_mcp_change(event):
                 
     if _main_loop and not _main_loop.is_closed():
         asyncio.run_coroutine_threadsafe(discover_external_mcps(), _main_loop)
-
-@app.on_event("startup")
-async def startup_event():
-    global _main_loop, _watch_id
-    print("Worker starting up...")
-    _main_loop = asyncio.get_running_loop()
-    _watch_id = identity_mgr.client.add_watch_prefix_callback("/registry/mcps/", on_mcp_change)
-    await get_hub_client()
-    await discover_external_mcps()
-    print("Worker startup complete.")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    print("Worker shutting down...")
-    global _watch_id
-    if _watch_id:
-        identity_mgr.client.cancel_watch(_watch_id)
-    hub_client = await get_hub_client()
-    if hub_client:
-        await hub_client.__aexit__(None, None, None)
 
 @app.get("/health")
 async def health():

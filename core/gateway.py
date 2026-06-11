@@ -6,10 +6,17 @@ from pathlib import Path
 from typing import Dict, List
 import uvicorn
 import aiofiles
+from contextlib import asynccontextmanager
 from fastmcp import FastMCP
 from core.auth import AuthMiddleware, IdentityManager, auth_token_var, user_id_var
 from fastapi.middleware.cors import CORSMiddleware
 from core.discovery import discover_agents, is_agent_configured
+
+@asynccontextmanager
+async def lifespan(app):
+    app.state.http_client = httpx.AsyncClient(timeout=30.0)
+    yield
+    await app.state.http_client.aclose()
 
 # Initialize FastMCP server with host and port
 mcp = FastMCP("Agent Gateway")
@@ -17,6 +24,8 @@ mcp = FastMCP("Agent Gateway")
 # FastMCP underlying FastAPI app
 if hasattr(mcp, "_app"):
     app = mcp._app
+    app.router.lifespan_context = lifespan
+    
     DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
     cors_origins_str = os.getenv("CORS_ALLOWED_ORIGINS", "")
     if DEV_MODE:
@@ -70,13 +79,22 @@ async def list_agents() -> List[Dict[str, str]]:
         return [{"name": "Error", "description": f"Failed to verify agent configurations: {e}"}]
     
     try:
-        async with httpx.AsyncClient() as client:
+        if hasattr(app, "state") and hasattr(app.state, "http_client"):
+            client = app.state.http_client
             resp = await client.get(f"{HOST_URL}/health", timeout=5.0)
             if resp.status_code == 200:
                 data = resp.json()
                 agents_data = data.get("agents", {})
             else:
                 return [{"name": "Error", "description": f"Host API unreachable (HTTP {resp.status_code})"}]
+        else:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(f"{HOST_URL}/health", timeout=5.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    agents_data = data.get("agents", {})
+                else:
+                    return [{"name": "Error", "description": f"Host API unreachable (HTTP {resp.status_code})"}]
     except Exception as e:
         print(f"Error fetching active agents from host: {e}")
         return [{"name": "Error", "description": f"Host API unreachable ({str(e)})"}]
@@ -149,19 +167,25 @@ async def use_agent(agent_name: str, prompt: str) -> str:
         headers["Authorization"] = f"Bearer {token}"
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{HOST_URL}/v1/chat/completions",
-                json={
-                    "model": agent_name,
-                    "messages": [{"role": "user", "content": prompt}]
-                },
-                headers=headers,
-                timeout=60.0
-            )
-            response.raise_for_status()
-            data = response.json()
-            return data["choices"][0]["message"]["content"]
+        req_kwargs = {
+            "json": {
+                "model": agent_name,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            "headers": headers,
+            "timeout": 60.0
+        }
+        
+        if hasattr(app, "state") and hasattr(app.state, "http_client"):
+            client = app.state.http_client
+            response = await client.post(f"{HOST_URL}/v1/chat/completions", **req_kwargs)
+        else:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(f"{HOST_URL}/v1/chat/completions", **req_kwargs)
+                
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 503:
             return f"SYSTEM: The agent '{agent_name}' is currently offline due to technical failures and cannot process requests."

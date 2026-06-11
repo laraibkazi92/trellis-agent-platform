@@ -71,7 +71,7 @@ claude mcp add --transport http trellis http://localhost:8002/mcp --header "Auth
 
 ## Development Workflow
 
-1. Scaffold new agents/tools inside their respective directories. You can automate this process using the [Agent Builder (Meta-Agent)](docs/agent_builder.md) to port existing Claude Code skills.
+1. Scaffold new agents/tools inside their respective directories. See [Building Agents](docs/agents.md) and [Building Tools](docs/tools.md).
 2. Tools should use `stdin` for JSON arguments and `stdout` for JSON results. See [Building Tools](docs/tools.md).
 3. Agents are defined with configurations and skills. See [Building Agents](docs/agents.md).
 4. Run `python scripts/sync_to_db.py` to push changes to etcd.

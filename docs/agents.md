@@ -1,78 +1,153 @@
-# Developer Guide: Building Agents
+# Agents: Consuming & Building
 
-This guide provides essential information for developers to build, configure, and deploy agents within **Trellis**.
+Agents are the core compute units of Trellis. Each agent combines an LLM model with a system prompt and a set of tools to create a specialized AI assistant.
 
-## 🤖 Agent Architecture
+---
 
-Agents in this framework are defined by a combination of configuration (metadata, model parameters, tool access) and instruction (skills, prompt). 
+## Consuming Agents
+
+### Via REST API (OpenAI-compatible)
+
+The Universal Agent Host (`core/host.py`, port 8000) exposes an OpenAI-compatible chat completions endpoint. Specify the agent by name in the `model` field.
+
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{
+    "model": "troubleshooting-agent",
+    "messages": [{"role": "user", "content": "Check status of tenant acme-corp"}]
+  }'
+```
+
+**Auth**: Bearer token required. Generate API keys in the Dashboard UI under **API Keys**. Disable auth with `DEV_MODE=true` for local development only.
+
+**Streaming**: Add `"stream": true` to the request body to receive SSE-streamed tokens.
+
+### Via MCP Gateway
+
+The Gateway MCP (`core/gateway.py`, port 8002) exposes your entire agent fleet as MCP tools, compatible with any MCP client (Claude Desktop, Claude Code, etc.).
+
+```bash
+# Connect Claude Code to the framework
+claude mcp add --transport http trellis http://localhost:8002/mcp \
+  --header "Authorization: Bearer YOUR_API_KEY"
+```
+
+Each agent becomes an MCP tool named after it. The **supervisor** agent is a special meta-agent that can inspect the fleet and route to any other agent.
+
+### Listing Available Agents
+
+```bash
+curl http://localhost:8000/agents \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+Or view all agents in the Dashboard UI at **http://localhost:8080**.
+
+---
+
+## Building Agents
 
 ### Directory Structure
 
-Each agent must be entirely contained within its own subdirectory inside the `agents/` folder:
+Each agent lives in its own subdirectory under `workspace/agents/`:
 
 ```text
-agents/
+workspace/agents/
 └── my-agent/
-    ├── config.yaml    # Core configuration and tool access
-    └── skills.md      # System instructions and behavior
+    ├── config.yaml    # Identity, model, tool access
+    └── skills.md      # System prompt and behavioral instructions
 ```
+
+Both files are required. After creating them, run `python scripts/sync_to_db.py` to register the agent.
 
 ---
 
-## 1. Configuration (`config.yaml`)
-
-The `config.yaml` file defines the identity, LLM parameters, and permissions of the agent.
-
-### Required Fields
-
-*   **`name`** *(string)*: A unique identifier for the agent (e.g., `troubleshooting-agent`). This is used for routing and DB storage.
-*   **`version`** *(string)*: Semantic versioning of the agent (e.g., `0.1.0`).
-*   **`author`** *(string)*: Email or name of the creator (e.g., `user@example.com`).
-*   **`description`** *(string)*: A concise summary of what the agent does. Displayed in the UI.
-*   **`model`** *(string)*: The specific LLM to use. Common choices include:
-    *   `gemini-3-flash-preview`
-    *   *(Other models supported by PydanticAI/Gemini integrations)*
-*   **`thinking_level`** *(string)*: Controls the reasoning depth. Allowed values typically include `low`, `medium`, `high`.
-*   **`allowed_tools`** *(array of strings)*: A list of tool `name`s this agent is permitted to execute. If the agent needs no tools, provide an empty list `[]`.
-
-### Example `config.yaml`
+### `config.yaml` — All Fields
 
 ```yaml
-name: agent-builder
-version: 0.1.0
-author: dev@acme.com
-description: Meta-agent for creating and updating agents and tools within the framework.
-tags: ["system", "meta", "scaffolding"]
-model: gemini-3-flash-preview
-thinking_level: medium
-allowed_tools:
-  - framework_scaffolder
-  - github_search
+name: my-agent                    # Required. Unique snake-case identifier. Used in API routing.
+version: 0.1.0                    # Required. Semantic version string.
+author: user@example.com          # Required. Creator email or name.
+description: "Does X and Y."      # Required. Shown in the UI. LLM uses this for routing decisions.
+model: gemini-3-flash-preview     # Required. LLM model identifier (see supported models below).
+thinking_level: medium            # Required. One of: none, low, medium, high.
+allowed_tools:                    # Required. Tool names this agent may call. Use [] for no tools.
+  - get_system_time
+  - tl_issues_fetch
+allowed_mcps:                     # Optional. External MCP server names to connect.
+  - logs
+a2a_access:                       # Optional. Other agent names this agent may delegate to.
+  - troubleshooting-agent
+tags:                             # Optional. Labels for UI filtering and discovery.
+  - support
+  - tickets
 ```
 
+**`thinking_level`**: Controls reasoning depth and token cost. `none` is fastest; `high` enables deep chain-of-thought. Match to task complexity.
+
+**`allowed_tools`**: Must exactly match the `name` field in each tool's `tool.yaml`. The hub exposes only listed tools to this agent.
+
+**`allowed_mcps`**: Must exactly match the `name` in each `mcp.yaml`. All tools from that MCP server become available to the agent. Tool names are prefixed `mcp__{mcp_name}__{tool_name}` internally.
+
+**`a2a_access`**: Enables Agent-to-Agent delegation. The agent can call listed agents as sub-tasks (as if calling a tool). The supervisor agent has access to all agents by default.
+
+**Supported models** (examples):
+- `gemini-3-flash-preview` — fast, cost-efficient
+- `gemini-3.1-pro-preview` — more capable reasoning
+- `claude-sonnet-4-6` — Anthropic Sonnet
+- `claude-opus-4-8` — Anthropic Opus
+
 ---
 
-## 2. Instructions (`skills.md`)
+### `skills.md` — Writing Effective System Prompts
 
-The `skills.md` file contains the system instructions for the agent. This is passed directly to the LLM to define its behavior, context, and operational rules.
+The `skills.md` file is passed directly to the LLM as the system prompt. It defines the agent's role, behavior, tool usage guidance, and constraints.
 
-### Best Practices for `skills.md`
+**Recommended structure:**
 
-1.  **Role Definition**: Clearly state who the agent is and its primary objective at the very beginning.
-2.  **Tool Usage Guidance**: Explain *when* and *how* to use the tools specified in `allowed_tools`.
-3.  **Formatting Rules**: If the agent should output specific Markdown structures (like JSON blocks, specific headers, or tables), provide templates here.
-4.  **Tone & Constraints**: Set boundaries on what the agent should *not* do, and how it should communicate (e.g., "Be concise", "Do not invent Issues tickets").
+```markdown
+# My Agent
+
+You are a [role] responsible for [primary objective].
+
+## Tools
+
+### `tool_name`
+Use this tool when [condition]. Always pass [required fields].
+
+## Output Format
+
+[Describe expected response structure — JSON, Markdown tables, bullet lists, etc.]
+
+## Constraints
+
+- Do not [forbidden action 1].
+- Do not [forbidden action 2].
+- If you cannot complete a task, say so clearly rather than guessing.
+```
+
+**Best practices:**
+1. **Be specific about tool usage** — explain *when* to call each tool, not just that it exists.
+2. **Provide output templates** — LLMs follow formatting examples more reliably than prose descriptions.
+3. **Set hard constraints** — prevents hallucination of data (e.g., "Do not invent Issues ticket IDs").
+4. **Keep it focused** — one agent, one responsibility. Narrow scope = better accuracy.
 
 ---
 
-## 🔄 Synchronizing Changes
+### Sync to Registry
 
-The Trellis framework uses `etcd` as its central state registry. After you create or edit an agent's files, you **must** synchronize the local files to the registry so the host picks them up.
-
-Run this command from the project root:
+After creating or editing agent files, push changes to etcd:
 
 ```bash
 python scripts/sync_to_db.py
 ```
 
-Check the logs to ensure your agent's config and skills were saved successfully.
+Confirm the output shows your agent:
+```
+Saved config for agent: my-agent
+Saved skills for agent: my-agent
+```
+
+Changes take effect immediately on the next request — the host reloads from etcd per request, so no restart is needed.

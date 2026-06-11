@@ -1,121 +1,241 @@
-# Developer Guide: Building Tools
+# Tools: Consuming & Building
 
-This guide provides detailed instructions on how to build, configure, and register tools within **Trellis**. Tools are external functions that agents can call to interact with APIs, databases, or the local environment.
+Tools are standalone executables that agents call to interact with external systems — APIs, databases, CLIs, or any process. They are language-agnostic and communicate via JSON over stdin/stdout.
 
-## 🛠 Tool Architecture
+---
 
-The framework uses a polyglot Hub (FastMCP) that supports tools written in Python, Go, and Node.js. Tools communicate via standard input/output using a specific JSON protocol.
+## Consuming Tools (As an Agent Developer)
+
+### Wiring a Tool to an Agent
+
+Add the tool's `name` to the agent's `allowed_tools` list in `config.yaml`:
+
+```yaml
+allowed_tools:
+  - tl_issues_fetch
+  - get_system_time
+  - slack_post_message
+```
+
+The name must exactly match the `name` field in the tool's `tool.yaml`. The hub will expose only the listed tools to the agent.
+
+### Providing Secrets and Variables
+
+Tools that call external APIs need credentials. These are stored per-user in etcd and injected as environment variables at runtime — never hardcoded.
+
+1. Open the Dashboard UI at **http://localhost:8080**
+2. Navigate to **Secrets** (for API keys/tokens) or **Variables** (for non-sensitive config)
+3. Add the key names declared in the tool's `tool.yaml`
+
+For **background workflows**, populate secrets under the workflow/background context scope, not the user scope.
+
+### Testing a Tool Locally
+
+Tools read from stdin, so you can test any tool independently without running the full stack:
+
+```bash
+# Python tool
+echo '{"issues_keys": ["OPS-123"], "include_comments": true}' \
+  | ISSUES_API_TOKEN=your_token python workspace/tools/tickets/tl_fetch_issues.py
+
+# With multiple env vars
+echo '{"ticket_id": "FD-456"}' \
+  | SUPPORT_API_KEY=key SUPPORT_DOMAIN=acme.support.com \
+  python workspace/tools/tickets/tl_fetch_support.py
+```
+
+Check the tool's `tool.yaml` for required `inputs`, `secrets`, and `variables` before testing.
+
+---
+
+## Building Tools
 
 ### Directory Structure
 
-Tools live in the `tools/` directory. You can group multiple related tools in a single subdirectory.
+Tools live in `workspace/tools/`. Group related tools in one directory — a single directory can define multiple tools via a list in `tool.yaml`.
 
 ```text
-tools/
-└── tickets/
-    ├── tool.yaml              # Configuration for all tools in this folder
-    ├── tl_fetch_issues.py       # Implementation script 1
-    ├── tl_extract_summary.py  # Implementation script 2
-    ├── lib/                   # Optional shared code folder
-    └── .env.example           # Recommended for documenting required secrets
+workspace/tools/
+└── my-tool/
+    ├── tool.yaml          # Tool definitions (YAML list of tool objects)
+    ├── my_script.py       # Implementation entrypoint
+    ├── lib/               # Optional: shared code within this tool suite
+    │   └── clients.py
+    └── .env.example       # Recommended: document required secrets for developers
 ```
 
 ---
 
-## 1. The I/O Protocol
+### The I/O Protocol
 
-Regardless of the language you choose, your tool script must adhere to this standard:
+All tool scripts — regardless of language — must follow this protocol:
 
-*   **Input**: Read a single JSON object from `stdin`. This object contains the arguments passed by the agent.
-*   **Output**: Print a single JSON object to `stdout`. This object is returned to the agent.
-*   **Logging/Errors**: Use `stderr` for any logging, debugging, or error messages. Do **not** print non-JSON text to `stdout`, as it will break the parsing process.
+- **Input**: Read a single JSON object from `stdin`.
+- **Output**: Print a single JSON object to `stdout`.
+- **Errors / Logs**: Write to `stderr` only. **Never print non-JSON text to `stdout`** — it breaks parsing.
+
+**Python template:**
+```python
+import json
+import sys
+import os
+
+def main():
+    args = json.load(sys.stdin)
+    
+    # Access inputs
+    my_arg = args["my_arg"]
+    optional_arg = args.get("optional_arg", "default")
+    
+    # ... do work ...
+    
+    result = {"output_field": "value"}
+    json.dump(result, sys.stdout)
+
+if __name__ == "__main__":
+    main()
+```
+
+**Error handling — return structured errors, don't raise unhandled exceptions:**
+```python
+try:
+    result = do_work(args)
+    json.dump({"success": True, "data": result}, sys.stdout)
+except Exception as e:
+    print(f"Error: {e}", file=sys.stderr)
+    json.dump({"success": False, "error": str(e)}, sys.stdout)
+```
 
 ---
 
-## 2. Configuration (`tool.yaml`)
+### `tool.yaml` — All Fields
 
-The `tool.yaml` file defines the tools in a directory. It can be a single object or an array of objects.
-
-### Required Fields
-
-*   **`name`** *(string)*: Unique identifier for the tool (e.g., `tl_issues_fetch`). Agents use this name in their `allowed_tools` list.
-*   **`version`** *(string)*: Semantic version (e.g., `3.2.0`).
-*   **`author`** *(string)*: Creator's name or email.
-*   **`description`** *(string)*: Clear description of what the tool does. The LLM uses this to decide when to call it.
-*   **`runtime`** *(string)*: The execution environment (e.g., `python`, `node`, `go`).
-*   **`entrypoint`** *(string)*: The main file to execute (e.g., `tl_fetch_issues.py`).
-*   **`rel_path`** *(string)*: The relative path to the tool directory from the root (e.g., `tools/tickets`).
-*   **`inputs`** *(object)*: Schema of arguments the tool accepts. Each key is an argument name, containing:
-    *   `type`: `string`, `boolean`, `array`, `object`, `number`.
-    *   `description`: What the argument represents.
-    *   `required`: `true` or `false`.
-*   **`outputs`** *(object)*: Schema of the JSON returned via `stdout`.
-*   **`secrets`** *(array of strings or object)*: (Optional) List of environment variable names the tool needs (e.g., `ISSUES_API_TOKEN`). You can either provide a simple array of strings, or use a nested object structure for context-aware requirements:
-    *   `general`: Secrets required across all agent contexts.
-    *   `background`: Secrets required *only* when called by a background workflow (script or agent).
-    *   `user`: Secrets required *only* when called by a standard/human-facing agent.
-*   **`variables`** *(array of strings or object)*: (Optional) Same format as `secrets`, but for non-sensitive configuration variables. It supports the exact same nested structure (`general`, `background`, `user`) as secrets.
-
-### Example `tool.yaml`
+`tool.yaml` is a YAML list — one entry per tool. Multiple tools can share a directory and file.
 
 ```yaml
-- name: tl_issues_fetch
-  version: 3.2.0
-  author: markh@acme.com
-  description: Fetches one or more Issues issues including comments.
-  runtime: python
-  entrypoint: tl_fetch_issues.py
-  rel_path: tools/tickets
-  inputs:
-    issues_keys:
-      type: array
-      description: List of Issues keys (e.g., OPS-123) to fetch.
+- name: my_tool                   # Required. Unique identifier. Must match agent's allowed_tools entry.
+  version: 0.1.0                  # Required. Semantic version.
+  author: user@example.com        # Required.
+  description: "Fetches X from Y." # Required. LLM reads this to decide when and how to call the tool.
+  runtime: python                 # Required. One of: python, node, go.
+  entrypoint: my_script.py        # Required. File to execute relative to the tool directory.
+  rel_path: tools/my-tool         # Required. Directory path relative to repo root.
+  inputs:                         # Required. Schema of the stdin JSON object.
+    my_arg:
+      type: string                # One of: string, boolean, array, object, number.
+      description: "What this argument is."
       required: true
-    include_comments:
+    optional_arg:
       type: boolean
-      description: Whether to include issue comments.
+      description: "Whether to include X."
       required: false
-  secrets:
-    background:
-      - ISSUES_CLIENT_SECRET
-    user:
-      - ISSUES_API_TOKEN
-  variables:
-    background:
-      - ISSUES_CLIENT_ID
-    user:
-      - ISSUES_EMAIL
-      - ISSUES_URL
-  outputs:
-    issues:
+  outputs:                        # Required. Schema of the stdout JSON object.
+    result:
+      type: string
+      description: "The result value."
+    items:
       type: array
-      description: List of raw Issues issue data.
+      description: "List of result objects."
+  secrets:                        # Optional. API keys / credentials injected as env vars at runtime.
+    general:
+      - MY_API_KEY                # Required for all callers (user and background).
+    user:
+      - USER_PERSONAL_TOKEN       # Required only when called by a user-facing agent.
+    background:
+      - BG_SERVICE_ACCOUNT_KEY    # Required only when called by a background workflow.
+  variables:                      # Optional. Non-sensitive config (URLs, IDs). Same structure as secrets.
+    user:
+      - MY_SERVICE_URL
+      - MY_EMAIL
+    background:
+      - BG_SERVICE_URL
+```
+
+**Secrets vs Variables**: Both are stored in etcd and injected as environment variables. `secrets` is for sensitive credentials; `variables` is for non-sensitive config like base URLs or email addresses.
+
+**Simple form** (no context scoping — all callers get the same keys):
+```yaml
+secrets:
+  - MY_API_KEY
+  - ANOTHER_SECRET
+variables:
+  - MY_SERVICE_URL
+```
+
+**Contextual scoping** (`general` / `user` / `background`): Lets one tool authenticate differently depending on whether it's called by a user agent (personal token) or a background workflow (service account). Required fields differ by context.
+
+---
+
+### Runtimes
+
+| Runtime | `entrypoint` | Notes |
+|---------|-------------|-------|
+| `python` | `.py` file | Python 3.12 container environment |
+| `node` | `.js` file | Node.js; install deps in the tool directory |
+| `go` | compiled binary | Build and commit the binary to the directory |
+
+---
+
+### Multi-Tool Directories
+
+A single directory can host multiple related tools. `tool.yaml` is a YAML list:
+
+```yaml
+- name: issues_fetch
+  entrypoint: tl_fetch_issues.py
+  ...
+
+- name: issues_comment
+  entrypoint: tl_post_comment.py
+  ...
+```
+
+Both tools share the same `lib/` and `.env.example`.
+
+---
+
+### Shared Code Patterns
+
+**Within a tool suite** (scripts in the same directory): Use a `lib/` subdirectory.
+```python
+import sys, os
+sys.path.insert(0, os.path.dirname(__file__))
+from lib.clients import get_issues_client
+```
+
+**Across separate tool suites**: Extract to `workspace/shared/` and insert the workspace root into `sys.path`.
+```python
+import sys, os
+# Insert workspace root so shared modules are importable
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+from shared.issues.client import IssuesClient
+from shared.slack.client import SlackClient
 ```
 
 ---
 
-## 3. Local Development & Testing
+### Sync to Registry
 
-Because tools are just standard scripts reading `stdin`, you can test them locally without running the entire framework:
-
-```bash
-# Example: Testing a Python tool
-echo '{"issues_keys": ["OPS-123"]}' | ISSUES_API_TOKEN=your_token python tools/tickets/tl_fetch_issues.py
-```
-
-### Best Practices
-
-*   **Flat over Nested**: Keep your tool folder self-contained. Avoid complex packaging.
-*   **Shared Logic (Tool level)**: If scripts in a tool suite share code, place it in a `lib/` subdirectory within the tool's folder.
-*   **Shared Logic (Workspace level)**: If logic must be shared across multiple completely separate tool suites, extract it to `workspace/shared/` and dynamically insert the workspace root into `sys.path`.
-*   **Secrets**: Never hardcode API keys in scripts. Define them in `tool.yaml`'s `secrets` array and access them via environment variables (e.g., `os.getenv('ISSUES_API_TOKEN')`).
-
----
-
-## 🔄 Synchronizing Changes
-
-Run this from the project root after creating or modifying `tool.yaml`:
+After creating or modifying `tool.yaml`, push to etcd:
 
 ```bash
 python scripts/sync_to_db.py
 ```
+
+Confirm the output shows your tool:
+```
+Saved config for tool: my_tool
+```
+
+The hub reloads tool configs dynamically, so no restart is needed for most changes.
+
+---
+
+### Local Development Checklist
+
+- [ ] `tool.yaml` has a unique `name` not already in use
+- [ ] `rel_path` matches the actual directory path from repo root
+- [ ] Script reads all inputs from `sys.stdin` (JSON), writes only JSON to `sys.stdout`
+- [ ] Secrets/variables declared in `tool.yaml` and accessible via `os.getenv()`
+- [ ] Tool tested locally with `echo '{...}' | ENV_VAR=val python script.py`
+- [ ] `python scripts/sync_to_db.py` run after changes
