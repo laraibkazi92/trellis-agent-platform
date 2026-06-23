@@ -340,6 +340,16 @@ class IdentityManager:
         self.set_config("disabled_workflows", workflows)
 
     @retry_etcd()
+    def get_agent_memory_enabled(self) -> bool:
+        """Retrieve the global agent-memory feature flag (admin master switch)."""
+        return bool(self.get_config("agent_memory_enabled", False))
+
+    @retry_etcd()
+    def set_agent_memory_enabled(self, enabled: bool) -> None:
+        """Set the global agent-memory feature flag (admin master switch)."""
+        self.set_config("agent_memory_enabled", bool(enabled))
+
+    @retry_etcd()
     def get_app_config(self) -> Dict[str, Any]:
         """Retrieve the application configuration for whitelabeling."""
         # Start with environment variables as defaults
@@ -382,6 +392,28 @@ class IdentityManager:
         if value:
             return value.decode('utf-8')
         return None
+
+    @retry_etcd()
+    def save_agent_embedding(self, name: str, vector: List[float]) -> None:
+        """Persist an agent's description embedding for semantic search."""
+        self.client.put(f"/registry/agents/{name}/embedding", json.dumps(vector))
+
+    @retry_etcd()
+    def get_all_agent_embeddings(self) -> Dict[str, List[float]]:
+        """Bulk-fetch every agent's cached embedding vector, keyed by agent name."""
+        embeddings: Dict[str, List[float]] = {}
+        prefix = "/registry/agents/"
+        suffix = "/embedding"
+        for value, metadata in self.client.get_prefix(prefix):
+            key_str = metadata.key.decode('utf-8')
+            if key_str.startswith(prefix) and key_str.endswith(suffix) and value:
+                name = key_str[len(prefix):-len(suffix)]
+                if name:
+                    try:
+                        embeddings[name] = json.loads(value.decode('utf-8'))
+                    except json.JSONDecodeError:
+                        pass
+        return embeddings
 
     @retry_etcd()
     def list_agents(self) -> List[str]:

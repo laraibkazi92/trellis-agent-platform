@@ -116,10 +116,12 @@ async def admin_dashboard(request: Request):
         k["user_email"] = user_email_map.get(k.get("user_id"), "Unknown User")
         
     flash_msg = request.session.pop("flash_msg", None)
-    
+
+    agent_memory_enabled = await asyncio.to_thread(identity_mgr.get_agent_memory_enabled)
+
     return templates.TemplateResponse(
         request=request,
-        name="admin.html", 
+        name="admin.html",
         context={
             "user": user,
             "users": users,
@@ -129,9 +131,24 @@ async def admin_dashboard(request: Request):
                 "total_keys": len(keys),
                 "total_agents": len(agents)
             },
+            "feature_flags": {
+                "agent_memory_enabled": agent_memory_enabled
+            },
             "flash_msg": flash_msg
         }
     )
+
+@router.post("/admin/feature-flags/agent-memory")
+async def toggle_agent_memory_flag(request: Request, enabled: str = Form(...)):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    should_enable = enabled.lower() == 'true'
+    await asyncio.to_thread(identity_mgr.set_agent_memory_enabled, should_enable)
+
+    state_str = "enabled" if should_enable else "disabled"
+    request.session["flash_msg"] = f"Agent Memory {state_str} globally. Changes take effect within ~20 seconds."
+    return RedirectResponse(url='/admin', status_code=303)
 
 @router.post("/admin/users/toggle_ban")
 async def toggle_user_ban(request: Request, user_id: str = Form(...), is_banned: str = Form(...)):
@@ -526,6 +543,8 @@ async def save_agent(request: Request, name: str):
     config["a2a_access"] = form.getlist("a2a_access")
     config["allowed_tools"] = form.getlist("allowed_tools")
     config["allowed_mcps"] = form.getlist("allowed_mcps")
+    # Checkbox: only present in form when checked.
+    config["agent_memory"] = form.get("agent_memory") == "true"
     skills_content = form.get("skills_content", "")
     
     await asyncio.to_thread(identity_mgr.save_agent_config, safe_name, config)

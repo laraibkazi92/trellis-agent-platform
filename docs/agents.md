@@ -34,7 +34,13 @@ claude mcp add --transport http trellis http://localhost:8002/mcp \
   --header "Authorization: Bearer YOUR_API_KEY"
 ```
 
-Each agent becomes an MCP tool named after it. The **supervisor** agent is a special meta-agent that can inspect the fleet and route to any other agent.
+The gateway exposes three tools (it does **not** create one tool per agent, so it scales to large fleets):
+
+- **`search_agents(query, limit)`** — semantic search over the fleet; returns a ranked shortlist of relevant agents (`name`, `description`). Use this to discover who can handle a task.
+- **`use_agent(agent_name, prompt)`** — run a specific agent.
+- **`auto_select(prompt)`** — let the framework route for you: hands the request to the **supervisor**, which searches the fleet and delegates to the best-matching agent(s).
+
+Typical flow: call `search_agents` to find the right agent, then `use_agent` to run it — or just call `auto_select` and let the supervisor decide.
 
 ### Listing Available Agents
 
@@ -83,7 +89,21 @@ a2a_access:                       # Optional. Other agent names this agent may d
 tags:                             # Optional. Labels for UI filtering and discovery.
   - support
   - tickets
+agent_memory: false               # Optional. Opt into per-agent persistent memory (Hindsight).
 ```
+
+**`agent_memory`**: When `true`, the framework automatically recalls relevant context from
+past interactions before each run and retains the exchange afterward — no skill-prompt or
+tool changes required. This only takes effect if an admin has turned on the global
+**Agent Memory** feature flag (Admin Dashboard → Feature Flags); otherwise it is a no-op.
+Can also be toggled per-agent in the agent editor UI. The LLM/embedding model Hindsight
+uses for extraction is configured via `HINDSIGHT_LLM_*` env vars (see `.env.example`),
+independent of the agent's own `model`.
+
+> ⚠️ **Scope:** Memory is keyed by agent name and **shared across all users** of that agent.
+> The agent builds institutional knowledge over time, but one user's context can surface in
+> another user's session. Do not enable it for agents handling user-private data unless that
+> sharing is acceptable.
 
 **`thinking_level`**: Controls reasoning depth and token cost. `none` is fastest; `high` enables deep chain-of-thought. Match to task complexity.
 
@@ -91,7 +111,7 @@ tags:                             # Optional. Labels for UI filtering and discov
 
 **`allowed_mcps`**: Must exactly match the `name` in each `mcp.yaml`. All tools from that MCP server become available to the agent. Tool names are prefixed `mcp__{mcp_name}__{tool_name}` internally.
 
-**`a2a_access`**: Enables Agent-to-Agent delegation. The agent can call listed agents as sub-tasks (as if calling a tool). The supervisor agent has access to all agents by default.
+**`a2a_access`**: Enables Agent-to-Agent delegation. The agent can call listed agents as sub-tasks (as if calling a tool). Keep this list small and intentional — the supervisor does not use `a2a_access`; it discovers and delegates dynamically via `search_agents` + `delegate`.
 
 **Supported models** (examples):
 - `gemini-3-flash-preview` — fast, cost-efficient
@@ -150,4 +170,4 @@ Saved config for agent: my-agent
 Saved skills for agent: my-agent
 ```
 
-Changes take effect immediately on the next request — the host reloads from etcd per request, so no restart is needed.
+Changes take effect on the next request — the host watches etcd for config changes and evicts the cached agent instance automatically, so no restart is needed.

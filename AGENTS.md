@@ -42,6 +42,7 @@ Full guides for consuming and building each framework component:
 - **Multi-Tool Support**: A single directory can host multiple tools; `tool.yaml` should be a list of configurations.
 - **Logical Porting**: When porting external skills (e.g. from Claude Code), preserve all business logic/formatting but translate shell commands into framework tool calls.
 - **Auth**: Endpoints under `/v1/chat/completions`, `/mcp`, `/sse`, and `/messages` require Bearer tokens unless `DEV_MODE=true` is set. Note that `/sse` and `/messages` are typically sub-paths of `/mcp`.
+- **Agent Memory**: Backed by Hindsight (`core/memory.py`), wired at the framework level — recall via a dynamic instruction in `build_agent`, retain at the two `agent.run` sites (`host.py`, `tasks.py`). Banks are keyed by agent name (per-agent, shared across users). Gated by the admin `agent_memory_enabled` feature flag AND per-agent `agent_memory: true`. All ops are fail-open. Visibility: the `hindsight` container exposes the Control Plane web UI on **port 9999** (browse banks/memories/entity graphs by agent name); the API is on 8888. CLI: `hindsight configure --api-url http://localhost:8888` then `hindsight bank list`.
 
 ## 🎨 UI/UX & Frontend Design Patterns
 - **Terminology**: 

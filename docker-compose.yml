@@ -13,6 +13,7 @@ services:
     container_name: db-sync
     environment:
       <<: *common-env
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
     volumes:
       - ./workspace:/app/workspace
       - ./core:/app/core
@@ -38,6 +39,7 @@ services:
       GOOGLE_API_KEY: ${GEMINI_API_KEY}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
       REDIS_URL: redis://redis:6379/0
+      HINDSIGHT_URL: http://hindsight:8888
     volumes:
       - health-data:/app/data
       - ./workspace:/app/workspace
@@ -139,6 +141,7 @@ services:
       HUB_URL: http://hub:8001/mcp
       GOOGLE_API_KEY: ${GEMINI_API_KEY}
       REDIS_URL: redis://redis:6379/0
+      HINDSIGHT_URL: http://hindsight:8888
     volumes:
       - ./workspace:/app/workspace
       - ./core:/app/core
@@ -178,6 +181,43 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+
+  # Agent Memory backend (Hindsight). The standalone image bundles BOTH the API server
+  # (port 8888, used by host/taskiq-worker via HINDSIGHT_URL) AND the Control Plane web UI
+  # (port 9999, for browsing banks/memories/entity graphs), plus an embedded Postgres
+  # (data under /home/hindsight/.pg0). Gated at runtime by the admin 'agent_memory_enabled'
+  # feature flag; agents opt in via `agent_memory: true`.
+  # NOTE: confirm env var names / ports against the pinned image tag (https://hindsight.vectorize.io).
+  # Slim variant: no bundled local ML models — relies on the Gemini API for LLM + embeddings.
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:0.8.1-slim
+    container_name: hindsight
+    environment:
+      TZ: UTC
+      # LLM used by Hindsight for fact extraction / reflection. Defaults to Gemini using
+      # the framework's GEMINI_API_KEY; override provider/model via .env.
+      HINDSIGHT_API_LLM_PROVIDER: ${HINDSIGHT_LLM_PROVIDER:-gemini}
+      HINDSIGHT_API_LLM_MODEL: ${HINDSIGHT_LLM_MODEL:-gemini-2.5-flash}
+      HINDSIGHT_API_LLM_API_KEY: ${HINDSIGHT_LLM_API_KEY:-${GEMINI_API_KEY}}
+      # Embeddings used for semantic recall. NOTE: the provider value for Gemini/Google
+      # embeddings is "google" (the model/key/dim vars below keep the GEMINI_ prefix).
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: ${HINDSIGHT_EMBEDDINGS_PROVIDER:-google}
+      HINDSIGHT_API_EMBEDDINGS_GEMINI_MODEL: ${HINDSIGHT_EMBEDDINGS_MODEL:-gemini-embedding-2}
+      HINDSIGHT_API_EMBEDDINGS_GEMINI_API_KEY: ${HINDSIGHT_LLM_API_KEY:-${GEMINI_API_KEY}}
+      # Output vector size (Matryoshka). Must be set BEFORE storing data — changing it later
+      # requires wiping the hindsight-data volume. gemini-embedding-2 supports 128–3072
+      # (recommended 768/1536/3072) and auto-normalizes truncated dimensions.
+      HINDSIGHT_API_EMBEDDINGS_GEMINI_OUTPUT_DIMENSIONALITY: ${HINDSIGHT_EMBEDDINGS_DIMENSIONS:-768}
+      # Reranker. The slim image has no local cross-encoder (no sentence-transformers), so the
+      # default 'local' fails. 'rrf' = Reciprocal Rank Fusion passthrough: no neural rerank,
+      # no extra model/key/cost — recall still fuses the semantic/BM25/graph/temporal strategies.
+      HINDSIGHT_API_RERANKER_PROVIDER: ${HINDSIGHT_RERANKER_PROVIDER:-rrf}
+    ports:
+      - "8888:8888"   # API server (used internally by the framework)
+      - "9999:9999"   # Control Plane web UI — browse to http://localhost:9999
+    volumes:
+      - hindsight-data:/home/hindsight/.pg0
+    restart: unless-stopped
 
   ui:
     build: .
@@ -237,3 +277,4 @@ networks:
 volumes:
   etcd-data:
   health-data:
+  hindsight-data:

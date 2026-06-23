@@ -52,6 +52,48 @@
   </div>
 </div>
 
+<!-- Feature Flags -->
+<div class="bg-white shadow-sm rounded-xl border border-gray-200 mb-8 overflow-hidden">
+  <div class="px-6 py-4 border-b border-gray-200 bg-gray-50">
+    <h2 class="text-lg font-semibold text-gray-900">Feature Flags</h2>
+  </div>
+  <div class="px-6 py-4">
+    <div class="flex items-center justify-between">
+      <div class="pr-6">
+        <p class="text-sm font-semibold text-gray-900">Agent Memory</p>
+        <p class="text-sm text-gray-500 mt-1">
+          Master switch for per-agent persistent memory (Hindsight). When on, agents that opt in via
+          <code class="text-xs bg-gray-100 px-1 py-0.5 rounded">agent_memory: true</code> in their config will recall and
+          retain context across sessions. Memory is shared across all users of a given agent.
+        </p>
+      </div>
+      <div class="flex items-center gap-3 shrink-0">
+        {% if feature_flags.agent_memory_enabled %}
+          <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-100 text-emerald-800">Enabled</span>
+          <form action="/admin/feature-flags/agent-memory" method="POST" class="inline-block"
+                onsubmit="return confirm('Disable Agent Memory globally? Agents will stop recalling and retaining memory.');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="enabled" value="false">
+            <button type="submit" class="inline-flex items-center px-4 py-2 bg-white border border-gray-300 text-gray-700 text-sm font-medium rounded-md hover:bg-gray-50 shadow-sm transition-colors uppercase font-mono tracking-wide">
+              Disable
+            </button>
+          </form>
+        {% else %}
+          <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-600">Disabled</span>
+          <form action="/admin/feature-flags/agent-memory" method="POST" class="inline-block"
+                onsubmit="return confirm('Enable Agent Memory globally?');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="enabled" value="true">
+            <button type="submit" class="inline-flex items-center px-4 py-2 bg-neutral-800 text-white text-sm font-medium rounded-md hover:bg-neutral-900 shadow-sm transition-colors uppercase font-mono tracking-wide">
+              Enable
+            </button>
+          </form>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Users Table -->
 <div class="bg-white shadow-sm rounded-xl border border-gray-200 mb-8 overflow-hidden">
   <div class="px-6 py-4 border-b border-gray-200 bg-gray-50">

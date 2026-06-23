@@ -28,18 +28,22 @@ from core.tasks import run_background_agent
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _main_loop, _watch_id
+    global _main_loop, _watch_id, _agent_watch_id
     print("Worker starting up...")
     _main_loop = asyncio.get_running_loop()
     app.state.http_client = httpx.AsyncClient(timeout=30.0)
     _watch_id = identity_mgr.client.add_watch_prefix_callback("/registry/mcps/", on_mcp_change)
+    _agent_watch_id = identity_mgr.client.add_watch_prefix_callback("/registry/agents/", on_agent_change)
     await get_hub_client()
     await discover_external_mcps()
+    asyncio.create_task(prewarm_agents())
     print("Worker startup complete.")
     yield
     print("Worker shutting down...")
     if _watch_id:
         identity_mgr.client.cancel_watch(_watch_id)
+    if _agent_watch_id:
+        identity_mgr.client.cancel_watch(_agent_watch_id)
     hub_client = await get_hub_client()
     if hub_client:
         await hub_client.__aexit__(None, None, None)
@@ -65,7 +69,9 @@ app.add_middleware(
 )
 
 from core.agent_factory import (
-    build_agent,
+    get_agent,
+    evict_agent,
+    prewarm_agents,
     discover_external_mcps,
     get_hub_client,
     get_identity_manager,
@@ -73,6 +79,7 @@ from core.agent_factory import (
     mcp_client_cache,
     _hub_client
 )
+from core.memory import get_memory_manager
 
 identity_mgr = get_identity_manager()
 app.add_middleware(AuthMiddleware, identity_mgr=identity_mgr)
@@ -92,6 +99,7 @@ class ChatRequest(BaseModel):
 
 _main_loop: Optional[asyncio.AbstractEventLoop] = None
 _watch_id: Any = None
+_agent_watch_id: Any = None
 
 def on_mcp_change(event):
     for ev in event.events:
@@ -99,13 +107,21 @@ def on_mcp_change(event):
         parts = key.split('/')
         if len(parts) >= 4:
             mcp_name = parts[3]
-            # Invalidate specific cache keys
             keys_to_delete = [k for k in mcp_client_cache.keys() if mcp_name in str(k)]
             for k in keys_to_delete:
                 mcp_client_cache.pop(k, None)
-                
+
     if _main_loop and not _main_loop.is_closed():
         asyncio.run_coroutine_threadsafe(discover_external_mcps(), _main_loop)
+
+
+def on_agent_change(event):
+    for ev in event.events:
+        key = ev.key.decode('utf-8')
+        parts = key.split('/')
+        # key format: /registry/agents/{name}/...
+        if len(parts) >= 4:
+            evict_agent(parts[3])
 
 @app.get("/health")
 async def health():
@@ -144,7 +160,7 @@ async def chat_completions(request: ChatRequest):
     if health_monitor.get_status("agent", request.model).get("status") == "Offline":
         raise HTTPException(status_code=503, detail="Agent offline")
 
-    agent = await build_agent(request.model)
+    agent = await get_agent(request.model)
     
     history = []
     for msg in request.messages[:-1]:
@@ -161,6 +177,14 @@ async def chat_completions(request: ChatRequest):
             # Send usage to a background thread to not block return
             asyncio.create_task(asyncio.to_thread(identity_mgr.record_usage, user_id, u.request_tokens or 0, u.response_tokens or 0))
             asyncio.create_task(asyncio.to_thread(identity_mgr.record_agent_usage, user_id, request.model, u.request_tokens or 0, u.response_tokens or 0))
+        # Agent memory: retain this exchange (fire-and-forget; gated + fail-open internally).
+        memory_mgr = get_memory_manager()
+        if memory_mgr.active_for(cfg_data):
+            asyncio.create_task(memory_mgr.retain(
+                bank=request.model,
+                user_msg=request.messages[-1].content,
+                agent_output=result.output,
+            ))
         return {"choices": [{"message": {"role": "assistant", "content": result.output}}]}
     except Exception as e:
         health_monitor.record_event("agent", request.model, is_success=False, error_details=str(e))

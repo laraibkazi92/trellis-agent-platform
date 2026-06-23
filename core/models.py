@@ -46,6 +46,7 @@ class AgentConfig(BaseModel):
     a2a_access: List[str] = Field(default_factory=list, description="List of other agents this agent can call.")
     allowed_tools: List[str] = Field(default_factory=list, description="List of MCP tools this agent is allowed to use.")
     allowed_mcps: List[str] = Field(default_factory=list, description="List of MCP servers this agent is allowed to connect to.")
+    agent_memory: bool = Field(default=False, description="Opt this agent into per-agent persistent memory (Hindsight). Requires the admin 'agent_memory_enabled' feature flag to also be on.")
 
 class MCPToolDefinition(BaseModel):
     name: str

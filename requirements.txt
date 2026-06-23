@@ -2,7 +2,7 @@ pydantic>=2.0.0
 pyyaml
 fastapi
 pydantic-ai[gemini]
-google-generativeai
+google-genai
 mcp[all]
 fastmcp
 uvicorn
@@ -32,3 +32,4 @@ subagents-pydantic-ai
 pydantic-ai-backend[console]
 pydantic-ai-shields
 pydantic-ai-rlm
+hindsight-client

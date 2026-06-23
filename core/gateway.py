@@ -11,6 +11,7 @@ from fastmcp import FastMCP
 from core.auth import AuthMiddleware, IdentityManager, auth_token_var, user_id_var
 from fastapi.middleware.cors import CORSMiddleware
 from core.discovery import discover_agents, is_agent_configured
+from core.agent_search import search_agents as _search_agents_ranked, DEFAULT_LIMIT as AGENT_SEARCH_LIMIT
 
 @asynccontextmanager
 async def lifespan(app):
@@ -66,9 +67,13 @@ async def get_agent_description(config: dict, skills_path: Path) -> str:
         pass
     return "No description available."
 
-@mcp.tool()
-async def list_agents() -> List[Dict[str, str]]:
-    """List all available agents and their descriptions."""
+async def _get_visible_agents() -> List[Dict[str, str]]:
+    """Internal: agents visible to the current user, with health-decorated descriptions.
+
+    Applies the same filtering the old public ``list_agents`` tool did (disabled /
+    offline / background / unconfigured), scoped to the calling user. No longer exposed
+    as an MCP tool — clients use ``search_agents`` instead to avoid dumping every agent.
+    """
     user_id = user_id_var.get()
     
     try:
@@ -148,6 +153,32 @@ async def list_agents() -> List[Dict[str, str]]:
     return agents
 
 @mcp.tool()
+async def search_agents(query: str, limit: int = AGENT_SEARCH_LIMIT) -> List[Dict[str, str]]:
+    """Find the agents most relevant to a request.
+
+    Use this to discover which specialized agent(s) can handle a task, then call the
+    chosen one with `use_agent`. Returns a short, ranked list of `{name, description}` —
+    not the full catalog — so it scales to large numbers of agents.
+    """
+    visible = await _get_visible_agents()
+    # _get_visible_agents already drops the supervisor's offline marker etc.; keep its
+    # (health-decorated) descriptions, but order/limit by semantic relevance.
+    visible_by_name = {a["name"]: a for a in visible if a["name"] != "supervisor"}
+    if not visible_by_name:
+        return []
+
+    ranked = await _search_agents_ranked(query, limit=0, include_disabled=False)
+
+    results: List[Dict[str, str]] = []
+    for r in ranked:
+        agent = visible_by_name.get(r["name"])
+        if agent:
+            results.append({"name": agent["name"], "description": agent["description"]})
+            if len(results) >= limit:
+                break
+    return results
+
+@mcp.tool()
 async def use_agent(agent_name: str, prompt: str) -> str:
     """Call a specific agent with a prompt."""
     token = auth_token_var.get()
@@ -155,9 +186,15 @@ async def use_agent(agent_name: str, prompt: str) -> str:
     
     if agent_name != "supervisor":
         try:
-            configured = await is_agent_configured(agent_name, user_id)
-            if not configured:
-                return f"SYSTEM: The agent '{agent_name}' requires configuration before it can be used. Please complete its setup in the UI."
+            status = await is_agent_configured(agent_name, user_id)
+            if not status["configured"]:
+                parts = [f"SYSTEM: Agent '{agent_name}' requires configuration before it can be used."]
+                if status["missing_secrets"]:
+                    parts.append(f"Missing secrets: {', '.join(status['missing_secrets'])}.")
+                if status["missing_variables"]:
+                    parts.append(f"Missing variables: {', '.join(status['missing_variables'])}.")
+                parts.append(f"Configure it at: /agents/{agent_name}/configure")
+                return " ".join(parts)
         except Exception as e:
             print(f"Error checking agent configuration for '{agent_name}': {e}")
             return f"SYSTEM: Error checking agent configuration for '{agent_name}': {e}"
@@ -196,14 +233,15 @@ async def use_agent(agent_name: str, prompt: str) -> str:
         return f"SYSTEM: Failed to connect to agent '{agent_name}': {str(e)}"
 
 @mcp.tool()
-async def marketplace_router(prompt: str) -> str:
-    """Route a request through the Supervisor agent with a dynamic agent roster."""
-    agents = await list_agents()
-    roster = "\n".join([f"- {a['name']}: {a['description']}" for a in agents if a['name'] != 'supervisor'])
-    
-    routing_prompt = f"Available Agents:\n{roster}\n\nUser Request: {prompt}"
-    
-    return await use_agent("supervisor", routing_prompt)
+async def auto_select(prompt: str) -> str:
+    """Automatically pick the best agent for a request and run it.
+
+    Hands the request to the Supervisor, which searches for the most relevant
+    specialized agent(s) and delegates to them. Use this when you don't know which
+    agent to call — it routes for you. To target a specific agent yourself, use
+    `search_agents` then `use_agent` instead.
+    """
+    return await use_agent("supervisor", prompt)
 
 if __name__ == "__main__":
     app = mcp.http_app()

@@ -285,7 +285,14 @@ async def run_background_agent(
         
         # 3. Execute the run
         result = await agent.run(prompt)
-        
+
+        # Agent memory: retain this exchange (awaited so it completes within the worker
+        # task lifetime; gated by feature flag + agent config, and fail-open internally).
+        from core.memory import get_memory_manager
+        memory_mgr = get_memory_manager()
+        if memory_mgr.active_for(config_data):
+            await memory_mgr.retain(bank=agent_name, user_msg=prompt, agent_output=result.output)
+
         # Log usage
         usage_data = {}
         if hasattr(result, 'usage'):

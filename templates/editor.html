@@ -239,6 +239,17 @@
                 
 
                 <div class="mb-8 pt-8 border-t border-neutral-200 dark:border-neutral-800">
+                    <label class="form-label mb-4">Agent Memory</label>
+                    <div class="flex items-center p-3 border border-neutral-300 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-950/50 hover:bg-white dark:hover:bg-neutral-800 transition-colors">
+                        <input id="agent_memory" name="agent_memory" value="true" type="checkbox" class="h-4 w-4 text-accent border-neutral-300 dark:border-neutral-600 bg-white dark:bg-neutral-900 rounded-none focus:ring-accent focus:ring-offset-0 dark:focus:ring-offset-neutral-900" {% if config.get('agent_memory') %}checked{% endif %}>
+                        <label for="agent_memory" class="ml-3 flex flex-col justify-center text-sm font-mono text-neutral-900 dark:text-neutral-100 cursor-pointer w-full">
+                            <span>Enable persistent memory for this agent</span>
+                            <span class="text-xs text-neutral-500 dark:text-neutral-400 mt-1 whitespace-normal">Recalls &amp; retains context across sessions (Hindsight). Memory is shared across all users of this agent. Requires the global <span class="font-bold">Agent Memory</span> feature flag (Admin Dashboard) to be enabled.</span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="mb-8 pt-8 border-t border-neutral-200 dark:border-neutral-800">
                     <label class="form-label flex justify-between items-end mb-4">
                         Allowed MCP Servers
                         <span class="font-normal text-[10px] text-neutral-500">DYNAMIC DISCOVERY</span>

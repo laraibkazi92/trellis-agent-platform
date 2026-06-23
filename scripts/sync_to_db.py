@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.auth import IdentityManager
+from core.embeddings import embed_text
 
 BASE_DIR = Path(__file__).parent.parent
 WORKSPACE_DIR = BASE_DIR / "workspace"
@@ -51,7 +52,21 @@ def sync_agent(identity_mgr, agent_dir, name=None, default_type=None):
             
         identity_mgr.save_agent_config(name, config)
         print(f"  Saved config for agent: {name} (Type: {config.get('type')})")
-        
+
+        # Index the agent for semantic search. Skipped for background agents/scripts
+        # and the supervisor, which are never returned by search_agents.
+        if config.get("type") not in ("background_agent", "background_script") and name != "supervisor":
+            parts = [config.get("name", name), config.get("description", "")]
+            tags = config.get("tags") or []
+            if tags:
+                parts.append(" ".join(str(t) for t in tags))
+            vector = embed_text("\n".join(p for p in parts if p), task_type="retrieval_document")
+            if vector:
+                identity_mgr.save_agent_embedding(name, vector)
+                print(f"  Indexed embedding for agent: {name}")
+            else:
+                print(f"  Skipped embedding for agent: {name} (embeddings unavailable)")
+
     if skills_path.exists():
         with open(skills_path, "r") as f:
             skills = f.read()
@@ -147,6 +162,7 @@ def main():
         print(f"  Deleting obsolete agent: {agent}")
         identity_mgr.client.delete(f"/registry/agents/{agent}/config")
         identity_mgr.client.delete(f"/registry/agents/{agent}/skills")
+        identity_mgr.client.delete(f"/registry/agents/{agent}/embedding")
         
     for tool in existing_tools - seen_tools:
         print(f"  Deleting obsolete tool: {tool}")
