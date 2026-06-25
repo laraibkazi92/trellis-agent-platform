@@ -3,6 +3,7 @@ from pathlib import Path
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 import markdown
+import nh3
 from core.dependencies import templates
 
 router = APIRouter(prefix="/docs", tags=["docs"])
@@ -23,7 +24,9 @@ DOC_MAP = {
 @router.get("/{doc_type}", response_class=HTMLResponse)
 async def read_doc(request: Request, doc_type: str):
     user = request.session.get('user')
-    
+    if not user:
+        return RedirectResponse(url='/login')
+
     doc_info = DOC_MAP.get(doc_type)
     if not doc_info:
         return HTMLResponse(content="Documentation not found", status_code=404)
@@ -37,7 +40,13 @@ async def read_doc(request: Request, doc_type: str):
     with open(file_path, "r", encoding="utf-8") as f:
         md_content = f.read()
 
-    html_content = markdown.markdown(md_content, extensions=['fenced_code', 'codehilite', 'tables'])
+    html_content = nh3.clean(
+        markdown.markdown(md_content, extensions=['fenced_code', 'codehilite', 'tables']),
+        tags={"p", "br", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li",
+              "strong", "em", "code", "pre", "blockquote", "table", "thead",
+              "tbody", "tr", "th", "td", "hr", "a", "span", "div"},
+        attributes={"a": {"href", "title"}, "code": {"class"}, "span": {"class"}, "div": {"class"}, "td": {"align"}, "th": {"align"}},
+    )
 
     return templates.TemplateResponse(
         request=request,

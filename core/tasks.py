@@ -136,6 +136,8 @@ async def run_background_script(
             raise ValueError(f"Workflow '{agent_name}' is missing rel_path configuration.")
             
         script_dir = (base_dir / rel_path).resolve()
+        if not script_dir.is_relative_to(base_dir):
+            raise ValueError(f"Invalid rel_path '{rel_path}': escapes base directory.")
         entrypoint = config_data.get("entrypoint")
         if not entrypoint:
             raise ValueError(f"Workflow '{agent_name}' is missing entrypoint configuration.")

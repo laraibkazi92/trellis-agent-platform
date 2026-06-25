@@ -39,13 +39,9 @@ def _get_encryption_key() -> bytes:
 def _encrypt_string(plaintext: str) -> str:
     if not plaintext:
         return plaintext
-    try:
-        from cryptography.fernet import Fernet
-        f = Fernet(_get_encryption_key())
-        return f.encrypt(plaintext.encode('utf-8')).decode('utf-8')
-    except Exception as e:
-        logger.error(f"Encryption failed: {e}")
-        return plaintext
+    from cryptography.fernet import Fernet
+    f = Fernet(_get_encryption_key())
+    return f.encrypt(plaintext.encode('utf-8')).decode('utf-8')
 
 def _decrypt_string(ciphertext: str) -> str:
     if not ciphertext:
@@ -55,7 +51,8 @@ def _decrypt_string(ciphertext: str) -> str:
         f = Fernet(_get_encryption_key())
         return f.decrypt(ciphertext.encode('utf-8')).decode('utf-8')
     except Exception:
-        # Fallback if the string was not encrypted or key is wrong
+        # Fallback for values stored before encryption was introduced
+        logger.warning("Decryption failed — returning value as-is (may be unencrypted legacy data)")
         return ciphertext
 
 def retry_etcd(max_retries=10, delay=2):
@@ -726,7 +723,7 @@ class AuthMiddleware:
             path = scope.get("path", "")
             normalized_path = re.sub(r'/+', '/', path)
             
-            protected_prefixes = ("/v1/chat/completions", "/sse", "/messages", "/mcp")
+            protected_prefixes = ("/v1/", "/sse", "/messages", "/mcp")
             if any(normalized_path.startswith(prefix) for prefix in protected_prefixes):
                 headers = dict(scope.get("headers", []))
                 auth_header = headers.get(b"authorization", b"").decode("utf-8", errors="ignore")
@@ -753,12 +750,6 @@ class AuthMiddleware:
                     user_id = None
                 
                 if not user_id:
-                    if self.dev_mode:
-                        auth_token_var.set("dev-token")
-                        user_id_var.set("dev-user-id")
-                        scope["state"] = scope.get("state", {})
-                        scope["state"]["user_id"] = "dev-user-id"
-                        return await self.app(scope, receive, send)
                     await self._send_error(scope, send, 401, b'{"error": "Invalid API Key"}')
                     return
                     
@@ -810,5 +801,15 @@ def get_identity_mgr():
     return identity_mgr
 
 async def get_current_user(request: Request):
-    """Helper to get the current user from the session."""
-    return request.session.get('user')
+    """Helper to get the current user from the session, enforcing ban status."""
+    user = request.session.get('user')
+    if not user:
+        return None
+    user_id = user.get('sub')
+    if user_id:
+        from core.dependencies import identity_mgr
+        db_user = await asyncio.to_thread(identity_mgr.get_user, user_id)
+        if db_user and db_user.get('is_banned'):
+            request.session.clear()
+            return None
+    return user

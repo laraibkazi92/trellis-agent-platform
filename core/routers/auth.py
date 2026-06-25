@@ -4,8 +4,9 @@ from fastapi import APIRouter, Request, Depends
 from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import oauth, identity_mgr, HAS_GITHUB_AUTH, HAS_OIDC_AUTH, templates, ALLOWED_DOMAINS
 
-def require_auth(request: Request):
-    user = request.session.get('user')
+async def require_auth(request: Request):
+    from core.auth import get_current_user
+    user = await get_current_user(request)
     if not user:
         return RedirectResponse(url='/login')
     return user

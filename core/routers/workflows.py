@@ -1,5 +1,6 @@
 import json
 import asyncio
+import secrets as secrets_module
 import yaml
 from typing import Dict, Any, List, Optional, Literal
 from fastapi import APIRouter, Request, Form
@@ -168,7 +169,10 @@ async def configure_background_agent_secrets(request: Request, agent_name: str):
     user = await get_current_user(request)
     if not user:
         return RedirectResponse(url='/login')
-        
+    if not is_admin(request):
+        request.session["flash_msg"] = "Admin access required."
+        return RedirectResponse(url='/workflows', status_code=303)
+
     form = await request.form()
     
     config = await asyncio.to_thread(identity_mgr.get_agent_config, agent_name)
@@ -385,7 +389,13 @@ async def update_background_trigger(request: Request):
             trigger["expression"] = parts if len(parts) > 1 else (parts[0] if parts else "")
         elif validated_data.trigger_type == "webhook":
             trigger["provider"] = validated_data.webhook_provider or "generic"
-            trigger["secret"] = validated_data.webhook_secret or "secret"
+            webhook_secret = validated_data.webhook_secret or secrets_module.token_hex(32)
+            trigger["secret"] = webhook_secret
+            if not validated_data.webhook_secret:
+                request.session["flash_msg"] = (
+                    f"No webhook secret provided — a random secret was generated: {webhook_secret}  "
+                    f"Copy this value and configure it in your webhook provider."
+                )
         config_data["trigger"] = trigger
     elif validated_data.trigger_type == "none" and "trigger" in config_data:
         del config_data["trigger"]

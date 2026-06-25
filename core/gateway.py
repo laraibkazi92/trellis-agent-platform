@@ -232,17 +232,6 @@ async def use_agent(agent_name: str, prompt: str) -> str:
     except Exception as e:
         return f"SYSTEM: Failed to connect to agent '{agent_name}': {str(e)}"
 
-@mcp.tool()
-async def auto_select(prompt: str) -> str:
-    """Automatically pick the best agent for a request and run it.
-
-    Hands the request to the Supervisor, which searches for the most relevant
-    specialized agent(s) and delegates to them. Use this when you don't know which
-    agent to call — it routes for you. To target a specific agent yourself, use
-    `search_agents` then `use_agent` instead.
-    """
-    return await use_agent("supervisor", prompt)
-
 if __name__ == "__main__":
     app = mcp.http_app()
     app.add_middleware(AuthMiddleware, identity_mgr=identity_mgr)

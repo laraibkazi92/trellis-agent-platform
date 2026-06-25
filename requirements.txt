@@ -33,3 +33,5 @@ pydantic-ai-backend[console]
 pydantic-ai-shields
 pydantic-ai-rlm
 hindsight-client
+json-repair
+nh3

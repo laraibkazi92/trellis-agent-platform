@@ -8,14 +8,24 @@ Agents are the core compute units of Trellis. Each agent combines an LLM model w
 
 ### Via REST API (OpenAI-compatible)
 
-The Universal Agent Host (`core/host.py`, port 8000) exposes an OpenAI-compatible chat completions endpoint. Specify the agent by name in the `model` field.
+The Universal Agent Host (`core/host.py`, port 8000) exposes an OpenAI-compatible chat completions endpoint. Specify the agent by name in the `model` field. Omitting `model` (or passing `"auto"`) routes the request through the supervisor, which picks the best agent automatically.
 
 ```bash
+# Target a specific agent
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -d '{
     "model": "troubleshooting-agent",
+    "messages": [{"role": "user", "content": "Check status of tenant acme-corp"}]
+  }'
+
+# Let the framework auto-route (model defaults to "auto")
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{
+    "model": "auto",
     "messages": [{"role": "user", "content": "Check status of tenant acme-corp"}]
   }'
 ```
@@ -34,13 +44,12 @@ claude mcp add --transport http trellis http://localhost:8002/mcp \
   --header "Authorization: Bearer YOUR_API_KEY"
 ```
 
-The gateway exposes three tools (it does **not** create one tool per agent, so it scales to large fleets):
+The gateway exposes two tools (it does **not** create one tool per agent, so it scales to large fleets):
 
 - **`search_agents(query, limit)`** — semantic search over the fleet; returns a ranked shortlist of relevant agents (`name`, `description`). Use this to discover who can handle a task.
 - **`use_agent(agent_name, prompt)`** — run a specific agent.
-- **`auto_select(prompt)`** — let the framework route for you: hands the request to the **supervisor**, which searches the fleet and delegates to the best-matching agent(s).
 
-Typical flow: call `search_agents` to find the right agent, then `use_agent` to run it — or just call `auto_select` and let the supervisor decide.
+Typical flow: call `search_agents` to find the right agent, then `use_agent` to run it. To let the framework decide, call `use_agent("supervisor", prompt)` — the supervisor searches the fleet and delegates to the best-matching agent(s).
 
 ### Listing Available Agents
 

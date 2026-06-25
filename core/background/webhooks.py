@@ -2,6 +2,7 @@ import hmac
 import hashlib
 import json
 import logging
+import time
 from typing import Optional, Dict, Any, Callable
 from fastapi import APIRouter, Request, HTTPException, Depends
 from core.auth import IdentityManager
@@ -92,7 +93,14 @@ def validate_slack(payload_body: bytes, secret: str, request: Request) -> bool:
     timestamp = request.headers.get("X-Slack-Request-Timestamp")
     if not signature or not timestamp:
         return False
-    
+
+    # Reject requests older than 5 minutes to prevent replay attacks
+    try:
+        if abs(time.time() - float(timestamp)) > 300:
+            return False
+    except (ValueError, TypeError):
+        return False
+
     # Slack signature requires concatenating version, timestamp, and body
     sig_basestring = f"v0:{timestamp}:{payload_body.decode('utf-8')}".encode('utf-8')
     hash_object = hmac.new(secret.encode('utf-8'), msg=sig_basestring, digestmod=hashlib.sha256)

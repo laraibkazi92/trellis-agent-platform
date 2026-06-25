@@ -85,7 +85,10 @@ class MemoryManager:
 
     def _recall_sync(self, bank: str, query: str, limit: int) -> str:
         client = self._get_client()
-        resp = client.recall(bank_id=bank, query=query)
+        try:
+            resp = client.recall(bank_id=bank, query=query, top_k=limit)
+        except TypeError:
+            resp = client.recall(bank_id=bank, query=query)
 
         # Response shape: object with `.results` (list of RecallResult), or a bare list.
         results = getattr(resp, "results", None)

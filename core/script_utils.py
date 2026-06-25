@@ -21,16 +21,18 @@ def run_local_tool(tool_name: str, kwargs: dict) -> dict:
             
         base_dir = Path(__file__).parent.parent
         tool_dir = (base_dir / rel_path).resolve()
-        
+        if not tool_dir.is_relative_to(base_dir):
+            return {"success": False, "error": f"Tool '{tool_name}' has invalid path: escapes base directory."}
+
         entrypoint = tool_config.get("entrypoint")
         runtime = tool_config.get("runtime", "python")
-        
+
         if not entrypoint:
             return {"success": False, "error": f"Tool '{tool_name}' missing entrypoint."}
-            
+
         entrypoint_path = (tool_dir / entrypoint).resolve()
-        if not entrypoint_path.is_file():
-            return {"success": False, "error": f"Tool entrypoint '{entrypoint_path}' not found."}
+        if not entrypoint_path.is_relative_to(tool_dir) or not entrypoint_path.is_file():
+            return {"success": False, "error": f"Tool entrypoint not found or outside tool directory."}
             
         if runtime == "python":
             cmd = ["python", str(entrypoint_path)]

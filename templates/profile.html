@@ -228,7 +228,7 @@
     // Ensure active tab on load is correct
     document.addEventListener('DOMContentLoaded', () => {
         const urlParams = new URLSearchParams(window.location.search);
-        let activeTab = urlParams.get('tab') || '{{ active_tab }}' || 'details';
+        let activeTab = urlParams.get('tab') || {{ active_tab | tojson }} || 'details';
         if (activeTab === 'metrics') {
             activeTab = 'details';
         }

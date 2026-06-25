@@ -28,12 +28,13 @@ from core.tasks import run_background_agent
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _main_loop, _watch_id, _agent_watch_id
+    global _main_loop, _watch_id, _agent_watch_id, _memory_watch_id
     print("Worker starting up...")
     _main_loop = asyncio.get_running_loop()
     app.state.http_client = httpx.AsyncClient(timeout=30.0)
     _watch_id = identity_mgr.client.add_watch_prefix_callback("/registry/mcps/", on_mcp_change)
     _agent_watch_id = identity_mgr.client.add_watch_prefix_callback("/registry/agents/", on_agent_change)
+    _memory_watch_id = identity_mgr.client.add_watch_prefix_callback("/config/framework/agent_memory_enabled", on_memory_flag_change)
     await get_hub_client()
     await discover_external_mcps()
     asyncio.create_task(prewarm_agents())
@@ -44,6 +45,8 @@ async def lifespan(app: FastAPI):
         identity_mgr.client.cancel_watch(_watch_id)
     if _agent_watch_id:
         identity_mgr.client.cancel_watch(_agent_watch_id)
+    if _memory_watch_id:
+        identity_mgr.client.cancel_watch(_memory_watch_id)
     hub_client = await get_hub_client()
     if hub_client:
         await hub_client.__aexit__(None, None, None)
@@ -94,12 +97,13 @@ class ChatMessage(BaseModel):
     content: str
 
 class ChatRequest(BaseModel):
-    model: str
+    model: str = "auto"
     messages: List[ChatMessage]
 
 _main_loop: Optional[asyncio.AbstractEventLoop] = None
 _watch_id: Any = None
 _agent_watch_id: Any = None
+_memory_watch_id: Any = None
 
 def on_mcp_change(event):
     for ev in event.events:
@@ -122,6 +126,21 @@ def on_agent_change(event):
         # key format: /registry/agents/{name}/...
         if len(parts) >= 4:
             evict_agent(parts[3])
+
+
+def on_memory_flag_change(event):
+    """Evict all cached agents when the agent_memory_enabled flag toggles.
+
+    When the flag is disabled: F-01's runtime guard stops recall immediately;
+    eviction ensures agents also rebuild cleanly on next request.
+    When the flag is enabled: eviction forces a rebuild so agents with
+    agent_memory=true get their @agent.instructions callback wired in.
+    """
+    from core.agent_factory import _agent_cache
+    for name in list(_agent_cache.keys()):
+        evict_agent(name)
+    if _main_loop and not _main_loop.is_closed():
+        asyncio.run_coroutine_threadsafe(prewarm_agents(), _main_loop)
 
 @app.get("/health")
 async def health():
@@ -147,6 +166,9 @@ async def health():
 async def chat_completions(request: ChatRequest):
     if not request.messages or request.messages[-1].role != "user":
         raise HTTPException(status_code=400, detail="Invalid messages")
+
+    if request.model == "auto":
+        request = ChatRequest(model="supervisor", messages=request.messages)
 
     disabled = identity_mgr.get_disabled_standard_agents()
     if request.model in disabled:

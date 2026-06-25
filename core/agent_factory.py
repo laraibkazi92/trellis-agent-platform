@@ -340,6 +340,8 @@ async def build_agent(agent_name: str) -> Agent:
 
         @agent.instructions
         async def _recall_memory(ctx: RunContext[None]) -> str:
+            if not memory_mgr.is_globally_enabled():
+                return ""
             query = _latest_user_text(ctx)
             if not query:
                 return ""

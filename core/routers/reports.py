@@ -269,8 +269,16 @@ async def view_report(request: Request, report_path: str):
         
     if target_path.exists() and target_path.is_file():
         return FileResponse(
-            path=target_path, 
-            media_type="text/html"
+            path=target_path,
+            media_type="text/html",
+            headers={
+                "Content-Security-Policy": (
+                    "default-src 'none'; "
+                    "style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; "
+                    "font-src 'self'; "
+                    "img-src 'self' data:;"
+                )
+            }
         )
     else:
         request.session["flash_msg"] = "Error: Report file not found."

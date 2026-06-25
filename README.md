@@ -41,14 +41,24 @@ python scripts/sync_to_db.py
 Navigate to **http://localhost:8080** to access the Dashboard UI. Here you can review active agents, tools, and configure your API Keys and Tool Secrets.
 
 ### 5. API Usage
-Endpoints under `/v1/chat/completions`, `/mcp`, and `/sse` require `Bearer` token authentication (unless `DEV_MODE=true` is set).
+All `/v1/` endpoints, `/mcp`, and `/sse` require `Bearer` token authentication (unless `DEV_MODE=true` is set).
 
 ```bash
+# Target a specific agent
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -d '{
-    "model": "supervisor",
+    "model": "troubleshooting-agent",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+
+# Auto-route — omit model or pass "auto" to let the supervisor pick
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{
+    "model": "auto",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
 ```
