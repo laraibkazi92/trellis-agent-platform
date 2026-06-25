@@ -80,7 +80,8 @@ from core.agent_factory import (
     get_identity_manager,
     get_health_monitor,
     mcp_client_cache,
-    _hub_client
+    _hub_client,
+    SupervisorDeps,
 )
 from core.memory import get_memory_manager
 
@@ -191,14 +192,18 @@ async def chat_completions(request: ChatRequest):
         elif msg.role == "system": history.append(ModelRequest(parts=[UserPromptPart(content=f"[System Note]: {msg.content}")]))
     
     try:
-        result = await agent.run(request.messages[-1].content, message_history=history)
+        run_deps = SupervisorDeps() if request.model == "supervisor" else None
+        result = await agent.run(request.messages[-1].content, message_history=history, deps=run_deps)
         health_monitor.record_event("agent", request.model, is_success=True)
         user_id = user_id_var.get()
-        if user_id and hasattr(result, 'usage') and result.usage():
-            u = result.usage()
-            # Send usage to a background thread to not block return
-            asyncio.create_task(asyncio.to_thread(identity_mgr.record_usage, user_id, u.request_tokens or 0, u.response_tokens or 0))
-            asyncio.create_task(asyncio.to_thread(identity_mgr.record_agent_usage, user_id, request.model, u.request_tokens or 0, u.response_tokens or 0))
+        if user_id and hasattr(result, 'usage'):
+            u = result.usage
+            if callable(u):
+                u = u()
+            if u:
+                # Send usage to a background thread to not block return
+                asyncio.create_task(asyncio.to_thread(identity_mgr.record_usage, user_id, u.input_tokens or 0, u.output_tokens or 0))
+                asyncio.create_task(asyncio.to_thread(identity_mgr.record_agent_usage, user_id, request.model, u.input_tokens or 0, u.output_tokens or 0))
         # Agent memory: retain this exchange (fire-and-forget; gated + fail-open internally).
         memory_mgr = get_memory_manager()
         if memory_mgr.active_for(cfg_data):

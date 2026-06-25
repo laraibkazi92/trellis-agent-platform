@@ -1,7 +1,7 @@
 pydantic>=2.0.0
 pyyaml
 fastapi
-pydantic-ai[gemini]
+pydantic-ai[gemini]==2.0.0
 google-genai
 mcp[all]
 fastmcp

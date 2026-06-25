@@ -303,24 +303,24 @@ async def run_background_agent(
                 usage = usage()
             if usage:
                 usage_data = {
-                    "request_tokens": usage.request_tokens or 0,
-                    "response_tokens": usage.response_tokens or 0,
-                    "total_tokens": (usage.request_tokens or 0) + (usage.response_tokens or 0)
+                    "request_tokens": usage.input_tokens or 0,
+                    "response_tokens": usage.output_tokens or 0,
+                    "total_tokens": (usage.input_tokens or 0) + (usage.output_tokens or 0)
                 }
                 try:
                     await asyncio.to_thread(
                         identity_mgr.record_usage, 
                         user_id, 
-                        usage.request_tokens or 0, 
-                        usage.response_tokens or 0
+                        usage.input_tokens or 0, 
+                        usage.output_tokens or 0
                     )
                     # Support metric recording per-agent for observability
                     await asyncio.to_thread(
                         identity_mgr.record_agent_usage,
                         user_id,
                         agent_name,
-                        usage.request_tokens or 0,
-                        usage.response_tokens or 0
+                        usage.input_tokens or 0,
+                        usage.output_tokens or 0
                     )
                 except Exception as e:
                     print(f"Failed to record token usage for {user_id}: {e}")
