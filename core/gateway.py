@@ -67,7 +67,7 @@ async def get_agent_description(config: dict, skills_path: Path) -> str:
         pass
     return "No description available."
 
-async def _get_visible_agents() -> List[Dict[str, str]]:
+async def _get_visible_agents() -> List[Dict]:
     """Internal: agents visible to the current user, with health-decorated descriptions.
 
     Applies the same filtering the old public ``list_agents`` tool did (disabled /
@@ -111,14 +111,6 @@ async def _get_visible_agents() -> List[Dict[str, str]]:
         if agent_name in disabled_agents:
             continue
             
-        if agent_name == "supervisor":
-            description = "Intelligent routing agent."
-            status = agent_info.get("status", "Online")
-            if status == "Offline":
-                description += " [STATUS: OFFLINE]"
-            agents.append({"name": agent_name, "description": description})
-            continue
-
         agent_dict = agent_lookup.get(agent_name)
         if not agent_dict:
             continue
@@ -126,54 +118,69 @@ async def _get_visible_agents() -> List[Dict[str, str]]:
         if agent_dict.get("type") in ("background_agent", "background_script"):
             continue
             
-        if not agent_dict.get("is_configured", False):
-            continue
-            
+        is_configured = agent_dict.get("is_configured", False)
+
         description = agent_dict.get("description") or "No description available."
-        
+
         if not description or description == "No description available.":
             skills = agent_dict.get("skills", "")
             paragraphs = [p.strip() for p in skills.split("\n\n") if p.strip() and not p.strip().startswith("#")]
             if paragraphs:
                 description = paragraphs[0]
-                
-        status = agent_info.get("status", "Online")
-        offline_tools = agent_info.get("offline_tools", [])
-        
-        if status == "Offline":
-            description += " [STATUS: OFFLINE - DO NOT ROUTE REQUESTS HERE]"
-        elif status == "Degraded":
-            description += f" [STATUS: DEGRADED - Offline tools: {', '.join(offline_tools)}]"
-            
+
+        if not is_configured:
+            missing = []
+            if agent_dict.get("missing_secrets"):
+                missing.append(f"secrets: {', '.join(agent_dict['missing_secrets'])}")
+            if agent_dict.get("missing_variables"):
+                missing.append(f"variables: {', '.join(agent_dict['missing_variables'])}")
+            config_note = f" [NOT CONFIGURED — missing {'; '.join(missing)}. Configure at /agents/{agent_name}/configure]" if missing else " [NOT CONFIGURED — configure at /agents/{agent_name}/configure]"
+            description += config_note
+        else:
+            status = agent_info.get("status", "Online")
+            offline_tools = agent_info.get("offline_tools", [])
+            if status == "Offline":
+                description += " [STATUS: OFFLINE - DO NOT ROUTE REQUESTS HERE]"
+            elif status == "Degraded":
+                description += f" [STATUS: DEGRADED - Offline tools: {', '.join(offline_tools)}]"
+
         agents.append({
             "name": agent_name,
-            "description": description
+            "description": description,
+            "configured": is_configured,
         })
         
     return agents
 
 @mcp.tool()
-async def search_agents(query: str, limit: int = AGENT_SEARCH_LIMIT) -> List[Dict[str, str]]:
+async def search_agents(query: str, limit: int = AGENT_SEARCH_LIMIT) -> List[Dict]:
     """Find the agents most relevant to a request.
 
     Use this to discover which specialized agent(s) can handle a task, then call the
-    chosen one with `use_agent`. Returns a short, ranked list of `{name, description}` —
-    not the full catalog — so it scales to large numbers of agents.
+    chosen one with `use_agent`. Returns a short, ranked list of
+    `{name, description, configured}` — not the full catalog — so it scales to large
+    numbers of agents.
+
+    Unconfigured agents are included with `configured: false` and a note in their
+    description listing the missing credentials and a configure URL. Only call
+    `use_agent` on agents where `configured` is true.
     """
     visible = await _get_visible_agents()
-    # _get_visible_agents already drops the supervisor's offline marker etc.; keep its
-    # (health-decorated) descriptions, but order/limit by semantic relevance.
-    visible_by_name = {a["name"]: a for a in visible if a["name"] != "supervisor"}
+    visible_by_name = {a["name"]: a for a in visible}
     if not visible_by_name:
         return []
 
     ranked = await _search_agents_ranked(query, limit=0, include_disabled=False)
 
-    results: List[Dict[str, str]] = []
+    results: List[Dict] = []
     for r in ranked:
         agent = visible_by_name.get(r["name"])
         if agent:
-            results.append({"name": agent["name"], "description": agent["description"]})
+            results.append({
+                "name": agent["name"],
+                "description": agent["description"],
+                "configured": agent.get("configured", True),
+            })
             if len(results) >= limit:
                 break
     return results

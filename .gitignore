@@ -8,3 +8,4 @@ test_*.py
 .git_local_credentials
 
 workspace/reports/
+*.playwright*

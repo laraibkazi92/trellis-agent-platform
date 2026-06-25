@@ -17,6 +17,9 @@ from fastmcp import Client as FastMCPClient
 from fastmcp.client import StdioTransport, SSETransport, StreamableHttpTransport
 
 from subagents_pydantic_ai import SubAgentCapability, SubAgentConfig
+from subagents_pydantic_ai.registry import DynamicAgentRegistry
+from subagents_pydantic_ai.toolset import create_subagent_toolset
+from subagents_pydantic_ai.types import CompiledSubAgent
 from pydantic_ai_backends import ConsoleCapability, LocalBackend
 from pydantic_ai_shields import CostTracking, ToolGuard
 from pydantic_ai_rlm import create_rlm_toolset
@@ -39,6 +42,45 @@ mcp_client_cache = TTLCache(maxsize=100, ttl=300)
 # and concurrent requests. Invalidated per-agent via etcd watch in host.py.
 _agent_cache: Dict[str, Agent] = {}
 _agent_locks: Dict[str, asyncio.Lock] = {}
+
+class SupervisorDeps:
+    """Minimal deps for the supervisor agent satisfying SubAgentDepsProtocol."""
+    def __init__(self):
+        self.subagents: Dict[str, Any] = {}
+        self._subagent_state: Dict[str, Any] = {}
+
+    def clone_for_subagent(self, max_depth: int = 0) -> "SupervisorDeps":
+        return SupervisorDeps()
+
+
+class FrameworkAgentRegistry(DynamicAgentRegistry):
+    """DynamicAgentRegistry backed by the framework's agent cache.
+
+    Overrides get_compiled() to return None for disabled or offline agents so
+    the supervisor's task() tool never routes to them.
+    """
+    def __init__(self, identity_mgr: "IdentityManager", health_monitor: "HealthMonitor"):
+        super().__init__()
+        self._identity_mgr = identity_mgr
+        self._health_monitor = health_monitor
+
+    def get_compiled(self, name: str) -> Optional[CompiledSubAgent]:
+        if name in self._identity_mgr.get_disabled_standard_agents():
+            return None
+        if self._health_monitor.get_status("agent", name).get("status") == "Offline":
+            return None
+        return super().get_compiled(name)
+
+
+_supervisor_registry: Optional[FrameworkAgentRegistry] = None
+
+
+def get_supervisor_registry() -> FrameworkAgentRegistry:
+    global _supervisor_registry
+    if _supervisor_registry is None:
+        _supervisor_registry = FrameworkAgentRegistry(get_identity_manager(), get_health_monitor())
+    return _supervisor_registry
+
 
 _identity_mgr: Optional[IdentityManager] = None
 def get_identity_manager() -> IdentityManager:
@@ -236,17 +278,19 @@ def _register_mcp_tool(agent: Agent, mcp_tool: Any):
 def _register_external_mcp_tool(agent: Agent, mcp_name: str, mcp_tool: Any, prefixed_name: str = None):
     safe_mcp_tool = copy.deepcopy(mcp_tool) if hasattr(mcp_tool, "model_copy") else mcp_tool
     tool_name_for_agent = prefixed_name or safe_mcp_tool.name
-    
+
     async def tool_wrapper(ctx: RunContext[None], **kwargs: Any) -> Any:
         health_monitor = get_health_monitor()
         if health_monitor.get_status("tool", safe_mcp_tool.name).get("status") == "Offline":
             return "SYSTEM: Tool offline."
         user_id = user_id_var.get()
         if not user_id: raise Exception("No user_id found")
-        
-        client = await get_external_mcp_client(mcp_name, user_id)
-        result = await client.call_tool(safe_mcp_tool.name, kwargs)
-        return result.content
+        try:
+            client = await get_external_mcp_client(mcp_name, user_id)
+            result = await client.call_tool(safe_mcp_tool.name, kwargs)
+            return result.content
+        except Exception as e:
+            return f"Tool '{safe_mcp_tool.name}' returned an error: {e}"
 
     input_schema = getattr(safe_mcp_tool, "inputSchema", None) or getattr(safe_mcp_tool, "input_schema", None)
     if input_schema:
@@ -306,7 +350,7 @@ async def build_agent(agent_name: str) -> Agent:
         if blocked_console_tools:
             capabilities.append(ToolGuard(blocked=blocked_console_tools))
             
-    # 4. A2A Delegation (non-supervisor agents only; supervisor uses delegate() tool instead)
+    # 4. A2A Delegation (non-supervisor agents only; supervisor uses subagents-pydantic-ai toolset instead)
     subagent_configs = []
     for target in config.a2a_access or []:
         target_cfg = await asyncio.to_thread(identity_mgr.get_agent_config, target)
@@ -320,6 +364,16 @@ async def build_agent(agent_name: str) -> Agent:
 
     if subagent_configs:
         capabilities.append(SubAgentCapability(subagents=subagent_configs, default_model=config.model))
+
+    # 5. Supervisor delegation toolset — task/check_task/wait_tasks/cancel etc.
+    if agent_name == "supervisor":
+        toolsets.append(create_subagent_toolset(
+            subagents=[],
+            include_general_purpose=False,
+            default_model=config.model,
+            max_nesting_depth=0,
+            registry=get_supervisor_registry(),
+        ))
 
     agent = Agent(
         model,
@@ -383,12 +437,24 @@ async def get_agent(agent_name: str) -> Agent:
             return _agent_cache[agent_name]
         agent = await build_agent(agent_name)
         _agent_cache[agent_name] = agent
+        if agent_name != "supervisor":
+            identity_mgr = get_identity_manager()
+            cfg = await asyncio.to_thread(identity_mgr.get_agent_config, agent_name)
+            description = (cfg or {}).get("description", "")
+            registry = get_supervisor_registry()
+            if not registry.exists(agent_name):
+                registry.register(
+                    SubAgentConfig(name=agent_name, description=description, instructions=""),
+                    agent,
+                )
         return agent
 
 
 def evict_agent(agent_name: str) -> None:
     """Remove an agent from the cache (called from etcd watch thread — must be sync)."""
     _agent_cache.pop(agent_name, None)
+    if agent_name != "supervisor" and _supervisor_registry is not None:
+        _supervisor_registry.remove(agent_name)
 
 
 async def prewarm_agents() -> None:
@@ -417,58 +483,39 @@ def _register_admin_tools(agent: Agent):
         name="search_agents",
         description=(
             "Find the specialized agents most relevant to a request. Returns a ranked "
-            "shortlist of {name, description, status}. Use this to pick an agent name, "
-            "then call delegate(agent_name, prompt) to run it. Does not return the full "
-            "catalog — search with a focused query."
+            "shortlist of {name, description, status, configured}. Use this to pick an "
+            "agent name, then call task(subagent_type, description) to run it. "
+            "Agents with configured=false are missing credentials — do not delegate to them. "
+            "Disabled agents (status='disabled') can be re-enabled with manage_agent. "
+            "Does not return the full catalog — search with a focused query."
         ),
     )
-    async def search_agents(query: str, limit: int = 8) -> List[Dict[str, str]]:
+    async def search_agents(query: str, limit: int = 8) -> List[Dict]:
         from core.agent_search import search_agents as _search
+        from core.discovery import discover_agents
         # include_disabled=True so manage_agent can still locate disabled agents to re-enable.
-        return await _search(query, limit=limit, include_disabled=True)
-
-    @agent.tool_plain(
-        name="delegate",
-        description=(
-            "Run a specialized agent by name and return its response. "
-            "Use search_agents first to find the right agent name, then call this. "
-            "Inherits the current user's identity — no separate auth needed."
-        ),
-    )
-    async def delegate(agent_name: str, prompt: str) -> str:
-        if agent_name == "supervisor":
-            return "SYSTEM: Cannot delegate to supervisor."
-        identity_mgr_inner = get_identity_manager()
-        cfg = await asyncio.to_thread(identity_mgr_inner.get_agent_config, agent_name)
-        if not cfg:
-            return f"SYSTEM: Agent '{agent_name}' not found."
-        if cfg.get("type") in ("background_agent", "background_script"):
-            return f"SYSTEM: '{agent_name}' is a background agent and cannot be called directly."
-        disabled = identity_mgr_inner.get_disabled_standard_agents()
-        if agent_name in disabled:
-            return f"SYSTEM: Agent '{agent_name}' is disabled."
-        health_monitor_inner = get_health_monitor()
-        if health_monitor_inner.get_status("agent", agent_name).get("status") == "Offline":
-            return f"SYSTEM: Agent '{agent_name}' is offline."
+        results = await _search(query, limit=limit, include_disabled=True)
         user_id = user_id_var.get()
-        if user_id:
-            config_status = await is_agent_configured(agent_name, user_id)
-            if not config_status["configured"]:
-                parts = [f"SYSTEM: Agent '{agent_name}' requires configuration before it can be used."]
-                if config_status["missing_secrets"]:
-                    parts.append(f"Missing secrets: {', '.join(config_status['missing_secrets'])}.")
-                if config_status["missing_variables"]:
-                    parts.append(f"Missing variables: {', '.join(config_status['missing_variables'])}.")
-                parts.append(f"Configure it at: /agents/{agent_name}/configure")
-                return " ".join(parts)
-        try:
-            sub_agent = await get_agent(agent_name)
-            result = await sub_agent.run(prompt)
-            health_monitor_inner.record_event("agent", agent_name, is_success=True)
-            return result.output
-        except Exception as e:
-            health_monitor_inner.record_event("agent", agent_name, is_success=False, error_details=str(e))
-            return f"SYSTEM: Error from agent '{agent_name}': {e}"
+        if user_id and results:
+            discovered = await discover_agents(user_id=user_id)
+            config_lookup = {a["name"]: a for a in discovered}
+            for r in results:
+                agent_dict = config_lookup.get(r["name"], {})
+                is_configured = agent_dict.get("is_configured", True)
+                r["configured"] = is_configured
+                if not is_configured:
+                    missing = []
+                    if agent_dict.get("missing_secrets"):
+                        missing.append(f"secrets: {', '.join(agent_dict['missing_secrets'])}")
+                    if agent_dict.get("missing_variables"):
+                        missing.append(f"variables: {', '.join(agent_dict['missing_variables'])}")
+                    note = (
+                        f" [NOT CONFIGURED — missing {'; '.join(missing)}. Configure at /agents/{r['name']}/configure]"
+                        if missing else
+                        f" [NOT CONFIGURED — configure at /agents/{r['name']}/configure]"
+                    )
+                    r["description"] = r.get("description", "") + note
+        return results
 
     @agent.tool_plain(name="manage_agent", description="Enable, disable or reload an agent.")
     async def manage_agent(name: str, action: str) -> str:
