@@ -7,7 +7,8 @@ from typing import Dict, List
 import uvicorn
 import aiofiles
 from contextlib import asynccontextmanager
-from fastmcp import FastMCP
+from fastmcp import FastMCP, Context
+from mcp.types import ToolAnnotations
 from core.auth import AuthMiddleware, IdentityManager, auth_token_var, user_id_var
 from fastapi.middleware.cors import CORSMiddleware
 from core.discovery import discover_agents, is_agent_configured
@@ -152,8 +153,11 @@ async def _get_visible_agents() -> List[Dict]:
         
     return agents
 
-@mcp.tool()
-async def search_agents(query: str, limit: int = AGENT_SEARCH_LIMIT) -> List[Dict]:
+@mcp.tool(
+    title="Search Agents",
+    annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True),
+)
+async def search_agents(ctx: Context, query: str, limit: int = AGENT_SEARCH_LIMIT) -> List[Dict]:
     """Find the agents most relevant to a request.
 
     Use this to discover which specialized agent(s) can handle a task, then call the
@@ -164,12 +168,20 @@ async def search_agents(query: str, limit: int = AGENT_SEARCH_LIMIT) -> List[Dic
     Unconfigured agents are included with `configured: false` and a note in their
     description listing the missing credentials and a configure URL. Only call
     `use_agent` on agents where `configured` is true.
+
+    Args:
+        query: Natural-language description of the task or topic to find agents for.
+        limit: Maximum number of agents to return (default: 5).
     """
+    await ctx.report_progress(0, 2, message=f"Searching agents for: '{query}'")
+
     visible = await _get_visible_agents()
     visible_by_name = {a["name"]: a for a in visible}
     if not visible_by_name:
+        await ctx.report_progress(2, 2, message="No agents are currently available.")
         return []
 
+    await ctx.report_progress(1, 2, message="Ranking results...")
     ranked = await _search_agents_ranked(query, limit=0, include_disabled=False)
 
     results: List[Dict] = []
@@ -183,14 +195,31 @@ async def search_agents(query: str, limit: int = AGENT_SEARCH_LIMIT) -> List[Dic
             })
             if len(results) >= limit:
                 break
+
+    names = [r["name"] for r in results]
+    await ctx.report_progress(2, 2, message=f"Found {len(results)} agent(s): {', '.join(names) if names else 'none'}")
     return results
 
-@mcp.tool()
-async def use_agent(agent_name: str, prompt: str) -> str:
-    """Call a specific agent with a prompt."""
+@mcp.tool(
+    title="Use Agent",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
+)
+async def use_agent(ctx: Context, agent_name: str, prompt: str) -> str:
+    """Call a specific agent with a prompt and return its response.
+
+    Always call `search_agents` first to confirm the agent name and that it is
+    configured. Do not guess agent names.
+
+    Args:
+        agent_name: Exact name of the agent to call (from `search_agents`).
+        prompt: The full, self-contained request to send to the agent.
+    """
     token = auth_token_var.get()
     user_id = user_id_var.get()
-    
+
+    prompt_preview = prompt[:150] + "..." if len(prompt) > 150 else prompt
+    await ctx.report_progress(1, 3, message=f"Routing to agent: {agent_name} — \"{prompt_preview}\"")
+
     if agent_name != "supervisor":
         try:
             status = await is_agent_configured(agent_name, user_id)
@@ -205,10 +234,12 @@ async def use_agent(agent_name: str, prompt: str) -> str:
         except Exception as e:
             print(f"Error checking agent configuration for '{agent_name}': {e}")
             return f"SYSTEM: Error checking agent configuration for '{agent_name}': {e}"
-            
+
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+
+    await ctx.report_progress(2, 3, message=f"Calling {agent_name}...")
 
     try:
         req_kwargs = {
@@ -219,17 +250,19 @@ async def use_agent(agent_name: str, prompt: str) -> str:
             "headers": headers,
             "timeout": 60.0
         }
-        
+
         if hasattr(app, "state") and hasattr(app.state, "http_client"):
             client = app.state.http_client
             response = await client.post(f"{HOST_URL}/v1/chat/completions", **req_kwargs)
         else:
             async with httpx.AsyncClient() as client:
                 response = await client.post(f"{HOST_URL}/v1/chat/completions", **req_kwargs)
-                
+
         response.raise_for_status()
         data = response.json()
-        return data["choices"][0]["message"]["content"]
+        content = data["choices"][0]["message"]["content"]
+        await ctx.report_progress(3, 3, message=f"Agent '{agent_name}' responded ({len(content)} chars)")
+        return content
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 503:
             return f"SYSTEM: The agent '{agent_name}' is currently offline due to technical failures and cannot process requests."
