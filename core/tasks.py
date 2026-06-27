@@ -19,7 +19,7 @@ RESTRICTED_ENV_VARS = {"PATH", "PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "B
 
 # Redis broker configuration
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-broker = ListQueueBroker(redis_url)
+broker = ListQueueBroker(redis_url, socket_timeout=None)
 
 from taskiq import TaskiqScheduler, Context, TaskiqDepends
 from taskiq.schedule_sources import LabelScheduleSource
@@ -40,7 +40,7 @@ async def dynamic_cron_heartbeat():
     
     identity_mgr = get_identity_manager()
     agent_names = await asyncio.to_thread(identity_mgr.list_agents)
-    disabled_workflows = identity_mgr.get_disabled_workflows()
+    disabled_workflows = await asyncio.to_thread(identity_mgr.get_disabled_workflows)
     
     now = datetime.now()
     

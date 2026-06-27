@@ -1,3 +1,4 @@
+import json
 import os
 import yaml
 import asyncio
@@ -9,6 +10,7 @@ from cachetools import TTLCache
 import copy
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
@@ -100,6 +102,7 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     model: str = "auto"
     messages: List[ChatMessage]
+    stream: bool = False
 
 _main_loop: Optional[asyncio.AbstractEventLoop] = None
 _watch_id: Any = None
@@ -191,20 +194,21 @@ async def chat_completions(request: ChatRequest):
         elif msg.role == "assistant": history.append(ModelResponse(parts=[TextPart(content=msg.content)]))
         elif msg.role == "system": history.append(ModelRequest(parts=[UserPromptPart(content=f"[System Note]: {msg.content}")]))
     
-    try:
+    async def execute_agent():
         run_deps = SupervisorDeps() if request.model == "supervisor" else None
-        result = await agent.run(request.messages[-1].content, message_history=history, deps=run_deps)
+        return await agent.run(request.messages[-1].content, message_history=history, deps=run_deps)
+
+    captured_user_id = user_id_var.get()
+    
+    def handle_success(result, user_id):
         health_monitor.record_event("agent", request.model, is_success=True)
-        user_id = user_id_var.get()
         if user_id and hasattr(result, 'usage'):
             u = result.usage
             if callable(u):
                 u = u()
             if u:
-                # Send usage to a background thread to not block return
                 asyncio.create_task(asyncio.to_thread(identity_mgr.record_usage, user_id, u.input_tokens or 0, u.output_tokens or 0))
                 asyncio.create_task(asyncio.to_thread(identity_mgr.record_agent_usage, user_id, request.model, u.input_tokens or 0, u.output_tokens or 0))
-        # Agent memory: retain this exchange (fire-and-forget; gated + fail-open internally).
         memory_mgr = get_memory_manager()
         if memory_mgr.active_for(cfg_data):
             asyncio.create_task(memory_mgr.retain(
@@ -212,6 +216,68 @@ async def chat_completions(request: ChatRequest):
                 user_msg=request.messages[-1].content,
                 agent_output=result.output,
             ))
+
+    if request.stream:
+        async def event_generator():
+            event_queue = asyncio.Queue()
+            
+            def event_handler(event):
+                # PydanticAI streams events natively via the event_stream_handler
+                if type(event).__name__ == "ToolCallEvent":
+                    try:
+                        # Extract tool name based on the event structure
+                        if hasattr(event, "part") and hasattr(event.part, "tool_name"):
+                            event_queue.put_nowait({"status": "tool_call", "tool": event.part.tool_name})
+                    except Exception:
+                        pass
+                        
+            async def run_with_handler():
+                run_deps = SupervisorDeps() if request.model == "supervisor" else None
+                # Use run_stream to get events, but we just await the final result internally
+                # while pushing events to the queue
+                async with agent.run_stream(request.messages[-1].content, message_history=history, deps=run_deps, event_stream_handler=event_handler) as response:
+                    return await response.get_output()
+
+            task = asyncio.create_task(run_with_handler())
+            try:
+                while not task.done():
+                    try:
+                        # Wait for an event, or timeout and send a processing tick
+                        event_data = await asyncio.wait_for(event_queue.get(), timeout=5.0)
+                        yield json.dumps(event_data) + "\n"
+                    except asyncio.TimeoutError:
+                        yield json.dumps({"status": "processing"}) + "\n"
+                
+                # Task completed, get the final result text
+                final_text = task.result()
+                
+                # Mock a result object for handle_success since we only get raw text from run_stream output
+                class MockResult:
+                    def __init__(self, output):
+                        self.output = output
+                        self.usage = None # Cannot get full usage easily from stream right now
+                
+                result = MockResult(final_text)
+                handle_success(result, captured_user_id)
+                yield json.dumps({"choices": [{"message": {"role": "assistant", "content": final_text}}]}) + "\n"
+            except asyncio.CancelledError:
+                if not task.done():
+                    task.cancel()
+                raise
+            except Exception as e:
+                if not task.done():
+                    task.cancel()
+                health_monitor.record_event("agent", request.model, is_success=False, error_details=str(e))
+                yield json.dumps({"error": str(e)}) + "\n"
+            finally:
+                if not task.done():
+                    task.cancel()
+
+        return StreamingResponse(event_generator(), media_type="application/x-ndjson")
+
+    try:
+        result = await execute_agent()
+        handle_success(result, captured_user_id)
         return {"choices": [{"message": {"role": "assistant", "content": result.output}}]}
     except Exception as e:
         health_monitor.record_event("agent", request.model, is_success=False, error_details=str(e))

@@ -1,3 +1,4 @@
+import json
 import os
 import httpx
 import yaml
@@ -245,23 +246,40 @@ async def use_agent(ctx: Context, agent_name: str, prompt: str) -> str:
         req_kwargs = {
             "json": {
                 "model": agent_name,
-                "messages": [{"role": "user", "content": prompt}]
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": True
             },
             "headers": headers,
-            "timeout": 60.0
+            "timeout": httpx.Timeout(600.0, connect=10.0)
         }
 
+        async def _consume_stream(client_obj):
+            async with client_obj.stream("POST", f"{HOST_URL}/v1/chat/completions", **req_kwargs) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.strip(): continue
+                    try:
+                        data = json.loads(line)
+                        if data.get("status") == "processing":
+                            await ctx.report_progress(2, 3, message=f"Agent '{agent_name}' is thinking...")
+                        elif data.get("status") == "tool_call":
+                            await ctx.report_progress(2, 3, message=f"Agent '{agent_name}' is calling tool: {data.get('tool')}...")
+                        elif "choices" in data:
+                            return data["choices"][0]["message"]["content"]
+                        elif "error" in data:
+                            return f"SYSTEM: Agent '{agent_name}' execution failed: {data['error']}"
+                    except json.JSONDecodeError as e:
+                        print(f"Warning: Failed to parse JSON from agent stream: {e}. Raw line: {line}")
+            return f"SYSTEM: Agent '{agent_name}' returned no content."
+
         if hasattr(app, "state") and hasattr(app.state, "http_client"):
-            client = app.state.http_client
-            response = await client.post(f"{HOST_URL}/v1/chat/completions", **req_kwargs)
+            content = await _consume_stream(app.state.http_client)
         else:
             async with httpx.AsyncClient() as client:
-                response = await client.post(f"{HOST_URL}/v1/chat/completions", **req_kwargs)
+                content = await _consume_stream(client)
 
-        response.raise_for_status()
-        data = response.json()
-        content = data["choices"][0]["message"]["content"]
-        await ctx.report_progress(3, 3, message=f"Agent '{agent_name}' responded ({len(content)} chars)")
+        if not content.startswith("SYSTEM:"):
+            await ctx.report_progress(3, 3, message=f"Agent '{agent_name}' responded ({len(content)} chars)")
         return content
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 503:

@@ -78,36 +78,33 @@ class MemoryManager:
         if not query or not query.strip():
             return ""
         try:
-            return await asyncio.to_thread(self._recall_sync, bank, query, limit)
+            client = self._get_client()
+            try:
+                resp = await client.arecall(bank_id=bank, query=query, top_k=limit)
+            except TypeError:
+                resp = await client.arecall(bank_id=bank, query=query)
+
+            # Response shape: object with `.results` (list of RecallResult), or a bare list.
+            results = getattr(resp, "results", None)
+            if results is None and isinstance(resp, (list, tuple)):
+                results = resp
+            if not results:
+                return ""
+
+            lines = []
+            for r in results[:limit]:
+                text = getattr(r, "text", None)
+                if text is None and isinstance(r, dict):
+                    text = r.get("text")
+                if text:
+                    lines.append(f"- {text}")
+
+            if not lines:
+                return ""
+            return "## Relevant context from past interactions\n" + "\n".join(lines)
         except Exception as e:
             print(f"[memory] recall failed for bank='{bank}': {e}")
             return ""
-
-    def _recall_sync(self, bank: str, query: str, limit: int) -> str:
-        client = self._get_client()
-        try:
-            resp = client.recall(bank_id=bank, query=query, top_k=limit)
-        except TypeError:
-            resp = client.recall(bank_id=bank, query=query)
-
-        # Response shape: object with `.results` (list of RecallResult), or a bare list.
-        results = getattr(resp, "results", None)
-        if results is None and isinstance(resp, (list, tuple)):
-            results = resp
-        if not results:
-            return ""
-
-        lines = []
-        for r in results[:limit]:
-            text = getattr(r, "text", None)
-            if text is None and isinstance(r, dict):
-                text = r.get("text")
-            if text:
-                lines.append(f"- {text}")
-
-        if not lines:
-            return ""
-        return "## Relevant context from past interactions\n" + "\n".join(lines)
 
     # --- Retain ------------------------------------------------------------
 
@@ -116,14 +113,11 @@ class MemoryManager:
         if not user_msg or not agent_output:
             return
         try:
-            await asyncio.to_thread(self._retain_sync, bank, user_msg, agent_output)
+            client = self._get_client()
+            content = f"User asked: {user_msg}\nAgent responded: {agent_output}"
+            await client.aretain(bank_id=bank, content=content, context="conversation")
         except Exception as e:
             print(f"[memory] retain failed for bank='{bank}': {e}")
-
-    def _retain_sync(self, bank: str, user_msg: str, agent_output: str) -> None:
-        client = self._get_client()
-        content = f"User asked: {user_msg}\nAgent responded: {agent_output}"
-        client.retain(bank_id=bank, content=content, context="conversation")
 
 
 _memory_mgr: Optional[MemoryManager] = None
