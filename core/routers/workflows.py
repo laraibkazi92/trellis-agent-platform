@@ -266,6 +266,99 @@ async def cancel_background_run(request: Request, agent_name: str, run_id: str):
         
     return RedirectResponse(url='/workflows', status_code=303)
 
+@router.post("/workflows/{agent_name}/runs/clear-active")
+async def clear_agent_active_runs(request: Request, agent_name: str):
+    user = await get_current_user(request)
+    if not user:
+        return RedirectResponse(url='/login')
+        
+    if not is_admin(request):
+        request.session["flash_msg"] = "Admin access required."
+        return RedirectResponse(url='/workflows', status_code=303)
+
+    safe_name = sanitize_name(agent_name)
+    if not safe_name:
+        request.session["flash_msg"] = "Invalid agent name parameter."
+        return RedirectResponse(url='/workflows', status_code=303)
+        
+    cleared_count = 0
+    try:
+        runs = await asyncio.to_thread(identity_mgr.get_agent_runs, safe_name)
+        tasks = []
+        for run_record in runs:
+            if run_record.get("state") in ("pending", "processing"):
+                metadata = run_record.get("metadata", {})
+                metadata["cancelled_by"] = user.id
+                metadata["cancelled_at"] = datetime.now().isoformat()
+                metadata["reason"] = "Mass cleared by admin"
+                
+                tasks.append(
+                    asyncio.to_thread(
+                        identity_mgr.record_agent_run_state,
+                        safe_name,
+                        run_record.get("run_id"),
+                        "cancelled",
+                        metadata
+                    )
+                )
+        
+        if tasks:
+            await asyncio.gather(*tasks)
+            cleared_count = len(tasks)
+                
+        request.session["flash_msg"] = f"Successfully cleared {cleared_count} active run(s) for '{safe_name}'."
+    except Exception as e:
+        print(f"Error clearing active runs for {safe_name}: {e}")
+        request.session["flash_msg"] = f"Failed to clear runs: {str(e)}"
+        
+    return RedirectResponse(url='/workflows', status_code=303)
+
+@router.post("/workflows/runs/clear-all-active")
+async def clear_all_active_runs(request: Request):
+    user = await get_current_user(request)
+    if not user:
+        return RedirectResponse(url='/login')
+        
+    if not is_admin(request):
+        request.session["flash_msg"] = "Admin access required."
+        return RedirectResponse(url='/workflows', status_code=303)
+
+    cleared_count = 0
+    try:
+        agent_names = await asyncio.to_thread(identity_mgr.list_agents)
+        tasks = []
+        for name in agent_names:
+            config_data = await asyncio.to_thread(identity_mgr.get_agent_config, name)
+            if config_data and config_data.get("type") in ("background_agent", "background_script"):
+                runs = await asyncio.to_thread(identity_mgr.get_agent_runs, name)
+                for run_record in runs:
+                    if run_record.get("state") in ("pending", "processing"):
+                        metadata = run_record.get("metadata", {})
+                        metadata["cancelled_by"] = user.id
+                        metadata["cancelled_at"] = datetime.now().isoformat()
+                        metadata["reason"] = "Global mass cleared by admin"
+                        
+                        tasks.append(
+                            asyncio.to_thread(
+                                identity_mgr.record_agent_run_state,
+                                name,
+                                run_record.get("run_id"),
+                                "cancelled",
+                                metadata
+                            )
+                        )
+                        
+        if tasks:
+            await asyncio.gather(*tasks)
+            cleared_count = len(tasks)
+                        
+        request.session["flash_msg"] = f"Successfully cleared {cleared_count} active run(s) across all workflows."
+    except Exception as e:
+        print(f"Error clearing all active runs: {e}")
+        request.session["flash_msg"] = f"Failed to globally clear runs: {str(e)}"
+        
+    return RedirectResponse(url='/workflows', status_code=303)
+
 @router.post("/workflows/{agent_name}/run")
 
 async def run_background_agent_manual(request: Request, agent_name: str):

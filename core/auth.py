@@ -677,22 +677,23 @@ class IdentityManager:
             "metadata": metadata
         }
         # To support updating existing records, fetch and merge if it already exists
-        value, _ = self.client.get(key)
-        if value:
-            try:
-                existing = json.loads(value.decode('utf-8'))
-                existing.update(record)
-                if "created_at" not in existing:
-                    existing["created_at"] = existing.get("timestamp")
-                existing["updated_at"] = record["timestamp"]
-                record = existing
-            except Exception:
-                pass
-        else:
-            record["created_at"] = record["timestamp"]
-            record["updated_at"] = record["timestamp"]
-            
-        self.client.put(key, json.dumps(record))
+        with self.client.lock(f"{key}_lock"):
+            value, _ = self.client.get(key)
+            if value:
+                try:
+                    existing = json.loads(value.decode('utf-8'))
+                    existing.update(record)
+                    if "created_at" not in existing:
+                        existing["created_at"] = existing.get("timestamp")
+                    existing["updated_at"] = record["timestamp"]
+                    record = existing
+                except Exception:
+                    pass
+            else:
+                record["created_at"] = record["timestamp"]
+                record["updated_at"] = record["timestamp"]
+                
+            self.client.put(key, json.dumps(record))
 
     @retry_etcd()
     def get_agent_runs(self, agent_name: str) -> List[Dict]:

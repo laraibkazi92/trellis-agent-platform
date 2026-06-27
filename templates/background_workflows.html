@@ -130,8 +130,18 @@
         <h1 class="text-3xl font-bold font-mono tracking-tight uppercase">Workflows</h1>
         <p class="text-neutral-500 dark:text-neutral-400 mt-2">Manage and monitor your event-driven and scheduled workflows.</p>
     </div>
-    <div class="relative w-full sm:w-72">
-        <input type="text" id="bg-agent-search" placeholder="Search..." class="w-full bg-white dark:bg-neutral-900 border border-neutral-300 dark:border-neutral-700 px-4 py-2 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 placeholder-neutral-500">
+    <div class="flex flex-col sm:flex-row items-center gap-4 w-full sm:w-auto">
+        {% if is_admin and (queue.pending|length > 0 or queue.processing|length > 0) %}
+        <form method="POST" action="/workflows/runs/clear-all-active" class="w-full sm:w-auto" onsubmit="return confirm('Are you sure you want to mass-cancel all pending and processing tasks across all workflows? This action cannot be undone.');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" onclick="showGlobalLoading('Clearing all active runs...')" class="w-full px-4 py-2 bg-red-500 hover:bg-red-600 text-white font-mono font-bold text-sm uppercase tracking-wider transition-colors flex items-center justify-center gap-2">
+                <i data-lucide="trash-2" class="w-4 h-4"></i> Clear Stuck Tasks
+            </button>
+        </form>
+        {% endif %}
+        <div class="relative w-full sm:w-72">
+            <input type="text" id="bg-agent-search" placeholder="Search..." class="w-full bg-white dark:bg-neutral-900 border border-neutral-300 dark:border-neutral-700 px-4 py-2 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 placeholder-neutral-500">
+        </div>
     </div>
 </div>
 
@@ -604,8 +614,6 @@
         </div>
         
         <div class="p-6 overflow-y-auto bg-neutral-50 dark:bg-neutral-950 flex-grow">
-            <h3 class="font-mono font-bold text-sm text-neutral-500 uppercase tracking-widest mb-4">Pending & Processing Runs</h3>
-            
             {% set active_runs = [] %}
             {% for run in queue.pending %}
                 {% if run.agent_name == agent.name %}{% set _ = active_runs.append(run) %}{% endif %}
@@ -613,6 +621,18 @@
             {% for run in queue.processing %}
                 {% if run.agent_name == agent.name %}{% set _ = active_runs.append(run) %}{% endif %}
             {% endfor %}
+            
+            <div class="flex justify-between items-center mb-4">
+                <h3 class="font-mono font-bold text-sm text-neutral-500 uppercase tracking-widest">Pending & Processing Runs</h3>
+                {% if is_admin and active_runs %}
+                <form method="POST" action="/workflows/{{ agent.name }}/runs/clear-active" onsubmit="return confirm('Are you sure you want to mass-cancel all pending and processing tasks for this workflow?');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <button type="submit" onclick="showGlobalLoading('Clearing active runs...')" class="text-red-500 hover:text-white border border-red-500 hover:bg-red-500 px-3 py-1 uppercase text-xs font-bold transition-colors flex items-center gap-1">
+                        <i data-lucide="trash-2" class="w-3 h-3"></i> Clear Stuck
+                    </button>
+                </form>
+                {% endif %}
+            </div>
             
             {% if active_runs %}
             <div class="overflow-x-auto border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 mb-8">
