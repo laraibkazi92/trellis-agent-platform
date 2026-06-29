@@ -1,4 +1,5 @@
 import json
+import os
 import asyncio
 import secrets as secrets_module
 import yaml
@@ -13,6 +14,38 @@ from core.discovery import get_agent_required_secrets, get_agent_required_variab
 from core.models import Identity, IdentityType
 
 from datetime import datetime
+
+_REDIS_QUEUE_NAME = "taskiq"
+
+async def _dequeue_pending_task_from_redis(task_id: str) -> bool:
+    """Remove a pending task from the Redis queue by task_id.
+
+    Returns True if removed, False if not found or on error.
+    Only pending tasks (not yet picked up by a worker) will be in the queue.
+    """
+    try:
+        import redis.asyncio as aioredis
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        client = aioredis.from_url(redis_url, decode_responses=True)
+        lua_script = """
+local items = redis.call('LRANGE', KEYS[1], 0, -1)
+for _, item in ipairs(items) do
+    local ok, data = pcall(cjson.decode, item)
+    if ok and data['task_id'] == ARGV[1] then
+        redis.call('LREM', KEYS[1], 1, item)
+        return 1
+    end
+end
+return 0
+"""
+        try:
+            result = await client.eval(lua_script, 1, _REDIS_QUEUE_NAME, task_id)
+            return bool(result)
+        finally:
+            await client.aclose()
+    except Exception as e:
+        print(f"Redis dequeue failed for task {task_id}: {e}")
+        return False
 
 class TriggerUpdate(BaseModel):
     trigger_type: Literal["none", "cron", "webhook"] = "none"
@@ -250,20 +283,27 @@ async def cancel_background_run(request: Request, agent_name: str, run_id: str):
         metadata = run_record.get("metadata", {})
         metadata["cancelled_by"] = user.id
         metadata["cancelled_at"] = datetime.now().isoformat()
-        
-        await asyncio.to_thread(
+
+        wrote = await asyncio.to_thread(
             identity_mgr.record_agent_run_state,
             safe_name,
             run_id,
             "cancelled",
             metadata
         )
-        
-        request.session["flash_msg"] = f"Run {run_id} for '{safe_name}' has been cancelled."
+
+        # Best-effort: remove from Redis queue if it hasn't been picked up yet
+        if current_state == "pending":
+            await _dequeue_pending_task_from_redis(run_id)
+
+        if wrote:
+            request.session["flash_msg"] = f"Run {run_id} for '{safe_name}' has been cancelled."
+        else:
+            request.session["flash_msg"] = f"Run {run_id} for '{safe_name}' is already in a terminal state."
     except Exception as e:
         print(f"Error cancelling run: {e}")
         request.session["flash_msg"] = f"Failed to cancel run: {str(e)}"
-        
+
     return RedirectResponse(url='/workflows', status_code=303)
 
 @router.post("/workflows/{agent_name}/runs/clear-active")
@@ -282,35 +322,55 @@ async def clear_agent_active_runs(request: Request, agent_name: str):
         return RedirectResponse(url='/workflows', status_code=303)
         
     cleared_count = 0
+    error_count = 0
     try:
         runs = await asyncio.to_thread(identity_mgr.get_agent_runs, safe_name)
-        tasks = []
+        pending_run_ids = []
+        etcd_tasks = []
         for run_record in runs:
-            if run_record.get("state") in ("pending", "processing"):
+            state = run_record.get("state")
+            if state in ("pending", "processing"):
+                run_id = run_record.get("run_id")
                 metadata = run_record.get("metadata", {})
                 metadata["cancelled_by"] = user.id
                 metadata["cancelled_at"] = datetime.now().isoformat()
                 metadata["reason"] = "Mass cleared by admin"
-                
-                tasks.append(
+                etcd_tasks.append(
                     asyncio.to_thread(
                         identity_mgr.record_agent_run_state,
                         safe_name,
-                        run_record.get("run_id"),
+                        run_id,
                         "cancelled",
                         metadata
                     )
                 )
-        
-        if tasks:
-            await asyncio.gather(*tasks)
-            cleared_count = len(tasks)
-                
-        request.session["flash_msg"] = f"Successfully cleared {cleared_count} active run(s) for '{safe_name}'."
+                if state == "pending":
+                    pending_run_ids.append(run_id)
+
+        if etcd_tasks:
+            results = await asyncio.gather(*etcd_tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    error_count += 1
+                    print(f"Error cancelling run for {safe_name}: {r}")
+                elif r:
+                    cleared_count += 1
+
+        # Best-effort: remove pending tasks from Redis queue
+        if pending_run_ids:
+            await asyncio.gather(
+                *[_dequeue_pending_task_from_redis(rid) for rid in pending_run_ids],
+                return_exceptions=True
+            )
+
+        if error_count:
+            request.session["flash_msg"] = f"Cleared {cleared_count} run(s) for '{safe_name}' ({error_count} failed)."
+        else:
+            request.session["flash_msg"] = f"Successfully cleared {cleared_count} active run(s) for '{safe_name}'."
     except Exception as e:
         print(f"Error clearing active runs for {safe_name}: {e}")
         request.session["flash_msg"] = f"Failed to clear runs: {str(e)}"
-        
+
     return RedirectResponse(url='/workflows', status_code=303)
 
 @router.post("/workflows/runs/clear-all-active")
@@ -324,39 +384,59 @@ async def clear_all_active_runs(request: Request):
         return RedirectResponse(url='/workflows', status_code=303)
 
     cleared_count = 0
+    error_count = 0
     try:
         agent_names = await asyncio.to_thread(identity_mgr.list_agents)
-        tasks = []
+        pending_run_ids = []
+        etcd_tasks = []
         for name in agent_names:
             config_data = await asyncio.to_thread(identity_mgr.get_agent_config, name)
             if config_data and config_data.get("type") in ("background_agent", "background_script"):
                 runs = await asyncio.to_thread(identity_mgr.get_agent_runs, name)
                 for run_record in runs:
-                    if run_record.get("state") in ("pending", "processing"):
+                    state = run_record.get("state")
+                    if state in ("pending", "processing"):
+                        run_id = run_record.get("run_id")
                         metadata = run_record.get("metadata", {})
                         metadata["cancelled_by"] = user.id
                         metadata["cancelled_at"] = datetime.now().isoformat()
                         metadata["reason"] = "Global mass cleared by admin"
-                        
-                        tasks.append(
+                        etcd_tasks.append(
                             asyncio.to_thread(
                                 identity_mgr.record_agent_run_state,
                                 name,
-                                run_record.get("run_id"),
+                                run_id,
                                 "cancelled",
                                 metadata
                             )
                         )
-                        
-        if tasks:
-            await asyncio.gather(*tasks)
-            cleared_count = len(tasks)
-                        
-        request.session["flash_msg"] = f"Successfully cleared {cleared_count} active run(s) across all workflows."
+                        if state == "pending":
+                            pending_run_ids.append(run_id)
+
+        if etcd_tasks:
+            results = await asyncio.gather(*etcd_tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    error_count += 1
+                    print(f"Error cancelling run (global clear): {r}")
+                elif r:
+                    cleared_count += 1
+
+        # Best-effort: remove pending tasks from Redis queue
+        if pending_run_ids:
+            await asyncio.gather(
+                *[_dequeue_pending_task_from_redis(rid) for rid in pending_run_ids],
+                return_exceptions=True
+            )
+
+        if error_count:
+            request.session["flash_msg"] = f"Cleared {cleared_count} run(s) across all workflows ({error_count} failed)."
+        else:
+            request.session["flash_msg"] = f"Successfully cleared {cleared_count} active run(s) across all workflows."
     except Exception as e:
         print(f"Error clearing all active runs: {e}")
         request.session["flash_msg"] = f"Failed to globally clear runs: {str(e)}"
-        
+
     return RedirectResponse(url='/workflows', status_code=303)
 
 @router.post("/workflows/{agent_name}/run")

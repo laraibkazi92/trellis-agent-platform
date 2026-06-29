@@ -267,6 +267,15 @@
                         <button onclick="openConfigModal('{{ agent.name }}')" class="font-mono text-xs font-bold border border-neutral-300 dark:border-neutral-700 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 px-3 py-1.5 uppercase tracking-wider transition-colors w-full max-w-[140px]">Configure</button>
                         
                         <button onclick="openQueueModal('{{ agent.name }}')" class="font-mono text-xs font-bold border border-neutral-300 dark:border-neutral-700 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 px-3 py-1.5 uppercase tracking-wider transition-colors w-full max-w-[140px]">Queue</button>
+
+                        {% if (agent.run_stats.pending > 0 or agent.run_stats.processing > 0) %}
+                        <form method="POST" action="/workflows/{{ agent.name }}/runs/clear-active" class="w-full max-w-[140px]" onsubmit="return confirm('Cancel all pending and processing runs for {{ agent.name }}?') && (showGlobalLoading('Clearing...'), true);">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                            <button type="submit" class="w-full font-mono text-xs font-bold border border-red-500 text-red-500 hover:bg-red-500 hover:text-white px-3 py-1.5 uppercase tracking-wider transition-colors flex items-center justify-center gap-1">
+                                <i data-lucide="x-circle" class="w-3 h-3"></i> Clear Stuck
+                            </button>
+                        </form>
+                        {% endif %}
                         {% endif %}
                         
                         {% if agent.required_secrets or agent.required_variables %}

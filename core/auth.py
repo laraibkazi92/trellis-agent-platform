@@ -665,8 +665,11 @@ class IdentityManager:
         return statuses
 
     @retry_etcd()
-    def record_agent_run_state(self, agent_name: str, run_id: str, state: str, metadata: Dict) -> None:
-        """Record or update the state of an agent execution run in etcd."""
+    def record_agent_run_state(self, agent_name: str, run_id: str, state: str, metadata: Dict) -> bool:
+        """Record or update the state of an agent execution run in etcd.
+
+        Returns True if the state was written, False if blocked by terminal-state guard.
+        """
         from datetime import datetime, timezone
         key = f"/runs/{agent_name}/{run_id}"
         record = {
@@ -682,6 +685,10 @@ class IdentityManager:
             if value:
                 try:
                     existing = json.loads(value.decode('utf-8'))
+                    # terminal states are immutable — no further transitions allowed
+                    _TERMINAL = {"completed", "failed", "cancelled"}
+                    if existing.get("state") in _TERMINAL:
+                        return False
                     existing.update(record)
                     if "created_at" not in existing:
                         existing["created_at"] = existing.get("timestamp")
@@ -692,8 +699,9 @@ class IdentityManager:
             else:
                 record["created_at"] = record["timestamp"]
                 record["updated_at"] = record["timestamp"]
-                
+
             self.client.put(key, json.dumps(record))
+            return True
 
     @retry_etcd()
     def get_agent_runs(self, agent_name: str) -> List[Dict]:

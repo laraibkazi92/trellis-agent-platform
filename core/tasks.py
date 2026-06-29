@@ -188,9 +188,39 @@ async def run_background_script(
             env=env
         )
 
+        cancelled_by_poller = False
+
+        async def _poll_for_cancellation(proc, check_interval: int = 15):
+            nonlocal cancelled_by_poller
+            if task_id == "unknown":
+                return
+            while True:
+                try:
+                    runs = await asyncio.to_thread(identity_mgr.get_agent_runs, agent_name)
+                    rec = next((r for r in runs if r.get("run_id") == task_id), None)
+                    if rec and rec.get("state") == "cancelled":
+                        print(f"Task {task_id} for {agent_name} cancelled mid-execution. Killing subprocess.")
+                        try:
+                            proc.kill()
+                        except (ProcessLookupError, PermissionError, OSError):
+                            pass
+                        cancelled_by_poller = True
+                        return
+                except Exception:
+                    pass
+                await asyncio.sleep(check_interval)
+
+        cancel_monitor = asyncio.create_task(_poll_for_cancellation(process))
         input_data = prompt.encode() if prompt else b""
-        stdout, stderr = await process.communicate(input=input_data)
-        
+        try:
+            stdout, stderr = await process.communicate(input=input_data)
+        finally:
+            cancel_monitor.cancel()
+            try:
+                await cancel_monitor
+            except asyncio.CancelledError:
+                pass
+
         output_str = ""
         if stdout:
             output_str += stdout.decode()
@@ -198,6 +228,8 @@ async def run_background_script(
             output_str += "\n" + stderr.decode()
 
         if process.returncode != 0:
+            if cancelled_by_poller:
+                return "Cancelled."
             raise RuntimeError(f"Script exited with status {process.returncode}:\n{output_str}")
 
         try:
@@ -214,9 +246,9 @@ async def run_background_script(
             )
         except Exception as err:
             print(f"Failed to record completed state for {agent_name} run {task_id}: {err}")
-                    
+
         return output_str.strip()
-        
+
     except Exception as e:
         print(f"Error running background script '{agent_name}': {e}")
         try:
@@ -284,9 +316,36 @@ async def run_background_agent(
         
         # 2. Build the PydanticAI Agent with full parity (Hub, MCP, A2A)
         agent = await build_agent(agent_name)
-        
-        # 3. Execute the run
-        result = await agent.run(prompt)
+
+        # 3. Execute the run with a concurrent cancellation monitor
+        async def _poll_for_agent_cancellation(agent_task_ref, check_interval: int = 15):
+            if task_id == "unknown":
+                return
+            while True:
+                try:
+                    runs = await asyncio.to_thread(identity_mgr.get_agent_runs, agent_name)
+                    rec = next((r for r in runs if r.get("run_id") == task_id), None)
+                    if rec and rec.get("state") == "cancelled":
+                        print(f"Task {task_id} for {agent_name} cancelled mid-execution. Cancelling agent task.")
+                        agent_task_ref.cancel()
+                        return
+                except Exception:
+                    pass
+                await asyncio.sleep(check_interval)
+
+        agent_run_task = asyncio.create_task(agent.run(prompt))
+        cancel_monitor = asyncio.create_task(_poll_for_agent_cancellation(agent_run_task))
+        try:
+            result = await agent_run_task
+        except asyncio.CancelledError:
+            print(f"Task {task_id} for {agent_name} agent execution was cancelled.")
+            return "Cancelled."
+        finally:
+            cancel_monitor.cancel()
+            try:
+                await cancel_monitor
+            except asyncio.CancelledError:
+                pass
 
         # Agent memory: retain this exchange (awaited so it completes within the worker
         # task lifetime; gated by feature flag + agent config, and fail-open internally).
@@ -325,7 +384,7 @@ async def run_background_agent(
                 except Exception as e:
                     print(f"Failed to record token usage for {user_id}: {e}")
                     
-        # Record completed state
+        # Record completed state (auth.py state machine guards against overwriting cancelled)
         try:
             await asyncio.to_thread(
                 identity_mgr.record_agent_run_state,
@@ -341,12 +400,12 @@ async def run_background_agent(
             )
         except Exception as err:
             print(f"Failed to record completed state for {agent_name} run {task_id}: {err}")
-                    
+
         return result.output
-        
+
     except Exception as e:
         print(f"Error running background agent '{agent_name}': {e}")
-        # Record failed state
+        # Record failed state (auth.py state machine guards against overwriting cancelled)
         try:
             await asyncio.to_thread(
                 identity_mgr.record_agent_run_state,
