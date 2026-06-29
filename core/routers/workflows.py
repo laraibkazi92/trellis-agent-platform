@@ -281,7 +281,7 @@ async def cancel_background_run(request: Request, agent_name: str, run_id: str):
             return RedirectResponse(url='/workflows', status_code=303)
             
         metadata = run_record.get("metadata", {})
-        metadata["cancelled_by"] = user.id
+        metadata["cancelled_by"] = user.get("email", user.get("sub"))
         metadata["cancelled_at"] = datetime.now().isoformat()
 
         wrote = await asyncio.to_thread(
@@ -332,7 +332,7 @@ async def clear_agent_active_runs(request: Request, agent_name: str):
             if state in ("pending", "processing"):
                 run_id = run_record.get("run_id")
                 metadata = run_record.get("metadata", {})
-                metadata["cancelled_by"] = user.id
+                metadata["cancelled_by"] = user.get("email", user.get("sub"))
                 metadata["cancelled_at"] = datetime.now().isoformat()
                 metadata["reason"] = "Mass cleared by admin"
                 etcd_tasks.append(
@@ -398,7 +398,7 @@ async def clear_all_active_runs(request: Request):
                     if state in ("pending", "processing"):
                         run_id = run_record.get("run_id")
                         metadata = run_record.get("metadata", {})
-                        metadata["cancelled_by"] = user.id
+                        metadata["cancelled_by"] = user.get("email", user.get("sub"))
                         metadata["cancelled_at"] = datetime.now().isoformat()
                         metadata["reason"] = "Global mass cleared by admin"
                         etcd_tasks.append(
