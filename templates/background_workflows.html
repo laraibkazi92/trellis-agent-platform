@@ -460,7 +460,7 @@
                             </div>
                             <div>
                                 <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">Secret Key</label>
-                                <input type="password" name="webhook_secret" id="modal-webhook-secret-{{ agent.name }}" placeholder="Enter validation secret" value="{{ agent.config.get('trigger', {}).get('secret', '') }}" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
+                                <input type="text" readonly name="webhook_secret" id="modal-webhook-secret-{{ agent.name }}" placeholder="Managed via Secrets Manager" value="{{ agent.config.get('trigger', {}).get('secret', '') }}" class="w-full bg-neutral-100 dark:bg-neutral-900 border border-neutral-300 dark:border-neutral-700 text-neutral-500 text-sm rounded-none block p-2.5 font-mono cursor-not-allowed">
                             </div>
                         </div>
                         <div class="mt-4">
