@@ -71,7 +71,7 @@ Whenever you add or modify an `mcp.yaml` file, you must sync the configuration t
 Run the following command from the root directory:
 
 ```bash
-python scripts/sync_to_db.py
+docker compose up -d --build
 ```
 
 The output will confirm that your MCP server has been registered:

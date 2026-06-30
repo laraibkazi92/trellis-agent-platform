@@ -190,9 +190,9 @@ This lets the same tool authenticate differently depending on whether it's calle
 
 After creating or editing workflow files, push to etcd:
 
-```bash
-python scripts/sync_to_db.py
-```
+   ```bash
+   docker compose up -d --build
+   ```
 
 Confirm the output shows your workflow:
 ```
@@ -210,4 +210,4 @@ The scheduler picks up new cron triggers automatically after sync. No restart re
 - [ ] Cron expression tested at [crontab.guru](https://crontab.guru)
 - [ ] Required secrets declared in the relevant tool's `tool.yaml` under `background` context
 - [ ] Background-scoped secrets populated in the Dashboard UI
-- [ ] `python scripts/sync_to_db.py` run after changes
+- [ ] `docker compose up -d --build` run after changes

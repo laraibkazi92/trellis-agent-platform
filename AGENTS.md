@@ -23,7 +23,7 @@
 
 ## 💻 Development Workflow
 - **Start/Rebuild**: `docker compose up -d --build`
-- **Registry Sync**: Use `python scripts/sync_to_db.py` to push filesystem changes to `etcd`.
+- **Registry Sync**: The registry is synchronized automatically when you rebuild and start the containers via `docker compose up -d --build`. You do not need to run manual sync scripts.
 - **DB/Config access**: Use `IdentityManager` in `core/auth.py` for all etcd operations.
 
 ## 📚 Developer Docs

@@ -38,6 +38,15 @@ ROUTES="
         proxy_send_timeout 3600s;
     }
 
+    location /webhooks {
+        set \$upstream_host http://host:8000;
+        proxy_pass \$upstream_host;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
     location ~ ^/mcp(/|$) {
         set \$upstream_gateway http://gateway:8002;
         proxy_pass \$upstream_gateway;

@@ -141,12 +141,15 @@ async def receive_webhook(agent_name: str, request: Request):
         
     # Secret Management: allow environment variable resolution
     import os
+    from core.auth import Identity
     actual_secret = secret_key
     if secret_key.startswith("env:"):
         env_var = secret_key[4:]
         actual_secret = os.environ.get(env_var)
     elif secret_key.startswith("secret:"):
-        actual_secret = await asyncio.to_thread(identity_mgr.get_config, f"secrets/{secret_key[7:]}")
+        system_identity = Identity.from_string("system:global")
+        global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
+        actual_secret = global_secrets.get(secret_key[7:])
         
     if not actual_secret:
         raise HTTPException(status_code=500, detail="Webhook secret could not be resolved from environment")
@@ -169,11 +172,19 @@ async def receive_webhook(agent_name: str, request: Request):
         xml_payload = f"<event_payload><![CDATA[\n{payload_str}\n]]></event_payload>"
         
         # Queue task with Taskiq
-        kiq_msg = await run_background_agent.kiq(
-            agent_name=agent_name, 
-            prompt=xml_payload, 
-            user_id="webhook"  # Using a system user for webhook operations
-        )
+        if config_data.get("type") == "background_script":
+            from core.tasks import run_background_script
+            kiq_msg = await run_background_script.kiq(
+                agent_name=agent_name, 
+                prompt=xml_payload, 
+                user_id="webhook"  # Using a system user for webhook operations
+            )
+        else:
+            kiq_msg = await run_background_agent.kiq(
+                agent_name=agent_name, 
+                prompt=xml_payload, 
+                user_id="webhook"  # Using a system user for webhook operations
+            )
         return {"status": "accepted", "task_id": kiq_msg.task_id}
         
     except Exception as e:

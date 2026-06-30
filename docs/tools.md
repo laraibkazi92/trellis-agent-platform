@@ -218,9 +218,9 @@ from shared.slack.client import SlackClient
 
 After creating or modifying `tool.yaml`, push to etcd:
 
-```bash
-python scripts/sync_to_db.py
-```
+   ```bash
+   docker compose up -d --build
+   ```
 
 Confirm the output shows your tool:
 ```
@@ -238,4 +238,4 @@ The hub reloads tool configs dynamically, so no restart is needed for most chang
 - [ ] Script reads all inputs from `sys.stdin` (JSON), writes only JSON to `sys.stdout`
 - [ ] Secrets/variables declared in `tool.yaml` and accessible via `os.getenv()`
 - [ ] Tool tested locally with `echo '{...}' | ENV_VAR=val python script.py`
-- [ ] `python scripts/sync_to_db.py` run after changes
+- [ ] `docker compose up -d --build` run after changes

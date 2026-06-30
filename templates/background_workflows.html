@@ -235,7 +235,14 @@
                         {% endif %}
                     {% elif agent.config.get('trigger', {}).get('type') == 'webhook' %}
                         <span class="font-bold text-neutral-500 uppercase">Webhook:</span><br/>
-                        <span class="text-accent dark:text-accent-dark">{{ agent.config.get('trigger', {}).get('provider') | uppercase }}</span>
+                        <span class="text-accent dark:text-accent-dark">{{ agent.config.get('trigger', {}).get('provider') | upper }}</span>
+                        <div class="mt-2 group relative">
+                            <code class="webhook-url-{{ agent.name }} hidden">{{ request.url.scheme }}://{{ request.url.netloc }}/webhooks/{{ agent.name }}</code>
+                            <div class="flex items-center gap-1">
+                                <input type="text" readonly value="{{ request.url.scheme }}://{{ request.url.netloc }}/webhooks/{{ agent.name }}" class="text-[10px] bg-neutral-100 dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 px-1.5 py-1 w-32 truncate font-mono text-neutral-500">
+                                <button type="button" onclick="copyToClipboard(this, '.webhook-url-{{ agent.name }}')" class="text-[10px] bg-neutral-200 hover:bg-neutral-300 dark:bg-neutral-700 dark:hover:bg-neutral-600 border border-neutral-300 dark:border-neutral-600 px-2 py-1 uppercase font-bold transition-colors">Copy</button>
+                            </div>
+                        </div>
                     {% else %}
                         <span class="text-neutral-400 dark:text-neutral-600">None</span>
                     {% endif %}
@@ -286,12 +293,14 @@
 
                         {% if agent.is_configured %}
                             {% if is_admin %}
+                            {% if agent.config.get('trigger', {}).get('type') != 'webhook' %}
                             <form method="POST" action="/workflows/{{ agent.name }}/run" class="w-full max-w-[140px]" onsubmit="showGlobalLoading('Enqueueing Task...')">
                                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                                 <button type="submit" class="w-full bg-accent hover:bg-accent-dark text-white text-xs font-bold uppercase tracking-wider px-3 py-1.5 transition-colors font-mono flex items-center justify-center gap-2">
                                     <i data-lucide="play" class="w-3 h-3"></i> Run Now
                                 </button>
                             </form>
+                            {% endif %}
                             {% endif %}
                         {% endif %}
                     </div>
@@ -452,6 +461,14 @@
                             <div>
                                 <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">Secret Key</label>
                                 <input type="password" name="webhook_secret" id="modal-webhook-secret-{{ agent.name }}" placeholder="Enter validation secret" value="{{ agent.config.get('trigger', {}).get('secret', '') }}" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
+                            </div>
+                        </div>
+                        <div class="mt-4">
+                            <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">Webhook Endpoint URL</label>
+                            <div class="group relative flex items-center gap-2">
+                                <code class="webhook-url-modal-{{ agent.name }} hidden">{{ request.url.scheme }}://{{ request.url.netloc }}/webhooks/{{ agent.name }}</code>
+                                <input type="text" readonly value="{{ request.url.scheme }}://{{ request.url.netloc }}/webhooks/{{ agent.name }}" class="w-full bg-neutral-100 dark:bg-neutral-900 border border-neutral-300 dark:border-neutral-700 text-neutral-500 text-sm rounded-none block p-2.5 font-mono select-all">
+                                <button type="button" onclick="copyToClipboard(this, '.webhook-url-modal-{{ agent.name }}')" class="bg-neutral-200 hover:bg-neutral-300 dark:bg-neutral-700 dark:hover:bg-neutral-600 border border-neutral-300 dark:border-neutral-600 px-4 py-2.5 text-xs uppercase font-bold transition-colors font-mono whitespace-nowrap h-full">Copy URL</button>
                             </div>
                         </div>
                     </div>

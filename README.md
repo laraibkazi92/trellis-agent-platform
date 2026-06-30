@@ -34,7 +34,7 @@ docker compose up -d --build
 ### 3. Sync Filesystem to Registry
 The framework uses etcd for state. When you modify or add new agents/tools on the filesystem, sync them to the database:
 ```bash
-python scripts/sync_to_db.py
+docker compose up -d --build
 ```
 
 ### 4. Dashboard UI
@@ -84,7 +84,7 @@ claude mcp add --transport http trellis http://localhost:8002/mcp --header "Auth
 1. Scaffold new agents/tools inside their respective directories. See [Building Agents](docs/agents.md) and [Building Tools](docs/tools.md).
 2. Tools should use `stdin` for JSON arguments and `stdout` for JSON results. See [Building Tools](docs/tools.md).
 3. Agents are defined with configurations and skills. See [Building Agents](docs/agents.md).
-4. Run `python scripts/sync_to_db.py` to push changes to etcd.
+4. Run `docker compose up -d --build` to push changes to etcd.
 5. Manage third-party credentials via the **Tool Secrets** UI.
 
 ## License

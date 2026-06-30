@@ -75,7 +75,7 @@ workspace/agents/
     └── skills.md      # System prompt and behavioral instructions
 ```
 
-Both files are required. After creating them, run `python scripts/sync_to_db.py` to register the agent.
+Both files are required. After creating them, restart the containers (`docker compose up -d --build`) to register the agent.
 
 ---
 
@@ -170,7 +170,7 @@ Use this tool when [condition]. Always pass [required fields].
 After creating or editing agent files, push changes to etcd:
 
 ```bash
-python scripts/sync_to_db.py
+docker compose up -d --build
 ```
 
 Confirm the output shows your agent:
