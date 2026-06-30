@@ -274,7 +274,8 @@ async def view_report(request: Request, report_path: str):
             headers={
                 "Content-Security-Policy": (
                     "default-src 'none'; "
-                    "style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; "
+                    "script-src https://cdn.tailwindcss.com; "
+                    "style-src 'self' 'unsafe-inline'; "
                     "font-src 'self'; "
                     "img-src 'self' data:;"
                 )
