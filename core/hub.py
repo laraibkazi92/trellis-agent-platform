@@ -279,5 +279,5 @@ def register_tools():
 if __name__ == "__main__":
     register_tools()
     import uvicorn
-    app = mcp.http_app()
+    app = mcp.http_app(host_origin_protection=False)
     uvicorn.run(app, host="0.0.0.0", port=8001)
