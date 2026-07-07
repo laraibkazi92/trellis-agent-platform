@@ -54,6 +54,12 @@ services:
         condition: service_healthy
       db-sync:
         condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8000/health > /dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
     restart: unless-stopped
 
   # Polyglot Tool Hub (Internal MCP Server)
@@ -260,9 +266,12 @@ services:
     #   # SSL_CERT_DIR=/path/to/ssl/dir
     #   - ${SSL_CERT_DIR:-./gateway/ssl}:/etc/nginx/ssl:ro
     depends_on:
-      - ui
-      - host
-      - gateway
+      ui:
+        condition: service_started
+      host:
+        condition: service_healthy
+      gateway:
+        condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ > /dev/null || exit 1"]
       interval: 10s

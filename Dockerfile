@@ -32,6 +32,11 @@ ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 COPY requirements.txt .
 RUN uv pip install --system --no-cache -r requirements.txt && uv pip install --system --upgrade certifi
 
+# Precompile bytecode for installed packages so it's baked into the image layer
+# instead of being recompiled on every container recreate (each restart otherwise
+# gets a fresh writable layer with no .pyc cache, costing ~10s+ per worker on import).
+RUN python -m compileall -q /usr/local/lib/python3.12/site-packages
+
 # Natively install the updated certificates into the Debian OS
 RUN cp $(python -c "import certifi; print(certifi.where())") /usr/local/share/ca-certificates/mozilla-certifi.crt \
     && update-ca-certificates

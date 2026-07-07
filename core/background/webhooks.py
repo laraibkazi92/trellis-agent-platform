@@ -141,15 +141,15 @@ async def receive_webhook(agent_name: str, request: Request):
         
     # Secret Management: allow environment variable resolution
     import os
-    from core.auth import Identity
+    from core.auth import Identity, IdentityType
     actual_secret = secret_key
     if secret_key.startswith("env:"):
         env_var = secret_key[4:]
         actual_secret = os.environ.get(env_var)
     elif secret_key.startswith("secret:"):
-        system_identity = Identity.from_string("system:global")
-        global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
-        actual_secret = global_secrets.get(secret_key[7:])
+        workflow_identity = Identity(id=agent_name, type=IdentityType.WORKFLOW)
+        resolved_secrets = await asyncio.to_thread(identity_mgr.get_resolved_config, workflow_identity, "secrets")
+        actual_secret = resolved_secrets.get(secret_key[7:])
         
     if not actual_secret:
         raise HTTPException(status_code=500, detail="Webhook secret could not be resolved from environment")
