@@ -6,6 +6,7 @@ import re
 import contextvars
 import asyncio
 import hashlib
+import jwt
 import os
 from typing import Dict, List, Optional, Any, Union
 from functools import wraps
@@ -717,6 +718,96 @@ class IdentityManager:
         runs.sort(key=lambda x: x.get("updated_at", x.get("timestamp", "")), reverse=True)
         return runs
 
+    # --- MCP OAuth 2.1 State Management ---
+
+    def get_or_create_jwt_secret(self) -> bytes:
+        """Return the stable JWT signing secret, creating it on first call.
+
+        The secret is stored encrypted in etcd at /config/oauth/jwt_secret.
+        Concurrent calls are serialized via an etcd lock so only one secret
+        is ever written.
+        """
+        key = "/config/oauth/jwt_secret"
+        value, _ = self.client.get(key)
+        if value:
+            return _decrypt_string(value.decode("utf-8")).encode("utf-8")
+
+        with self.client.lock("oauth_jwt_secret_init", ttl=10):
+            # Re-check inside the lock to handle the concurrent-creation race
+            value, _ = self.client.get(key)
+            if value:
+                return _decrypt_string(value.decode("utf-8")).encode("utf-8")
+
+            new_secret = secrets.token_hex(32)
+            self.client.put(key, _encrypt_string(new_secret))
+            logger.info("Generated and stored new JWT signing secret.")
+            return new_secret.encode("utf-8")
+
+    @retry_etcd()
+    def save_oauth_client(self, client_id: str, client_secret: str, metadata: Dict) -> None:
+        """Register a dynamic OAuth client.
+
+        The raw client_secret is never stored; only its SHA-256 hash is kept
+        so it can be verified later without being leaked from etcd.
+        """
+        client_secret_hash = hashlib.sha256(client_secret.encode()).hexdigest()
+        record = {
+            "client_id": client_id,
+            "client_secret_hash": client_secret_hash,
+            **metadata,
+        }
+        self.client.put(f"/oauth/clients/{client_id}", json.dumps(record))
+
+    @retry_etcd()
+    def get_oauth_client(self, client_id: str) -> Optional[Dict]:
+        """Retrieve an OAuth client record by client_id."""
+        value, _ = self.client.get(f"/oauth/clients/{client_id}")
+        if value:
+            return json.loads(value.decode("utf-8"))
+        return None
+
+    def save_oauth_code(self, code: str, data: Dict, ttl: int = 300) -> None:
+        """Store a one-time authorization code with a TTL (default 5 min).
+
+        The lease ensures etcd automatically purges the code after it expires,
+        preventing stale codes from accumulating.
+        """
+        lease = self.client.lease(ttl)
+        self.client.put(f"/oauth/codes/{code}", json.dumps(data), lease=lease)
+
+    def get_and_delete_oauth_code(self, code: str) -> Optional[Dict]:
+        """Atomically consume an authorization code (one-time use).
+
+        Returns the code data if valid, None if not found or already used.
+        Deletion happens inside a lock to prevent replay attacks under concurrent requests.
+        """
+        key = f"/oauth/codes/{code}"
+        with self.client.lock(f"oauth_code_{code}", ttl=5):
+            value, _ = self.client.get(key)
+            if not value:
+                return None
+            data = json.loads(value.decode("utf-8"))
+            self.client.delete(key)
+            return data
+
+    def save_revoked_token(self, jti: str, exp: int) -> None:
+        """Add a JWT ID to the revocation denylist.
+
+        Uses a lease so etcd auto-purges the entry when the token would have
+        expired anyway — no unbounded growth of the denylist.
+        Not decorated with @retry_etcd() because lease creation is not idempotent.
+        """
+        ttl = max(int(exp - time.time()), 1)
+        lease = self.client.lease(ttl)
+        self.client.put(f"/oauth/revoked/{jti}", b"1", lease=lease)
+
+    @retry_etcd()
+    def is_token_revoked(self, jti: str) -> bool:
+        """Return True if the JWT ID is on the revocation denylist."""
+        value, _ = self.client.get(f"/oauth/revoked/{jti}")
+        return value is not None
+
+
 class AuthMiddleware:
     def __init__(self, app, identity_mgr: IdentityManager):
         self.app = app
@@ -736,7 +827,12 @@ class AuthMiddleware:
             if any(normalized_path.startswith(prefix) for prefix in protected_prefixes):
                 headers = dict(scope.get("headers", []))
                 auth_header = headers.get(b"authorization", b"").decode("utf-8", errors="ignore")
-                
+
+                proto = headers.get(b"x-forwarded-proto", b"https").decode("utf-8", errors="ignore")
+                host = headers.get(b"host", b"localhost").decode("utf-8", errors="ignore")
+                resource_metadata_url = f"{proto}://{host}/.well-known/oauth-protected-resource"
+                www_authenticate = f'Bearer realm="mcp", resource_metadata="{resource_metadata_url}"'.encode()
+
                 if self.dev_mode and (not auth_header or not auth_header.startswith("Bearer ")):
                     auth_token_var.set("dev-token")
                     user_id_var.set("dev-user-id")
@@ -745,21 +841,23 @@ class AuthMiddleware:
                     return await self.app(scope, receive, send)
                 
                 if not auth_header or not auth_header.startswith("Bearer "):
-                    await self._send_error(scope, send, 401, b'{"error": "Missing or invalid Authorization header"}')
+                    await self._send_error(scope, send, 401, b'{"error": "Missing or invalid Authorization header"}', [(b"www-authenticate", www_authenticate)])
                     return
                 
                 token = auth_header.split(" ")[1]
                 try:
                     if token.startswith("exec_"):
                         user_id = await asyncio.to_thread(self.identity_mgr.validate_execution_token, token)
+                    elif token.count('.') == 2:
+                        user_id = await self._validate_jwt(token)
                     else:
                         user_id = await asyncio.to_thread(self.identity_mgr.validate_key, token)
                 except Exception as e:
-                    logger.error(f"Error validating key or token: {e}")
+                    logger.error(f"Error validating token: {e}")
                     user_id = None
-                
+
                 if not user_id:
-                    await self._send_error(scope, send, 401, b'{"error": "Invalid API Key"}')
+                    await self._send_error(scope, send, 401, b'{"error": "Invalid or expired token"}', [(b"www-authenticate", www_authenticate)])
                     return
                     
                 # Set the ContextVars so downstream async functions can access them
@@ -781,14 +879,33 @@ class AuthMiddleware:
             logger.error(f"Unhandled exception in ASGI AuthMiddleware: {e}", exc_info=True)
             await self._send_error(scope, send, 500, b'{"error": "Internal Server Error"}')
 
-    async def _send_error(self, scope, send, status: int, body: bytes):
+    async def _validate_jwt(self, token: str) -> Optional[str]:
+        """Validate an MCP OAuth JWT and return the sub (user_id) if valid."""
+        try:
+            secret = await asyncio.to_thread(self.identity_mgr.get_or_create_jwt_secret)
+            payload = jwt.decode(token, secret, algorithms=["HS256"], audience="mcp:tools")
+            jti = payload.get("jti")
+            if jti:
+                revoked = await asyncio.to_thread(self.identity_mgr.is_token_revoked, jti)
+                if revoked:
+                    logger.warning("JWT rejected: token has been revoked (jti=%s)", jti)
+                    return None
+            return payload.get("sub")
+        except jwt.PyJWTError as e:
+            logger.warning(f"JWT validation failed: {e}")
+            return None
+
+    async def _send_error(self, scope, send, status: int, body: bytes, extra_headers: list = None):
         if scope["type"] == "websocket":
             await send({"type": "websocket.close", "code": 1008})
         else:
+            response_headers = [(b"content-type", b"application/json")]
+            if extra_headers:
+                response_headers.extend(extra_headers)
             await send({
                 "type": "http.response.start",
                 "status": status,
-                "headers": [(b"content-type", b"application/json")],
+                "headers": response_headers,
             })
             await send({
                 "type": "http.response.body",

@@ -1,5 +1,6 @@
 import os
 import asyncio
+from urllib.parse import urlparse
 from fastapi import APIRouter, Request, Depends
 from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import oauth, identity_mgr, HAS_GITHUB_AUTH, HAS_OIDC_AUTH, templates, ALLOWED_DOMAINS
@@ -15,6 +16,25 @@ router = APIRouter()
 
 
 DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
+
+
+def _safe_post_login_redirect(url: str, current_host: str) -> str:
+    """Return url only if it's on current_host; fall back to '/'.
+
+    Prevents open-redirect attacks when the HOST header is spoofable in the
+    deployment — the stored post_login_redirect could otherwise point off-domain.
+    """
+    if not url:
+        return "/"
+    try:
+        parsed = urlparse(url)
+        if not parsed.scheme:
+            return url  # relative path — inherently on-host
+        if parsed.netloc == current_host:
+            return url
+    except Exception:
+        pass
+    return "/"
 
 def is_domain_allowed(email: str) -> bool:
     if not ALLOWED_DOMAINS:
@@ -52,7 +72,11 @@ async def login_dev(request: Request):
             await asyncio.to_thread(identity_mgr.upsert_user, user['sub'], user)
         except Exception as e:
             print(f"Warning: Failed to upsert mock user in etcd: {e}")
-    return RedirectResponse(url='/')
+    next_url = _safe_post_login_redirect(
+        request.session.pop("post_login_redirect", "/"),
+        request.headers.get("host", "localhost"),
+    )
+    return RedirectResponse(url=next_url)
 
 @router.get("/login/oidc")
 async def login_oidc(request: Request):
@@ -76,7 +100,11 @@ async def auth_callback(request: Request):
         request.session['user'] = user
         # Upsert user to etcd
         await asyncio.to_thread(identity_mgr.upsert_user, user['sub'], dict(user))
-    return RedirectResponse(url='/')
+    next_url = _safe_post_login_redirect(
+        request.session.pop("post_login_redirect", "/"),
+        request.headers.get("host", "localhost"),
+    )
+    return RedirectResponse(url=next_url)
 
 @router.get("/logout")
 async def logout(request: Request):
@@ -120,4 +148,8 @@ async def auth_github_callback(request: Request):
         request.session['user'] = userinfo
         # Upsert user to etcd
         await asyncio.to_thread(identity_mgr.upsert_user, userinfo['sub'], dict(userinfo))
-    return RedirectResponse(url='/')
+    next_url = _safe_post_login_redirect(
+        request.session.pop("post_login_redirect", "/"),
+        request.headers.get("host", "localhost"),
+    )
+    return RedirectResponse(url=next_url)
