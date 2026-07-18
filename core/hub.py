@@ -123,6 +123,14 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
             framework_url = identity_mgr.get_config("HOST_URL", os.getenv("HOST_URL", "http://localhost:8000"))
             env["FRAMEWORK_API_URL"] = framework_url
 
+            # Auto-inject user identity (email)
+            if os.getenv("DEV_MODE", "false").lower() == "true":
+                env["TRELLIS_USER_EMAIL"] = os.getenv("DEV_USER_EMAIL", "dev-user@local.host")
+            else:
+                user_profile = identity_mgr.get_user(user_id)
+                if user_profile and user_profile.get("email"):
+                    env["TRELLIS_USER_EMAIL"] = user_profile["email"]
+
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=subprocess.PIPE,
