@@ -2,7 +2,10 @@ import json
 import os
 import yaml
 import asyncio
+import logging
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from asyncache import cached
@@ -200,30 +203,39 @@ async def chat_completions(request: ChatRequest):
 
     captured_user_id = user_id_var.get()
     
-    def handle_success(result, user_id):
+    async def handle_success(result, user_id):
         health_monitor.record_event("agent", request.model, is_success=True)
         if user_id and hasattr(result, 'usage'):
             u = result.usage
             if callable(u):
                 u = u()
             if u:
-                asyncio.create_task(asyncio.to_thread(identity_mgr.record_usage, user_id, u.input_tokens or 0, u.output_tokens or 0))
-                asyncio.create_task(asyncio.to_thread(identity_mgr.record_agent_usage, user_id, request.model, u.input_tokens or 0, u.output_tokens or 0))
+                input_tokens = getattr(u, 'input_tokens', 0) or 0
+                output_tokens = getattr(u, 'output_tokens', 0) or 0
+                try:
+                    await asyncio.to_thread(identity_mgr.record_usage, user_id, input_tokens, output_tokens)
+                    await asyncio.to_thread(identity_mgr.record_agent_usage, user_id, request.model, input_tokens, output_tokens)
+                except Exception as e:
+                    logger.error(f"Failed to record token usage for {user_id}: {e}")
         memory_mgr = get_memory_manager()
         if memory_mgr.active_for(cfg_data):
-            asyncio.create_task(memory_mgr.retain(
-                bank=request.model,
-                user_msg=request.messages[-1].content,
-                agent_output=result.output,
-            ))
+            try:
+                asyncio.create_task(memory_mgr.retain(
+                    bank=request.model,
+                    user_msg=request.messages[-1].content,
+                    agent_output=result.output,
+                ))
+            except Exception as e:
+                logger.error(f"Failed to retain memory for {request.model}: {e}")
 
     if request.stream:
         async def event_generator():
             event_queue = asyncio.Queue()
             
-            def event_handler(event):
-                # PydanticAI streams events natively via the event_stream_handler
-                if type(event).__name__ == "ToolCallEvent":
+            async def event_handler(*args, **kwargs):
+                # PydanticAI streams events natively via event_stream_handler passing (run_ctx, event)
+                event = args[1] if len(args) > 1 else (args[0] if args else None)
+                if event and type(event).__name__ == "ToolCallEvent":
                     try:
                         # Extract tool name based on the event structure
                         if hasattr(event, "part") and hasattr(event.part, "tool_name"):
@@ -236,7 +248,8 @@ async def chat_completions(request: ChatRequest):
                 # Use run_stream to get events, but we just await the final result internally
                 # while pushing events to the queue
                 async with agent.run_stream(request.messages[-1].content, message_history=history, deps=run_deps, event_stream_handler=event_handler) as response:
-                    return await response.get_output()
+                    output = await response.get_output()
+                    return output, response.usage
 
             task = asyncio.create_task(run_with_handler())
             try:
@@ -248,17 +261,17 @@ async def chat_completions(request: ChatRequest):
                     except asyncio.TimeoutError:
                         yield json.dumps({"status": "processing"}) + "\n"
                 
-                # Task completed, get the final result text
-                final_text = task.result()
+                # Task completed, get the final result text and usage
+                final_text, usage = task.result()
                 
-                # Mock a result object for handle_success since we only get raw text from run_stream output
+                # Mock a result object for handle_success with usage stats from stream
                 class MockResult:
-                    def __init__(self, output):
+                    def __init__(self, output, usage):
                         self.output = output
-                        self.usage = None # Cannot get full usage easily from stream right now
+                        self.usage = usage
                 
-                result = MockResult(final_text)
-                handle_success(result, captured_user_id)
+                result = MockResult(final_text, usage)
+                await handle_success(result, captured_user_id)
                 yield json.dumps({"choices": [{"message": {"role": "assistant", "content": final_text}}]}) + "\n"
             except asyncio.CancelledError:
                 if not task.done():
@@ -277,7 +290,7 @@ async def chat_completions(request: ChatRequest):
 
     try:
         result = await execute_agent()
-        handle_success(result, captured_user_id)
+        await handle_success(result, captured_user_id)
         return {"choices": [{"message": {"role": "assistant", "content": result.output}}]}
     except Exception as e:
         health_monitor.record_event("agent", request.model, is_success=False, error_details=str(e))

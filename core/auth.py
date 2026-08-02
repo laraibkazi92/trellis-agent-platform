@@ -531,18 +531,47 @@ class IdentityManager:
             return json.loads(value.decode('utf-8'))
         return {"input_tokens": 0, "output_tokens": 0, "total_requests": 0}
 
+    def _atomic_update_usage_json(self, key: str, update_fn) -> Dict[str, Any]:
+        """Atomically update a JSON record in etcd using Compare-And-Swap (CAS)."""
+        for _ in range(20):
+            raw_val, _ = self.client.get(key)
+            if raw_val is None:
+                initial_data = update_fn({})
+                new_bytes = json.dumps(initial_data).encode('utf-8')
+                if self.client.put_if_not_exists(key, new_bytes):
+                    return initial_data
+            else:
+                try:
+                    current_data = json.loads(raw_val.decode('utf-8'))
+                except Exception:
+                    current_data = {}
+                updated_data = update_fn(current_data)
+                new_bytes = json.dumps(updated_data).encode('utf-8')
+                if self.client.replace(key, raw_val, new_bytes):
+                    return updated_data
+        # Fallback if max retries reached
+        raw_val, _ = self.client.get(key)
+        current_data = json.loads(raw_val.decode('utf-8')) if raw_val else {}
+        final_data = update_fn(current_data)
+        self.client.put(key, json.dumps(final_data))
+        return final_data
+
     @retry_etcd()
     def record_usage(self, user_id: str, input_tokens: int, output_tokens: int) -> None:
-        """Increment token usage for a user."""
+        """Increment token usage for a user atomically."""
         if not user_id:
             return
             
-        current = self.get_user_usage(user_id)
-        current["input_tokens"] = current.get("input_tokens", 0) + input_tokens
-        current["output_tokens"] = current.get("output_tokens", 0) + output_tokens
-        current["total_requests"] = current.get("total_requests", 0) + 1
+        inp = input_tokens or 0
+        outp = output_tokens or 0
         
-        self.client.put(f"/usage/{user_id}", json.dumps(current))
+        def update(current: Dict[str, Any]) -> Dict[str, Any]:
+            current["input_tokens"] = current.get("input_tokens", 0) + inp
+            current["output_tokens"] = current.get("output_tokens", 0) + outp
+            current["total_requests"] = current.get("total_requests", 0) + 1
+            return current
+
+        self._atomic_update_usage_json(f"/usage/{user_id}", update)
 
     @retry_etcd()
     def get_user_agent_usage(self, user_id: str) -> Dict[str, Dict[str, int]]:
@@ -557,19 +586,22 @@ class IdentityManager:
 
     @retry_etcd()
     def record_agent_usage(self, user_id: str, agent_name: str, input_tokens: int, output_tokens: int) -> None:
-        """Increment token usage for a specific agent for a user."""
+        """Increment token usage for a specific agent for a user atomically."""
         if not user_id or not agent_name:
             return
             
-        key = f"/usage/{user_id}/agents/{agent_name}"
-        value, _ = self.client.get(key)
-        current = json.loads(value.decode('utf-8')) if value else {"input_tokens": 0, "output_tokens": 0, "total_requests": 0}
+        inp = input_tokens or 0
+        outp = output_tokens or 0
         
-        current["input_tokens"] += input_tokens
-        current["output_tokens"] += output_tokens
-        current["total_requests"] += 1
-        
-        self.client.put(key, json.dumps(current))
+        def update(current: Dict[str, Any]) -> Dict[str, Any]:
+            if not current:
+                current = {"input_tokens": 0, "output_tokens": 0, "total_requests": 0}
+            current["input_tokens"] = current.get("input_tokens", 0) + inp
+            current["output_tokens"] = current.get("output_tokens", 0) + outp
+            current["total_requests"] = current.get("total_requests", 0) + 1
+            return current
+
+        self._atomic_update_usage_json(f"/usage/{user_id}/agents/{agent_name}", update)
 
     @retry_etcd()
     def get_user_tool_usage(self, user_id: str) -> Dict[str, int]:

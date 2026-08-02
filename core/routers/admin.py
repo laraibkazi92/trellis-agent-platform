@@ -101,7 +101,7 @@ async def admin_dashboard(request: Request):
     sem = asyncio.Semaphore(10)
     async def fetch_usage(u):
         async with sem:
-            user_id = u.get("sub")
+            user_id = u.get("sub") or u.get("id") or u.get("user_id")
             if not user_id:
                 # Fallback for legacy or malformed records
                 u["usage"] = {"input_tokens": 0, "output_tokens": 0, "total_requests": 0}
@@ -111,7 +111,11 @@ async def admin_dashboard(request: Request):
     await asyncio.gather(*(fetch_usage(u) for u in users))
         
     # Map keys to user emails for display
-    user_email_map = {u.get("sub", "unknown"): u.get("email", "Unknown") for u in users}
+    user_email_map = {}
+    for u in users:
+        uid = u.get("sub") or u.get("id") or u.get("user_id")
+        if uid:
+            user_email_map[uid] = u.get("email", "Unknown")
     for k in keys:
         k["user_email"] = user_email_map.get(k.get("user_id"), "Unknown User")
         
