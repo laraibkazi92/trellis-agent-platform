@@ -9,3 +9,8 @@ data/
 
 workspace/reports/
 *.playwright*
+
+# example-cli MCP bundle (generated artifacts — rebuild with `npm run build`)
+workspace/mcps/example-cli/bundle/devops.js
+workspace/mcps/example-cli/bundle/devops.js.map
+workspace/mcps/example-cli/node_modules/
