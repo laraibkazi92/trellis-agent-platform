@@ -196,6 +196,9 @@ async def get_external_mcp_client(mcp_name: str, user_id: str) -> FastMCPClient:
     await client.__aenter__()
     return client
 
+def is_hub_connected() -> bool:
+    return _hub_client is not None
+
 async def get_hub_client() -> FastMCPClient:
     global _hub_client, _hub_tools_cache
     if _hub_client is None:

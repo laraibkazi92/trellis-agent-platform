@@ -85,7 +85,7 @@ from core.agent_factory import (
     get_identity_manager,
     get_health_monitor,
     mcp_client_cache,
-    _hub_client,
+    is_hub_connected,
     SupervisorDeps,
 )
 from core.memory import get_memory_manager
@@ -161,13 +161,17 @@ async def health():
         if name == "supervisor" or name in disabled: continue
         
         # Check tool status from the pre-fetched tool_healths
-        offline_tools = [t for t in cfg.get("allowed_tools", []) if tool_healths.get(t, {}).get("status") == "Offline"]
+        offline_tools = [
+            t for t in cfg.get("allowed_tools", [])
+            if health_monitor._evaluate_status(tool_healths.get(t, {})).get("status") == "Offline"
+        ]
         
-        agent_global_status = agent_healths.get(name, {})
-        status_str = "Offline" if agent_global_status.get("status") == "Offline" else ("Degraded" if offline_tools else "Online")
+        agent_global_status = health_monitor._evaluate_status(agent_healths.get(name, {}))
+        agent_status_val = agent_global_status.get("status", "Online")
+        status_str = "Offline" if agent_status_val == "Offline" else ("Degraded" if offline_tools else agent_status_val)
         agents_status[name] = {"status": status_str, "offline_tools": offline_tools, "agent_error": agent_global_status.get("last_error")}
     
-    return {"status": "healthy", "agents": agents_status, "agents_disabled": disabled, "hub_connected": _hub_client is not None}
+    return {"status": "healthy", "agents": agents_status, "agents_disabled": disabled, "hub_connected": is_hub_connected()}
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatRequest):
