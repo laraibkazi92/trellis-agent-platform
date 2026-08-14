@@ -3,7 +3,7 @@ test_*.py
 *pycache*
 .env
 
-./*.pngdata/
+data/
 
 .git_local_credentials
 
