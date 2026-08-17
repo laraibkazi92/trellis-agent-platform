@@ -61,6 +61,7 @@ class MCPConfig(BaseModel):
     args: Optional[List[str]] = Field(default_factory=list)
     env: Optional[Dict[str, str]] = Field(default_factory=dict)
     secrets: Optional[Union[List[str], Dict[str, List[str]]]] = Field(default_factory=list, description="List of user secrets required by this MCP.")
+    optional_secrets: Optional[List[str]] = Field(default_factory=list, description="Secrets injected when present but not required for the MCP to start.")
     variables: Optional[Union[List[str], Dict[str, List[str]]]] = Field(default_factory=list, description="List of non-sensitive configuration variables required by this MCP.")
     tools: Optional[List[MCPToolDefinition]] = Field(default_factory=list, description="Optional statically defined tools to bypass dynamic discovery.")
 

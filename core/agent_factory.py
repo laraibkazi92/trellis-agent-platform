@@ -179,7 +179,10 @@ async def get_external_mcp_client(mcp_name: str, user_id: str) -> FastMCPClient:
     
     # Inject Secrets (Scoped)
     env = _inject_config(config.env, config.secrets, identity_mgr, user_id, "secrets", is_background)
-    
+
+    # Inject Optional Secrets (Scoped — silently skipped when absent, never blocks startup)
+    env = _inject_config(env, config.optional_secrets, identity_mgr, user_id, "secrets", is_background)
+
     # Inject Variables (Scoped)
     env = _inject_config(env, config.variables, identity_mgr, user_id, "variables", is_background)
 

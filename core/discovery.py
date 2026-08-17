@@ -59,6 +59,35 @@ async def get_agent_required_secrets(config: Dict) -> List[str]:
             
     return sorted(list(required))
 
+async def get_agent_optional_secrets(config: Dict) -> List[str]:
+    """Helper to determine all optional secrets for an agent's allowed MCPs.
+
+    Optional secrets are informational — their absence does not block the agent
+    from being configured. When present they are injected into the MCP process env.
+    """
+    optional = set()
+    is_background = config.get("type") in ("background_agent", "background_script")
+
+    allowed_mcps = config.get("allowed_mcps", [])
+    for mcp_name in allowed_mcps:
+        mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
+        if mcp_config and mcp_config.get("optional_secrets"):
+            resolved = _resolve_requirements(mcp_config.get("optional_secrets"), is_background)
+            optional.update(resolved)
+
+    allowed_tools = config.get("allowed_tools", [])
+    for tool_name in allowed_tools:
+        if tool_name.startswith("mcp__"):
+            parts = tool_name.split("__")
+            if len(parts) >= 3:
+                mcp_name = parts[1]
+                mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
+                if mcp_config and mcp_config.get("optional_secrets"):
+                    resolved = _resolve_requirements(mcp_config.get("optional_secrets"), is_background)
+                    optional.update(resolved)
+
+    return sorted(list(optional))
+
 async def get_agent_required_variables(config: Dict) -> List[str]:
     """Helper to determine all required non-sensitive variables for an agent based on its config, tools, and MCPs."""
     required = set()
@@ -100,21 +129,20 @@ async def is_agent_configured(agent_name: str, user_id: str) -> Dict:
       - configured (bool)
       - missing_secrets (List[str])
       - missing_variables (List[str])
+      - optional_missing_secrets (List[str])  — informational; does not affect configured
     """
     if agent_name == "supervisor":
-        return {"configured": True, "missing_secrets": [], "missing_variables": []}
+        return {"configured": True, "missing_secrets": [], "missing_variables": [], "optional_missing_secrets": []}
 
     config = await asyncio.to_thread(identity_mgr.get_agent_config, agent_name)
     if not config:
-        return {"configured": False, "missing_secrets": [], "missing_variables": []}
+        return {"configured": False, "missing_secrets": [], "missing_variables": [], "optional_missing_secrets": []}
 
     is_background = config.get("type") in ("background_agent", "background_script")
 
     required_secrets = await get_agent_required_secrets(config)
     required_variables = await get_agent_required_variables(config)
-
-    if not required_secrets and not required_variables:
-        return {"configured": True, "missing_secrets": [], "missing_variables": []}
+    optional_secrets = await get_agent_optional_secrets(config)
 
     system_identity = Identity(id="system", type=IdentityType.SYSTEM)
     global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
@@ -122,9 +150,12 @@ async def is_agent_configured(agent_name: str, user_id: str) -> Dict:
 
     user_required_secrets = [s for s in required_secrets if s not in global_secrets]
     user_required_variables = [s for s in required_variables if s not in global_variables]
+    user_optional_secrets = [s for s in optional_secrets if s not in global_secrets]
 
     if not user_required_secrets and not user_required_variables:
-        return {"configured": True, "missing_secrets": [], "missing_variables": []}
+        # Still resolve optional_missing_secrets even when the agent is configured.
+        if not user_optional_secrets:
+            return {"configured": True, "missing_secrets": [], "missing_variables": [], "optional_missing_secrets": []}
 
     identity = Identity.from_string(user_id) if not is_background else Identity(id=agent_name, type=IdentityType.WORKFLOW)
 
@@ -133,11 +164,13 @@ async def is_agent_configured(agent_name: str, user_id: str) -> Dict:
 
     missing_secrets = [s for s in user_required_secrets if s not in ident_secrets]
     missing_variables = [v for v in user_required_variables if v not in ident_variables]
+    optional_missing_secrets = [s for s in user_optional_secrets if s not in ident_secrets]
 
     return {
         "configured": not missing_secrets and not missing_variables,
         "missing_secrets": missing_secrets,
         "missing_variables": missing_variables,
+        "optional_missing_secrets": optional_missing_secrets,
     }
 
 async def discover_agents(user_id: Optional[str] = None, include_background: bool = False) -> List[Dict]:
@@ -182,11 +215,13 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
         is_configured = True
         missing_secrets = []
         missing_variables = []
-        
+        optional_missing_secrets = []
+
         # Optimized requirement resolution using pre-fetched configs
         required_secrets = set()
         required_variables = set()
-        
+        optional_secrets = set()
+
         # 1. Include requirements from agent/workflow config
         if config.get("secrets"):
             required_secrets.update(_resolve_requirements(config.get("secrets"), is_background))
@@ -212,7 +247,9 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
                             required_secrets.update(_resolve_requirements(mcp_config.get("secrets"), is_background))
                         if mcp_config.get("variables"):
                             required_variables.update(_resolve_requirements(mcp_config.get("variables"), is_background))
-        
+                        if mcp_config.get("optional_secrets"):
+                            optional_secrets.update(_resolve_requirements(mcp_config.get("optional_secrets"), is_background))
+
         allowed_mcps = config.get("allowed_mcps", [])
         for mcp_name in allowed_mcps:
             mcp_config = all_mcp_configs.get(mcp_name)
@@ -221,9 +258,12 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
                     required_secrets.update(_resolve_requirements(mcp_config.get("secrets"), is_background))
                 if mcp_config.get("variables"):
                     required_variables.update(_resolve_requirements(mcp_config.get("variables"), is_background))
-        
+                if mcp_config.get("optional_secrets"):
+                    optional_secrets.update(_resolve_requirements(mcp_config.get("optional_secrets"), is_background))
+
         user_required_secrets = [s for s in required_secrets if s not in global_secrets]
         user_required_variables = [s for s in required_variables if s not in global_variables]
+        user_optional_secrets = [s for s in optional_secrets if s not in global_secrets]
         
         current_config_secrets = {}
         current_config_variables = {}
@@ -242,12 +282,16 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
             if req not in current_config_secrets:
                 is_configured = False
                 missing_secrets.append(req)
-        
+
         for req in user_required_variables:
             if req not in current_config_variables:
                 is_configured = False
                 missing_variables.append(req)
-        
+
+        for opt in user_optional_secrets:
+            if opt not in current_config_secrets:
+                optional_missing_secrets.append(opt)
+
         agents.append({
             "name": config.get("name", name),
             "type": config.get("type", "user_agent"),
@@ -266,6 +310,7 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
             "is_configured": is_configured,
             "missing_secrets": missing_secrets,
             "missing_variables": missing_variables,
+            "optional_missing_secrets": optional_missing_secrets,
             "current_variables": current_config_variables
          })
 
