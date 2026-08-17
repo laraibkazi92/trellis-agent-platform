@@ -17,6 +17,18 @@ from core.agent_factory import (
 
 RESTRICTED_ENV_VARS = {"PATH", "PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "BASH_ENV", "ENV", "HOSTALIASES"}
 
+MAX_RUN_OUTPUT_CHARS = int(os.getenv("MAX_RUN_OUTPUT_CHARS", "32768")) # 32 KB limit
+MAX_RUN_ERROR_CHARS = int(os.getenv("MAX_RUN_ERROR_CHARS", "4096"))   # 4 KB limit
+
+def _truncate_output(text: Optional[str], max_chars: int = MAX_RUN_OUTPUT_CHARS) -> str:
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    half = max(1, (max_chars - 100) // 2)
+    omitted = max(0, len(text) - (half * 2))
+    return f"{text[:half]}\n\n[... Truncated {omitted} characters ...]\n\n{text[-half:]}"
+
 # Redis broker configuration
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 broker = ListQueueBroker(redis_url, socket_timeout=None)
@@ -52,6 +64,13 @@ async def dynamic_cron_heartbeat():
         if not config_data or config_data.get("type") not in ("background_agent", "background_script"):
             continue
             
+        # Periodic pruning of historical workflow runs (runs once per hour at minute 0)
+        if now.minute == 0:
+            try:
+                await asyncio.to_thread(identity_mgr.prune_agent_runs, name, 100)
+            except Exception as e:
+                print(f"Failed to periodically prune runs for {name}: {e}")
+
         trigger = config_data.get("trigger")
         if trigger and trigger.get("type") == "cron":
             expr_data = trigger.get("expression")
@@ -104,8 +123,7 @@ async def run_background_script(
         
         try:
             # Check for cancellation before processing
-            runs = await asyncio.to_thread(identity_mgr.get_agent_runs, agent_name)
-            run_record = next((r for r in runs if r.get("run_id") == task_id), None)
+            run_record = await asyncio.to_thread(identity_mgr.get_agent_run, agent_name, task_id)
             
             if run_record and run_record.get("state") == "cancelled":
                 print(f"Task {task_id} for {agent_name} was cancelled before processing. Aborting.")
@@ -116,7 +134,7 @@ async def run_background_script(
                 agent_name,
                 task_id,
                 "processing",
-                {"prompt": prompt, "user_id": user_id}
+                {"prompt": _truncate_output(prompt, max_chars=8192), "user_id": user_id}
             )
         except Exception as err:
             print(f"Failed to record processing state for {agent_name} run {task_id}: {err}")
@@ -196,8 +214,7 @@ async def run_background_script(
                 return
             while True:
                 try:
-                    runs = await asyncio.to_thread(identity_mgr.get_agent_runs, agent_name)
-                    rec = next((r for r in runs if r.get("run_id") == task_id), None)
+                    rec = await asyncio.to_thread(identity_mgr.get_agent_run, agent_name, task_id)
                     if rec and rec.get("state") == "cancelled":
                         print(f"Task {task_id} for {agent_name} cancelled mid-execution. Killing subprocess.")
                         try:
@@ -239,9 +256,9 @@ async def run_background_script(
                 task_id,
                 "completed",
                 {
-                    "prompt": prompt,
+                    "prompt": _truncate_output(prompt, max_chars=8192),
                     "user_id": user_id,
-                    "output": output_str.strip()
+                    "output": _truncate_output(output_str.strip())
                 }
             )
         except Exception as err:
@@ -258,9 +275,9 @@ async def run_background_script(
                 task_id,
                 "failed",
                 {
-                    "prompt": prompt,
+                    "prompt": _truncate_output(prompt, max_chars=8192),
                     "user_id": user_id,
-                    "error": str(e)
+                    "error": str(e)[:MAX_RUN_ERROR_CHARS]
                 }
             )
         except Exception as err:
@@ -287,8 +304,7 @@ async def run_background_agent(
         # Record processing state
         try:
             # Check for cancellation before processing
-            runs = await asyncio.to_thread(identity_mgr.get_agent_runs, agent_name)
-            run_record = next((r for r in runs if r.get("run_id") == task_id), None)
+            run_record = await asyncio.to_thread(identity_mgr.get_agent_run, agent_name, task_id)
             
             if run_record and run_record.get("state") == "cancelled":
                 print(f"Task {task_id} for {agent_name} was cancelled before processing. Aborting.")
@@ -299,7 +315,7 @@ async def run_background_agent(
                 agent_name,
                 task_id,
                 "processing",
-                {"prompt": prompt, "user_id": user_id}
+                {"prompt": _truncate_output(prompt, max_chars=8192), "user_id": user_id}
             )
         except Exception as err:
             print(f"Failed to record processing state for {agent_name} run {task_id}: {err}")
@@ -323,8 +339,7 @@ async def run_background_agent(
                 return
             while True:
                 try:
-                    runs = await asyncio.to_thread(identity_mgr.get_agent_runs, agent_name)
-                    rec = next((r for r in runs if r.get("run_id") == task_id), None)
+                    rec = await asyncio.to_thread(identity_mgr.get_agent_run, agent_name, task_id)
                     if rec and rec.get("state") == "cancelled":
                         print(f"Task {task_id} for {agent_name} cancelled mid-execution. Cancelling agent task.")
                         agent_task_ref.cancel()
@@ -392,9 +407,9 @@ async def run_background_agent(
                 task_id,
                 "completed",
                 {
-                    "prompt": prompt,
+                    "prompt": _truncate_output(prompt, max_chars=8192),
                     "user_id": user_id,
-                    "output": result.output,
+                    "output": _truncate_output(str(result.output) if result.output else ""),
                     "usage": usage_data
                 }
             )
@@ -413,9 +428,9 @@ async def run_background_agent(
                 task_id,
                 "failed",
                 {
-                    "prompt": prompt,
+                    "prompt": _truncate_output(prompt, max_chars=8192),
                     "user_id": user_id,
-                    "error": str(e)
+                    "error": str(e)[:MAX_RUN_ERROR_CHARS]
                 }
             )
         except Exception as err:

@@ -14,7 +14,7 @@ import core.health_db as health_db
 class HealthMonitor:
     def __init__(self, identity_mgr: "IdentityManager"):
         self.identity_mgr = identity_mgr
-        self.failure_threshold = int(os.getenv("HEALTH_FAILURE_THRESHOLD", "5"))
+        self.failure_threshold = int(os.getenv("HEALTH_FAILURE_THRESHOLD", "10"))
         self.cooldown_seconds = int(os.getenv("HEALTH_COOLDOWN_SECONDS", "60"))
         # Initialize the health events database
         health_db.init_db()

@@ -64,6 +64,11 @@ def retry_etcd(max_retries=10, delay=2):
                 try:
                     return func(self, *args, **kwargs)
                 except Exception as e:
+                    # Fast-fail immediately on non-transient resource exhaustion (e.g. gRPC message > 4MB)
+                    err_str = str(e)
+                    if "RESOURCE_EXHAUSTED" in err_str:
+                        logger.error(f"etcd operation failed with RESOURCE_EXHAUSTED (payload too large). Fast-failing without retry: {e}")
+                        raise
                     logger.warning(f"etcd operation failed (attempt {attempt + 1}/{max_retries}): {e}")
                     if attempt == max_retries - 1:
                         logger.error(f"etcd operation failed after {max_retries} attempts.")
@@ -737,8 +742,21 @@ class IdentityManager:
             return True
 
     @retry_etcd()
-    def get_agent_runs(self, agent_name: str) -> List[Dict]:
-        """Retrieve all runs for a specific agent, sorted by timestamp descending."""
+    def get_agent_run(self, agent_name: str, run_id: str) -> Optional[Dict]:
+        """Retrieve a specific run by agent name and run_id without scanning the full prefix."""
+        key = f"/runs/{agent_name}/{run_id}"
+        value, _ = self.client.get(key)
+        if value:
+            try:
+                return json.loads(value.decode('utf-8'))
+            except Exception as e:
+                logger.warning(f"Failed to decode agent run record for {key}: {e}")
+                return None
+        return None
+
+    @retry_etcd()
+    def get_agent_runs(self, agent_name: str, limit: Optional[int] = None) -> List[Dict]:
+        """Retrieve runs for a specific agent, sorted by timestamp descending, with optional limit."""
         runs = []
         prefix = f"/runs/{agent_name}/"
         for value, metadata in self.client.get_prefix(prefix):
@@ -748,7 +766,47 @@ class IdentityManager:
                 except Exception as e:
                     logger.warning(f"Failed to decode agent run record: {e}")
         runs.sort(key=lambda x: x.get("updated_at", x.get("timestamp", "")), reverse=True)
+        if limit is not None and limit > 0:
+            return runs[:limit]
         return runs
+
+    @retry_etcd()
+    def prune_agent_runs(self, agent_name: str, keep_last: int = 50) -> int:
+        """Prune historical runs for an agent, retaining only the latest `keep_last` records.
+        
+        Returns the number of deleted records.
+        """
+        prefix = f"/runs/{agent_name}/"
+        records = []
+        for value, metadata in self.client.get_prefix(prefix):
+            key_str = metadata.key.decode('utf-8')
+            if value:
+                try:
+                    parsed = json.loads(value.decode('utf-8'))
+                    ts = parsed.get("updated_at", parsed.get("timestamp", ""))
+                    records.append((key_str, ts))
+                except Exception:
+                    # If corrupted, mark for deletion
+                    records.append((key_str, ""))
+            else:
+                records.append((key_str, ""))
+
+        if len(records) <= keep_last:
+            return 0
+
+        # Sort descending by timestamp so newest records come first
+        records.sort(key=lambda x: x[1], reverse=True)
+        to_delete = records[keep_last:]
+        deleted_count = 0
+        for key_str, _ in to_delete:
+            try:
+                self.client.delete(key_str)
+                deleted_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to delete old run key {key_str}: {e}")
+        
+        logger.info(f"Pruned {deleted_count} historical run records for agent '{agent_name}'.")
+        return deleted_count
 
     # --- MCP OAuth 2.1 State Management ---
 

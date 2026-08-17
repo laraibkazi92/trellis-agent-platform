@@ -14,7 +14,7 @@ def test_identity_from_string_agent():
     assert identity.id == "daily-report"
     assert identity.type == IdentityType.WORKFLOW
     assert identity.to_legacy_string() == "svc_agent_daily-report"
-    assert identity.get_etcd_path("secrets") == "/identities/agent/daily-report/secrets"
+    assert identity.get_etcd_path("secrets") == "/identities/workflow/daily-report/secrets"
 
 def test_identity_from_string_system():
     id_str = "system"

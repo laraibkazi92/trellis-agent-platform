@@ -1,6 +1,7 @@
 import json
 import os
 import asyncio
+import logging
 import secrets as secrets_module
 import yaml
 from typing import Dict, Any, List, Optional, Literal
@@ -14,6 +15,8 @@ from core.discovery import get_agent_required_secrets, get_agent_required_variab
 from core.models import Identity, IdentityType
 
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 _REDIS_QUEUE_NAME = "taskiq"
 
@@ -173,7 +176,13 @@ async def workflows_view(request: Request):
     }
     for w_item in workflows_list:
         w_name = w_item["name"]
-        agent_runs = await asyncio.to_thread(identity_mgr.get_agent_runs, w_name)
+        try:
+            agent_runs = await asyncio.to_thread(identity_mgr.get_agent_runs, w_name, 100)
+        except Exception as e:
+            logger.error(f"Failed to fetch runs for workflow '{w_name}': {e}")
+            agent_runs = []
+            w_item["runs_error"] = str(e)
+            
         for run in agent_runs:
             state = run.get("state")
             if state in queue:
@@ -265,9 +274,8 @@ async def cancel_background_run(request: Request, agent_name: str, run_id: str):
         return RedirectResponse(url='/workflows', status_code=303)
         
     try:
-        # Get current run state
-        runs = await asyncio.to_thread(identity_mgr.get_agent_runs, safe_name)
-        run_record = next((r for r in runs if r.get("run_id") == run_id), None)
+        # Get current run state via single-run lookup
+        run_record = await asyncio.to_thread(identity_mgr.get_agent_run, safe_name, run_id)
         
         if not run_record:
             request.session["flash_msg"] = f"Run {run_id} not found."
@@ -392,7 +400,12 @@ async def clear_all_active_runs(request: Request):
         for name in agent_names:
             config_data = await asyncio.to_thread(identity_mgr.get_agent_config, name)
             if config_data and config_data.get("type") in ("background_agent", "background_script"):
-                runs = await asyncio.to_thread(identity_mgr.get_agent_runs, name)
+                try:
+                    runs = await asyncio.to_thread(identity_mgr.get_agent_runs, name)
+                except Exception as e:
+                    logger.error(f"Error fetching runs for {name} during clear-all: {e}")
+                    error_count += 1
+                    continue
                 for run_record in runs:
                     state = run_record.get("state")
                     if state in ("pending", "processing"):
