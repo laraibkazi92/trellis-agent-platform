@@ -75,4 +75,6 @@ class ToolConfig(BaseModel):
     inputs: Optional[Dict[str, Any]] = None
     outputs: Optional[Dict[str, Any]] = None
     secrets: Optional[Union[List[str], Dict[str, List[str]]]] = Field(default_factory=list)
+    optional_secrets: Optional[List[str]] = Field(default_factory=list, description="Secrets injected when present but not required for the tool to run.")
     variables: Optional[Union[List[str], Dict[str, List[str]]]] = Field(default_factory=list)
+    secret_groups: Optional[List[Dict[str, Any]]] = Field(default_factory=list, description="UI hint for /configuration: renders a set of optional_secrets as a single card with a selector (e.g. an environment dropdown) instead of flat rows. Each group: {label, select_label, options: [{value, label, fields: [{key, label, type}]}]}.")

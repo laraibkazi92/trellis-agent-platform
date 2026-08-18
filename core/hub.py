@@ -100,6 +100,14 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
 
     try:
         env = os.environ.copy()
+
+        # Any CLI binary dropped into workspace/bin/ on the host becomes
+        # available to every tool automatically — workspace/ is already
+        # bind-mounted into this container, so this needs no per-tool
+        # docker-compose volume mount and no image rebuild.
+        workspace_bin = str((BASE_DIR / "workspace" / "bin").resolve())
+        env["PATH"] = f"{workspace_bin}{os.pathsep}{env.get('PATH', '')}"
+
         if user_id:
             from core.discovery import _resolve_requirements
             is_background = user_id.startswith("svc_agent_")
@@ -110,7 +118,14 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
                 secrets = identity_mgr.get_resolved_config(user_id, "secrets", keys=secret_keys)
                 safe_secrets = {str(k): str(v) for k, v in secrets.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
                 env.update(safe_secrets)
-            
+
+            # Scoped Optional Secret Injection (absence does not block tool execution)
+            optional_secret_keys = _resolve_requirements(getattr(config, "optional_secrets", None), is_background)
+            if optional_secret_keys:
+                optional_secrets = identity_mgr.get_resolved_config(user_id, "secrets", keys=optional_secret_keys)
+                safe_optional_secrets = {str(k): str(v) for k, v in optional_secrets.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
+                env.update(safe_optional_secrets)
+
             # Scoped Variable Injection
             variable_keys = _resolve_requirements(config.variables, is_background)
             if variable_keys:

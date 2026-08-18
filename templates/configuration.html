@@ -44,9 +44,13 @@
                             <span class="font-mono text-sm font-bold uppercase tracking-wide text-neutral-900 dark:text-neutral-100">
                                 {{ item.key }}
                             </span>
-                            
+
                             {% if item.type == 'variable' %}
                             <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-mono font-bold uppercase border border-blue-500/30 bg-blue-50 text-blue-600 dark:bg-blue-950/20 dark:text-blue-400 rounded">
+                                {{ item.label }}
+                            </span>
+                            {% elif item.type == 'secret_group' %}
+                            <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-mono font-bold uppercase border border-purple-500/30 bg-purple-50 text-purple-600 dark:bg-purple-950/20 dark:text-purple-400 rounded">
                                 {{ item.label }}
                             </span>
                             {% else %}
@@ -56,7 +60,7 @@
                             {% endif %}
                         </div>
                     </div>
-                    
+
                     <div class="flex flex-wrap gap-1.5 items-center">
                         <span class="text-neutral-400 dark:text-neutral-500 font-mono text-[10px] uppercase tracking-wider mr-1">Required by:</span>
                         {% for tool in item.tools %}
@@ -65,18 +69,44 @@
                         </a>
                         {% endfor %}
                     </div>
-                    
+
                     {% if item.type == 'variable' %}
-                    <input type="text" 
-                           id="{{ item.key }}" 
-                           name="{{ item.key }}" 
+                    <input type="text"
+                           id="{{ item.key }}"
+                           name="{{ item.key }}"
                            value="{{ item.value }}"
                            placeholder="{{ item.placeholder }}"
                            class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
+                    {% elif item.type == 'secret_group' %}
+                    <div class="flex items-center gap-3">
+                        <label class="font-mono text-xs uppercase tracking-wider text-neutral-500 dark:text-neutral-400">{{ item.select_label }}</label>
+                        <select class="secret-group-select bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-2 font-mono text-sm rounded focus:outline-none focus:border-accent dark:focus:border-accent-dark"
+                                data-group-key="{{ item.key | e }}">
+                            {% for option in item.options %}
+                            <option value="{{ option.value }}">{{ option.label }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    {% for option in item.options %}
+                    <div class="secret-group-option space-y-3 pt-2 {{ '' if loop.first else 'hidden' }}"
+                         data-group-key="{{ item.key | e }}" data-option-value="{{ option.value }}">
+                        {% for field in option.fields %}
+                        <div>
+                            <label for="{{ field.key }}" class="block font-mono text-[11px] uppercase tracking-wider text-neutral-400 dark:text-neutral-500 mb-1">{{ option.label }} {{ field.label }}</label>
+                            <input type="{{ field.type }}"
+                                   id="{{ field.key }}"
+                                   name="{{ field.key }}"
+                                   value="{{ field.value }}"
+                                   placeholder="{{ field.placeholder }}"
+                                   class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
+                        </div>
+                        {% endfor %}
+                    </div>
+                    {% endfor %}
                     {% else %}
-                    <input type="password" 
-                           id="{{ item.key }}" 
-                           name="{{ item.key }}" 
+                    <input type="password"
+                           id="{{ item.key }}"
+                           name="{{ item.key }}"
                            value=""
                            placeholder="{{ item.placeholder }}"
                            class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
@@ -235,6 +265,19 @@ document.addEventListener('DOMContentLoaded', function() {
     
     // Initial display
     updateUI();
+
+    // Secret group selectors (e.g. netctl's environment dropdown): switching
+    // the selector only toggles which option panel is visible via the
+    // 'hidden' class — every option's inputs stay mounted in the DOM, so
+    // values already typed for other options are never cleared.
+    document.querySelectorAll('.secret-group-select').forEach(select => {
+        select.addEventListener('change', () => {
+            const groupKey = select.getAttribute('data-group-key');
+            document.querySelectorAll(`.secret-group-option[data-group-key="${CSS.escape(groupKey)}"]`).forEach(panel => {
+                panel.classList.toggle('hidden', panel.getAttribute('data-option-value') !== select.value);
+            });
+        });
+    });
 });
 </script>
 {% endblock %}

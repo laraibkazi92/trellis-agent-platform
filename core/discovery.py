@@ -85,6 +85,11 @@ async def get_agent_optional_secrets(config: Dict) -> List[str]:
                 if mcp_config and mcp_config.get("optional_secrets"):
                     resolved = _resolve_requirements(mcp_config.get("optional_secrets"), is_background)
                     optional.update(resolved)
+        else:
+            tool_config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
+            if tool_config and tool_config.get("optional_secrets"):
+                resolved = _resolve_requirements(tool_config.get("optional_secrets"), is_background)
+                optional.update(resolved)
 
     return sorted(list(optional))
 

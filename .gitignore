@@ -14,3 +14,8 @@ workspace/reports/
 workspace/mcps/example-cli/bundle/devops.js
 workspace/mcps/example-cli/bundle/devops.js.map
 workspace/mcps/example-cli/node_modules/
+
+# Host-installed CLI binaries (netctl, opsctl, etc.) — placed here directly on
+# the host, never committed. See core/hub.py's PATH injection.
+workspace/bin/*
+!workspace/bin/.gitkeep
