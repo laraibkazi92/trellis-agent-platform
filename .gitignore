@@ -15,7 +15,11 @@ workspace/mcps/example-cli/bundle/devops.js
 workspace/mcps/example-cli/bundle/devops.js.map
 workspace/mcps/example-cli/node_modules/
 
-# Host-installed CLI binaries (netctl, opsctl, etc.) — placed here directly on
-# the host, never committed. See core/hub.py's PATH injection.
-workspace/bin/*
-!workspace/bin/.gitkeep
+# Host-installed CLI binaries (netctl, etc.) — placed directly on the host
+# into each tool's own bin/ (e.g. workspace/tools/netctl-cli/bin/netctl),
+# never committed. See core/hub.py's per-tool PATH injection.
+workspace/tools/*/bin/
+
+# opsctl venv — built directly on the host via `uv venv` + `uv pip install
+# <wheel>`, never committed (see workspace/tools/opsctl/wrapper.py).
+workspace/tools/opsctl/.venv/

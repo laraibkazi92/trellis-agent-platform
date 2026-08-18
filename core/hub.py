@@ -101,12 +101,13 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
     try:
         env = os.environ.copy()
 
-        # Any CLI binary dropped into workspace/bin/ on the host becomes
-        # available to every tool automatically — workspace/ is already
-        # bind-mounted into this container, so this needs no per-tool
-        # docker-compose volume mount and no image rebuild.
-        workspace_bin = str((BASE_DIR / "workspace" / "bin").resolve())
-        env["PATH"] = f"{workspace_bin}{os.pathsep}{env.get('PATH', '')}"
+        # A CLI binary dropped into this tool's own bin/ on the host becomes
+        # available to it automatically — workspace/ is already bind-mounted
+        # into this container, so this needs no docker-compose volume mount
+        # and no image rebuild. Scoped per-tool (rather than one shared
+        # directory) so different tools' binaries can't collide by name.
+        tool_bin = str((tool_dir / "bin").resolve())
+        env["PATH"] = f"{tool_bin}{os.pathsep}{env.get('PATH', '')}"
 
         if user_id:
             from core.discovery import _resolve_requirements
