@@ -4,16 +4,18 @@ import httpx
 import yaml
 import asyncio
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 import uvicorn
 import aiofiles
 from contextlib import asynccontextmanager
 from fastmcp import FastMCP, Context
-from mcp.types import ToolAnnotations
+from mcp.types import TextContent, ToolAnnotations
 from core.auth import AuthMiddleware, IdentityManager, auth_token_var, user_id_var
 from fastapi.middleware.cors import CORSMiddleware
-from core.discovery import discover_agents, is_agent_configured
+from core.discovery import discover_agents, is_agent_configured, is_tool_configured
 from core.agent_search import search_agents as _search_agents_ranked, DEFAULT_LIMIT as AGENT_SEARCH_LIMIT
+from core.tool_search import search_tools as _search_tools_ranked, DEFAULT_LIMIT as TOOL_SEARCH_LIMIT
+from core.agent_factory import get_hub_client, get_external_mcp_client
 
 @asynccontextmanager
 async def lifespan(app):
@@ -289,6 +291,139 @@ async def use_agent(ctx: Context, agent_name: str, prompt: str) -> str:
         return f"SYSTEM: Error calling agent '{agent_name}': {e.response.text}"
     except Exception as e:
         return f"SYSTEM: Failed to connect to agent '{agent_name}': {str(e)}"
+
+async def _is_tool_publicly_whitelisted(tool_name: str) -> bool:
+    """Authorization Guard for `use_tool`: check `public`/`public_tools` directly against
+    the tool's/MCP's own registry config, independent of `search_tools`. This must not
+    assume every whitelisted tool was necessarily discoverable via search — an MCP server
+    without a static `tools:` list in its `mcp.yaml` never surfaces in `search_tools`
+    output even once marked public (see core/tool_search.py), but its whitelisted tools
+    must still be directly executable here.
+
+    Fails closed on anything unexpected (unknown tool, malformed `mcp__` name, non-`True`
+    `public` value, non-list `public_tools`) — mirrors the secure-by-default checks
+    already applied in `is_tool_configured`/`search_tools`.
+    """
+    if tool_name.startswith("mcp__"):
+        parts = tool_name.split("__", 2)
+        if len(parts) != 3:
+            return False
+        _, server_name, sub_tool_name = parts
+        config = await asyncio.to_thread(identity_mgr.get_mcp_config, server_name)
+        if not config:
+            return False
+        public_tools_raw = config.get("public_tools", [])
+        public_tools = set(public_tools_raw) if isinstance(public_tools_raw, list) else set()
+        return config.get("public") is True or sub_tool_name in public_tools
+
+    config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
+    if not config:
+        return False
+    return config.get("public") is True
+
+
+def _extract_tool_output(result: Any) -> Any:
+    """Unwrap a fastmcp `CallToolResult` into the raw structured value a direct caller
+    expects, preserving full stdout/JSON/error codes rather than pydantic-ai's
+    agent-facing `.content` (a list of MCP content blocks).
+
+    Local hub tools (see core/hub.py's `run_tool`) return a plain dict (e.g.
+    `{"stdout", "stderr", "exit_code"}`) which FastMCP surfaces as `structured_content`/
+    `data` — prefer those. Falls back to joined text content for tools that only ever
+    emit unstructured text.
+    """
+    if result.data is not None:
+        return result.data
+    if result.structured_content is not None:
+        return result.structured_content
+    texts = [c.text for c in (result.content or []) if isinstance(c, TextContent)]
+    if texts:
+        return "\n".join(texts)
+    return None
+
+
+@mcp.tool(
+    title="Search Tools",
+    annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True),
+)
+async def search_tools(ctx: Context, query: str, limit: int = TOOL_SEARCH_LIMIT) -> List[Dict]:
+    """Find deterministic tools available for direct execution.
+
+    Use this to discover which whitelisted tool can handle a request — a CLI lookup,
+    status check, or single deterministic operation — then call `use_tool` to execute
+    it directly, with no intermediate agent hop.
+
+    Returns a short, ranked list of Tool Cards: `{name, description, parameters,
+    configured, status, source}`. Unconfigured tools are included with `configured:
+    false` and a note in their description listing the missing secrets/variables. Only
+    call `use_tool` on tools where `configured` is true.
+
+    Args:
+        query: Natural-language description of the command or lookup to find a tool for.
+        limit: Maximum number of tools to return (default: 8).
+    """
+    user_id = user_id_var.get()
+    await ctx.report_progress(0, 1, message=f"Searching tools for: '{query}'")
+
+    results = await _search_tools_ranked(query=query, limit=limit, user_id=user_id)
+
+    names = [r["name"] for r in results]
+    await ctx.report_progress(1, 1, message=f"Found {len(results)} tool(s): {', '.join(names) if names else 'none'}")
+    return results
+
+
+@mcp.tool(
+    title="Use Tool",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False),
+)
+async def use_tool(ctx: Context, tool_name: str, arguments: Dict[str, Any]) -> Any:
+    """Directly execute a whitelisted deterministic tool with arguments.
+
+    Bypasses all agent hops and returns the raw structured output. Always call
+    `search_tools` first to confirm the exact tool name, its parameter schema, and
+    that it is configured — do not guess.
+
+    Args:
+        tool_name: Exact name of the tool (e.g. 'opsctl', 'netctl', or an MCP tool's
+            'mcp__{server}__{name}' form as returned by `search_tools`).
+        arguments: Dictionary of arguments matching the tool's input schema.
+    """
+    user_id = user_id_var.get()
+
+    await ctx.report_progress(0, 3, message=f"Checking access for: {tool_name}")
+    try:
+        whitelisted = await _is_tool_publicly_whitelisted(tool_name)
+    except Exception as e:
+        return f"SYSTEM: Error checking tool access for '{tool_name}': {e}"
+    if not whitelisted:
+        return f"SYSTEM: Access denied. Tool '{tool_name}' is internal and not exposed for direct execution."
+
+    await ctx.report_progress(1, 3, message=f"Checking configuration for: {tool_name}")
+    try:
+        status = await is_tool_configured(tool_name, user_id)
+    except Exception as e:
+        return f"SYSTEM: Error checking configuration for tool '{tool_name}': {e}"
+    if not status["configured"]:
+        missing = status["missing_secrets"] + status["missing_variables"]
+        missing_text = ", ".join(missing) if missing else "required configuration"
+        return f"SYSTEM: Tool '{tool_name}' requires configuration before it can be used. Missing: {missing_text}. Configure at /configuration"
+
+    await ctx.report_progress(2, 3, message=f"Executing {tool_name}...")
+    try:
+        if tool_name.startswith("mcp__"):
+            _, server_name, sub_tool_name = tool_name.split("__", 2)
+            client = await get_external_mcp_client(server_name, user_id)
+            result = await client.call_tool(sub_tool_name, arguments, raise_on_error=False)
+        else:
+            client = await get_hub_client()
+            result = await client.call_tool(tool_name, {**arguments, "__user_id": user_id}, raise_on_error=False)
+    except Exception as e:
+        return f"SYSTEM: Error executing tool '{tool_name}': {e}"
+
+    output = _extract_tool_output(result)
+    await ctx.report_progress(3, 3, message=f"Tool '{tool_name}' execution complete.")
+    return output
+
 
 if __name__ == "__main__":
     app = mcp.http_app()

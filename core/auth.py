@@ -480,6 +480,28 @@ class IdentityManager:
         return self._get_all_configs_by_prefix("/registry/tools/")
 
     @retry_etcd()
+    def save_tool_embedding(self, name: str, vector: List[float]) -> None:
+        """Persist a tool's description embedding for semantic search."""
+        self.client.put(f"/registry/tools/{name}/embedding", json.dumps(vector))
+
+    @retry_etcd()
+    def get_all_tool_embeddings(self) -> Dict[str, List[float]]:
+        """Bulk-fetch every tool's cached embedding vector, keyed by tool name."""
+        embeddings: Dict[str, List[float]] = {}
+        prefix = "/registry/tools/"
+        suffix = "/embedding"
+        for value, metadata in self.client.get_prefix(prefix):
+            key_str = metadata.key.decode('utf-8')
+            if key_str.startswith(prefix) and key_str.endswith(suffix) and value:
+                name = key_str[len(prefix):-len(suffix)]
+                if name:
+                    try:
+                        embeddings[name] = json.loads(value.decode('utf-8'))
+                    except json.JSONDecodeError:
+                        pass
+        return embeddings
+
+    @retry_etcd()
     def save_mcp_config(self, name: str, config: Dict) -> None:
         self.client.put(f"/registry/mcps/{name}/config", json.dumps(config))
 

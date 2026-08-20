@@ -97,6 +97,7 @@ services:
     environment:
       <<: *common-env
       HOST_URL: http://host:8000
+      HUB_URL: http://hub:8001/mcp
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
     volumes:
       - ./workspace:/app/workspace
@@ -106,6 +107,7 @@ services:
     command: python core/gateway.py
     depends_on:
       - host
+      - hub
     restart: unless-stopped
 
   etcd:

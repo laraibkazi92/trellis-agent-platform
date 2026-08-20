@@ -60,6 +60,8 @@ class MCPConfig(BaseModel):
     command: Optional[str] = None
     args: Optional[List[str]] = Field(default_factory=list)
     env: Optional[Dict[str, str]] = Field(default_factory=dict)
+    public: bool = Field(default=False, description="Expose all tools from this MCP server publicly.")
+    public_tools: List[str] = Field(default_factory=list, description="Whitelist of specific tool names exposed publicly.")
     secrets: Optional[Union[List[str], Dict[str, List[str]]]] = Field(default_factory=list, description="List of user secrets required by this MCP.")
     optional_secrets: Optional[List[str]] = Field(default_factory=list, description="Secrets injected when present but not required for the MCP to start.")
     variables: Optional[Union[List[str], Dict[str, List[str]]]] = Field(default_factory=list, description="List of non-sensitive configuration variables required by this MCP.")
@@ -72,6 +74,7 @@ class ToolConfig(BaseModel):
     description: str
     runtime: str = Field(..., pattern="^(python|go|ts|bash)$")
     entrypoint: str
+    public: bool = Field(default=False, description="Expose this tool directly to external MCP clients and gateway search.")
     inputs: Optional[Dict[str, Any]] = None
     outputs: Optional[Dict[str, Any]] = None
     secrets: Optional[Union[List[str], Dict[str, List[str]]]] = Field(default_factory=list)

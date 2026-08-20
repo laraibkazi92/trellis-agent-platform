@@ -93,6 +93,41 @@ async def get_agent_optional_secrets(config: Dict) -> List[str]:
 
     return sorted(list(optional))
 
+def flatten_secret_group_keys(secret_groups: List[Dict]) -> set:
+    """Flattens a list of secret_groups into the set of underlying secret keys."""
+    keys = set()
+    for group in secret_groups:
+        for option in group.get("options", []):
+            for field in option.get("fields", []):
+                keys.add(field["key"])
+    return keys
+
+def _unsatisfied_secret_group_keys(secret_groups: List[Dict], available_secrets: Dict) -> List[str]:
+    """Returns the keys of secret_groups where no single option has all its fields set.
+
+    Grouped credentials (e.g. netctl's per-environment username/password) are declared as
+    optional_secrets precisely because a user only needs ONE option (e.g. one environment)
+    configured, not all of them. But "at least one option's keys are individually present in
+    optional_secrets" is not the same as "at least one option is fully configured" — a group
+    with zero options configured must still surface as missing, or is_tool_configured/
+    is_agent_configured silently reports configured=True for a tool the user has never set up.
+    """
+    missing = []
+    for group in secret_groups:
+        options = group.get("options", [])
+        if not options:
+            continue
+        satisfied = any(
+            option.get("fields") and all(f["key"] in available_secrets for f in option["fields"])
+            for option in options
+        )
+        if not satisfied:
+            for option in options:
+                for field in option.get("fields", []):
+                    if field["key"] not in available_secrets and field["key"] not in missing:
+                        missing.append(field["key"])
+    return missing
+
 async def get_agent_required_variables(config: Dict) -> List[str]:
     """Helper to determine all required non-sensitive variables for an agent based on its config, tools, and MCPs."""
     required = set()
@@ -322,14 +357,94 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
     agents.sort(key=lambda x: x["name"].lower())
     return agents
 
+async def is_tool_configured(tool_name: str, user_id: Optional[str] = None) -> Dict:
+    """Check if a specific tool (local or MCP, e.g. ``mcp__{server}__{name}``) is
+    configured for a user.
+
+    Reuses the same secret/variable resolution primitives as :func:`is_agent_configured`
+    (``_resolve_requirements``, ``flatten_secret_group_keys``) but resolves requirements
+    from the tool's/MCP's own config rather than an agent's ``allowed_tools``/``allowed_mcps``
+    aggregation. Direct tool execution has no "background" context, so ``_resolve_requirements``
+    is always called with ``is_background=False`` (i.e. dict-shaped requirements resolve their
+    ``general`` + ``user`` keys).
+
+    A tool declaring ``secret_groups`` (e.g. opsctl/netctl's per-environment credential picker)
+    is only considered configured once at least one option's full field set is present —
+    see :func:`_unsatisfied_secret_group_keys`. This intentionally makes ``is_tool_configured``
+    stricter than the legacy single-item ``is_agent_configured`` above, which does not
+    factor secret_groups into its result at all.
+
+    Returns a dict with keys:
+      - configured (bool)
+      - missing_secrets (List[str])
+      - missing_variables (List[str])
+      - optional_missing_secrets (List[str])  — informational; does not affect configured
+    """
+    not_configured = {"configured": False, "missing_secrets": [], "missing_variables": [], "optional_missing_secrets": []}
+
+    if tool_name.startswith("mcp__"):
+        parts = tool_name.split("__")
+        if len(parts) < 3:
+            return not_configured
+        config = await asyncio.to_thread(identity_mgr.get_mcp_config, parts[1])
+    else:
+        config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
+
+    if not config:
+        return not_configured
+
+    required_secrets = _resolve_requirements(config.get("secrets"), False)
+    required_variables = _resolve_requirements(config.get("variables"), False)
+    optional_secrets = _resolve_requirements(config.get("optional_secrets"), False)
+    secret_groups = config.get("secret_groups") or []
+    grouped_keys = flatten_secret_group_keys(secret_groups)
+
+    system_identity = Identity(id="system", type=IdentityType.SYSTEM)
+    global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
+    global_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
+
+    user_required_secrets = [s for s in required_secrets if s not in global_secrets and s not in grouped_keys]
+    user_required_variables = [v for v in required_variables if v not in global_variables]
+    user_optional_secrets = [s for s in optional_secrets if s not in global_secrets and s not in grouped_keys]
+
+    if not user_id:
+        available_secrets = global_secrets
+        missing_group_keys = _unsatisfied_secret_group_keys(secret_groups, available_secrets)
+        missing_secrets = user_required_secrets + [k for k in missing_group_keys if k not in user_required_secrets]
+        return {
+            "configured": not missing_secrets and not user_required_variables,
+            "missing_secrets": missing_secrets,
+            "missing_variables": user_required_variables,
+            "optional_missing_secrets": user_optional_secrets,
+        }
+
+    identity = Identity.from_string(user_id)
+    ident_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "secrets")
+    ident_variables = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "variables")
+
+    available_secrets = {**global_secrets, **ident_secrets}
+    missing_group_keys = _unsatisfied_secret_group_keys(secret_groups, available_secrets)
+
+    missing_secrets = [s for s in user_required_secrets if s not in ident_secrets]
+    missing_secrets += [k for k in missing_group_keys if k not in missing_secrets]
+    missing_variables = [v for v in user_required_variables if v not in ident_variables]
+    optional_missing_secrets = [s for s in user_optional_secrets if s not in ident_secrets]
+
+    return {
+        "configured": not missing_secrets and not missing_variables,
+        "missing_secrets": missing_secrets,
+        "missing_variables": missing_variables,
+        "optional_missing_secrets": optional_missing_secrets,
+    }
+
 async def discover_tools() -> List[Dict]:
     """Scan etcd registry for tools using optimized bulk fetching."""
     tools = []
-    
+
     tool_configs = await asyncio.to_thread(identity_mgr.get_all_tool_configs)
     mcp_configs = await asyncio.to_thread(identity_mgr.get_all_mcp_configs)
     tool_health = await asyncio.to_thread(identity_mgr.get_all_health_statuses, "tool")
-    
+
     for name, config in tool_configs.items():
         health = tool_health.get(name)
         tools.append({
@@ -342,10 +457,14 @@ async def discover_tools() -> List[Dict]:
             "outputs": config.get("outputs", {}),
             "version": config.get("version", "0.1.0"),
             "health": health or {"status": "Online"},
-            "is_mcp": False
+            "is_mcp": False,
+            "public": config.get("public") is True
         })
-            
+
     for mcp_name, mcp_config in mcp_configs.items():
+        mcp_public = mcp_config.get("public") is True
+        public_tools_raw = mcp_config.get("public_tools", [])
+        public_tools = set(public_tools_raw) if isinstance(public_tools_raw, list) else set()
         if "tools" in mcp_config:
             for t in mcp_config["tools"]:
                 inputs = {}
@@ -368,8 +487,9 @@ async def discover_tools() -> List[Dict]:
                     "version": "1.0.0",
                     "health": {"status": "Online"},
                     "is_mcp": True,
-                    "mcp_source": mcp_name
+                    "mcp_source": mcp_name,
+                    "public": mcp_public or t.get("name", "") in public_tools
                 })
-                
+
     tools.sort(key=lambda x: x["name"].lower())
     return tools

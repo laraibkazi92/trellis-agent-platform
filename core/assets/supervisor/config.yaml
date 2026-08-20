@@ -1,8 +1,8 @@
 name: supervisor
 version: 0.1.0
 author: markh@acme.com
-description: Central router agent for the framework.
-tags: ["routing", "orchestration"]
+description: Central router agent for the framework. Resolves deterministic CLI/lookup requests directly via search_tools/use_tool, and delegates complex multi-step investigations to specialized agents via search_agents/task.
+tags: ["routing", "orchestration", "direct-tool-execution", "two-tier-dispatch"]
 model: gemini-3-flash-preview
 thinking_level: medium
 a2a_access:

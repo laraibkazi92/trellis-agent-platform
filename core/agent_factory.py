@@ -28,6 +28,7 @@ from core.auth import IdentityManager, user_id_var
 from core.models import AgentConfig, MCPConfig
 from core.health import HealthMonitor
 from core.discovery import is_agent_configured
+from core.tool_search import DEFAULT_LIMIT as TOOL_SEARCH_LIMIT
 
 # Shared global states and caches
 _hub_client: Optional[FastMCPClient] = None
@@ -482,9 +483,55 @@ async def prewarm_agents() -> None:
             print(f"Prewarm: skipping '{name}': {e}")
 
 
+async def _is_tool_publicly_whitelisted(tool_name: str) -> bool:
+    """Authorization Guard for the supervisor's `use_tool`: check `public`/`public_tools`
+    directly against the tool's/MCP's own registry config.
+
+    Deliberately mirrors `core.gateway._is_tool_publicly_whitelisted` rather than importing
+    it — `core/gateway.py` already imports `get_hub_client`/`get_external_mcp_client` from
+    this module, so importing back from `gateway.py` here would create a circular import.
+    Fails closed on anything unexpected (unknown tool, malformed `mcp__` name, non-`True`
+    `public` value, non-list `public_tools`), matching `is_tool_configured`'s secure-by-default
+    behavior.
+    """
+    identity_mgr = get_identity_manager()
+    if tool_name.startswith("mcp__"):
+        parts = tool_name.split("__", 2)
+        if len(parts) != 3:
+            return False
+        _, server_name, sub_tool_name = parts
+        config = await asyncio.to_thread(identity_mgr.get_mcp_config, server_name)
+        if not config:
+            return False
+        public_tools_raw = config.get("public_tools", [])
+        public_tools = set(public_tools_raw) if isinstance(public_tools_raw, list) else set()
+        return config.get("public") is True or sub_tool_name in public_tools
+
+    config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
+    if not config:
+        return False
+    return config.get("public") is True
+
+
+def _extract_tool_output(result: Any) -> Any:
+    """Unwrap a fastmcp `CallToolResult` into the raw structured value a direct caller
+    expects (mirrors `core.gateway._extract_tool_output` — see that function's docstring
+    for why `.data`/`.structured_content` are preferred over pydantic-ai's agent-facing
+    `.content`)."""
+    from mcp.types import TextContent
+    if result.data is not None:
+        return result.data
+    if result.structured_content is not None:
+        return result.structured_content
+    texts = [c.text for c in (result.content or []) if isinstance(c, TextContent)]
+    if texts:
+        return "\n".join(texts)
+    return None
+
+
 def _register_admin_tools(agent: Agent):
     identity_mgr = get_identity_manager()
-    
+
     @agent.tool_plain(
         name="search_agents",
         description=(
@@ -522,6 +569,67 @@ def _register_admin_tools(agent: Agent):
                     )
                     r["description"] = r.get("description", "") + note
         return results
+
+    @agent.tool_plain(
+        name="search_tools",
+        description=(
+            "Find deterministic tools available for direct execution — CLI lookups, "
+            "resource inspections, status checks, single commands. Returns a ranked "
+            "shortlist of Tool Cards {name, description, parameters, configured, status, "
+            "source}. Use this to pick a tool name and its parameter schema, then call "
+            "use_tool(tool_name, arguments) to execute it directly — no agent hop needed. "
+            "Tools with configured=false are missing credentials — do not call use_tool "
+            "on them; tell the user which credentials are missing instead. "
+            "Does not return the full catalog — search with a focused query."
+        ),
+    )
+    async def search_tools(query: str, limit: int = TOOL_SEARCH_LIMIT) -> List[Dict]:
+        from core.tool_search import search_tools as _search_tools_ranked
+        user_id = user_id_var.get()
+        return await _search_tools_ranked(query, limit=limit, user_id=user_id)
+
+    @agent.tool_plain(
+        name="use_tool",
+        description=(
+            "Directly execute a whitelisted deterministic tool with arguments, bypassing "
+            "any agent delegation. Always call search_tools first to confirm the exact "
+            "tool name, its parameter schema, and that it is configured — do not guess. "
+            "Returns the raw structured tool output (e.g. stdout/JSON), not a "
+            "conversational summary."
+        ),
+    )
+    async def use_tool(tool_name: str, arguments: Dict[str, Any]) -> Any:
+        user_id = user_id_var.get()
+
+        try:
+            whitelisted = await _is_tool_publicly_whitelisted(tool_name)
+        except Exception as e:
+            return f"SYSTEM: Error checking tool access for '{tool_name}': {e}"
+        if not whitelisted:
+            return f"SYSTEM: Access denied. Tool '{tool_name}' is internal and not exposed for direct execution."
+
+        try:
+            from core.discovery import is_tool_configured
+            status = await is_tool_configured(tool_name, user_id)
+        except Exception as e:
+            return f"SYSTEM: Error checking configuration for tool '{tool_name}': {e}"
+        if not status["configured"]:
+            missing = status["missing_secrets"] + status["missing_variables"]
+            missing_text = ", ".join(missing) if missing else "required configuration"
+            return f"SYSTEM: Tool '{tool_name}' requires configuration before it can be used. Missing: {missing_text}. Configure at /configuration"
+
+        try:
+            if tool_name.startswith("mcp__"):
+                _, server_name, sub_tool_name = tool_name.split("__", 2)
+                client = await get_external_mcp_client(server_name, user_id)
+                result = await client.call_tool(sub_tool_name, arguments, raise_on_error=False)
+            else:
+                client = await get_hub_client()
+                result = await client.call_tool(tool_name, {**arguments, "__user_id": user_id}, raise_on_error=False)
+        except Exception as e:
+            return f"SYSTEM: Error executing tool '{tool_name}': {e}"
+
+        return _extract_tool_output(result)
 
     @agent.tool_plain(name="manage_agent", description="Enable, disable or reload an agent.")
     async def manage_agent(name: str, action: str) -> str:

@@ -137,6 +137,21 @@ def main():
                 seen_tools.add(name)
                 print(f"  Saved config for tool: {name}")
 
+                # Index the embedding only for tools exposed publicly via the gateway.
+                if config.get("public"):
+                    inputs = config.get("inputs") or {}
+                    input_keys = ", ".join(
+                        f"{key}:{spec.get('type', 'any')}" if isinstance(spec, dict) else str(key)
+                        for key, spec in inputs.items()
+                    )
+                    parts = [name, config.get("description", ""), input_keys]
+                    vector = embed_text("\n".join(p for p in parts if p), task_type="retrieval_document")
+                    if vector:
+                        identity_mgr.save_tool_embedding(name, vector)
+                        print(f"  Indexed embedding for tool: {name}")
+                    else:
+                        print(f"  Skipped embedding for tool: {name} (embeddings unavailable)")
+
     print("\nSyncing MCPs to etcd...")
     if MCPS_DIR.exists():
         for mcp_yaml in MCPS_DIR.glob("**/mcp.yaml"):
@@ -167,6 +182,7 @@ def main():
     for tool in existing_tools - seen_tools:
         print(f"  Deleting obsolete tool: {tool}")
         identity_mgr.client.delete(f"/registry/tools/{tool}/config")
+        identity_mgr.client.delete(f"/registry/tools/{tool}/embedding")
         
     for mcp in existing_mcps - seen_mcps:
         print(f"  Deleting obsolete MCP: {mcp}")
