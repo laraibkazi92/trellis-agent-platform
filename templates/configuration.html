@@ -265,19 +265,7 @@ document.addEventListener('DOMContentLoaded', function() {
     
     // Initial display
     updateUI();
-
-    // Secret group selectors (e.g. netctl's environment dropdown): switching
-    // the selector only toggles which option panel is visible via the
-    // 'hidden' class — every option's inputs stay mounted in the DOM, so
-    // values already typed for other options are never cleared.
-    document.querySelectorAll('.secret-group-select').forEach(select => {
-        select.addEventListener('change', () => {
-            const groupKey = select.getAttribute('data-group-key');
-            document.querySelectorAll(`.secret-group-option[data-group-key="${CSS.escape(groupKey)}"]`).forEach(panel => {
-                panel.classList.toggle('hidden', panel.getAttribute('data-option-value') !== select.value);
-            });
-        });
-    });
+    // Secret group dropdown toggle behavior is wired up globally in base.html.
 });
 </script>
 {% endblock %}

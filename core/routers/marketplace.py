@@ -4,7 +4,7 @@ import asyncio
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import templates, identity_mgr, CSRFRoute
-from core.discovery import discover_agents, discover_tools, get_agent_required_secrets, get_agent_required_variables
+from core.discovery import discover_agents, discover_tools, get_agent_required_secrets, get_agent_required_variables, get_agent_secret_groups, get_tool_configuration_context, flatten_secret_group_keys
 from core.auth import is_admin
 from core.models import Identity, IdentityType
 
@@ -101,17 +101,19 @@ async def configure_agent_secrets(request: Request, agent_name: str):
     
     required_secrets = await get_agent_required_secrets(config)
     required_variables = await get_agent_required_variables(config)
-    
+    secret_groups = await get_agent_secret_groups(config)
+    grouped_secret_keys = flatten_secret_group_keys(secret_groups)
+
     secrets_updated = False
     variables_updated = False
-    
+
     for key, value in form.items():
         if key in ("csrf_token",):
             continue
-            
+
         val_str = str(value).strip()
-        
-        if key in required_secrets and key not in global_secrets:
+
+        if (key in required_secrets or key in grouped_secret_keys) and key not in global_secrets:
             if val_str:
                 current_secrets[key] = val_str
                 secrets_updated = True
@@ -150,20 +152,89 @@ async def tools(request: Request):
     user = request.session.get('user')
     if not user:
         return RedirectResponse(url='/login')
-        
+
     tools = await discover_tools()
-    
+    user_id = user.get('sub')
+
+    # Publicly-exposed local tools are callable directly via the MCP gateway/supervisor's
+    # search_tools/use_tool (see __spec_docs/direct_tool_gateway_execution_spec.md) —
+    # highlight them and let the user configure their own credentials right here, since
+    # they're no longer necessarily reachable only through an agent's "Configure Agent"
+    # flow. Scoped to local tools only: MCP-sourced tools are whitelisted per-server via
+    # `public`/`public_tools` and their credentials are configured at the server level.
+    direct_access_tools = [t for t in tools if t.get("public") and not t.get("is_mcp")]
+    for tool in direct_access_tools:
+        context = await get_tool_configuration_context(tool["name"], user_id)
+        if context:
+            tool.update(context)
+
     flash_msg = request.session.pop("flash_msg", None)
-    
+
     return templates.TemplateResponse(
         request=request,
-        name="tools.html", 
+        name="tools.html",
         context={
             "user": user,
             "tools": tools,
+            "direct_access_tools": direct_access_tools,
             "flash_msg": flash_msg
         }
     )
+
+@router.post("/tools/{tool_name}/configure")
+async def configure_tool_secrets(request: Request, tool_name: str):
+    user = request.session.get('user')
+    if not user:
+        return RedirectResponse(url='/login')
+
+    config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
+    if not config or config.get("public") is not True:
+        request.session["flash_msg"] = "Tool not found or not directly configurable."
+        return RedirectResponse(url='/tools', status_code=303)
+
+    user_id = user['sub']
+    context = await get_tool_configuration_context(tool_name, user_id)
+    if not context:
+        request.session["flash_msg"] = "Tool not found or not directly configurable."
+        return RedirectResponse(url='/tools', status_code=303)
+
+    form = await request.form()
+    identity = Identity.from_string(user_id)
+
+    current_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "secrets")
+    current_variables = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "variables")
+
+    known_secrets = (
+        set(context["required_secrets"])
+        | set(context["optional_secrets"])
+        | flatten_secret_group_keys(config.get("secret_groups") or [])
+    )
+    known_variables = set(context["required_variables"])
+
+    secrets_updated = False
+    variables_updated = False
+
+    for key, value in form.items():
+        if key == "csrf_token":
+            continue
+
+        val_str = str(value).strip()
+
+        if key in known_secrets:
+            if val_str:  # only update secret if not empty
+                current_secrets[key] = val_str
+                secrets_updated = True
+        elif key in known_variables:
+            current_variables[key] = val_str
+            variables_updated = True
+
+    if secrets_updated:
+        await asyncio.to_thread(identity_mgr.save_identity_config, identity, "secrets", current_secrets)
+    if variables_updated:
+        await asyncio.to_thread(identity_mgr.save_identity_config, identity, "variables", current_variables)
+
+    request.session["flash_msg"] = f"Configuration and secrets saved for {tool_name} successfully."
+    return RedirectResponse(url='/tools', status_code=303)
 
 @router.get("/mcps", response_class=HTMLResponse)
 async def mcps_page(request: Request):

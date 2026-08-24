@@ -93,6 +93,28 @@ async def get_agent_optional_secrets(config: Dict) -> List[str]:
 
     return sorted(list(optional))
 
+async def get_agent_secret_groups(config: Dict) -> List[Dict]:
+    """Helper to determine all secret-group credential sets (e.g. netctl's
+    per-environment username/password dropdown) declared by an agent's
+    directly-attached tools and MCPs."""
+    groups: List[Dict] = []
+
+    allowed_tools = config.get("allowed_tools", [])
+    for tool_name in allowed_tools:
+        if tool_name.startswith("mcp__"):
+            continue
+        tool_config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
+        if tool_config and tool_config.get("secret_groups"):
+            groups.extend(tool_config.get("secret_groups"))
+
+    allowed_mcps = config.get("allowed_mcps", [])
+    for mcp_name in allowed_mcps:
+        mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
+        if mcp_config and mcp_config.get("secret_groups"):
+            groups.extend(mcp_config.get("secret_groups"))
+
+    return groups
+
 def flatten_secret_group_keys(secret_groups: List[Dict]) -> set:
     """Flattens a list of secret_groups into the set of underlying secret keys."""
     keys = set()
@@ -261,6 +283,7 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
         required_secrets = set()
         required_variables = set()
         optional_secrets = set()
+        secret_groups_raw = []
 
         # 1. Include requirements from agent/workflow config
         if config.get("secrets"):
@@ -277,6 +300,8 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
                     required_secrets.update(_resolve_requirements(tool_config.get("secrets"), is_background))
                 if tool_config.get("variables"):
                     required_variables.update(_resolve_requirements(tool_config.get("variables"), is_background))
+                if tool_config.get("secret_groups"):
+                    secret_groups_raw.extend(tool_config.get("secret_groups"))
             elif tool_name.startswith("mcp__"):
                 parts = tool_name.split("__")
                 if len(parts) >= 3:
@@ -289,6 +314,8 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
                             required_variables.update(_resolve_requirements(mcp_config.get("variables"), is_background))
                         if mcp_config.get("optional_secrets"):
                             optional_secrets.update(_resolve_requirements(mcp_config.get("optional_secrets"), is_background))
+                        if mcp_config.get("secret_groups"):
+                            secret_groups_raw.extend(mcp_config.get("secret_groups"))
 
         allowed_mcps = config.get("allowed_mcps", [])
         for mcp_name in allowed_mcps:
@@ -300,10 +327,14 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
                     required_variables.update(_resolve_requirements(mcp_config.get("variables"), is_background))
                 if mcp_config.get("optional_secrets"):
                     optional_secrets.update(_resolve_requirements(mcp_config.get("optional_secrets"), is_background))
+                if mcp_config.get("secret_groups"):
+                    secret_groups_raw.extend(mcp_config.get("secret_groups"))
 
-        user_required_secrets = [s for s in required_secrets if s not in global_secrets]
+        grouped_keys = flatten_secret_group_keys(secret_groups_raw)
+
+        user_required_secrets = [s for s in required_secrets if s not in global_secrets and s not in grouped_keys]
         user_required_variables = [s for s in required_variables if s not in global_variables]
-        user_optional_secrets = [s for s in optional_secrets if s not in global_secrets]
+        user_optional_secrets = [s for s in optional_secrets if s not in global_secrets and s not in grouped_keys]
         
         current_config_secrets = {}
         current_config_variables = {}
@@ -332,6 +363,29 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
             if opt not in current_config_secrets:
                 optional_missing_secrets.append(opt)
 
+        agent_secret_groups = []
+        for group in secret_groups_raw:
+            options = []
+            for option in group.get("options", []):
+                fields = []
+                for field in option.get("fields", []):
+                    fields.append({
+                        "key": field["key"],
+                        "label": field.get("label", field["key"]),
+                        "type": field.get("type", "password"),
+                        "is_set": field["key"] in current_config_secrets,
+                    })
+                options.append({
+                    "value": option.get("value"),
+                    "label": option.get("label", option.get("value")),
+                    "fields": fields
+                })
+            agent_secret_groups.append({
+                "label": group.get("label", "Credential Group"),
+                "select_label": group.get("select_label", "Option"),
+                "options": options
+            })
+
         agents.append({
             "name": config.get("name", name),
             "type": config.get("type", "user_agent"),
@@ -351,7 +405,8 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
             "missing_secrets": missing_secrets,
             "missing_variables": missing_variables,
             "optional_missing_secrets": optional_missing_secrets,
-            "current_variables": current_config_variables
+            "current_variables": current_config_variables,
+            "secret_groups": agent_secret_groups
          })
 
     agents.sort(key=lambda x: x["name"].lower())
@@ -435,6 +490,75 @@ async def is_tool_configured(tool_name: str, user_id: Optional[str] = None) -> D
         "missing_secrets": missing_secrets,
         "missing_variables": missing_variables,
         "optional_missing_secrets": optional_missing_secrets,
+    }
+
+async def get_tool_configuration_context(tool_name: str, user_id: str) -> Optional[Dict]:
+    """Build the full credential-configuration context for a single publicly-exposed
+    local tool, for rendering an inline "Configure Tool" form directly on the Tools page.
+
+    This is the per-tool analog of ``discover_agents()``'s per-agent secret/variable/
+    secret_group aggregation — but a tool's config is already flat (no allowed_tools/
+    allowed_mcps aggregation needed, unlike an agent which can pull requirements from
+    many attached tools/MCPs). Delegates the configured/missing-secrets determination to
+    :func:`is_tool_configured` (single source of truth) and only adds what that function
+    doesn't return: the *full* required/optional secret and variable lists (so the form
+    can show already-configured fields too, not just missing ones), current variable
+    values, and per-field ``is_set`` flags for secret_groups — mirroring the shape
+    ``discover_agents()`` already builds for agent cards.
+
+    Returns ``None`` if the tool isn't found. Only intended for local tools (MCP tools'
+    credentials are configured at the server level, not per-tool).
+    """
+    config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
+    if not config:
+        return None
+
+    status = await is_tool_configured(tool_name, user_id)
+
+    required_secrets = _resolve_requirements(config.get("secrets"), False)
+    optional_secrets = _resolve_requirements(config.get("optional_secrets"), False)
+    required_variables = _resolve_requirements(config.get("variables"), False)
+    secret_groups_raw = config.get("secret_groups") or []
+    grouped_keys = flatten_secret_group_keys(secret_groups_raw)
+
+    identity = Identity.from_string(user_id)
+    system_identity = Identity(id="system", type=IdentityType.SYSTEM)
+    current_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "secrets")
+    current_variables = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "variables")
+    global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
+
+    secret_groups = []
+    for group in secret_groups_raw:
+        options = []
+        for option in group.get("options", []):
+            fields = []
+            for field in option.get("fields", []):
+                fields.append({
+                    "key": field["key"],
+                    "label": field.get("label", field["key"]),
+                    "type": field.get("type", "password"),
+                    "is_set": field["key"] in current_secrets,
+                })
+            options.append({
+                "value": option.get("value"),
+                "label": option.get("label", option.get("value")),
+                "fields": fields,
+            })
+        secret_groups.append({
+            "label": group.get("label", "Credential Group"),
+            "select_label": group.get("select_label", "Option"),
+            "options": options,
+        })
+
+    return {
+        "required_secrets": [s for s in required_secrets if s not in global_secrets and s not in grouped_keys],
+        "optional_secrets": [s for s in optional_secrets if s not in global_secrets and s not in grouped_keys],
+        "missing_secrets": status["missing_secrets"],
+        "required_variables": required_variables,
+        "missing_variables": status["missing_variables"],
+        "current_variables": current_variables,
+        "secret_groups": secret_groups,
+        "is_configured": status["configured"],
     }
 
 async def discover_tools() -> List[Dict]:

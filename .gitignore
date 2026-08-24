@@ -20,6 +20,14 @@ workspace/mcps/example-cli/node_modules/
 # never committed. See core/hub.py's per-tool PATH injection.
 workspace/tools/*/bin/
 
+# netctl binary + its source archive — placed directly on the host into
+# workspace/tools/netctl-cli/, never committed (see wrapper.py's NETCTL_BIN).
+workspace/tools/netctl-cli/netctl
+workspace/tools/netctl-cli/*.tar.gz
+
 # opsctl venv — built directly on the host via `uv venv` + `uv pip install
 # <wheel>`, never committed (see workspace/tools/opsctl/wrapper.py).
 workspace/tools/opsctl/.venv/
+workspace/tools/opsctl/*.whl
+
+.DS_Store
