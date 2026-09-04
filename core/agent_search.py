@@ -64,6 +64,8 @@ async def search_agents(query: str, limit: int = DEFAULT_LIMIT, include_disabled
             continue
         if cfg.get("type") in _BACKGROUND_TYPES:
             continue
+        if cfg.get("external", True) is False:
+            continue
 
         is_disabled = name in disabled
         if is_disabled and not include_disabled:

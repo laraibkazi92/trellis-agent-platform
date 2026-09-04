@@ -189,6 +189,8 @@ async def chat_completions(request: ChatRequest):
     if not cfg_data: raise HTTPException(status_code=404, detail="Agent not found")
     if cfg_data.get("type") in ("background_agent", "background_script"):
         raise HTTPException(status_code=403, detail="Background agents cannot be called directly.")
+    if request.model != "supervisor" and cfg_data.get("external", True) is False:
+        raise HTTPException(status_code=403, detail=f"Access denied: Agent '{request.model}' is internal and cannot be called directly.")
 
     if health_monitor.get_status("agent", request.model).get("status") == "Offline":
         raise HTTPException(status_code=503, detail="Agent offline")

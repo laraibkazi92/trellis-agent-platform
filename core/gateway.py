@@ -121,7 +121,9 @@ async def _get_visible_agents() -> List[Dict]:
             
         if agent_dict.get("type") in ("background_agent", "background_script"):
             continue
-            
+        if agent_dict.get("external", True) is False:
+            continue
+
         is_configured = agent_dict.get("is_configured", False)
 
         description = agent_dict.get("description") or "No description available."
@@ -222,6 +224,10 @@ async def use_agent(ctx: Context, agent_name: str, prompt: str) -> str:
 
     prompt_preview = prompt[:150] + "..." if len(prompt) > 150 else prompt
     await ctx.report_progress(1, 3, message=f"Routing to agent: {agent_name} — \"{prompt_preview}\"")
+
+    cfg = await asyncio.to_thread(identity_mgr.get_agent_config, agent_name)
+    if cfg and cfg.get("external", True) is False:
+        return f"SYSTEM: Access denied. Agent '{agent_name}' is internal and cannot be called directly."
 
     if agent_name != "supervisor":
         try:
