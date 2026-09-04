@@ -70,6 +70,9 @@ class FrameworkAgentRegistry(DynamicAgentRegistry):
             return None
         if self._health_monitor.get_status("agent", name).get("status") == "Offline":
             return None
+        cfg = self._identity_mgr.get_agent_config(name)
+        if cfg and cfg.get("external", True) is False:
+            return None
         return super().get_compiled(name)
 
 
@@ -362,6 +365,12 @@ async def build_agent(agent_name: str) -> Agent:
     for target in config.a2a_access or []:
         target_cfg = await asyncio.to_thread(identity_mgr.get_agent_config, target)
         if target_cfg:
+            if target_cfg.get("internal", True) is False:
+                print(
+                    f"Agent '{agent_name}' attempted to configure A2A delegation to "
+                    f"'{target}', but '{target}' has internal=False. Skipping."
+                )
+                continue
             target_instructions = await asyncio.to_thread(identity_mgr.get_agent_skills, target)
             subagent_configs.append(SubAgentConfig(
                 name=target,
@@ -449,7 +458,7 @@ async def get_agent(agent_name: str) -> Agent:
             cfg = await asyncio.to_thread(identity_mgr.get_agent_config, agent_name)
             description = (cfg or {}).get("description", "")
             registry = get_supervisor_registry()
-            if not registry.exists(agent_name):
+            if not registry.exists(agent_name) and (cfg or {}).get("external", True) is not False:
                 registry.register(
                     SubAgentConfig(name=agent_name, description=description, instructions=""),
                     agent,
