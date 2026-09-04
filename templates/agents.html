@@ -89,6 +89,15 @@
         </div>
         <div class="flex items-center gap-2 mb-4">
             <span class="text-[10px] font-mono font-bold bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400 px-2 py-0.5 rounded border border-neutral-200 dark:border-neutral-700 uppercase">v{{ agent.version }}</span>
+            {% if agent.external is false %}
+            <span class="text-[10px] font-mono font-bold bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300 border border-amber-300 dark:border-amber-700 px-2 py-0.5 rounded uppercase flex items-center gap-1">
+                <i data-lucide="lock" class="w-3 h-3"></i> INTERNAL ONLY
+            </span>
+            {% else %}
+            <span class="text-[10px] font-mono font-bold bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300 border border-blue-300 dark:border-blue-700 px-2 py-0.5 rounded uppercase flex items-center gap-1">
+                <i data-lucide="globe" class="w-3 h-3"></i> EXTERNAL
+            </span>
+            {% endif %}
             <span class="text-xs font-mono text-neutral-500 dark:text-neutral-500">By: {{ agent.author }}</span>
             {% if not agent.is_configured %}
             <div class="relative group inline-block z-10">
@@ -292,6 +301,12 @@
             <div class="flex flex-col gap-8 flex-grow min-h-0">
                 <div class="flex flex-col">
                     <h4 class="font-bold mb-4 uppercase text-sm border-b border-neutral-200 dark:border-neutral-800 pb-2">OpenAI API Compatible</h4>
+                    {% if agent.external is false %}
+                    <div class="border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 text-amber-800 dark:text-amber-300 p-4 text-xs font-mono leading-relaxed rounded-sm flex items-start gap-2.5">
+                        <i data-lucide="lock" class="w-4 h-4 shrink-0 mt-0.5"></i>
+                        <span>Direct API invocation disabled. This agent is marked as internal-only (<code class="bg-amber-100 dark:bg-amber-900/40 px-1 py-0.5 rounded-sm">external: false</code>) and cannot be called directly via <code class="bg-amber-100 dark:bg-amber-900/40 px-1 py-0.5 rounded-sm">/v1/chat/completions</code>.</span>
+                    </div>
+                    {% else %}
                     <div class="relative group">
                         <button onclick="copyToClipboard(this, 'code')" class="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity bg-neutral-100 dark:bg-neutral-800 border border-neutral-300 dark:border-neutral-600 text-xs font-bold font-mono px-2 py-1 uppercase text-neutral-600 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark z-10">Copy</button>
                         <pre class="bg-white dark:bg-[#0a0a0a] p-4 text-xs font-mono overflow-x-auto text-neutral-800 dark:text-neutral-300 border border-neutral-200 dark:border-neutral-800 flex-grow rounded-sm"><code>curl -X POST {{ public_host_url }}/v1/chat/completions \
@@ -302,11 +317,19 @@
     "messages": [{"role": "user", "content": "Hello!"}]
   }'</code></pre>
                     </div>
+                    {% endif %}
                 </div>
 
                 <div class="flex flex-col">
                     <h4 class="font-bold mb-4 uppercase text-sm border-b border-neutral-200 dark:border-neutral-800 pb-2">A2A (Agent-to-Agent)</h4>
+                    {% if agent.external is false %}
+                    <div class="border border-accent dark:border-accent-dark bg-accent/5 dark:bg-accent-dark/10 text-neutral-800 dark:text-neutral-200 p-4 text-xs font-mono leading-relaxed rounded-sm flex items-start gap-2.5 mb-4">
+                        <i data-lucide="workflow" class="w-4 h-4 shrink-0 mt-0.5 text-accent dark:text-accent-dark"></i>
+                        <span>This internal subagent is designed to be invoked by other specialized agents. Add it to the caller's <code class="bg-neutral-200 dark:bg-neutral-800 px-1.5 py-0.5 text-xs text-accent dark:text-accent-dark rounded-sm">a2a_access</code> in config.yaml:</span>
+                    </div>
+                    {% else %}
                     <p class="text-sm text-neutral-600 dark:text-neutral-400 font-mono mb-4">To call this agent from another agent, add it to the caller's <code class="bg-neutral-200 dark:bg-neutral-800 px-1.5 py-0.5 text-xs text-accent dark:text-accent-dark rounded-sm">a2a_access</code> list in config.yaml.</p>
+                    {% endif %}
                     <div class="relative group">
                         <button onclick="copyToClipboard(this, 'code')" class="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity bg-neutral-100 dark:bg-neutral-800 border border-neutral-300 dark:border-neutral-600 text-xs font-bold font-mono px-2 py-1 uppercase text-neutral-600 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark z-10">Copy</button>
                         <pre class="bg-white dark:bg-[#0a0a0a] p-4 text-xs font-mono overflow-x-auto text-neutral-800 dark:text-neutral-300 border border-neutral-200 dark:border-neutral-800 flex-grow rounded-sm"><code># caller config.yaml
@@ -317,11 +340,18 @@ a2a_access:
 
                 <div class="flex flex-col">
                     <h4 class="font-bold mb-4 uppercase text-sm border-b border-neutral-200 dark:border-neutral-800 pb-2">MCP Usage</h4>
+                    {% if agent.external is false %}
+                    <div class="border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 text-amber-800 dark:text-amber-300 p-4 text-xs font-mono leading-relaxed rounded-sm flex items-start gap-2.5">
+                        <i data-lucide="lock" class="w-4 h-4 shrink-0 mt-0.5"></i>
+                        <span>Gateway invocation disabled. This agent is marked as internal-only (<code class="bg-amber-100 dark:bg-amber-900/40 px-1 py-0.5 rounded-sm">external: false</code>) and cannot be invoked via the <code class="bg-amber-100 dark:bg-amber-900/40 px-1 py-0.5 rounded-sm">use_agent</code> tool.</span>
+                    </div>
+                    {% else %}
                     <p class="text-sm text-neutral-600 dark:text-neutral-400 font-mono mb-4">Assuming you have connected the Framework MCP Gateway, you can call this agent via the `use_agent` tool.</p>
                     <div class="relative group mb-4">
                         <button onclick="copyToClipboard(this, 'code')" class="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity bg-neutral-100 dark:bg-neutral-800 border border-neutral-300 dark:border-neutral-600 text-xs font-bold font-mono px-2 py-1 uppercase text-neutral-600 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark z-10">Copy</button>
                         <pre class="bg-white dark:bg-[#0a0a0a] p-4 text-xs font-mono overflow-x-auto text-neutral-800 dark:text-neutral-300 border border-neutral-200 dark:border-neutral-800 flex-grow rounded-sm m-0"><code>use_agent(agent_name="{{ agent.name }}", prompt="...")</code></pre>
                     </div>
+                    {% endif %}
                 </div>
             </div>
         </div>

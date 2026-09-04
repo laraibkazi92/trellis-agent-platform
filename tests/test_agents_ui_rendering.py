@@ -1,0 +1,161 @@
+"""Tests for Phase 5 (Dashboard Catalog UI & Conditional Connection Modal) — see
+__spec_docs/internal_external_agents_spec.md.
+
+Renders the real templates/agents.html Jinja2 template (via the app's configured
+Jinja2Templates environment, matching the pattern in tests/test_admin_agent_visibility.py)
+against synthetic agent payloads with varied `external`/`internal` flags, and asserts:
+  - The `INTERNAL ONLY` badge renders for `external: False` agents, and the `EXTERNAL`
+    badge renders for `external: True` (or omitted) agents.
+  - The connection modal's OpenAI API / MCP `use_agent` snippets are replaced by an
+    advisory notice for `external: False` agents, and retained for `external: True`.
+  - The A2A section always renders the `a2a_access` snippet, with the internal-only
+    callout text shown only for `external: False` agents.
+"""
+from core.dependencies import templates
+
+
+class _FakeURL:
+    path = "/agents"
+
+
+class _FakeRequest:
+    url = _FakeURL()
+
+
+def _base_agent(name, **overrides):
+    agent = {
+        "name": name,
+        "version": "0.1.0",
+        "author": "test-author",
+        "description": "A test agent.",
+        "is_disabled": False,
+        "is_configured": True,
+        "required_secrets": [],
+        "required_variables": [],
+        "secret_groups": [],
+        "missing_secrets": [],
+        "missing_variables": [],
+        "health": {"status": "Online"},
+    }
+    agent.update(overrides)
+    return agent
+
+
+def _render(agents):
+    context = {
+        "request": _FakeRequest(),
+        "user": {"name": "Test User", "sub": "test-user"},
+        "agents": agents,
+        "flash_msg": None,
+        "public_host_url": "http://localhost:8000",
+        "public_mcp_url": "http://localhost:8002/mcp",
+        "is_admin": False,
+        "csrf_token": "test-csrf-token",
+        "app_name": "Trellis",
+        "app_accent_color": "#0055FF",
+        "app_accent_color_dark": "#3377FF",
+    }
+    return templates.env.get_template("agents.html").render(**context)
+
+
+def _connect_modal_block(html, agent_name):
+    marker = f'id="connect-{agent_name}"'
+    start = html.index(marker)
+    next_marker_pos = html.find('id="connect-', start + len(marker))
+    end = next_marker_pos if next_marker_pos != -1 else html.index("<script>", start)
+    return html[start:end]
+
+
+def _card_block(html, agent_name):
+    marker = f'data-agent-name="{agent_name}"'
+    start = html.index(marker)
+    end = html.index(f'id="connect-{agent_name}"', start)
+    return html[start:end]
+
+
+def test_internal_only_badge_rendered_for_external_false():
+    agents = [_base_agent("internal-worker", external=False, internal=True)]
+    html = _render(agents)
+    card = _card_block(html, "internal-worker")
+
+    assert "INTERNAL ONLY" in card
+    assert "EXTERNAL" not in card
+
+
+def test_external_badge_rendered_when_external_true():
+    agents = [_base_agent("general-agent", external=True, internal=True)]
+    html = _render(agents)
+    card = _card_block(html, "general-agent")
+
+    assert "EXTERNAL" in card
+    assert "INTERNAL ONLY" not in card
+
+
+def test_external_badge_rendered_when_external_omitted():
+    agents = [_base_agent("legacy-agent")]
+    html = _render(agents)
+    card = _card_block(html, "legacy-agent")
+
+    assert "EXTERNAL" in card
+    assert "INTERNAL ONLY" not in card
+
+
+def test_curl_snippet_replaced_by_advisory_when_external_false():
+    agents = [_base_agent("internal-worker", external=False, internal=True)]
+    html = _render(agents)
+    modal = _connect_modal_block(html, "internal-worker")
+
+    assert "curl -X POST" not in modal
+    assert "Direct API invocation disabled" in modal
+    assert "internal-only" in modal
+    assert "use_agent(agent_name=" not in modal
+    assert "Gateway invocation disabled" in modal
+
+
+def test_curl_snippet_present_when_external_true():
+    agents = [_base_agent("general-agent", external=True, internal=True)]
+    html = _render(agents)
+    modal = _connect_modal_block(html, "general-agent")
+
+    assert "curl -X POST" in modal
+    assert "Direct API invocation disabled" not in modal
+    assert 'use_agent(agent_name="general-agent"' in modal
+    assert "Gateway invocation disabled" not in modal
+
+
+def test_a2a_section_always_present_with_internal_callout_when_external_false():
+    agents = [_base_agent("internal-worker", external=False, internal=True)]
+    html = _render(agents)
+    modal = _connect_modal_block(html, "internal-worker")
+
+    assert 'a2a_access:\n  - "internal-worker"' in modal
+    assert "designed to be invoked by other specialized agents" in modal
+
+
+def test_a2a_section_present_without_internal_callout_when_external_true():
+    agents = [_base_agent("general-agent", external=True, internal=True)]
+    html = _render(agents)
+    modal = _connect_modal_block(html, "general-agent")
+
+    assert 'a2a_access:\n  - "general-agent"' in modal
+    assert "designed to be invoked by other specialized agents" not in modal
+
+
+def test_multi_agent_render_scopes_badges_and_modals_independently():
+    agents = [
+        _base_agent("internal-worker", external=False, internal=True),
+        _base_agent("general-agent", external=True, internal=True),
+    ]
+    html = _render(agents)
+
+    internal_card = _card_block(html, "internal-worker")
+    general_card = _card_block(html, "general-agent")
+    assert "INTERNAL ONLY" in internal_card and "EXTERNAL" not in internal_card
+    assert "EXTERNAL" in general_card and "INTERNAL ONLY" not in general_card
+
+    internal_modal = _connect_modal_block(html, "internal-worker")
+    general_modal = _connect_modal_block(html, "general-agent")
+    assert "Direct API invocation disabled" in internal_modal
+    assert "curl -X POST" not in internal_modal
+    assert "Direct API invocation disabled" not in general_modal
+    assert "curl -X POST" in general_modal
