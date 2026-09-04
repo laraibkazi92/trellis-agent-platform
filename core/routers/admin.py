@@ -417,7 +417,9 @@ async def editor_page(request: Request, type: str, name: str):
         config = await asyncio.to_thread(identity_mgr.get_agent_config, safe_name)
         skills_content = await asyncio.to_thread(identity_mgr.get_agent_skills, safe_name) or ""
         all_agents = await asyncio.to_thread(identity_mgr.list_agents)
-        
+        all_agent_configs = await asyncio.to_thread(identity_mgr.get_all_agent_configs)
+        internal_agents = {n: cfg.get("internal", True) for n, cfg in all_agent_configs.items()}
+
         all_tools_data = []
         # Bulk fetch all tools and MCPs
         local_tool_configs = await asyncio.to_thread(identity_mgr.get_all_tool_configs)
@@ -463,6 +465,7 @@ async def editor_page(request: Request, type: str, name: str):
                 "config": config,
                 "skills_content": skills_content,
                 "all_agents": all_agents,
+                "internal_agents": internal_agents,
                 "all_tools": all_tools,
                 "all_mcps": all_mcps
             }
@@ -542,9 +545,17 @@ async def save_agent(request: Request, name: str):
     
     config["version"] = form.get("version")
     config["description"] = form.get("description")
-    
-    # Handle multiple a2a_access values
-    config["a2a_access"] = form.getlist("a2a_access")
+    # Checkboxes: only present in form when checked.
+    config["external"] = form.get("external") == "true"
+    config["internal"] = form.get("internal") == "true"
+
+    # Handle multiple a2a_access values, filtering out targets with internal: False
+    # (prevents misconfiguration even if bypassed via raw POST).
+    all_agent_configs = await asyncio.to_thread(identity_mgr.get_all_agent_configs)
+    config["a2a_access"] = [
+        target for target in form.getlist("a2a_access")
+        if all_agent_configs.get(target, {}).get("internal", True) is not False
+    ]
     config["allowed_tools"] = form.getlist("allowed_tools")
     config["allowed_mcps"] = form.getlist("allowed_mcps")
     # Checkbox: only present in form when checked.
