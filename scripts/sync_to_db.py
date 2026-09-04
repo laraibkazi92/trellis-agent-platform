@@ -41,7 +41,10 @@ def sync_agent(identity_mgr, agent_dir, name=None, default_type=None):
             
         if not config.get("type") and default_type:
             config["type"] = default_type
-            
+
+        config["external"] = config.get("external", True)
+        config["internal"] = config.get("internal", True)
+
         # For script types, we need the rel_path so the engine knows where to run it
         try:
             rel_path = agent_dir.relative_to(BASE_DIR)

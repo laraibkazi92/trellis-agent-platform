@@ -47,6 +47,8 @@ class AgentConfig(BaseModel):
     allowed_tools: List[str] = Field(default_factory=list, description="List of MCP tools this agent is allowed to use.")
     allowed_mcps: List[str] = Field(default_factory=list, description="List of MCP servers this agent is allowed to connect to.")
     agent_memory: bool = Field(default=False, description="Opt this agent into per-agent persistent memory (Hindsight). Requires the admin 'agent_memory_enabled' feature flag to also be on.")
+    external: bool = Field(default=True, description="Available for direct consumption by users, Host API, Gateway MCP, and Supervisor agent.")
+    internal: bool = Field(default=True, description="Available to be called by other specialized agents via a2a_access.")
 
 class MCPToolDefinition(BaseModel):
     name: str

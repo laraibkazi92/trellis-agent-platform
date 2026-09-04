@@ -398,6 +398,8 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
             "model": config.get("model", "gemini-3-flash-preview"),
             "thinking_level": config.get("thinking_level", "medium"),
             "version": config.get("version", "0.1.0"),
+            "external": config.get("external", True),
+            "internal": config.get("internal", True),
             "health": health or {"status": "Online"},
             "required_secrets": sorted(list(user_required_secrets)),
             "required_variables": sorted(list(user_required_variables)),
