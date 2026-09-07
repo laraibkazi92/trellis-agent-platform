@@ -25,7 +25,7 @@ from pydantic_ai_shields import CostTracking, ToolGuard
 from pydantic_ai_rlm import create_rlm_toolset
 
 from core.auth import IdentityManager, user_id_var
-from core.models import AgentConfig, MCPConfig
+from core.models import AgentConfig, MCPConfig, is_agent_external, is_agent_internal
 from core.health import HealthMonitor
 from core.discovery import is_agent_configured
 from core.tool_search import DEFAULT_LIMIT as TOOL_SEARCH_LIMIT
@@ -71,7 +71,7 @@ class FrameworkAgentRegistry(DynamicAgentRegistry):
         if self._health_monitor.get_status("agent", name).get("status") == "Offline":
             return None
         cfg = self._identity_mgr.get_agent_config(name)
-        if cfg and cfg.get("external", True) is False:
+        if cfg and not is_agent_external(cfg):
             return None
         return super().get_compiled(name)
 
@@ -365,7 +365,7 @@ async def build_agent(agent_name: str) -> Agent:
     for target in config.a2a_access or []:
         target_cfg = await asyncio.to_thread(identity_mgr.get_agent_config, target)
         if target_cfg:
-            if target_cfg.get("internal", True) is False:
+            if not is_agent_internal(target_cfg):
                 print(
                     f"Agent '{agent_name}' attempted to configure A2A delegation to "
                     f"'{target}', but '{target}' has internal=False. Skipping."
@@ -458,7 +458,7 @@ async def get_agent(agent_name: str) -> Agent:
             cfg = await asyncio.to_thread(identity_mgr.get_agent_config, agent_name)
             description = (cfg or {}).get("description", "")
             registry = get_supervisor_registry()
-            if not registry.exists(agent_name) and (cfg or {}).get("external", True) is not False:
+            if not registry.exists(agent_name) and is_agent_external(cfg):
                 registry.register(
                     SubAgentConfig(name=agent_name, description=description, instructions=""),
                     agent,
@@ -466,11 +466,45 @@ async def get_agent(agent_name: str) -> Agent:
         return agent
 
 
-def evict_agent(agent_name: str) -> None:
-    """Remove an agent from the cache (called from etcd watch thread — must be sync)."""
+def evict_agent(agent_name: str, _visited: Optional[set] = None) -> None:
+    """Remove an agent from the cache (called from etcd watch thread — must be sync).
+
+    Also cascades the eviction to every OTHER cached agent whose `a2a_access` lists
+    `agent_name` as a delegation target. This closes a staleness gap: `build_agent()`'s
+    A2A loop compiles a caller's reachable-subagent set once, at build time, into a static
+    `SubAgentCapability` baked into the vendored subagents package (no live re-check like
+    `FrameworkAgentRegistry.get_compiled()` does for `external`). If a target agent's
+    `internal` flag flips to False after a caller has already been built, the caller's
+    cached, already-compiled agent would otherwise keep a working delegation path to that
+    target indefinitely. Evicting the caller too forces it to be rebuilt (re-running the
+    A2A loop's `internal` check) the next time it's requested.
+
+    `_visited` guards against infinite recursion on a2a_access cycles/diamonds; it's an
+    internal recursion detail and defaults to None so existing callers (e.g. `on_agent_change`)
+    are unaffected.
+    """
+    if _visited is None:
+        _visited = set()
+    if agent_name in _visited:
+        return
+    _visited.add(agent_name)
+
     _agent_cache.pop(agent_name, None)
     if agent_name != "supervisor" and _supervisor_registry is not None:
         _supervisor_registry.remove(agent_name)
+
+    try:
+        identity_mgr = get_identity_manager()
+        all_configs = identity_mgr.get_all_agent_configs()
+    except Exception as e:
+        print(f"evict_agent: failed to fetch agent configs for reverse-dependency propagation: {e}")
+        return
+
+    for other_name, cfg in (all_configs or {}).items():
+        if other_name == agent_name or other_name in _visited:
+            continue
+        if agent_name in ((cfg or {}).get("a2a_access") or []):
+            evict_agent(other_name, _visited)
 
 
 async def prewarm_agents() -> None:

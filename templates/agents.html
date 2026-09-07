@@ -322,20 +322,31 @@
 
                 <div class="flex flex-col">
                     <h4 class="font-bold mb-4 uppercase text-sm border-b border-neutral-200 dark:border-neutral-800 pb-2">A2A (Agent-to-Agent)</h4>
-                    {% if agent.external is false %}
+                    {% if agent.internal is false %}
+                    <div class="border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 text-amber-800 dark:text-amber-300 p-4 text-xs font-mono leading-relaxed rounded-sm flex items-start gap-2.5">
+                        <i data-lucide="lock" class="w-4 h-4 shrink-0 mt-0.5"></i>
+                        <span>A2A delegation disabled. This agent has Internal Access turned off (<code class="bg-amber-100 dark:bg-amber-900/40 px-1 py-0.5 rounded-sm">internal: false</code>) and cannot be invoked via another agent's <code class="bg-amber-100 dark:bg-amber-900/40 px-1 py-0.5 rounded-sm">a2a_access</code> list in config.yaml — it will be silently skipped.</span>
+                    </div>
+                    {% elif agent.external is false %}
                     <div class="border border-accent dark:border-accent-dark bg-accent/5 dark:bg-accent-dark/10 text-neutral-800 dark:text-neutral-200 p-4 text-xs font-mono leading-relaxed rounded-sm flex items-start gap-2.5 mb-4">
                         <i data-lucide="workflow" class="w-4 h-4 shrink-0 mt-0.5 text-accent dark:text-accent-dark"></i>
                         <span>This internal subagent is designed to be invoked by other specialized agents. Add it to the caller's <code class="bg-neutral-200 dark:bg-neutral-800 px-1.5 py-0.5 text-xs text-accent dark:text-accent-dark rounded-sm">a2a_access</code> in config.yaml:</span>
                     </div>
-                    {% else %}
-                    <p class="text-sm text-neutral-600 dark:text-neutral-400 font-mono mb-4">To call this agent from another agent, add it to the caller's <code class="bg-neutral-200 dark:bg-neutral-800 px-1.5 py-0.5 text-xs text-accent dark:text-accent-dark rounded-sm">a2a_access</code> list in config.yaml.</p>
-                    {% endif %}
                     <div class="relative group">
                         <button onclick="copyToClipboard(this, 'code')" class="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity bg-neutral-100 dark:bg-neutral-800 border border-neutral-300 dark:border-neutral-600 text-xs font-bold font-mono px-2 py-1 uppercase text-neutral-600 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark z-10">Copy</button>
                         <pre class="bg-white dark:bg-[#0a0a0a] p-4 text-xs font-mono overflow-x-auto text-neutral-800 dark:text-neutral-300 border border-neutral-200 dark:border-neutral-800 flex-grow rounded-sm"><code># caller config.yaml
 a2a_access:
   - "{{ agent.name }}"</code></pre>
                     </div>
+                    {% else %}
+                    <p class="text-sm text-neutral-600 dark:text-neutral-400 font-mono mb-4">To call this agent from another agent, add it to the caller's <code class="bg-neutral-200 dark:bg-neutral-800 px-1.5 py-0.5 text-xs text-accent dark:text-accent-dark rounded-sm">a2a_access</code> list in config.yaml.</p>
+                    <div class="relative group">
+                        <button onclick="copyToClipboard(this, 'code')" class="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity bg-neutral-100 dark:bg-neutral-800 border border-neutral-300 dark:border-neutral-600 text-xs font-bold font-mono px-2 py-1 uppercase text-neutral-600 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark z-10">Copy</button>
+                        <pre class="bg-white dark:bg-[#0a0a0a] p-4 text-xs font-mono overflow-x-auto text-neutral-800 dark:text-neutral-300 border border-neutral-200 dark:border-neutral-800 flex-grow rounded-sm"><code># caller config.yaml
+a2a_access:
+  - "{{ agent.name }}"</code></pre>
+                    </div>
+                    {% endif %}
                 </div>
 
                 <div class="flex flex-col">

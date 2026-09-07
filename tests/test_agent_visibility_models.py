@@ -3,8 +3,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.models import AgentConfig
+from core.models import AgentConfig, coerce_bool_flag
 import core.discovery as discovery_module
+from scripts.sync_to_db import sync_agent
 
 
 def _agent_kwargs(**overrides):
@@ -99,3 +100,93 @@ def test_discover_agents_reports_explicit_visibility_flags(monkeypatch):
     assert by_name["internal-worker"]["internal"] is True
     assert by_name["front-door-bot"]["external"] is True
     assert by_name["front-door-bot"]["internal"] is False
+
+
+# --- coerce_bool_flag --------------------------------------------------------------
+
+def test_coerce_bool_flag_bool_passthrough():
+    assert coerce_bool_flag(True) is True
+    assert coerce_bool_flag(False) is False
+
+
+def test_coerce_bool_flag_string_variants():
+    assert coerce_bool_flag("true") is True
+    assert coerce_bool_flag("True") is True
+    assert coerce_bool_flag("yes") is True
+    assert coerce_bool_flag("1") is True
+    assert coerce_bool_flag("on") is True
+    assert coerce_bool_flag("false") is False
+    assert coerce_bool_flag("False") is False
+    assert coerce_bool_flag("no") is False
+    assert coerce_bool_flag("0") is False
+    assert coerce_bool_flag("off") is False
+
+
+def test_coerce_bool_flag_none_returns_default():
+    assert coerce_bool_flag(None) is True
+    assert coerce_bool_flag(None, default=False) is False
+
+
+def test_coerce_bool_flag_unrecognized_string_returns_default():
+    assert coerce_bool_flag("maybe") is True
+    assert coerce_bool_flag("maybe", default=False) is False
+
+
+def test_coerce_bool_flag_non_bool_non_str_uses_bool_conversion():
+    assert coerce_bool_flag(1) is True
+    assert coerce_bool_flag(0) is False
+    assert coerce_bool_flag([]) is False
+    assert coerce_bool_flag(["x"]) is True
+
+
+# --- sync_agent (scripts/sync_to_db.py) --------------------------------------------
+
+class FakeIdentityManagerSync:
+    """Minimal stand-in for IdentityManager covering sync_agent()'s calls."""
+
+    def __init__(self):
+        self.saved_configs = {}
+
+    def save_agent_config(self, name, config):
+        self.saved_configs[name] = dict(config)
+
+    def save_agent_skills(self, name, skills):
+        pass
+
+    def save_agent_embedding(self, name, vector):
+        pass
+
+
+def _write_agent_config(tmp_path, yaml_text):
+    agent_dir = tmp_path / "some-agent"
+    agent_dir.mkdir()
+    (agent_dir / "config.yaml").write_text(yaml_text)
+    return agent_dir
+
+
+def test_sync_agent_coerces_legacy_string_external_false(tmp_path):
+    agent_dir = _write_agent_config(
+        tmp_path,
+        'name: some-agent\ntype: background_script\nexternal: "false"\ninternal: "true"\n',
+    )
+    fake_identity = FakeIdentityManagerSync()
+
+    sync_agent(fake_identity, agent_dir)
+
+    saved = fake_identity.saved_configs["some-agent"]
+    assert saved["external"] is False
+    assert saved["internal"] is True
+
+
+def test_sync_agent_coerces_legacy_string_external_true(tmp_path):
+    agent_dir = _write_agent_config(
+        tmp_path,
+        'name: some-agent\ntype: background_script\nexternal: "true"\ninternal: "false"\n',
+    )
+    fake_identity = FakeIdentityManagerSync()
+
+    sync_agent(fake_identity, agent_dir)
+
+    saved = fake_identity.saved_configs["some-agent"]
+    assert saved["external"] is True
+    assert saved["internal"] is False

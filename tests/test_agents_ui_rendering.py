@@ -8,8 +8,11 @@ against synthetic agent payloads with varied `external`/`internal` flags, and as
     badge renders for `external: True` (or omitted) agents.
   - The connection modal's OpenAI API / MCP `use_agent` snippets are replaced by an
     advisory notice for `external: False` agents, and retained for `external: True`.
-  - The A2A section always renders the `a2a_access` snippet, with the internal-only
-    callout text shown only for `external: False` agents.
+  - The A2A section renders the `a2a_access` snippet with the internal-only callout
+    text for `external: False, internal: True` agents, the default caller-instructions
+    text for `external: True, internal: True` agents, and — for any agent with
+    `internal: False` (regardless of `external`) — a blocked-delegation advisory in
+    place of the snippet, since such agents are silently skipped by the A2A loop.
 """
 from core.dependencies import templates
 
@@ -139,6 +142,29 @@ def test_a2a_section_present_without_internal_callout_when_external_true():
 
     assert 'a2a_access:\n  - "general-agent"' in modal
     assert "designed to be invoked by other specialized agents" not in modal
+
+
+def test_a2a_blocked_advisory_when_internal_false_external_true():
+    agents = [_base_agent("entrypoint-agent", external=True, internal=False)]
+    html = _render(agents)
+    modal = _connect_modal_block(html, "entrypoint-agent")
+
+    assert "cannot be invoked via" in modal
+    assert "internal: false" in modal
+    assert "To call this agent from another agent, add it to the caller's" not in modal
+    assert 'a2a_access:\n  - "entrypoint-agent"' not in modal
+
+
+def test_a2a_blocked_advisory_when_internal_false_external_false():
+    agents = [_base_agent("private-agent", external=False, internal=False)]
+    html = _render(agents)
+    modal = _connect_modal_block(html, "private-agent")
+
+    assert "cannot be invoked via" in modal
+    assert "internal: false" in modal
+    assert "To call this agent from another agent, add it to the caller's" not in modal
+    assert "designed to be invoked by other specialized agents" not in modal
+    assert 'a2a_access:\n  - "private-agent"' not in modal
 
 
 def test_multi_agent_render_scopes_badges_and_modals_independently():

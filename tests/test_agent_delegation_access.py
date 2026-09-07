@@ -250,3 +250,132 @@ def test_build_agent_injects_internal_true_a2a_target(monkeypatch):
     assert len(subagent_caps) == 1
     names = [sa["name"] for sa in subagent_caps[0].subagents]
     assert names == ["data-parser"]
+
+
+# --- evict_agent() reverse-dependency (a2a_access) propagation ---------------
+#
+# Covers the staleness gap where build_agent()'s A2A loop compiles a caller's reachable
+# subagents once, at build time, into a static SubAgentCapability. If a target's `internal`
+# flag flips to False after the caller was already built and cached, evicting only the
+# target left the caller's stale, still-working delegation path in place indefinitely.
+# evict_agent() must also evict any OTHER cached agent whose a2a_access references the
+# evicted agent, recursively, with cycle protection.
+
+class FakeIdentityManagerEvict:
+    """Minimal identity manager stand-in exposing only what evict_agent() needs:
+    get_all_agent_configs()."""
+
+    def __init__(self, configs: Dict[str, Dict]):
+        self._configs = configs
+
+    def get_all_agent_configs(self) -> Dict[str, Dict]:
+        return {name: dict(cfg) for name, cfg in self._configs.items()}
+
+
+def _seed_cache_and_registry(monkeypatch, names):
+    """Populate _agent_cache and a fresh _supervisor_registry with sentinel agents for
+    each name in `names`, mirroring how get_agent() would have left things after a
+    successful build."""
+    fake_cache = {name: object() for name in names}
+    monkeypatch.setattr(agent_factory, "_agent_cache", fake_cache, raising=False)
+
+    fresh_registry = agent_factory.FrameworkAgentRegistry(
+        FakeIdentityManagerRegistry({}), FakeHealthMonitor()
+    )
+    for name in names:
+        config = SubAgentConfig(name=name, description="d", instructions="")
+        fresh_registry.agents[name] = object()
+        fresh_registry.configs[name] = config
+        fresh_registry._compiled[name] = CompiledSubAgent(name=name, description="d", agent=object(), config=config)
+    monkeypatch.setattr(agent_factory, "_supervisor_registry", fresh_registry, raising=False)
+    return fake_cache, fresh_registry
+
+
+def test_evict_agent_cascades_to_caller_via_a2a_access(monkeypatch):
+    """A has a2a_access: ["B"]. Evicting B must also evict A (the caller), since A's
+    already-compiled SubAgentCapability may still contain a working delegation path to B."""
+    cache, registry = _seed_cache_and_registry(monkeypatch, ["A", "B"])
+    fake_identity = FakeIdentityManagerEvict({
+        "A": {"name": "A", "a2a_access": ["B"]},
+        "B": {"name": "B", "a2a_access": []},
+    })
+    monkeypatch.setattr(agent_factory, "get_identity_manager", lambda: fake_identity)
+
+    agent_factory.evict_agent("B")
+
+    assert "B" not in cache
+    assert "A" not in cache
+    assert registry.exists("A") is False
+    assert registry.exists("B") is False
+
+
+def test_evict_agent_does_not_over_evict_unrelated_agents(monkeypatch):
+    """Regression guard: evicting B when no other agent references B in a2a_access must
+    only evict B — an unrelated agent C must be left untouched."""
+    cache, registry = _seed_cache_and_registry(monkeypatch, ["B", "C"])
+    fake_identity = FakeIdentityManagerEvict({
+        "B": {"name": "B", "a2a_access": []},
+        "C": {"name": "C", "a2a_access": []},
+    })
+    monkeypatch.setattr(agent_factory, "get_identity_manager", lambda: fake_identity)
+
+    agent_factory.evict_agent("B")
+
+    assert "B" not in cache
+    assert "C" in cache
+    assert registry.exists("C") is True
+
+
+def test_evict_agent_cascades_through_chain(monkeypatch):
+    """Chain A -> B -> C (A's a2a_access references B, B's references C). Evicting C must
+    cascade-evict B (direct caller of C) and A (indirect caller, via B) too."""
+    cache, registry = _seed_cache_and_registry(monkeypatch, ["A", "B", "C"])
+    fake_identity = FakeIdentityManagerEvict({
+        "A": {"name": "A", "a2a_access": ["B"]},
+        "B": {"name": "B", "a2a_access": ["C"]},
+        "C": {"name": "C", "a2a_access": []},
+    })
+    monkeypatch.setattr(agent_factory, "get_identity_manager", lambda: fake_identity)
+
+    agent_factory.evict_agent("C")
+
+    assert cache == {}
+    assert registry.exists("A") is False
+    assert registry.exists("B") is False
+    assert registry.exists("C") is False
+
+
+def test_evict_agent_handles_a2a_access_cycle_without_infinite_loop(monkeypatch):
+    """A cycle (A references B, B references A) must terminate cleanly rather than
+    recursing forever, and must still evict both agents in the cycle."""
+    cache, registry = _seed_cache_and_registry(monkeypatch, ["A", "B"])
+    fake_identity = FakeIdentityManagerEvict({
+        "A": {"name": "A", "a2a_access": ["B"]},
+        "B": {"name": "B", "a2a_access": ["A"]},
+    })
+    monkeypatch.setattr(agent_factory, "get_identity_manager", lambda: fake_identity)
+
+    agent_factory.evict_agent("A")
+
+    assert cache == {}
+    assert registry.exists("A") is False
+    assert registry.exists("B") is False
+
+
+def test_evict_agent_is_defensive_when_config_fetch_fails(monkeypatch):
+    """If fetching all agent configs raises (e.g. a transient etcd error), evict_agent must
+    still successfully evict the originally-requested agent rather than propagating the
+    exception — only the reverse-dependency cascade is best-effort."""
+    cache, registry = _seed_cache_and_registry(monkeypatch, ["A", "B"])
+
+    class BrokenIdentityManager:
+        def get_all_agent_configs(self):
+            raise RuntimeError("etcd unavailable")
+
+    monkeypatch.setattr(agent_factory, "get_identity_manager", lambda: BrokenIdentityManager())
+
+    agent_factory.evict_agent("B")
+
+    assert "B" not in cache
+    assert "A" in cache  # cascade couldn't run, but the direct eviction still succeeded
+    assert registry.exists("B") is False

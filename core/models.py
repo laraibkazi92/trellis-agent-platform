@@ -50,6 +50,38 @@ class AgentConfig(BaseModel):
     external: bool = Field(default=True, description="Available for direct consumption by users, Host API, Gateway MCP, and Supervisor agent.")
     internal: bool = Field(default=True, description="Available to be called by other specialized agents via a2a_access.")
 
+
+def is_agent_external(cfg: Optional[dict]) -> bool:
+    """True unless the config explicitly sets external: false. Fail-open on missing/malformed values."""
+    return (cfg or {}).get("external", True) is not False
+
+
+def is_agent_internal(cfg: Optional[dict]) -> bool:
+    """True unless the config explicitly sets internal: false. Fail-open on missing/malformed values."""
+    return (cfg or {}).get("internal", True) is not False
+
+
+def coerce_bool_flag(value, default: bool = True) -> bool:
+    """Normalize a raw config value (bool, YAML/string, or missing) to a real bool.
+
+    Handles legacy config.yaml values that were YAML-quoted as strings (e.g. "false")
+    instead of real booleans, so downstream `is not False` / `is False` identity
+    checks always operate on genuine bools once a config has passed through a write path
+    that calls this.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "yes", "1", "on"):
+            return True
+        if v in ("false", "no", "0", "off"):
+            return False
+        return default
+    return bool(value)
+
 class MCPToolDefinition(BaseModel):
     name: str
     description: str

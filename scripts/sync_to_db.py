@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.auth import IdentityManager
 from core.embeddings import embed_text
+from core.models import coerce_bool_flag
 
 BASE_DIR = Path(__file__).parent.parent
 WORKSPACE_DIR = BASE_DIR / "workspace"
@@ -42,8 +43,8 @@ def sync_agent(identity_mgr, agent_dir, name=None, default_type=None):
         if not config.get("type") and default_type:
             config["type"] = default_type
 
-        config["external"] = config.get("external", True)
-        config["internal"] = config.get("internal", True)
+        config["external"] = coerce_bool_flag(config.get("external"), True)
+        config["internal"] = coerce_bool_flag(config.get("internal"), True)
 
         # For script types, we need the rel_path so the engine knows where to run it
         try:

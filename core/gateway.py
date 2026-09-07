@@ -16,6 +16,7 @@ from core.discovery import discover_agents, is_agent_configured, is_tool_configu
 from core.agent_search import search_agents as _search_agents_ranked, DEFAULT_LIMIT as AGENT_SEARCH_LIMIT
 from core.tool_search import search_tools as _search_tools_ranked, DEFAULT_LIMIT as TOOL_SEARCH_LIMIT
 from core.agent_factory import get_hub_client, get_external_mcp_client
+from core.models import is_agent_external
 
 @asynccontextmanager
 async def lifespan(app):
@@ -121,7 +122,7 @@ async def _get_visible_agents() -> List[Dict]:
             
         if agent_dict.get("type") in ("background_agent", "background_script"):
             continue
-        if agent_dict.get("external", True) is False:
+        if not is_agent_external(agent_dict):
             continue
 
         is_configured = agent_dict.get("is_configured", False)
@@ -226,7 +227,7 @@ async def use_agent(ctx: Context, agent_name: str, prompt: str) -> str:
     await ctx.report_progress(1, 3, message=f"Routing to agent: {agent_name} — \"{prompt_preview}\"")
 
     cfg = await asyncio.to_thread(identity_mgr.get_agent_config, agent_name)
-    if cfg and cfg.get("external", True) is False:
+    if cfg and not is_agent_external(cfg):
         return f"SYSTEM: Access denied. Agent '{agent_name}' is internal and cannot be called directly."
 
     if agent_name != "supervisor":

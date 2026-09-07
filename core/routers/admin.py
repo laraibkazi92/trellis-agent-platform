@@ -10,7 +10,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import templates, CSRFRoute
 from core.auth import IdentityManager
 from core.health import HealthMonitor
-from core.models import Identity, IdentityType
+from core.models import Identity, IdentityType, is_agent_internal, coerce_bool_flag
 
 router = APIRouter(route_class=CSRFRoute)
 
@@ -419,6 +419,10 @@ async def editor_page(request: Request, type: str, name: str):
         all_agents = await asyncio.to_thread(identity_mgr.list_agents)
         all_agent_configs = await asyncio.to_thread(identity_mgr.get_all_agent_configs)
         internal_agents = {n: cfg.get("internal", True) for n, cfg in all_agent_configs.items()}
+        a2a_dependents = [
+            n for n, cfg in all_agent_configs.items()
+            if n != safe_name and safe_name in (cfg.get("a2a_access") or [])
+        ]
 
         all_tools_data = []
         # Bulk fetch all tools and MCPs
@@ -466,6 +470,7 @@ async def editor_page(request: Request, type: str, name: str):
                 "skills_content": skills_content,
                 "all_agents": all_agents,
                 "internal_agents": internal_agents,
+                "a2a_dependents": a2a_dependents,
                 "all_tools": all_tools,
                 "all_mcps": all_mcps
             }
@@ -545,16 +550,27 @@ async def save_agent(request: Request, name: str):
     
     config["version"] = form.get("version")
     config["description"] = form.get("description")
-    # Checkboxes: only present in form when checked.
-    config["external"] = form.get("external") == "true"
-    config["internal"] = form.get("internal") == "true"
+    # Checkboxes: only present in form when checked. A hidden "_submitted" sentinel
+    # (always present when this form is actually submitted from editor.html) lets us
+    # distinguish a deliberate browser uncheck from a raw/scripted POST that never
+    # included these newer fields at all -- the latter must preserve the agent's
+    # existing value rather than silently flipping it to False.
+    if "external_submitted" in form:
+        config["external"] = form.get("external") == "true"
+    else:
+        config["external"] = coerce_bool_flag(config.get("external"), True)
+
+    if "internal_submitted" in form:
+        config["internal"] = form.get("internal") == "true"
+    else:
+        config["internal"] = coerce_bool_flag(config.get("internal"), True)
 
     # Handle multiple a2a_access values, filtering out targets with internal: False
     # (prevents misconfiguration even if bypassed via raw POST).
     all_agent_configs = await asyncio.to_thread(identity_mgr.get_all_agent_configs)
     config["a2a_access"] = [
         target for target in form.getlist("a2a_access")
-        if all_agent_configs.get(target, {}).get("internal", True) is not False
+        if is_agent_internal(all_agent_configs.get(target, {}))
     ]
     config["allowed_tools"] = form.getlist("allowed_tools")
     config["allowed_mcps"] = form.getlist("allowed_mcps")

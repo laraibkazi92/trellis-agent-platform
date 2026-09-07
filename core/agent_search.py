@@ -17,6 +17,7 @@ from typing import List, Dict
 
 from core.auth import IdentityManager
 from core.embeddings import embed_text, cosine
+from core.models import is_agent_external
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ async def search_agents(query: str, limit: int = DEFAULT_LIMIT, include_disabled
     Each result is ``{"name", "description", "status"}``. Background agents/scripts and
     the supervisor are always excluded. Disabled agents are excluded unless
     ``include_disabled`` is True (the Supervisor passes True so it can still manage them).
+    Agents with ``external: False`` (internal-only agents) are always excluded.
     Pass ``limit <= 0`` to get the full ranked list (used by callers that apply their own
     visibility filter on top of the ranking).
     """
@@ -64,7 +66,7 @@ async def search_agents(query: str, limit: int = DEFAULT_LIMIT, include_disabled
             continue
         if cfg.get("type") in _BACKGROUND_TYPES:
             continue
-        if cfg.get("external", True) is False:
+        if not is_agent_external(cfg):
             continue
 
         is_disabled = name in disabled
