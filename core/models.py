@@ -33,6 +33,76 @@ class Identity(BaseModel):
         """Returns the structured etcd path: /identities/{type}/{id}/{category}"""
         return f"/identities/{self.type.value}/{self.id}/{category}"
 
+class AgentRule(BaseModel):
+    """Declarative operational routing rule for a specific agent."""
+    description: Optional[str] = Field(
+        default=None,
+        description="Brief summary of what this rule governs."
+    )
+    use_when: List[str] = Field(
+        default_factory=list,
+        description="Positive operational conditions when this agent MUST be selected."
+    )
+    do_not_use_when: List[str] = Field(
+        default_factory=list,
+        description="Strict negative boundaries when this agent MUST NOT be selected."
+    )
+    examples: List[str] = Field(
+        default_factory=list,
+        description="Representative user queries matching this rule."
+    )
+
+
+class GlobalRule(BaseModel):
+    """Central organizational override rule for cross-agent dispute resolution."""
+    rule_id: str = Field(
+        description="Unique identifier for the global rule (e.g. override-pcap-triage)."
+    )
+    target_agent: str = Field(
+        description="Exact agent name that this rule locks onto."
+    )
+    description: Optional[str] = Field(
+        default=None,
+        description="Operational context and justification for the override."
+    )
+    use_when: List[str] = Field(
+        default_factory=list,
+        description="Positive operational conditions triggering this global override."
+    )
+    do_not_use_when: List[str] = Field(
+        default_factory=list,
+        description="Strict negative boundaries disqualifying this global override."
+    )
+    examples: List[str] = Field(
+        default_factory=list,
+        description="Representative user queries matching this override."
+    )
+
+
+class RoutingRulesConfig(BaseModel):
+    """Top-level schema for workspace/routing_rules.yaml."""
+    version: str = Field(default="1.0")
+    global_rules: List[GlobalRule] = Field(default_factory=list)
+
+
+class RuleEvaluationResult(BaseModel):
+    """Structured LLM decision output for rule evaluation."""
+    matched_agent: Optional[str] = Field(
+        default=None,
+        description="Exact name of the matching agent if a rule positively locks onto the query, or null if no rule matches."
+    )
+    confidence: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence score between 0.0 and 1.0 reflecting how unambiguously the query matches the rule criteria."
+    )
+    reasoning: str = Field(
+        default="",
+        description="Brief explanation of why the rule matched or why no rule applied."
+    )
+
+
 class AgentConfig(BaseModel):
     """Configuration for an Agent, parsed from config.yaml."""
     name: str
@@ -49,6 +119,7 @@ class AgentConfig(BaseModel):
     agent_memory: bool = Field(default=False, description="Opt this agent into per-agent persistent memory (Hindsight). Requires the admin 'agent_memory_enabled' feature flag to also be on.")
     external: bool = Field(default=True, description="Available for direct consumption by users, Host API, Gateway MCP, and Supervisor agent.")
     internal: bool = Field(default=True, description="Available to be called by other specialized agents via a2a_access.")
+    rules: List[AgentRule] = Field(default_factory=list, description="Declarative routing rules evaluated by the Trellis Rules Engine before semantic search.")
 
 
 def is_agent_external(cfg: Optional[dict]) -> bool:

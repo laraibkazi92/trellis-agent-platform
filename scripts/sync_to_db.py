@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.auth import IdentityManager
 from core.embeddings import embed_text
-from core.models import coerce_bool_flag
+from core.models import coerce_bool_flag, AgentRule, RoutingRulesConfig
 
 BASE_DIR = Path(__file__).parent.parent
 WORKSPACE_DIR = BASE_DIR / "workspace"
@@ -39,12 +39,21 @@ def sync_agent(identity_mgr, agent_dir, name=None, default_type=None):
         
         if "allowed_tools" not in config:
             config["allowed_tools"] = []
-            
+
         if not config.get("type") and default_type:
             config["type"] = default_type
 
         config["external"] = coerce_bool_flag(config.get("external"), True)
         config["internal"] = coerce_bool_flag(config.get("internal"), True)
+
+        # Validate declarative routing rules before persisting; drop the raw
+        # value rather than crash the whole sync if a config.yaml is malformed.
+        raw_rules = config.get("rules", [])
+        try:
+            config["rules"] = [rule.model_dump() for rule in [AgentRule(**r) for r in raw_rules]]
+        except Exception as e:
+            print(f"  WARNING: invalid rules for agent {name}, dropping rules: {e}")
+            config["rules"] = []
 
         # For script types, we need the rel_path so the engine knows where to run it
         try:
@@ -55,7 +64,9 @@ def sync_agent(identity_mgr, agent_dir, name=None, default_type=None):
             pass
             
         identity_mgr.save_agent_config(name, config)
-        print(f"  Saved config for agent: {name} (Type: {config.get('type')})")
+        rule_count = len(config.get("rules") or [])
+        rules_suffix = f", with {rule_count} rules" if rule_count else ""
+        print(f"  Saved config for agent: {name} (Type: {config.get('type')}{rules_suffix})")
 
         # Index the agent for semantic search. Skipped for background agents/scripts
         # and the supervisor, which are never returned by search_agents.
@@ -155,6 +166,21 @@ def main():
                         print(f"  Indexed embedding for tool: {name}")
                     else:
                         print(f"  Skipped embedding for tool: {name} (embeddings unavailable)")
+
+    print("\nSyncing routing rules to etcd...")
+    routing_rules_path = WORKSPACE_DIR / "routing_rules.yaml"
+    if routing_rules_path.exists():
+        with open(routing_rules_path, "r") as f:
+            raw_routing_rules = yaml.safe_load(f) or {}
+        try:
+            routing_rules = RoutingRulesConfig(**raw_routing_rules)
+        except Exception as e:
+            print(f"  WARNING: invalid workspace/routing_rules.yaml, skipping: {e}")
+        else:
+            identity_mgr.save_routing_rules(routing_rules.model_dump())
+            print(f"  Saved routing rules from workspace/routing_rules.yaml ({len(routing_rules.global_rules)} global rules)")
+    else:
+        print("  No workspace/routing_rules.yaml found, skipping.")
 
     print("\nSyncing MCPs to etcd...")
     if MCPS_DIR.exists():

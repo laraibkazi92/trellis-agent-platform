@@ -538,6 +538,19 @@ class IdentityManager:
         return deleted
 
     @retry_etcd()
+    def save_routing_rules(self, rules_data: Dict[str, Any]) -> None:
+        """Persist the central Trellis Rules Engine cross-agent overrides."""
+        self.client.put("/registry/routing_rules", json.dumps(rules_data))
+
+    @retry_etcd()
+    def get_routing_rules(self) -> Optional[Dict[str, Any]]:
+        """Retrieve the central Trellis Rules Engine cross-agent overrides."""
+        value, _ = self.client.get("/registry/routing_rules")
+        if value:
+            return json.loads(value.decode('utf-8'))
+        return None
+
+    @retry_etcd()
     def get_health_status(self, entity_type: str, name: str) -> Optional[Dict]:
         """Retrieve the health status of an agent or tool."""
         value, _ = self.client.get(f"/health/{entity_type}/{name}")
