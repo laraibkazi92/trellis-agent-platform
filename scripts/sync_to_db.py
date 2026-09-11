@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.auth import IdentityManager
 from core.embeddings import embed_text
-from core.models import coerce_bool_flag, AgentRule, RoutingRulesConfig
+from core.models import coerce_bool_flag, AgentRule, GlobalRule, RoutingRulesConfig
 
 BASE_DIR = Path(__file__).parent.parent
 WORKSPACE_DIR = BASE_DIR / "workspace"
@@ -18,6 +18,23 @@ WORKSPACE_DIR = BASE_DIR / "workspace"
 AGENTS_DIR = WORKSPACE_DIR / "agents"
 WORKFLOWS_DIR = WORKSPACE_DIR / "workflows"
 TOOLS_DIR = WORKSPACE_DIR / "tools"
+
+
+def _warn_unknown_rule_keys(model_cls, raw_rules, context):
+    """Warn (don't fail) when a raw rule dict has a key the model doesn't know about --
+    these models don't set extra="forbid", so a typo like `when_to_use` instead of
+    `use_when` is otherwise silently dropped and produces a rule that never matches
+    anything, with no other signal to the author."""
+    known = set(model_cls.model_fields.keys())
+    for i, item in enumerate(raw_rules or []):
+        if isinstance(item, dict):
+            unknown = sorted(set(item.keys()) - known)
+            if unknown:
+                print(
+                    f"  WARNING: {context} rule #{i} has unrecognized field(s) {unknown} "
+                    f"(known fields: {sorted(known)}) — check for a typo; unrecognized "
+                    "fields are silently dropped, not an error."
+                )
 MCPS_DIR = WORKSPACE_DIR / "mcps"
 
 # Supervisor is an internal core agent
@@ -49,6 +66,7 @@ def sync_agent(identity_mgr, agent_dir, name=None, default_type=None):
         # Validate declarative routing rules before persisting; drop the raw
         # value rather than crash the whole sync if a config.yaml is malformed.
         raw_rules = config.get("rules", [])
+        _warn_unknown_rule_keys(AgentRule, raw_rules, f"agent '{name}'")
         try:
             config["rules"] = [rule.model_dump() for rule in [AgentRule(**r) for r in raw_rules]]
         except Exception as e:
@@ -172,11 +190,19 @@ def main():
     if routing_rules_path.exists():
         with open(routing_rules_path, "r") as f:
             raw_routing_rules = yaml.safe_load(f) or {}
+        _warn_unknown_rule_keys(GlobalRule, raw_routing_rules.get("global_rules", []), "global")
         try:
             routing_rules = RoutingRulesConfig(**raw_routing_rules)
         except Exception as e:
             print(f"  WARNING: invalid workspace/routing_rules.yaml, skipping: {e}")
         else:
+            for rule in routing_rules.global_rules:
+                if rule.target_agent not in seen_agents:
+                    print(
+                        f"  WARNING: global rule '{rule.rule_id}' targets unknown agent "
+                        f"'{rule.target_agent}' — check for a typo against a real agent name; "
+                        "this rule will never match anything."
+                    )
             identity_mgr.save_routing_rules(routing_rules.model_dump())
             print(f"  Saved routing rules from workspace/routing_rules.yaml ({len(routing_rules.global_rules)} global rules)")
     else:

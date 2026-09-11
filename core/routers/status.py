@@ -79,9 +79,13 @@ async def status_page(request: Request, user=Depends(require_auth)):
     total_entities = len(agents) + len(tools)
     offline_count = 0
     
-    # Pre-fetch all health events in bulk if possible? 
+    # Pre-fetch all health events in bulk if possible?
     # For now, let's keep it but ensure discover_agents was optimized.
-    
+
+    # Deliberately raw (not the cooldown-aware evaluate_health_status used by the
+    # rules engine and the /agents marketplace page): this is a historical/audit view
+    # of actual circuit-breaker trips and the 30-day timeline, which an evaluated
+    # "Half-Open" status would misrepresent.
     for agent in agents:
         agent_name = agent["name"]
         status_info = agent.get("health", {})

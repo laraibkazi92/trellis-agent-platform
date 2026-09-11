@@ -156,17 +156,64 @@ Only **eligible** agents' rules are ever compiled into the LLM decider's prompt.
 - `type` is `background_agent` or `background_script`.
 - `external: false` is set (internal-only worker subagents are never surfaced to query routing).
 - The agent is in the disabled-agents set.
-- The agent's health status is `Offline`.
-- The agent is **unconfigured** — missing a required secret or variable.
 - The agent has an empty `rules:` list (nothing to evaluate).
 
-This prevents "black hole" routing, where a query would deterministically lock onto an agent that
-can't actually serve the request. Access-group / OIDC filtering is explicitly **out of scope** for
-this gating — it is not consulted here.
+Access-group / OIDC filtering is explicitly **out of scope** for this gating — it is not consulted
+here.
+
+> **Health and configuration-readiness are deliberately *not* part of this list.** An offline or
+> unconfigured agent's rules are still compiled into the prompt and can still be matched — see
+> [Availability: Handled After the Match, Not Before](#availability-handled-after-the-match-not-before)
+> below. Only administrative disablement produces a full, silent exclusion here; offline/unconfigured
+> is a separate, post-match concern.
 
 If **no** eligible agent has rules and **no** global rules exist, the rules engine is skipped
 entirely (`has_active_rules()` returns `False`) — the query goes straight to vector semantic search
 with zero added latency, exactly as it did before this feature existed.
+
+---
+
+## Availability: Handled After the Match, Not Before
+
+A confident rule match is only honored as a lock if the matched agent is also currently **available**
+— this check happens in `core/agent_search.py:_resolve_rule_lock()`, strictly *after* the LLM decider
+returns a confident match, using the same unified evaluators the rest of the platform uses (agent
+health cooldown evaluation, configuration-readiness resolution):
+
+- **Available** (Online, or a circuit-breaker-recovered "Half-Open" agent past its cooldown window)
+  → the lock is honored normally: `search_agents()` returns **exactly one** result, the locked agent —
+  this holds regardless of the caller's `limit`, including `limit <= 0`. A rules-engine lock is meant
+  to be deterministic and authoritative, never diluted or truncated by the caller.
+- **Offline**, or **unconfigured** (missing a required secret or variable) → the lock is *not*
+  honored. `search_agents()` instead falls through to the normal ranked semantic fallback (governed by
+  `limit` as usual) and prepends an "unavailable match" note:
+
+  > The routing policy identified '\<agent>' as the best match for this query, but it is currently
+  > offline / not configured. Showing next-best alternatives below.
+
+  This note is **additional** to `limit`, not subtracted from it — a caller requesting `limit=5` still
+  gets 5 ranked alternatives, plus the note, when this happens. The note item also carries
+  `unavailable_match: True` (present on no other result) — both callers of `search_agents()` check this
+  before re-decorating results by agent name (`core/gateway.py`'s MCP tool, `core/agent_factory.py`'s
+  Supervisor tool), so its wording is never overwritten or double-annotated. It's still fully readable
+  on its own if a consumer only looks at `description` and ignores the flag.
+
+  > **Note:** the matched-but-unavailable agent is *not* filtered out of the ranked semantic-fallback
+  > pool below the note — it can legitimately appear a second time among the alternatives, with its own
+  > ordinary (undecorated) description, if it ranks well on its own. This is intentional, not a bug: the
+  > note explains why the *rules-engine lock* didn't fire; the fallback ranking is a wholly separate
+  > mechanism free to still surface the same agent as one candidate among several.
+
+An administratively **disabled** agent never reaches this check at all — it's excluded from
+eligibility outright (see [Readiness Gating](#readiness-gating) above), so no note is ever produced
+for it; it's simply absent from consideration, same as before.
+
+This design means a rules-engine lock, once returned by `search_agents()`, can never collapse to zero
+results downstream — there's no second gate left that can disagree with it and drop it. A genuinely
+separate, unavoidable race remains: the agent recommended at search time could still change state
+(get disabled, lose a secret) in the window between search and actual invocation — that's handled by
+`use_agent`'s fresh, single-agent, point-of-use configuration check immediately before dispatch, which
+is the correct layer for that guarantee, not `search_agents()` itself.
 
 ---
 
@@ -247,9 +294,13 @@ change (see `docs/agents.md`).
 3. **Fail-open resilience**: set `RULES_EVALUATION_TIMEOUT=0.001` and repeat query 1. Expect
    `[RulesEngine] Evaluation timed out after 0.001s; failing open to semantic search`, and a normal,
    successful vector-search result with no error surfaced to the caller.
-4. **Readiness gating**: disable `troubleshooting-agent` (or revoke a required secret) and repeat
-   query 1. Its rules must not be evaluated at all — the query should fall through to remaining
-   eligible agents.
+4. **Administrative disablement**: disable `troubleshooting-agent` and repeat query 1. Its rules must
+   not be evaluated at all — the query should fall through to remaining eligible agents, with no
+   "unavailable match" note (disablement is a silent exclusion, not a post-match note).
+5. **Offline/unconfigured match**: take `troubleshooting-agent` offline (or revoke a required secret)
+   *without* disabling it, and repeat query 1. Its rules are still evaluated and still match — but the
+   response should now lead with an "unavailable match" note naming it, followed by the normal ranked
+   semantic-fallback alternatives (not a hard exclusion).
 
 Grep targets when debugging in production:
 
@@ -274,9 +325,10 @@ Grep targets when debugging in production:
   configured/healthy) on top of what `search_agents()` already fetches, but **only** when at least
   one rule exists anywhere in the deployment — a zero-rules deployment (the default, out of the box)
   pays no extra cost per query.
-- A rule lock returns **only the locked agent** when the caller's `limit` is `<= 0` or `1` (this
-  includes the Gateway MCP tool's internal `limit=0` convention, which normally means "give me the
-  full ranked catalog"). This is intentional — the point of a deterministic lock is one authoritative
-  answer, not a muddied top-N — but it means a rule firing can reduce the number of results a caller
-  gets back compared to an unlocked query. Pass an explicit `limit > 1` if you need the locked agent
-  plus semantically-ranked alternates filling the remaining slots.
+- A rule lock **always** returns exactly one result — the locked agent — regardless of the caller's
+  `limit`, including `limit <= 0`. This is intentional: the point of a deterministic lock is one
+  authoritative answer, never a muddied top-N, and the caller has no way to override it (there is no
+  "bypass the rules engine" flag by design — see [Availability: Handled After the Match, Not
+  Before](#availability-handled-after-the-match-not-before)). The Gateway MCP tool now passes its
+  caller's real `limit` straight through to `search_agents()` rather than the old `limit=0`-then-
+  truncate convention.

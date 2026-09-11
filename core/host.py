@@ -26,8 +26,8 @@ from fastmcp import Client as FastMCPClient
 from fastmcp.client import StdioTransport, SSETransport, StreamableHttpTransport
 
 from core.auth import AuthMiddleware, IdentityManager, user_id_var
-from core.models import AgentConfig, MCPConfig, is_agent_external
-from core.health import HealthMonitor
+from core.models import AgentConfig, MCPConfig, is_agent_external, is_routable_agent_type
+from core.health import HealthMonitor, compute_agent_operational_status
 from core.background.webhooks import router as webhooks_router
 from core.tasks import run_background_agent
 
@@ -158,19 +158,14 @@ async def health():
     
     agents_status = {}
     for name, cfg in configs.items():
-        if name == "supervisor" or name in disabled: continue
+        if not is_routable_agent_type(name, cfg) or name in disabled: continue
         if not is_agent_external(cfg): continue
 
-        # Check tool status from the pre-fetched tool_healths
-        offline_tools = [
-            t for t in cfg.get("allowed_tools", [])
-            if health_monitor._evaluate_status(tool_healths.get(t, {})).get("status") == "Offline"
-        ]
-        
-        agent_global_status = health_monitor._evaluate_status(agent_healths.get(name, {}))
-        agent_status_val = agent_global_status.get("status", "Online")
-        status_str = "Offline" if agent_status_val == "Offline" else ("Degraded" if offline_tools else agent_status_val)
-        agents_status[name] = {"status": status_str, "offline_tools": offline_tools, "agent_error": agent_global_status.get("last_error")}
+        # Shared with core/gateway.py's _get_visible_agents() (Phase D) -- see
+        # core/health.py:compute_agent_operational_status.
+        agents_status[name] = compute_agent_operational_status(
+            cfg, agent_healths.get(name), tool_healths, cooldown_seconds=health_monitor.cooldown_seconds
+        )
     
     return {"status": "healthy", "agents": agents_status, "agents_disabled": disabled, "hub_connected": is_hub_connected()}
 

@@ -56,6 +56,89 @@ def test_register_admin_tools_includes_search_tools_and_use_tool_alongside_searc
     assert "use_tool" in fake_agent.tools
 
 
+def test_search_agents_tool_preserves_unavailable_match_note(monkeypatch):
+    """Phase E of the Trellis Rules Engine hardening plan
+    (__spec_docs/rules_engine_hardening_plan.md, E1/E3) added an "unavailable match"
+    note to core.agent_search.search_agents()'s output, marked with
+    unavailable_match=True, specifically so a caller that also decorates results by
+    agent name doesn't clobber its already-final, self-contained sentence. This
+    wrapper's own "[NOT CONFIGURED ...]" append must be skipped for that item -- found
+    by an adversarial Phase E review pass: without this guard, an offline-reason note
+    could be double-annotated as "...currently offline... [NOT CONFIGURED ...]",
+    actively misleading the Supervisor LLM about why the agent isn't available."""
+    fake_agent = _build_fake_agent()
+
+    note_description = (
+        "The routing policy identified 'troubleshooting-agent' as the best match for "
+        "this query, but it is currently not configured. Showing next-best "
+        "alternatives below."
+    )
+
+    async def fake_search(query, limit=8, include_disabled=False):
+        return [{
+            "name": "troubleshooting-agent",
+            "description": note_description,
+            "status": "Unconfigured",
+            "unavailable_match": True,
+        }]
+
+    async def fake_discover_agents(user_id=None):
+        return [{
+            "name": "troubleshooting-agent",
+            "is_configured": False,
+            "missing_secrets": ["API_KEY"],
+            "missing_variables": [],
+        }]
+
+    import core.agent_search as agent_search_module
+    import core.discovery as discovery_module
+    monkeypatch.setattr(agent_search_module, "search_agents", fake_search)
+    monkeypatch.setattr(discovery_module, "discover_agents", fake_discover_agents)
+    user_id_var.set("user-1")
+
+    result = asyncio.run(fake_agent.tools["search_agents"]("Analyze the PCAP trace"))
+
+    assert result == [{
+        "name": "troubleshooting-agent",
+        "description": note_description,
+        "status": "Unconfigured",
+        "unavailable_match": True,
+        "configured": False,
+    }]
+
+
+def test_search_agents_tool_still_annotates_ordinary_unconfigured_result(monkeypatch):
+    """Non-regression: an ordinary (non-note) unconfigured result still gets the
+    "[NOT CONFIGURED ...]" note appended, exactly as before Phase E."""
+    fake_agent = _build_fake_agent()
+
+    async def fake_search(query, limit=8, include_disabled=False):
+        return [{"name": "ticket-summary-agent", "description": "Generates summaries.", "status": "Online"}]
+
+    async def fake_discover_agents(user_id=None):
+        return [{
+            "name": "ticket-summary-agent",
+            "is_configured": False,
+            "missing_secrets": ["API_KEY"],
+            "missing_variables": [],
+        }]
+
+    import core.agent_search as agent_search_module
+    import core.discovery as discovery_module
+    monkeypatch.setattr(agent_search_module, "search_agents", fake_search)
+    monkeypatch.setattr(discovery_module, "discover_agents", fake_discover_agents)
+    user_id_var.set("user-1")
+
+    result = asyncio.run(fake_agent.tools["search_agents"]("Generate an executive summary"))
+
+    assert result == [{
+        "name": "ticket-summary-agent",
+        "description": "Generates summaries. [NOT CONFIGURED — missing secrets: API_KEY. Configure at /agents/ticket-summary-agent/configure]",
+        "status": "Online",
+        "configured": False,
+    }]
+
+
 def test_search_tools_tool_delegates_to_ranked_search_with_caller_user_id(monkeypatch):
     fake_agent = _build_fake_agent()
     cards = [

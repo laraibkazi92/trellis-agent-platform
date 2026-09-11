@@ -167,6 +167,25 @@ def test_a2a_blocked_advisory_when_internal_false_external_false():
     assert 'a2a_access:\n  - "private-agent"' not in modal
 
 
+def test_configure_button_highlighted_when_unconfigured_via_secret_groups_only():
+    """Regression for a Phase C follow-up finding (rules_engine_hardening_plan.md §2C):
+    an agent can now be is_configured=False purely because of an unsatisfied
+    secret_groups option, with empty required_secrets/required_variables -- the
+    Configure Agent button's orange highlight condition must account for that case too,
+    not just the plain required_secrets/required_variables case."""
+    agent = _base_agent(
+        "example-agent",
+        is_configured=False,
+        required_secrets=[],
+        required_variables=[],
+        secret_groups=[{"label": "Environment", "select_label": "Option", "options": []}],
+    )
+    html = _render([agent])
+    card = _card_block(html, "example-agent")
+
+    assert "border-orange-500" in card
+
+
 def test_multi_agent_render_scopes_badges_and_modals_independently():
     agents = [
         _base_agent("internal-worker", external=False, internal=True),

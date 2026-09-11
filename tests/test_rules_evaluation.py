@@ -85,9 +85,16 @@ class FakeAgent:
 
 @pytest.fixture(autouse=True)
 def _isolate_rules_engine(monkeypatch):
-    """Reset the query-result cache and stub out the real LLM client for every test."""
+    """Reset the query-result cache and stub out the real LLM client for every test.
+
+    Also pre-seeds the admin-timeout-override cache as "just refreshed, no override" so
+    tests never trigger a background etcd refresh (there is none in this environment;
+    the refresh is fire-and-forget and would otherwise leak a lingering thread per test).
+    """
     monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
     monkeypatch.setattr(rules_engine, "Agent", FakeAgent)
+    monkeypatch.setattr(rules_engine, "_cached_timeout_override", None)
+    monkeypatch.setattr(rules_engine, "_timeout_override_checked_at", rules_engine.time.monotonic())
     rules_engine._query_result_cache.clear()
     FakeAgent.behavior = None
     yield

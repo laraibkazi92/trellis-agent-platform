@@ -1,4 +1,4 @@
-from core.models import ToolConfig, MCPConfig
+from core.models import ToolConfig, MCPConfig, is_routable_agent_type
 
 
 def _tool_kwargs(**overrides):
@@ -38,3 +38,26 @@ def test_mcp_config_public_true():
     config = MCPConfig(name="example-mcp", public=True)
     assert config.public is True
     assert config.public_tools == []
+
+
+# --- is_routable_agent_type (Phase A: shared structural exclusion predicate) ---
+
+def test_is_routable_agent_type_excludes_supervisor():
+    assert is_routable_agent_type("supervisor", {"type": "user_agent"}) is False
+
+
+def test_is_routable_agent_type_excludes_background_agent():
+    assert is_routable_agent_type("nightly-sync", {"type": "background_agent"}) is False
+
+
+def test_is_routable_agent_type_excludes_background_script():
+    assert is_routable_agent_type("cleanup-job", {"type": "background_script"}) is False
+
+
+def test_is_routable_agent_type_true_for_ordinary_user_agent():
+    assert is_routable_agent_type("troubleshooting-agent", {"type": "user_agent"}) is True
+
+
+def test_is_routable_agent_type_fails_open_on_missing_or_none_cfg():
+    assert is_routable_agent_type("some-agent", {}) is True
+    assert is_routable_agent_type("some-agent", None) is True

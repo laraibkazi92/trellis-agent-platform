@@ -132,6 +132,20 @@ def is_agent_internal(cfg: Optional[dict]) -> bool:
     return (cfg or {}).get("internal", True) is not False
 
 
+BACKGROUND_AGENT_TYPES = ("background_agent", "background_script")
+
+
+def is_routable_agent_type(name: str, cfg: Optional[dict]) -> bool:
+    """False for the supervisor or a background agent/script; True for an ordinary routable agent.
+
+    Single source of truth for the structural exclusion every agent-listing
+    surface (discovery, ranked search, rules-engine eligibility, Gateway
+    visibility, Host health reporting) needs to apply before layering on its
+    own additional filters (external/internal, disabled, offline, etc.).
+    """
+    return name != "supervisor" and (cfg or {}).get("type") not in BACKGROUND_AGENT_TYPES
+
+
 def coerce_bool_flag(value, default: bool = True) -> bool:
     """Normalize a raw config value (bool, YAML/string, or missing) to a real bool.
 

@@ -94,6 +94,53 @@
   </div>
 </div>
 
+<!-- Trellis Rules Engine -->
+<div class="bg-white shadow-sm rounded-xl border border-gray-200 mb-8 overflow-hidden">
+  <div class="px-6 py-4 border-b border-gray-200 bg-gray-50">
+    <h2 class="text-lg font-semibold text-gray-900">Trellis Rules Engine</h2>
+  </div>
+  <div class="px-6 py-4">
+    <div class="flex items-center justify-between flex-wrap gap-4">
+      <div class="pr-6">
+        <p class="text-sm font-semibold text-gray-900">LLM Evaluation Timeout</p>
+        <p class="text-sm text-gray-500 mt-1">
+          Hard timeout on the single-pass rules decider call before failing open to vector semantic
+          search. Effective value: <strong>{{ rules_engine.effective_timeout }}s</strong>
+          {% if rules_engine.timeout_override is not none %}
+            <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-100 text-emerald-800 ml-1">Override active</span>
+          {% else %}
+            <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-600 ml-1">Using default</span>
+          {% endif %}
+          (default {{ rules_engine.timeout_default }}s, set via the <code class="text-xs bg-gray-100 px-1 py-0.5 rounded">RULES_EVALUATION_TIMEOUT</code> env var).
+        </p>
+      </div>
+      <div class="flex items-center gap-2 shrink-0">
+        <form action="/admin/rules-engine/timeout" method="POST" class="flex items-center gap-2">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input
+            type="number" step="0.1" min="0.1" max="30" name="timeout_seconds" required
+            value="{{ rules_engine.timeout_override if rules_engine.timeout_override is not none else '' }}"
+            placeholder="{{ rules_engine.timeout_default }}"
+            class="w-28 rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-neutral-900"
+          >
+          <button type="submit" class="inline-flex items-center px-4 py-2 bg-neutral-800 text-white text-sm font-medium rounded-md hover:bg-neutral-900 shadow-sm transition-colors uppercase font-mono tracking-wide">
+            Save
+          </button>
+        </form>
+        {% if rules_engine.timeout_override is not none %}
+          <form action="/admin/rules-engine/timeout" method="POST">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="timeout_seconds" value="">
+            <button type="submit" class="inline-flex items-center px-4 py-2 bg-white border border-gray-300 text-gray-700 text-sm font-medium rounded-md hover:bg-gray-50 shadow-sm transition-colors uppercase font-mono tracking-wide">
+              Reset to default
+            </button>
+          </form>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Users Table -->
 <div class="bg-white shadow-sm rounded-xl border border-gray-200 mb-8 overflow-hidden">
   <div class="px-6 py-4 border-b border-gray-200 bg-gray-50">

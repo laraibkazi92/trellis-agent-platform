@@ -78,3 +78,21 @@ def test_health_omits_supervisor_and_disabled_agents_alongside_external_filter(m
 
     assert list(result["agents"].keys()) == ["general-agent"]
     assert result["agents_disabled"] == ["disabled-agent"]
+
+
+def test_health_excludes_background_agent_types(monkeypatch):
+    """Background agents/scripts are not directly invocable and should not be
+    reported in /health alongside ordinary routable agents (Phase A dedup:
+    core.host.health now shares core.models.is_routable_agent_type with the
+    other four exclusion sites instead of only checking for "supervisor")."""
+    fake_identity = FakeIdentityManagerHealth({
+        "general-agent": {"name": "general-agent", "type": "user_agent", "external": True, "allowed_tools": []},
+        "bg-agent": {"name": "bg-agent", "type": "background_agent", "external": True, "allowed_tools": []},
+        "bg-script": {"name": "bg-script", "type": "background_script", "external": True, "allowed_tools": []},
+    })
+    monkeypatch.setattr(host, "identity_mgr", fake_identity)
+    monkeypatch.setattr(host, "is_hub_connected", lambda: True)
+
+    result = asyncio.run(host.health())
+
+    assert list(result["agents"].keys()) == ["general-agent"]

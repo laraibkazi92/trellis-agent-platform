@@ -1,18 +1,28 @@
-"""Integration tests for Phase 4 (Trellis Rules Engine wiring) — see
-__spec_docs/rules_engine_spec.md.
+"""Integration tests for the Trellis Rules Engine wiring — see
+__spec_docs/rules_engine_spec.md and, for the Phase E behavior below,
+__spec_docs/rules_engine_hardening_plan.md.
 
 Covers core.agent_search.search_agents():
-  - A confident rule match short-circuits ranking entirely (embed_text never called).
-  - A rule match with limit > 1 places the locked agent first and fills remaining
-    slots from the ranked semantic fallback (excluding the locked agent).
+  - A confident, available rule match short-circuits ranking entirely (embed_text
+    never called) and returns **exactly one** result, regardless of `limit` --
+    including `limit <= 0` (Phase E, E1: no more "fill remaining slots").
+  - A confident match on an agent that turns out to be offline or unconfigured is
+    NOT honored as a lock -- it falls through to the ranked semantic fallback with a
+    leading "unavailable match" note that does not count against `limit` (Phase E,
+    E2/E3).
+  - Health/configuration-readiness no longer affect rule *eligibility* -- an
+    offline/unconfigured agent's rules are still compiled into the LLM prompt; only
+    administratively disabled agents are excluded from eligibility outright (silent,
+    no note).
   - No active rules configured anywhere skips the rules engine entirely (no
-    discover_agents call) and behaves exactly like pre-Phase-4 search.
+    discover_agents call) and behaves exactly like pre-rules-engine search.
   - A null rule match (e.g. confidence below threshold, or no rule fires) falls
     through cleanly to embedding-based ranking.
   - Any failure inside rule-lock resolution (etcd, discovery, or evaluate_rules
     itself) fails open to semantic ranking without raising.
 """
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -115,7 +125,10 @@ def test_search_agents_rule_short_circuit_bypasses_embedding(monkeypatch):
     }]
 
 
-def test_search_agents_rule_short_circuit_fills_remaining_slots(monkeypatch):
+def test_search_agents_rule_lock_ignores_caller_limit(monkeypatch):
+    """Phase E, E1: a rule lock always returns exactly one result, regardless of the
+    caller's `limit` -- no more "fill remaining slots with semantic fallback". The
+    embedding call must never happen once a lock fires, for any limit value."""
     configs = {
         "troubleshooting-agent": _troubleshooting_cfg(),
         "ticket-summary-agent": _case_summary_cfg(),
@@ -123,26 +136,77 @@ def test_search_agents_rule_short_circuit_fills_remaining_slots(monkeypatch):
     fake_identity = FakeIdentityManagerAgentSearch(configs, routing_rules={"version": "1.0", "global_rules": []})
     monkeypatch.setattr(agent_search, "identity_mgr", fake_identity)
     monkeypatch.setattr(agent_search, "discover_agents", _fake_discover_agents_all_configured)
-    monkeypatch.setattr(agent_search, "embed_text", lambda *a, **k: [1.0, 0.0])
-    monkeypatch.setattr(agent_search, "cosine", lambda a, b: 1.0)
+    monkeypatch.setattr(agent_search, "embed_text", _fail_embed)
 
     async def fake_evaluate_rules(query, global_rules, eligible_agents):
         return RuleEvaluationResult(matched_agent="troubleshooting-agent", confidence=0.95, reasoning="matched")
 
     monkeypatch.setattr(agent_search, "evaluate_rules", fake_evaluate_rules)
 
-    results = asyncio.run(agent_search.search_agents("Analyze the PCAP trace from Acme troubleshooting session 948", limit=5))
+    expected = [{
+        "name": "troubleshooting-agent",
+        "description": "Specialized agent for debugging Acme Troubleshooting Service issues.",
+        "status": "Online",
+    }]
 
-    assert [r["name"] for r in results] == ["troubleshooting-agent", "ticket-summary-agent"]
+    for limit in (5, 0, -1, None):
+        results = asyncio.run(agent_search.search_agents(
+            "Analyze the PCAP trace from Acme troubleshooting session 948", limit=limit
+        ))
+        assert results == expected
 
 
-# --- Disabled / unconfigured agents are never eligible for a rule lock ---
+# --- Locked agent's reported status is the evaluated one, not the raw one (Phase B) ---
 
-def test_search_agents_excludes_unconfigured_agent_from_rule_eligibility(monkeypatch):
-    """The real discover_agents()-derived configured_agents map and the real disabled
-    set must both flow through to filter_eligible_agents -- an agent that carries rules
-    but is unconfigured for this user must never appear in eligible_agents, even though
-    it would otherwise be exactly what the query is asking for."""
+def test_search_agents_locked_half_open_agent_reports_evaluated_status(monkeypatch):
+    """Phase B/E: a circuit-breaker-recovered "Half-Open" agent counts as available for
+    rules-engine locking. This availability check now happens in _resolve_rule_lock
+    itself, post-match (Phase E, E3) -- filter_eligible_agents no longer considers
+    health at all, so eligibility is unconditional; the match still resolves to a
+    normal lock (not an "unavailable" note), and the lock's own `status` field must
+    reflect the evaluated "Half-Open" status, not the raw stored "Offline" (see
+    rules_engine_hardening_plan.md §2B, finding F3 from the Phase B adversarial
+    review)."""
+    configs = {
+        "troubleshooting-agent": _troubleshooting_cfg(),
+        "ticket-summary-agent": _case_summary_cfg(),
+    }
+    stale_failure = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+
+    class FakeIdentityManagerHalfOpen(FakeIdentityManagerAgentSearch):
+        def get_all_health_statuses(self, kind):
+            return {"troubleshooting-agent": {"status": "Offline", "last_failure_time": stale_failure}}
+
+    fake_identity = FakeIdentityManagerHalfOpen(configs, routing_rules={"version": "1.0", "global_rules": []})
+    monkeypatch.setattr(agent_search, "identity_mgr", fake_identity)
+    monkeypatch.setattr(agent_search, "discover_agents", _fake_discover_agents_all_configured)
+    monkeypatch.setattr(agent_search, "embed_text", _fail_embed)
+
+    async def fake_evaluate_rules(query, global_rules, eligible_agents):
+        # Eligibility is unconditional now (E2) -- present regardless of health.
+        assert "troubleshooting-agent" in eligible_agents
+        return RuleEvaluationResult(matched_agent="troubleshooting-agent", confidence=0.95, reasoning="matched")
+
+    monkeypatch.setattr(agent_search, "evaluate_rules", fake_evaluate_rules)
+
+    results = asyncio.run(agent_search.search_agents("Analyze the PCAP trace from Acme troubleshooting session 948", limit=1))
+
+    assert results == [{
+        "name": "troubleshooting-agent",
+        "description": "Specialized agent for debugging Acme Troubleshooting Service issues.",
+        "status": "Half-Open",
+    }]
+
+
+# --- Disabled agents are never eligible for a rule lock; offline/unconfigured agents
+# are eligible but produce an "unavailable match" note instead of a lock (Phase E) ---
+
+def test_search_agents_unconfigured_matched_agent_produces_note_and_fallback(monkeypatch):
+    """Phase E, E2/E3: an unconfigured agent's rules ARE compiled into the LLM prompt
+    (no longer excluded from eligibility) -- but a confident match on it is not honored
+    as a lock. search_agents falls through to the ranked semantic fallback and prepends
+    an "unavailable match" note naming it, instead of silently hiding its rules from
+    consideration the way pre-Phase-E filter_eligible_agents did."""
     configs = {
         "troubleshooting-agent": _troubleshooting_cfg(),
         "ticket-summary-agent": _case_summary_cfg(),
@@ -161,15 +225,113 @@ def test_search_agents_excludes_unconfigured_agent_from_rule_eligibility(monkeyp
     monkeypatch.setattr(agent_search, "cosine", lambda a, b: 1.0 if b else 0.0)
 
     async def fake_evaluate_rules(query, global_rules, eligible_agents):
-        assert "troubleshooting-agent" not in eligible_agents
-        return None
+        # Eligibility no longer excludes unconfigured agents (E2).
+        assert "troubleshooting-agent" in eligible_agents
+        return RuleEvaluationResult(matched_agent="troubleshooting-agent", confidence=0.95, reasoning="matched")
 
     monkeypatch.setattr(agent_search, "evaluate_rules", fake_evaluate_rules)
 
     results = asyncio.run(agent_search.search_agents("Analyze the PCAP trace from Acme troubleshooting session 948", limit=5))
 
-    names = {r["name"] for r in results}
-    assert names == {"troubleshooting-agent", "ticket-summary-agent"}
+    assert results[0] == {
+        "name": "troubleshooting-agent",
+        "description": (
+            "The routing policy identified 'troubleshooting-agent' as the best match "
+            "for this query, but it is currently not configured. Showing next-best "
+            "alternatives below."
+        ),
+        "status": "Unconfigured",
+        "unavailable_match": True,
+    }
+    # Both real candidates still appear as ranked alternatives after the note -- the
+    # note is additional, per E1/E3, not a replacement for one of the real results.
+    alternative_names = {r["name"] for r in results[1:]}
+    assert alternative_names == {"troubleshooting-agent", "ticket-summary-agent"}
+    assert len(results) == 3
+    assert "unavailable_match" not in results[1]
+    assert "unavailable_match" not in results[2]
+
+
+def test_search_agents_offline_matched_agent_note_does_not_count_against_limit(monkeypatch):
+    """Phase E, E1/E3: the "unavailable match" note is additional to the caller's
+    `limit`, not subtracted from it -- a caller requesting `limit=2` still gets 2 real
+    ranked alternatives, plus the note, when the rules engine's confident match turns
+    out to be genuinely offline (no last_failure_time -- Phase B's fail-safe: it never
+    cools down to Half-Open)."""
+    configs = {
+        "troubleshooting-agent": _troubleshooting_cfg(),
+        "ticket-summary-agent": _case_summary_cfg(),
+        "general-agent": _case_summary_cfg(name="general-agent", description="Handles general requests."),
+    }
+
+    class FakeIdentityManagerOffline(FakeIdentityManagerAgentSearch):
+        def get_all_health_statuses(self, kind):
+            return {"troubleshooting-agent": {"status": "Offline"}}
+
+    fake_identity = FakeIdentityManagerOffline(configs, routing_rules={"version": "1.0", "global_rules": []})
+    monkeypatch.setattr(agent_search, "identity_mgr", fake_identity)
+    monkeypatch.setattr(agent_search, "discover_agents", _fake_discover_agents_all_configured)
+    monkeypatch.setattr(agent_search, "embed_text", lambda *a, **k: [1.0, 0.0])
+    monkeypatch.setattr(agent_search, "cosine", lambda a, b: 1.0 if b else 0.0)
+
+    async def fake_evaluate_rules(query, global_rules, eligible_agents):
+        assert "troubleshooting-agent" in eligible_agents
+        return RuleEvaluationResult(matched_agent="troubleshooting-agent", confidence=0.95, reasoning="matched")
+
+    monkeypatch.setattr(agent_search, "evaluate_rules", fake_evaluate_rules)
+
+    results = asyncio.run(agent_search.search_agents(
+        "Analyze the PCAP trace from Acme troubleshooting session 948", limit=2
+    ))
+
+    assert results[0]["status"] == "Offline"
+    assert results[0]["name"] == "troubleshooting-agent"
+    assert "currently offline" in results[0]["description"]
+    assert results[0]["unavailable_match"] is True
+    # 2 real alternatives (the caller's limit), plus the note = 3 total.
+    assert len(results) == 3
+    assert len(results[1:]) == 2
+
+
+def test_search_agents_offline_takes_precedence_over_unconfigured_in_note_reason(monkeypatch):
+    """An agent that is BOTH offline AND unconfigured must resolve deterministically to
+    a single note reason, not raise or produce an ambiguous/combined one.
+    _resolve_rule_lock checks health before configuration-readiness, so "offline" wins
+    -- added during Phase E's adversarial review pass, which found this combined state
+    was previously untested (and is the exact combination that made the
+    core/agent_factory.py double-annotation bug worse)."""
+    configs = {
+        "troubleshooting-agent": _troubleshooting_cfg(),
+        "ticket-summary-agent": _case_summary_cfg(),
+    }
+
+    class FakeIdentityManagerOffline(FakeIdentityManagerAgentSearch):
+        def get_all_health_statuses(self, kind):
+            return {"troubleshooting-agent": {"status": "Offline"}}
+
+    fake_identity = FakeIdentityManagerOffline(configs, routing_rules={"version": "1.0", "global_rules": []})
+    monkeypatch.setattr(agent_search, "identity_mgr", fake_identity)
+
+    async def fake_discover_agents_unconfigured(user_id=None):
+        return [
+            {"name": "troubleshooting-agent", "is_configured": False},
+            {"name": "ticket-summary-agent", "is_configured": True},
+        ]
+
+    monkeypatch.setattr(agent_search, "discover_agents", fake_discover_agents_unconfigured)
+    monkeypatch.setattr(agent_search, "embed_text", lambda *a, **k: [1.0, 0.0])
+    monkeypatch.setattr(agent_search, "cosine", lambda a, b: 1.0 if b else 0.0)
+
+    async def fake_evaluate_rules(query, global_rules, eligible_agents):
+        return RuleEvaluationResult(matched_agent="troubleshooting-agent", confidence=0.95, reasoning="matched")
+
+    monkeypatch.setattr(agent_search, "evaluate_rules", fake_evaluate_rules)
+
+    results = asyncio.run(agent_search.search_agents("Analyze the PCAP trace from Acme troubleshooting session 948", limit=5))
+
+    assert results[0]["status"] == "Offline"
+    assert "currently offline" in results[0]["description"]
+    assert "not configured" not in results[0]["description"]
 
 
 def test_search_agents_excludes_disabled_agent_from_rule_eligibility(monkeypatch):

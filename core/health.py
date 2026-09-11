@@ -11,6 +11,73 @@ if TYPE_CHECKING:
     from core.auth import IdentityManager
 import core.health_db as health_db
 
+DEFAULT_HEALTH_COOLDOWN_SECONDS = int(os.getenv("HEALTH_COOLDOWN_SECONDS", "60"))
+
+
+def compute_agent_operational_status(
+    cfg: Dict[str, Any],
+    agent_health: Optional[Dict[str, Any]],
+    tool_healths: Dict[str, Dict[str, Any]],
+    cooldown_seconds: int = DEFAULT_HEALTH_COOLDOWN_SECONDS,
+) -> Dict[str, Any]:
+    """Cross-reference an agent's own evaluated health against its ``allowed_tools``'
+    health to derive the combined Online/Offline/Degraded status.
+
+    Pure function (no I/O) so the two call sites that need this exact combined view --
+    ``core/host.py``'s ``/health`` handler and ``core/gateway.py``'s
+    ``_get_visible_agents()`` (Phase D, see ``rules_engine_hardening_plan.md`` §2D) --
+    derive it identically instead of maintaining two independently-drifting copies of
+    the same cross-reference logic.
+
+    Returns ``{"status", "offline_tools", "agent_error"}``.
+    """
+    offline_tools = [
+        t for t in cfg.get("allowed_tools", [])
+        if evaluate_health_status(tool_healths.get(t) or {}, cooldown_seconds).get("status") == "Offline"
+    ]
+    agent_eval_status = evaluate_health_status(agent_health or {}, cooldown_seconds)
+    status_val = agent_eval_status.get("status", "Online")
+    status = "Offline" if status_val == "Offline" else ("Degraded" if offline_tools else status_val)
+    return {
+        "status": status,
+        "offline_tools": offline_tools,
+        "agent_error": agent_eval_status.get("last_error"),
+    }
+
+
+def evaluate_health_status(
+    status: Dict[str, Any], cooldown_seconds: int = DEFAULT_HEALTH_COOLDOWN_SECONDS
+) -> Dict[str, Any]:
+    """Evaluate if an Offline status has exceeded its cooldown period and should
+    transition to Half-Open for probe requests.
+
+    Pure function (no I/O, only reads ``status`` and the system clock) so every
+    caller that needs to know whether an agent is *actually* usable right now --
+    ``core.agent_search._resolve_rule_lock``'s post-match availability check (rules
+    engine, Phase E), the ``/agents`` marketplace page, and the ``/health`` endpoint --
+    derives the same evaluated status from the same raw stored record, instead of
+    independently reimplementing (and silently disagreeing on) the cooldown transform.
+    """
+    if not status or status.get("status") != "Offline":
+        return status
+
+    last_failure_str = status.get("last_failure_time") or status.get("offline_since")
+    if last_failure_str:
+        try:
+            ts = last_failure_str.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(ts)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            if (now - dt).total_seconds() >= cooldown_seconds:
+                eval_status = copy.deepcopy(status)
+                eval_status["status"] = "Half-Open"
+                return eval_status
+        except Exception:
+            pass
+    return status
+
+
 class HealthMonitor:
     def __init__(self, identity_mgr: "IdentityManager"):
         self.identity_mgr = identity_mgr
@@ -24,24 +91,7 @@ class HealthMonitor:
         Evaluate if an Offline status has exceeded its cooldown period
         and should transition to Half-Open for probe requests.
         """
-        if not status or status.get("status") != "Offline":
-            return status
-        
-        last_failure_str = status.get("last_failure_time") or status.get("offline_since")
-        if last_failure_str:
-            try:
-                ts = last_failure_str.replace("Z", "+00:00")
-                dt = datetime.fromisoformat(ts)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                now = datetime.now(timezone.utc)
-                if (now - dt).total_seconds() >= self.cooldown_seconds:
-                    eval_status = copy.deepcopy(status)
-                    eval_status["status"] = "Half-Open"
-                    return eval_status
-            except Exception:
-                pass
-        return status
+        return evaluate_health_status(status, self.cooldown_seconds)
 
     def record_event(self, entity_type: str, name: str, is_success: bool, error_details: Optional[str] = None) -> Dict[str, Any]:
         """

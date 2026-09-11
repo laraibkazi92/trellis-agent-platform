@@ -352,6 +352,30 @@ class IdentityManager:
         """Set the global agent-memory feature flag (admin master switch)."""
         self.set_config("agent_memory_enabled", bool(enabled))
 
+    def get_rules_evaluation_timeout(self) -> Optional[float]:
+        """Retrieve the admin-configured Trellis Rules Engine LLM evaluation timeout
+        (seconds), or None if never set -- callers fall back to the
+        RULES_EVALUATION_TIMEOUT env var default in that case.
+
+        Not itself @retry_etcd()-decorated: get_config() already retries. Stacking a
+        second retry layer on top of it multiplies worst-case retry time (10x10 attempts)
+        instead of adding to it -- see get_agent_memory_enabled/set_agent_memory_enabled
+        above for the same (pre-existing) pattern; not fixed here to keep this change
+        scoped to the Rules Engine."""
+        value = self.get_config("rules_evaluation_timeout", None)
+        return float(value) if value is not None else None
+
+    def set_rules_evaluation_timeout(self, timeout_seconds: float) -> None:
+        """Set the admin-configured Trellis Rules Engine LLM evaluation timeout (seconds).
+
+        Not itself @retry_etcd()-decorated -- see get_rules_evaluation_timeout above."""
+        self.set_config("rules_evaluation_timeout", float(timeout_seconds))
+
+    @retry_etcd()
+    def clear_rules_evaluation_timeout(self) -> None:
+        """Remove the admin override, reverting to the RULES_EVALUATION_TIMEOUT env var default."""
+        self.client.delete("/config/framework/rules_evaluation_timeout")
+
     @retry_etcd()
     def get_app_config(self) -> Dict[str, Any]:
         """Retrieve the application configuration for whitelabeling."""

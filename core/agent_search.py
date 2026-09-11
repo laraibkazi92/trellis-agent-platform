@@ -19,19 +19,18 @@ import os
 import re
 import asyncio
 import logging
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional, Set, Tuple
 
 from core.auth import IdentityManager, user_id_var
 from core.discovery import discover_agents
 from core.embeddings import embed_text, cosine
-from core.models import is_agent_external
+from core.health import evaluate_health_status
+from core.models import is_agent_external, is_routable_agent_type
 from core.rules_engine import evaluate_rules, filter_eligible_agents
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_LIMIT = int(os.getenv("AGENT_SEARCH_LIMIT", "8"))
-
-_BACKGROUND_TYPES = ("background_agent", "background_script")
 
 identity_mgr = IdentityManager(
     host=os.getenv("ETCD_HOST", "127.0.0.1"),
@@ -60,9 +59,7 @@ def _build_candidates(
     """Build the ranked-search candidate pool (supervisor/background/internal excluded)."""
     candidates: List[Dict] = []
     for name, cfg in configs.items():
-        if name == "supervisor":
-            continue
-        if cfg.get("type") in _BACKGROUND_TYPES:
+        if not is_routable_agent_type(name, cfg):
             continue
         if not is_agent_external(cfg):
             continue
@@ -102,14 +99,28 @@ async def _resolve_rule_lock(
     configs: Dict[str, Dict],
     health: Dict[str, Dict],
     disabled: Set[str],
-) -> Optional[Dict]:
-    """Evaluate the Trellis Rules Engine and return a locked ``{name, description, status}``
-    dict, or ``None`` if no rule fires.
+) -> Tuple[Optional[Dict], Optional[Dict]]:
+    """Evaluate the Trellis Rules Engine and return ``(locked, unavailable_note)``.
+
+    ``locked`` is a ``{name, description, status}`` dict when a confident rule match is
+    also currently available (Half-Open counts as available, per Phase B); it's
+    ``None`` whenever no lock should be honored. ``unavailable_note`` is a ``{name,
+    reason, reason_status}`` dict when a confident rule match exists but the matched
+    agent is currently offline or unconfigured -- the two are mutually exclusive, and
+    both are ``None`` when no rule fires at all.
+
+    Per Phase E of the Trellis Rules Engine hardening plan
+    (``__spec_docs/rules_engine_hardening_plan.md``, E2/E3), ``filter_eligible_agents``
+    no longer considers health or configuration-readiness -- the LLM decider reasons
+    purely on declarative rule content, blind to availability. Availability is checked
+    here, only *after* a confident match, using the same Phase B/C unified evaluators
+    used everywhere else. Administratively disabled agents are excluded from
+    eligibility entirely (silent, no note) and never reach this availability check.
 
     Fully self-contained and fail-open: any error anywhere in this path (etcd fetch,
-    bulk configuration-readiness resolution, or LLM evaluation) results in ``None``, so
-    ``search_agents`` falls through to vector semantic search exactly as if no rules
-    existed. Rule evaluation must never crash query routing.
+    bulk configuration-readiness resolution, or LLM evaluation) results in
+    ``(None, None)``, so ``search_agents`` falls through to vector semantic search
+    exactly as if no rules existed. Rule evaluation must never crash query routing.
     """
     try:
         routing_rules_doc = await asyncio.to_thread(identity_mgr.get_routing_rules)
@@ -119,25 +130,37 @@ async def _resolve_rule_lock(
         # for the bulk discover_agents() configuration-readiness resolve below -- the
         # common case (no rules authored anywhere) should never pay that cost.
         if not global_rules and not any(cfg.get("rules") for cfg in configs.values()):
-            return None
+            return None, None
 
         discovered = await discover_agents(user_id=user_id_var.get())
         configured_agents = {a["name"]: a.get("is_configured", True) for a in discovered}
 
-        eligible_agents = filter_eligible_agents(configs, health, disabled, configured_agents)
+        eligible_agents = filter_eligible_agents(configs, disabled)
         rule_result = await evaluate_rules(query, global_rules, eligible_agents)
         if not rule_result or not rule_result.matched_agent:
-            return None
+            return None, None
 
-        matched_cfg = eligible_agents.get(rule_result.matched_agent, {})
+        matched_name = rule_result.matched_agent
+        matched_cfg = eligible_agents.get(matched_name, {})
+
+        # Evaluated (cooldown-aware), not raw -- a past-cooldown "Half-Open" agent
+        # counts as available (Phase B decision) and must be locked, not routed into
+        # the unavailable-note path.
+        evaluated = evaluate_health_status(health.get(matched_name) or {})
+        evaluated_status = evaluated.get("status", "Online")
+        if evaluated_status == "Offline":
+            return None, {"name": matched_name, "reason": "offline", "reason_status": "Offline"}
+        if configured_agents.get(matched_name) is False:
+            return None, {"name": matched_name, "reason": "not configured", "reason_status": "Unconfigured"}
+
         return {
-            "name": rule_result.matched_agent,
+            "name": matched_name,
             "description": matched_cfg.get("description", ""),
-            "status": (health.get(rule_result.matched_agent) or {}).get("status", "Online"),
-        }
+            "status": evaluated_status,
+        }, None
     except Exception as e:
         logger.warning(f"[RulesEngine] Unexpected error resolving rule lock ({e}); failing open to semantic search")
-        return None
+        return None, None
 
 
 async def search_agents(query: str, limit: int = DEFAULT_LIMIT, include_disabled: bool = False) -> List[Dict]:
@@ -147,17 +170,25 @@ async def search_agents(query: str, limit: int = DEFAULT_LIMIT, include_disabled
     the supervisor are always excluded. Disabled agents are excluded unless
     ``include_disabled`` is True (the Supervisor passes True so it can still manage them).
     Agents with ``external: False`` (internal-only agents) are always excluded.
-    Pass ``limit <= 0`` to get the full ranked list (used by callers that apply their own
-    visibility filter on top of the ranking) -- *unless* a rule locks (see below), in which
-    case ``limit <= 0`` is treated the same as ``limit == 1`` and only the locked agent is
-    returned; callers relying on the "full list" idiom to backfill from visibility-filtered
-    alternates should pass an explicit ``limit > 1`` instead if that matters for them.
+    Pass ``limit <= 0`` to get the full ranked list when no rule locks.
 
-    Before ranking, the Trellis Rules Engine is evaluated (see
-    ``__spec_docs/rules_engine_spec.md``). If a rule deterministically locks onto an
-    eligible agent, that agent is placed first with no embedding call required; when
-    ``limit`` allows more than one result, remaining slots are filled with the ranked
-    semantic fallback (excluding the locked agent).
+    Before ranking, the Trellis Rules Engine is evaluated (see ``docs/rules_engine.md``).
+    A confident rule match that is also currently available (Half-Open counts as
+    available, per Phase B) short-circuits ranking entirely: it returns **exactly one**
+    result, unconditionally -- regardless of ``limit``, including ``limit <= 0``. A
+    rules-engine lock is meant to be deterministic and authoritative, not diluted or
+    truncated by the caller (see rules_engine_hardening_plan.md §5, Phase E, E1).
+
+    If the rules engine confidently matches an agent that turns out to be offline or
+    unconfigured, the lock is *not* honored -- instead the query falls through to the
+    normal ranked semantic fallback (governed by ``limit`` as usual), with an extra
+    leading "unavailable match" note describing what was skipped. This note is
+    additional, not counted against ``limit``: a caller requesting ``limit=5`` still
+    gets 5 ranked alternatives, plus the note, when this happens. The note item also
+    carries ``unavailable_match: True`` (absent on every other result) so a caller that
+    re-decorates results by agent name (e.g. the Gateway MCP tool) can recognize it and
+    leave its crafted, self-contained description untouched -- it's still fully
+    readable by a caller that only looks at ``description``, ignoring this flag.
     """
     configs = await asyncio.to_thread(identity_mgr.get_all_agent_configs)
     embeddings = await asyncio.to_thread(identity_mgr.get_all_agent_embeddings)
@@ -171,21 +202,32 @@ async def search_agents(query: str, limit: int = DEFAULT_LIMIT, include_disabled
     if not candidates:
         return []
 
-    locked = await _resolve_rule_lock(query, configs, health, disabled)
+    locked, unavailable_note = await _resolve_rule_lock(query, configs, health, disabled)
     if locked:
-        if limit is None or limit <= 1:
-            return [locked]
-        remaining = [c for c in candidates if c["name"] != locked["name"]]
-        ranked = await _rank_candidates(query, remaining)
-        fill = ranked[: max(limit - 1, 0)]
-        return [locked] + [
-            {"name": c["name"], "description": c["description"], "status": c["status"]}
-            for c in fill
-        ]
+        return [locked]
 
     ranked = await _rank_candidates(query, candidates)
     selected = ranked if limit is None or limit <= 0 else ranked[:limit]
-    return [
+    results = [
         {"name": c["name"], "description": c["description"], "status": c["status"]}
         for c in selected
     ]
+
+    if unavailable_note:
+        name = unavailable_note["name"]
+        reason = unavailable_note["reason"]
+        results.insert(0, {
+            "name": name,
+            "description": (
+                f"The routing policy identified '{name}' as the best match for this "
+                f"query, but it is currently {reason}. Showing next-best alternatives below."
+            ),
+            "status": unavailable_note["reason_status"],
+            # Lets a caller that also re-decorates results (e.g. the Gateway MCP tool,
+            # see core/gateway.py:search_agents) recognize this item as the crafted,
+            # self-contained routing-policy note and leave its description untouched,
+            # rather than silently overwriting it with the same agent's own catalog
+            # description just because the name happens to still resolve there.
+            "unavailable_match": True,
+        })
+    return results

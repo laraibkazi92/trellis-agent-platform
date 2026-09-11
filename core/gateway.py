@@ -16,7 +16,8 @@ from core.discovery import discover_agents, is_agent_configured, is_tool_configu
 from core.agent_search import search_agents as _search_agents_ranked, DEFAULT_LIMIT as AGENT_SEARCH_LIMIT
 from core.tool_search import search_tools as _search_tools_ranked, DEFAULT_LIMIT as TOOL_SEARCH_LIMIT
 from core.agent_factory import get_hub_client, get_external_mcp_client
-from core.models import is_agent_external
+from core.models import is_agent_external, is_routable_agent_type
+from core.health import compute_agent_operational_status
 
 @asynccontextmanager
 async def lifespan(app):
@@ -78,49 +79,55 @@ async def _get_visible_agents() -> List[Dict]:
     Applies the same filtering the old public ``list_agents`` tool did (disabled /
     offline / background / unconfigured), scoped to the calling user. No longer exposed
     as an MCP tool — clients use ``search_agents`` instead to avoid dumping every agent.
+
+    Per Phase D of the Trellis Rules Engine hardening plan
+    (``__spec_docs/rules_engine_hardening_plan.md``), per-agent status/decoration is no
+    longer derived from the Host's ``/health`` JSON body — it's computed directly here
+    from etcd via the same Phase A/B/C shared helpers Host's own ``/health`` handler
+    uses (``is_routable_agent_type``, ``is_agent_external``, ``discover_agents``'s
+    configuration-readiness fields, ``evaluate_health_status``). A cheap
+    status-code-only ping to Host's ``/health`` is still done first, purely as a
+    liveness gate: Host and Gateway are separate processes, and if Host is down that
+    must still fail loudly and immediately here, exactly as before — only the JSON
+    body is no longer parsed or depended on.
     """
     user_id = user_id_var.get()
-    
+
     try:
         discovered_agents = await discover_agents(user_id=user_id)
-        agent_lookup = {a["name"]: a for a in discovered_agents}
     except Exception as e:
         print(f"Error checking agent configurations: {e}")
         return [{"name": "Error", "description": f"Failed to verify agent configurations: {e}"}]
-    
+
     try:
         if hasattr(app, "state") and hasattr(app.state, "http_client"):
-            client = app.state.http_client
-            resp = await client.get(f"{HOST_URL}/health", timeout=5.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                agents_data = data.get("agents", {})
-            else:
-                return [{"name": "Error", "description": f"Host API unreachable (HTTP {resp.status_code})"}]
+            resp = await app.state.http_client.get(f"{HOST_URL}/health", timeout=5.0)
         else:
             async with httpx.AsyncClient() as client:
                 resp = await client.get(f"{HOST_URL}/health", timeout=5.0)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    agents_data = data.get("agents", {})
-                else:
-                    return [{"name": "Error", "description": f"Host API unreachable (HTTP {resp.status_code})"}]
+        if resp.status_code != 200:
+            return [{"name": "Error", "description": f"Host API unreachable (HTTP {resp.status_code})"}]
     except Exception as e:
-        print(f"Error fetching active agents from host: {e}")
+        print(f"Error checking Host liveness: {e}")
         return [{"name": "Error", "description": f"Host API unreachable ({str(e)})"}]
 
+    try:
+        disabled_agents = identity_mgr.get_disabled_standard_agents()
+        agent_configs = await asyncio.to_thread(identity_mgr.get_all_agent_configs)
+        agent_healths = await asyncio.to_thread(identity_mgr.get_all_health_statuses, "agent")
+        tool_healths = await asyncio.to_thread(identity_mgr.get_all_health_statuses, "tool")
+    except Exception as e:
+        print(f"Error computing agent status from etcd: {e}")
+        return [{"name": "Error", "description": f"Failed to compute agent status: {e}"}]
+
     agents = []
-    disabled_agents = identity_mgr.get_disabled_standard_agents()
-    
-    for agent_name, agent_info in agents_data.items():
+
+    for agent_dict in discovered_agents:
+        agent_name = agent_dict["name"]
+
         if agent_name in disabled_agents:
             continue
-            
-        agent_dict = agent_lookup.get(agent_name)
-        if not agent_dict:
-            continue
-            
-        if agent_dict.get("type") in ("background_agent", "background_script"):
+        if not is_routable_agent_type(agent_name, agent_dict):
             continue
         if not is_agent_external(agent_dict):
             continue
@@ -144,19 +151,22 @@ async def _get_visible_agents() -> List[Dict]:
             config_note = f" [NOT CONFIGURED — missing {'; '.join(missing)}. Configure at /agents/{agent_name}/configure]" if missing else " [NOT CONFIGURED — configure at /agents/{agent_name}/configure]"
             description += config_note
         else:
-            status = agent_info.get("status", "Online")
-            offline_tools = agent_info.get("offline_tools", [])
+            # Shared with core/host.py's /health handler -- see
+            # core/health.py:compute_agent_operational_status.
+            cfg = agent_configs.get(agent_name) or {}
+            operational = compute_agent_operational_status(cfg, agent_healths.get(agent_name), tool_healths)
+            status = operational["status"]
             if status == "Offline":
                 description += " [STATUS: OFFLINE - DO NOT ROUTE REQUESTS HERE]"
             elif status == "Degraded":
-                description += f" [STATUS: DEGRADED - Offline tools: {', '.join(offline_tools)}]"
+                description += f" [STATUS: DEGRADED - Offline tools: {', '.join(operational['offline_tools'])}]"
 
         agents.append({
             "name": agent_name,
             "description": description,
             "configured": is_configured,
         })
-        
+
     return agents
 
 @mcp.tool(
@@ -169,7 +179,8 @@ async def search_agents(ctx: Context, query: str, limit: int = AGENT_SEARCH_LIMI
     Use this to discover which specialized agent(s) can handle a task, then call the
     chosen one with `use_agent`. Returns a short, ranked list of
     `{name, description, configured}` — not the full catalog — so it scales to large
-    numbers of agents.
+    numbers of agents. If the Trellis Rules Engine deterministically locks onto an
+    agent for this query, exactly one result is returned regardless of `limit`.
 
     Unconfigured agents are included with `configured: false` and a note in their
     description listing the missing credentials and a configure URL. Only call
@@ -177,30 +188,65 @@ async def search_agents(ctx: Context, query: str, limit: int = AGENT_SEARCH_LIMI
 
     Args:
         query: Natural-language description of the task or topic to find agents for.
-        limit: Maximum number of agents to return (default: 5).
+        limit: Maximum number of agents to return (default: AGENT_SEARCH_LIMIT env var, 8 if unset).
     """
     await ctx.report_progress(0, 2, message=f"Searching agents for: '{query}'")
 
-    visible = await _get_visible_agents()
-    visible_by_name = {a["name"]: a for a in visible}
-    if not visible_by_name:
+    # Per Phase E of the Trellis Rules Engine hardening plan
+    # (__spec_docs/rules_engine_hardening_plan.md, E4), _search_agents_ranked is called
+    # directly with the caller's real limit -- nothing downstream re-excludes on it
+    # anymore, so the old limit=0-then-intersect-then-truncate dance is no longer
+    # needed. _get_visible_agents() is used purely to annotate results (the
+    # `configured` flag and any richer status text) -- never to drop a result that
+    # search_agents already decided to return.
+    ranked = await _search_agents_ranked(query, limit=limit, include_disabled=False)
+    if not ranked:
         await ctx.report_progress(2, 2, message="No agents are currently available.")
         return []
 
-    await ctx.report_progress(1, 2, message="Ranking results...")
-    ranked = await _search_agents_ranked(query, limit=0, include_disabled=False)
+    await ctx.report_progress(1, 2, message="Annotating results...")
+    visible = await _get_visible_agents()
+    if len(visible) == 1 and visible[0].get("name") == "Error":
+        # Host is unreachable or etcd decoration failed -- surface that clearly rather
+        # than silently falling back to undecorated ranked results.
+        await ctx.report_progress(2, 2, message=visible[0]["description"])
+        return visible
+    visible_by_name = {a["name"]: a for a in visible}
 
     results: List[Dict] = []
     for r in ranked:
         agent = visible_by_name.get(r["name"])
-        if agent:
+
+        if r.get("unavailable_match"):
+            # search_agents()'s crafted "unavailable match" note (Phase E, E1/E3) --
+            # its description is already a final, self-contained sentence explaining
+            # why the routing-policy match was skipped. The matched agent's own name
+            # still resolves in `visible` (it isn't disabled/internal/background), so
+            # naively decorating this the same way as a real candidate would silently
+            # overwrite that sentence with the agent's own catalog description. Only
+            # the `configured` flag is taken from the lookup; the description is left
+            # untouched.
+            results.append({
+                "name": r["name"],
+                "description": r["description"],
+                "configured": agent.get("configured", True) if agent else True,
+            })
+        elif agent:
             results.append({
                 "name": agent["name"],
                 "description": agent["description"],
                 "configured": agent.get("configured", True),
             })
-            if len(results) >= limit:
-                break
+        else:
+            # Decorate, never re-exclude: a name search_agents already decided to
+            # return but that's absent from the visibility/decoration source (e.g. a
+            # momentarily inconsistent bulk etcd read) still comes back, using its own
+            # name/description/status rather than being silently dropped.
+            results.append({
+                "name": r["name"],
+                "description": r["description"],
+                "configured": True,
+            })
 
     names = [r["name"] for r in results]
     await ctx.report_progress(2, 2, message=f"Found {len(results)} agent(s): {', '.join(names) if names else 'none'}")

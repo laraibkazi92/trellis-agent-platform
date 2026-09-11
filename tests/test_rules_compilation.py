@@ -53,10 +53,18 @@ def _reset_prompt_cache():
 
 
 # --- filter_eligible_agents ---
+#
+# Per Phase E of the Trellis Rules Engine hardening plan
+# (__spec_docs/rules_engine_hardening_plan.md, E2), filter_eligible_agents no longer
+# takes health/configured_agents at all -- health and configuration-readiness are no
+# longer a factor in rule eligibility. That coverage now lives at the
+# core.agent_search.search_agents layer (see tests/test_rules_agent_search.py), which
+# checks availability only *after* a confident match and produces an "unavailable
+# match" note + semantic fallback instead of hiding the agent's rules outright.
 
 def test_gating_excludes_supervisor():
     configs = {"supervisor": _agent_cfg(name="supervisor")}
-    eligible = filter_eligible_agents(configs, {}, set(), {})
+    eligible = filter_eligible_agents(configs, set())
     assert eligible == {}
 
 
@@ -65,55 +73,31 @@ def test_gating_excludes_background_types():
         "bg-agent": _agent_cfg(name="bg-agent", type="background_agent"),
         "bg-script": _agent_cfg(name="bg-script", type="background_script"),
     }
-    eligible = filter_eligible_agents(configs, {}, set(), {})
+    eligible = filter_eligible_agents(configs, set())
     assert eligible == {}
 
 
 def test_gating_internal_only_agent():
     configs = {"internal-agent": _agent_cfg(name="internal-agent", external=False)}
-    eligible = filter_eligible_agents(configs, {}, set(), {})
+    eligible = filter_eligible_agents(configs, set())
     assert eligible == {}
 
 
 def test_gating_disabled_agent():
     configs = {"troubleshooting-agent": _agent_cfg()}
-    eligible = filter_eligible_agents(configs, {}, {"troubleshooting-agent"}, {})
-    assert eligible == {}
-
-
-def test_gating_offline_agent():
-    configs = {"troubleshooting-agent": _agent_cfg()}
-    health = {"troubleshooting-agent": {"status": "Offline"}}
-    eligible = filter_eligible_agents(configs, health, set(), {})
-    assert eligible == {}
-
-
-def test_gating_unconfigured_agent():
-    configs = {"troubleshooting-agent": _agent_cfg()}
-    configured_agents = {"troubleshooting-agent": False}
-    eligible = filter_eligible_agents(configs, {}, set(), configured_agents)
+    eligible = filter_eligible_agents(configs, {"troubleshooting-agent"})
     assert eligible == {}
 
 
 def test_gating_excludes_agents_with_no_rules():
     configs = {"ticket-summary-agent": _agent_cfg(name="ticket-summary-agent", rules=[])}
-    eligible = filter_eligible_agents(configs, {}, set(), {})
+    eligible = filter_eligible_agents(configs, set())
     assert eligible == {}
 
 
-def test_gating_retains_healthy_configured_eligible_agent():
+def test_gating_retains_eligible_agent():
     configs = {"troubleshooting-agent": _agent_cfg()}
-    health = {"troubleshooting-agent": {"status": "Online"}}
-    configured_agents = {"troubleshooting-agent": True}
-    eligible = filter_eligible_agents(configs, health, set(), configured_agents)
-    assert "troubleshooting-agent" in eligible
-
-
-def test_gating_agent_missing_from_health_and_configured_maps_is_retained():
-    """Fail-open: an agent absent from the health/configured maps (e.g. no health
-    record ever written, or discovery not queried for it) must not be excluded."""
-    configs = {"troubleshooting-agent": _agent_cfg()}
-    eligible = filter_eligible_agents(configs, {}, set(), {})
+    eligible = filter_eligible_agents(configs, set())
     assert "troubleshooting-agent" in eligible
 
 
@@ -135,12 +119,7 @@ def test_gating_multiple_agents_mixed_eligibility():
         "disabled-agent": _agent_cfg(name="disabled-agent"),
         "internal-agent": _agent_cfg(name="internal-agent", external=False),
     }
-    eligible = filter_eligible_agents(
-        configs,
-        health={"disabled-agent": {"status": "Online"}},
-        disabled_agents={"disabled-agent"},
-        configured_agents={"troubleshooting-agent": True, "ticket-summary-agent": True},
-    )
+    eligible = filter_eligible_agents(configs, disabled_agents={"disabled-agent"})
     assert set(eligible.keys()) == {"troubleshooting-agent", "ticket-summary-agent"}
 
 

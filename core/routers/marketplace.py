@@ -6,6 +6,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import templates, identity_mgr, CSRFRoute
 from core.discovery import discover_agents, discover_tools, get_agent_required_secrets, get_agent_required_variables, get_agent_secret_groups, get_tool_configuration_context, flatten_secret_group_keys
 from core.auth import is_admin
+from core.health import evaluate_health_status
 from core.models import Identity, IdentityType
 
 router = APIRouter(route_class=CSRFRoute)
@@ -45,10 +46,14 @@ async def agents(request: Request):
     admin_access = is_admin(request)
     agents = await discover_agents(user_id=user.get('sub'), include_background=False)
     disabled_agents = identity_mgr.get_disabled_standard_agents()
-    
+
     # Enrich agents with disabled status
     for agent in agents:
         agent["is_disabled"] = agent["name"] in disabled_agents
+        # This is an operational view of whether an agent is currently usable, so it
+        # shows the same cooldown-aware status (e.g. "Half-Open") that routing decisions
+        # actually honor, rather than the raw "Offline" discover_agents() returns.
+        agent["health"] = evaluate_health_status(agent.get("health") or {})
 
     flash_msg = request.session.pop("flash_msg", None)
     

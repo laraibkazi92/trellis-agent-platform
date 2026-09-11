@@ -2,7 +2,7 @@ import os
 import asyncio
 from typing import List, Dict, Optional
 from core.auth import IdentityManager
-from core.models import Identity, IdentityType
+from core.models import BACKGROUND_AGENT_TYPES, Identity, IdentityType
 
 # Initialize IdentityManager locally for discovery purposes
 identity_mgr = IdentityManager(
@@ -28,7 +28,7 @@ def _resolve_requirements(req_data, is_background: bool) -> List[str]:
 async def get_agent_required_secrets(config: Dict) -> List[str]:
     """Helper to determine all required secrets for an agent based on its config, tools, and MCPs."""
     required = set()
-    is_background = config.get("type") in ("background_agent", "background_script")
+    is_background = config.get("type") in BACKGROUND_AGENT_TYPES
     
     # 1. Include secrets explicitly declared in agent/workflow config
     if config.get("secrets"):
@@ -66,7 +66,7 @@ async def get_agent_optional_secrets(config: Dict) -> List[str]:
     from being configured. When present they are injected into the MCP process env.
     """
     optional = set()
-    is_background = config.get("type") in ("background_agent", "background_script")
+    is_background = config.get("type") in BACKGROUND_AGENT_TYPES
 
     allowed_mcps = config.get("allowed_mcps", [])
     for mcp_name in allowed_mcps:
@@ -96,12 +96,29 @@ async def get_agent_optional_secrets(config: Dict) -> List[str]:
 async def get_agent_secret_groups(config: Dict) -> List[Dict]:
     """Helper to determine all secret-group credential sets (e.g. netctl's
     per-environment username/password dropdown) declared by an agent's
-    directly-attached tools and MCPs."""
+    directly-attached tools and MCPs.
+
+    An ``mcp__``-prefixed ``allowed_tools`` entry resolves to its owning MCP's
+    ``secret_groups``, exactly as :func:`get_agent_required_secrets` already resolves
+    that same entry's ``secrets`` -- fixed as part of Phase C (see
+    ``__spec_docs/rules_engine_hardening_plan.md`` §2C.3), since this function's caller
+    (``core/routers/marketplace.py``'s configure-agent save handler) is the only way a
+    user can satisfy a secret_groups requirement that :func:`is_agent_configured`/
+    :func:`discover_agents` now (correctly, post-Phase-C) gate on; before this fix, an
+    agent referencing such an MCP only via ``allowed_tools`` (not ``allowed_mcps``)
+    would be reported "not configured" with no way to ever configure it, since the
+    save handler could never see that group's fields to persist.
+    """
     groups: List[Dict] = []
 
     allowed_tools = config.get("allowed_tools", [])
     for tool_name in allowed_tools:
         if tool_name.startswith("mcp__"):
+            parts = tool_name.split("__")
+            if len(parts) >= 3:
+                mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, parts[1])
+                if mcp_config and mcp_config.get("secret_groups"):
+                    groups.extend(mcp_config.get("secret_groups"))
             continue
         tool_config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
         if tool_config and tool_config.get("secret_groups"):
@@ -153,7 +170,7 @@ def _unsatisfied_secret_group_keys(secret_groups: List[Dict], available_secrets:
 async def get_agent_required_variables(config: Dict) -> List[str]:
     """Helper to determine all required non-sensitive variables for an agent based on its config, tools, and MCPs."""
     required = set()
-    is_background = config.get("type") in ("background_agent", "background_script")
+    is_background = config.get("type") in BACKGROUND_AGENT_TYPES
     
     # 1. Include variables explicitly declared in agent/workflow config
     if config.get("variables"):
@@ -184,6 +201,144 @@ async def get_agent_required_variables(config: Dict) -> List[str]:
             
     return sorted(list(required))
 
+def _resolve_agent_requirements(
+    config: Dict,
+    tool_configs: Dict[str, Dict],
+    mcp_configs: Dict[str, Dict],
+) -> Dict:
+    """Pure aggregation of an agent's required/optional secrets, required variables,
+    and raw ``secret_groups`` from its own config plus its ``allowed_tools``/
+    ``allowed_mcps``, given pre-fetched tool/mcp config dicts.
+
+    This is the single requirement-resolution algorithm shared by
+    :func:`is_agent_configured` (which fetches just the handful of tool/mcp configs
+    this one agent needs) and :func:`discover_agents` (which passes in its own
+    bulk-prefetched ``all_tool_configs``/``all_mcp_configs`` for the whole catalog) —
+    no I/O happens here, so neither caller's performance characteristics change.
+    """
+    is_background = config.get("type") in BACKGROUND_AGENT_TYPES
+    required_secrets = set()
+    required_variables = set()
+    optional_secrets = set()
+    secret_groups: List[Dict] = []
+
+    if config.get("secrets"):
+        required_secrets.update(_resolve_requirements(config.get("secrets"), is_background))
+    if config.get("variables"):
+        required_variables.update(_resolve_requirements(config.get("variables"), is_background))
+
+    def _absorb(cfg: Dict):
+        if cfg.get("secrets"):
+            required_secrets.update(_resolve_requirements(cfg.get("secrets"), is_background))
+        if cfg.get("variables"):
+            required_variables.update(_resolve_requirements(cfg.get("variables"), is_background))
+        if cfg.get("optional_secrets"):
+            optional_secrets.update(_resolve_requirements(cfg.get("optional_secrets"), is_background))
+        if cfg.get("secret_groups"):
+            secret_groups.extend(cfg.get("secret_groups"))
+
+    for tool_name in config.get("allowed_tools", []):
+        tool_config = tool_configs.get(tool_name)
+        if tool_config:
+            _absorb(tool_config)
+        elif tool_name.startswith("mcp__"):
+            parts = tool_name.split("__")
+            if len(parts) >= 3:
+                mcp_config = mcp_configs.get(parts[1])
+                if mcp_config:
+                    _absorb(mcp_config)
+
+    for mcp_name in config.get("allowed_mcps", []):
+        mcp_config = mcp_configs.get(mcp_name)
+        if mcp_config:
+            _absorb(mcp_config)
+
+    return {
+        "required_secrets": required_secrets,
+        "required_variables": required_variables,
+        "optional_secrets": optional_secrets,
+        "secret_groups": secret_groups,
+    }
+
+
+def _evaluate_agent_configuration(
+    required_secrets,
+    required_variables,
+    optional_secrets,
+    secret_groups: List[Dict],
+    global_secrets: Dict,
+    global_variables: Dict,
+    identity_secrets: Dict,
+    identity_variables: Dict,
+) -> Dict:
+    """Given an agent's aggregated requirements (from :func:`_resolve_agent_requirements`)
+    plus pre-fetched global/identity secret & variable dicts, compute the
+    configured/missing_secrets/missing_variables/optional_missing_secrets result.
+
+    Mirrors :func:`is_tool_configured`'s already-correct pattern: a key declared via a
+    ``secret_groups`` option is excluded from the plain required/optional lists (it's
+    only satisfiable as part of its group, not individually) and group satisfaction is
+    checked via :func:`_unsatisfied_secret_group_keys`. Previously neither
+    ``is_agent_configured`` nor ``discover_agents`` performed this group-satisfaction
+    check at all, so an agent depending on a tool/MCP with ``secret_groups`` where the
+    user has configured zero complete option could incorrectly report
+    ``is_configured: True`` (see ``__spec_docs/rules_engine_hardening_plan.md`` §4
+    finding 5) -- this function fixes that for both callers at once.
+    """
+    grouped_keys = flatten_secret_group_keys(secret_groups)
+
+    user_required_secrets = sorted(s for s in required_secrets if s not in global_secrets and s not in grouped_keys)
+    user_required_variables = sorted(v for v in required_variables if v not in global_variables)
+    user_optional_secrets = sorted(s for s in optional_secrets if s not in global_secrets and s not in grouped_keys)
+
+    available_secrets = {**global_secrets, **identity_secrets}
+    missing_group_keys = _unsatisfied_secret_group_keys(secret_groups, available_secrets)
+
+    missing_secrets = [s for s in user_required_secrets if s not in identity_secrets]
+    missing_secrets += [k for k in missing_group_keys if k not in missing_secrets]
+    missing_variables = [v for v in user_required_variables if v not in identity_variables]
+    optional_missing_secrets = [s for s in user_optional_secrets if s not in identity_secrets]
+
+    return {
+        "configured": not missing_secrets and not missing_variables,
+        "missing_secrets": missing_secrets,
+        "missing_variables": missing_variables,
+        "optional_missing_secrets": optional_missing_secrets,
+        "required_secrets": user_required_secrets,
+        "required_variables": user_required_variables,
+    }
+
+
+async def _fetch_agent_tool_mcp_configs(config: Dict) -> "tuple[Dict[str, Dict], Dict[str, Dict]]":
+    """Fetch just the tool/mcp configs this one agent's ``allowed_tools``/``allowed_mcps``
+    reference, keyed the same way :func:`discover_agents`'s bulk
+    ``all_tool_configs``/``all_mcp_configs`` are -- so both can be handed to the same
+    :func:`_resolve_agent_requirements`. Deliberately per-agent (not a full bulk fetch):
+    this is the single-agent path, called from a point-of-use context where fetching
+    the entire catalog's tool/mcp configs would be wasted work.
+    """
+    tool_configs: Dict[str, Dict] = {}
+    mcp_names = set(config.get("allowed_mcps", []))
+
+    for tool_name in config.get("allowed_tools", []):
+        if tool_name.startswith("mcp__"):
+            parts = tool_name.split("__")
+            if len(parts) >= 3:
+                mcp_names.add(parts[1])
+            continue
+        tool_config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
+        if tool_config:
+            tool_configs[tool_name] = tool_config
+
+    mcp_configs: Dict[str, Dict] = {}
+    for mcp_name in mcp_names:
+        mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
+        if mcp_config:
+            mcp_configs[mcp_name] = mcp_config
+
+    return tool_configs, mcp_configs
+
+
 async def is_agent_configured(agent_name: str, user_id: str) -> Dict:
     """Check if a specific agent is configured for a user.
 
@@ -200,39 +355,55 @@ async def is_agent_configured(agent_name: str, user_id: str) -> Dict:
     if not config:
         return {"configured": False, "missing_secrets": [], "missing_variables": [], "optional_missing_secrets": []}
 
-    is_background = config.get("type") in ("background_agent", "background_script")
+    is_background = config.get("type") in BACKGROUND_AGENT_TYPES
 
-    required_secrets = await get_agent_required_secrets(config)
-    required_variables = await get_agent_required_variables(config)
-    optional_secrets = await get_agent_optional_secrets(config)
+    tool_configs, mcp_configs = await _fetch_agent_tool_mcp_configs(config)
+    resolved = _resolve_agent_requirements(config, tool_configs, mcp_configs)
 
     system_identity = Identity(id="system", type=IdentityType.SYSTEM)
     global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
     global_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
 
-    user_required_secrets = [s for s in required_secrets if s not in global_secrets]
-    user_required_variables = [s for s in required_variables if s not in global_variables]
-    user_optional_secrets = [s for s in optional_secrets if s not in global_secrets]
+    grouped_keys = flatten_secret_group_keys(resolved["secret_groups"])
+    user_required_secrets = [s for s in resolved["required_secrets"] if s not in global_secrets and s not in grouped_keys]
+    user_required_variables = [v for v in resolved["required_variables"] if v not in global_variables]
+    user_optional_secrets = [s for s in resolved["optional_secrets"] if s not in global_secrets and s not in grouped_keys]
 
-    if not user_required_secrets and not user_required_variables:
-        # Still resolve optional_missing_secrets even when the agent is configured.
-        if not user_optional_secrets:
-            return {"configured": True, "missing_secrets": [], "missing_variables": [], "optional_missing_secrets": []}
+    # Cheap early exit before paying for the identity secrets/variables fetch below --
+    # preserved from the pre-Phase-C implementation for the common case (nothing
+    # required at all). Unlike the pre-Phase-C version, this also requires
+    # `secret_groups` to be empty: a group can be unsatisfied even when nothing is
+    # required outside of it, and that can only be determined by checking it against
+    # the identity's configured secrets below.
+    if not user_required_secrets and not user_required_variables and not user_optional_secrets and not resolved["secret_groups"]:
+        return {"configured": True, "missing_secrets": [], "missing_variables": [], "optional_missing_secrets": []}
 
     identity = Identity.from_string(user_id) if not is_background else Identity(id=agent_name, type=IdentityType.WORKFLOW)
 
     ident_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "secrets")
     ident_variables = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "variables")
 
-    missing_secrets = [s for s in user_required_secrets if s not in ident_secrets]
-    missing_variables = [v for v in user_required_variables if v not in ident_variables]
-    optional_missing_secrets = [s for s in user_optional_secrets if s not in ident_secrets]
+    # Pass the raw (unfiltered) resolved requirements plus the real global dicts --
+    # `_evaluate_agent_configuration` does its own global/grouped-key exclusion, so
+    # filtering again here would be redundant work and, worse, would need `global_secrets`
+    # passed as real data anyway for the group-satisfaction check (a group can be
+    # satisfied by a globally-set secret, not just a per-identity one).
+    evaluated = _evaluate_agent_configuration(
+        required_secrets=resolved["required_secrets"],
+        required_variables=resolved["required_variables"],
+        optional_secrets=resolved["optional_secrets"],
+        secret_groups=resolved["secret_groups"],
+        global_secrets=global_secrets,
+        global_variables=global_variables,
+        identity_secrets=ident_secrets,
+        identity_variables=ident_variables,
+    )
 
     return {
-        "configured": not missing_secrets and not missing_variables,
-        "missing_secrets": missing_secrets,
-        "missing_variables": missing_variables,
-        "optional_missing_secrets": optional_missing_secrets,
+        "configured": evaluated["configured"],
+        "missing_secrets": evaluated["missing_secrets"],
+        "missing_variables": evaluated["missing_variables"],
+        "optional_missing_secrets": evaluated["optional_missing_secrets"],
     }
 
 async def discover_agents(user_id: Optional[str] = None, include_background: bool = False) -> List[Dict]:
@@ -265,77 +436,21 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
         if name == "supervisor":
             continue
             
-        is_background = config.get("type") in ("background_agent", "background_script")
+        is_background = config.get("type") in BACKGROUND_AGENT_TYPES
         
         if is_background and not include_background:
             continue
             
         skills_content = agent_skills.get(name, "")
         health = agent_health.get(name)
-        
-        # Determine configuration status based on identity
-        is_configured = True
-        missing_secrets = []
-        missing_variables = []
-        optional_missing_secrets = []
 
-        # Optimized requirement resolution using pre-fetched configs
-        required_secrets = set()
-        required_variables = set()
-        optional_secrets = set()
-        secret_groups_raw = []
+        # Requirement resolution using pre-fetched bulk configs -- same pure algorithm
+        # is_agent_configured uses, just handed the whole catalog's tool/mcp configs
+        # instead of fetching a per-agent subset, preserving this function's bulk
+        # performance design.
+        resolved = _resolve_agent_requirements(config, all_tool_configs, all_mcp_configs)
+        secret_groups_raw = resolved["secret_groups"]
 
-        # 1. Include requirements from agent/workflow config
-        if config.get("secrets"):
-            required_secrets.update(_resolve_requirements(config.get("secrets"), is_background))
-        if config.get("variables"):
-            required_variables.update(_resolve_requirements(config.get("variables"), is_background))
-
-        # 2. Aggregate requirements from allowed tools
-        allowed_tools = config.get("allowed_tools", [])
-        for tool_name in allowed_tools:
-            tool_config = all_tool_configs.get(tool_name)
-            if tool_config:
-                if tool_config.get("secrets"):
-                    required_secrets.update(_resolve_requirements(tool_config.get("secrets"), is_background))
-                if tool_config.get("variables"):
-                    required_variables.update(_resolve_requirements(tool_config.get("variables"), is_background))
-                if tool_config.get("secret_groups"):
-                    secret_groups_raw.extend(tool_config.get("secret_groups"))
-            elif tool_name.startswith("mcp__"):
-                parts = tool_name.split("__")
-                if len(parts) >= 3:
-                    mcp_name = parts[1]
-                    mcp_config = all_mcp_configs.get(mcp_name)
-                    if mcp_config:
-                        if mcp_config.get("secrets"):
-                            required_secrets.update(_resolve_requirements(mcp_config.get("secrets"), is_background))
-                        if mcp_config.get("variables"):
-                            required_variables.update(_resolve_requirements(mcp_config.get("variables"), is_background))
-                        if mcp_config.get("optional_secrets"):
-                            optional_secrets.update(_resolve_requirements(mcp_config.get("optional_secrets"), is_background))
-                        if mcp_config.get("secret_groups"):
-                            secret_groups_raw.extend(mcp_config.get("secret_groups"))
-
-        allowed_mcps = config.get("allowed_mcps", [])
-        for mcp_name in allowed_mcps:
-            mcp_config = all_mcp_configs.get(mcp_name)
-            if mcp_config:
-                if mcp_config.get("secrets"):
-                    required_secrets.update(_resolve_requirements(mcp_config.get("secrets"), is_background))
-                if mcp_config.get("variables"):
-                    required_variables.update(_resolve_requirements(mcp_config.get("variables"), is_background))
-                if mcp_config.get("optional_secrets"):
-                    optional_secrets.update(_resolve_requirements(mcp_config.get("optional_secrets"), is_background))
-                if mcp_config.get("secret_groups"):
-                    secret_groups_raw.extend(mcp_config.get("secret_groups"))
-
-        grouped_keys = flatten_secret_group_keys(secret_groups_raw)
-
-        user_required_secrets = [s for s in required_secrets if s not in global_secrets and s not in grouped_keys]
-        user_required_variables = [s for s in required_variables if s not in global_variables]
-        user_optional_secrets = [s for s in optional_secrets if s not in global_secrets and s not in grouped_keys]
-        
         current_config_secrets = {}
         current_config_variables = {}
 
@@ -349,19 +464,27 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
             current_config_secrets = human_user_secrets
             current_config_variables = human_user_variables
 
-        for req in user_required_secrets:
-            if req not in current_config_secrets:
-                is_configured = False
-                missing_secrets.append(req)
-
-        for req in user_required_variables:
-            if req not in current_config_variables:
-                is_configured = False
-                missing_variables.append(req)
-
-        for opt in user_optional_secrets:
-            if opt not in current_config_secrets:
-                optional_missing_secrets.append(opt)
+        # Same evaluator is_agent_configured uses -- this is what wires
+        # _unsatisfied_secret_group_keys into discover_agents for the first time,
+        # fixing the bug where an agent depending on a tool/MCP with secret_groups and
+        # zero fully-configured options could incorrectly report is_configured: True
+        # (see rules_engine_hardening_plan.md §4 finding 5 / Phase C).
+        evaluated = _evaluate_agent_configuration(
+            required_secrets=resolved["required_secrets"],
+            required_variables=resolved["required_variables"],
+            optional_secrets=resolved["optional_secrets"],
+            secret_groups=secret_groups_raw,
+            global_secrets=global_secrets,
+            global_variables=global_variables,
+            identity_secrets=current_config_secrets,
+            identity_variables=current_config_variables,
+        )
+        is_configured = evaluated["configured"]
+        missing_secrets = evaluated["missing_secrets"]
+        missing_variables = evaluated["missing_variables"]
+        optional_missing_secrets = evaluated["optional_missing_secrets"]
+        user_required_secrets = evaluated["required_secrets"]
+        user_required_variables = evaluated["required_variables"]
 
         agent_secret_groups = []
         for group in secret_groups_raw:
@@ -401,8 +524,8 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
             "external": config.get("external", True),
             "internal": config.get("internal", True),
             "health": health or {"status": "Online"},
-            "required_secrets": sorted(list(user_required_secrets)),
-            "required_variables": sorted(list(user_required_variables)),
+            "required_secrets": user_required_secrets,
+            "required_variables": user_required_variables,
             "is_configured": is_configured,
             "missing_secrets": missing_secrets,
             "missing_variables": missing_variables,
@@ -427,9 +550,11 @@ async def is_tool_configured(tool_name: str, user_id: Optional[str] = None) -> D
 
     A tool declaring ``secret_groups`` (e.g. opsctl/netctl's per-environment credential picker)
     is only considered configured once at least one option's full field set is present —
-    see :func:`_unsatisfied_secret_group_keys`. This intentionally makes ``is_tool_configured``
-    stricter than the legacy single-item ``is_agent_configured`` above, which does not
-    factor secret_groups into its result at all.
+    see :func:`_unsatisfied_secret_group_keys`. As of Phase C (see
+    ``__spec_docs/rules_engine_hardening_plan.md``), :func:`is_agent_configured` and
+    :func:`discover_agents` apply this same group-satisfaction check via
+    :func:`_evaluate_agent_configuration`, so all three configuration-readiness checks now
+    agree on secret_groups semantics.
 
     Returns a dict with keys:
       - configured (bool)

@@ -11,6 +11,7 @@ from core.dependencies import templates, CSRFRoute
 from core.auth import IdentityManager
 from core.health import HealthMonitor
 from core.models import Identity, IdentityType, is_agent_internal, coerce_bool_flag
+from core.rules_engine import RULES_EVALUATION_TIMEOUT as RULES_EVALUATION_TIMEOUT_DEFAULT
 
 router = APIRouter(route_class=CSRFRoute)
 
@@ -122,6 +123,7 @@ async def admin_dashboard(request: Request):
     flash_msg = request.session.pop("flash_msg", None)
 
     agent_memory_enabled = await asyncio.to_thread(identity_mgr.get_agent_memory_enabled)
+    rules_evaluation_timeout_override = await asyncio.to_thread(identity_mgr.get_rules_evaluation_timeout)
 
     return templates.TemplateResponse(
         request=request,
@@ -138,6 +140,15 @@ async def admin_dashboard(request: Request):
             "feature_flags": {
                 "agent_memory_enabled": agent_memory_enabled
             },
+            "rules_engine": {
+                "timeout_override": rules_evaluation_timeout_override,
+                "timeout_default": RULES_EVALUATION_TIMEOUT_DEFAULT,
+                "effective_timeout": (
+                    rules_evaluation_timeout_override
+                    if rules_evaluation_timeout_override is not None
+                    else RULES_EVALUATION_TIMEOUT_DEFAULT
+                ),
+            },
             "flash_msg": flash_msg
         }
     )
@@ -152,6 +163,35 @@ async def toggle_agent_memory_flag(request: Request, enabled: str = Form(...)):
 
     state_str = "enabled" if should_enable else "disabled"
     request.session["flash_msg"] = f"Agent Memory {state_str} globally. Changes take effect within ~20 seconds."
+    return RedirectResponse(url='/admin', status_code=303)
+
+@router.post("/admin/rules-engine/timeout")
+async def set_rules_evaluation_timeout(request: Request, timeout_seconds: str = Form(...)):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    raw = timeout_seconds.strip()
+    if raw == "":
+        # Empty submission means "reset to default".
+        await asyncio.to_thread(identity_mgr.clear_rules_evaluation_timeout)
+        request.session["flash_msg"] = (
+            f"Rules Engine timeout reset to the default ({RULES_EVALUATION_TIMEOUT_DEFAULT}s). "
+            "Changes take effect within ~30 seconds."
+        )
+        return RedirectResponse(url='/admin', status_code=303)
+
+    try:
+        value = float(raw)
+    except ValueError:
+        request.session["flash_msg"] = f"Invalid timeout value '{raw}' — must be a number."
+        return RedirectResponse(url='/admin', status_code=303)
+
+    if not (0.1 <= value <= 30.0):
+        request.session["flash_msg"] = "Timeout must be between 0.1 and 30.0 seconds."
+        return RedirectResponse(url='/admin', status_code=303)
+
+    await asyncio.to_thread(identity_mgr.set_rules_evaluation_timeout, value)
+    request.session["flash_msg"] = f"Rules Engine timeout set to {value}s. Changes take effect within ~30 seconds."
     return RedirectResponse(url='/admin', status_code=303)
 
 @router.post("/admin/users/toggle_ban")

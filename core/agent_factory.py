@@ -599,7 +599,14 @@ def _register_admin_tools(agent: Agent):
                 agent_dict = config_lookup.get(r["name"], {})
                 is_configured = agent_dict.get("is_configured", True)
                 r["configured"] = is_configured
-                if not is_configured:
+                # search_agents()'s "unavailable match" note (Phase E of
+                # rules_engine_hardening_plan.md, E1/E3) is already a final,
+                # self-contained sentence -- appending our own "[NOT CONFIGURED ...]"
+                # tag onto it here would produce a redundant, and sometimes
+                # self-contradictory (e.g. "...currently offline... [NOT CONFIGURED
+                # ...]"), description. Mirrors the same guard in
+                # core/gateway.py:search_agents.
+                if not is_configured and not r.get("unavailable_match"):
                     missing = []
                     if agent_dict.get("missing_secrets"):
                         missing.append(f"secrets: {', '.join(agent_dict['missing_secrets'])}")
