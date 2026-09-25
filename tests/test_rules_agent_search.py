@@ -82,19 +82,21 @@ def _case_summary_cfg(**overrides):
     return cfg
 
 
-async def _fake_discover_agents_all_configured(user_id=None):
-    return [
-        {"name": "troubleshooting-agent", "is_configured": True},
-        {"name": "ticket-summary-agent", "is_configured": True},
-    ]
+async def _fake_is_agent_configured(agent_name, user_id=None):
+    return {
+        "configured": True,
+        "missing_secrets": [],
+        "missing_variables": [],
+        "optional_missing_secrets": [],
+    }
 
 
 def _fail_embed(*args, **kwargs):
     raise AssertionError("embed_text should not have been called")
 
 
-def _fail_discover(*args, **kwargs):
-    raise AssertionError("discover_agents should not have been called when no rules are configured")
+def _fail_configured(*args, **kwargs):
+    raise AssertionError("is_agent_configured should not have been called")
 
 
 # --- Rule short-circuit ---
@@ -106,7 +108,7 @@ def test_search_agents_rule_short_circuit_bypasses_embedding(monkeypatch):
     }
     fake_identity = FakeIdentityManagerAgentSearch(configs, routing_rules={"version": "1.0", "global_rules": []})
     monkeypatch.setattr(agent_search, "identity_mgr", fake_identity)
-    monkeypatch.setattr(agent_search, "discover_agents", _fake_discover_agents_all_configured)
+    monkeypatch.setattr(agent_search, "is_agent_configured", _fake_is_agent_configured)
     monkeypatch.setattr(agent_search, "embed_text", _fail_embed)
 
     async def fake_evaluate_rules(query, global_rules, eligible_agents):
@@ -135,7 +137,7 @@ def test_search_agents_rule_lock_ignores_caller_limit(monkeypatch):
     }
     fake_identity = FakeIdentityManagerAgentSearch(configs, routing_rules={"version": "1.0", "global_rules": []})
     monkeypatch.setattr(agent_search, "identity_mgr", fake_identity)
-    monkeypatch.setattr(agent_search, "discover_agents", _fake_discover_agents_all_configured)
+    monkeypatch.setattr(agent_search, "is_agent_configured", _fake_is_agent_configured)
     monkeypatch.setattr(agent_search, "embed_text", _fail_embed)
 
     async def fake_evaluate_rules(query, global_rules, eligible_agents):
@@ -179,7 +181,7 @@ def test_search_agents_locked_half_open_agent_reports_evaluated_status(monkeypat
 
     fake_identity = FakeIdentityManagerHalfOpen(configs, routing_rules={"version": "1.0", "global_rules": []})
     monkeypatch.setattr(agent_search, "identity_mgr", fake_identity)
-    monkeypatch.setattr(agent_search, "discover_agents", _fake_discover_agents_all_configured)
+    monkeypatch.setattr(agent_search, "is_agent_configured", _fake_is_agent_configured)
     monkeypatch.setattr(agent_search, "embed_text", _fail_embed)
 
     async def fake_evaluate_rules(query, global_rules, eligible_agents):
@@ -214,13 +216,12 @@ def test_search_agents_unconfigured_matched_agent_produces_note_and_fallback(mon
     fake_identity = FakeIdentityManagerAgentSearch(configs, routing_rules={"version": "1.0", "global_rules": []})
     monkeypatch.setattr(agent_search, "identity_mgr", fake_identity)
 
-    async def fake_discover_agents_unconfigured(user_id=None):
-        return [
-            {"name": "troubleshooting-agent", "is_configured": False},
-            {"name": "ticket-summary-agent", "is_configured": True},
-        ]
+    async def fake_is_agent_configured_unconfigured(agent_name, user_id=None):
+        if agent_name == "troubleshooting-agent":
+            return {"configured": False, "missing_secrets": ["ACME_API_KEY"], "missing_variables": []}
+        return {"configured": True, "missing_secrets": [], "missing_variables": []}
 
-    monkeypatch.setattr(agent_search, "discover_agents", fake_discover_agents_unconfigured)
+    monkeypatch.setattr(agent_search, "is_agent_configured", fake_is_agent_configured_unconfigured)
     monkeypatch.setattr(agent_search, "embed_text", lambda *a, **k: [1.0, 0.0])
     monkeypatch.setattr(agent_search, "cosine", lambda a, b: 1.0 if b else 0.0)
 
@@ -243,13 +244,12 @@ def test_search_agents_unconfigured_matched_agent_produces_note_and_fallback(mon
         "status": "Unconfigured",
         "unavailable_match": True,
     }
-    # Both real candidates still appear as ranked alternatives after the note -- the
-    # note is additional, per E1/E3, not a replacement for one of the real results.
+    # Deduplication: the unavailable matched agent must NOT appear again in the ranked alternatives below.
     alternative_names = {r["name"] for r in results[1:]}
-    assert alternative_names == {"troubleshooting-agent", "ticket-summary-agent"}
-    assert len(results) == 3
+    assert alternative_names == {"ticket-summary-agent"}
+    assert "troubleshooting-agent" not in alternative_names
+    assert len(results) == 2
     assert "unavailable_match" not in results[1]
-    assert "unavailable_match" not in results[2]
 
 
 def test_search_agents_offline_matched_agent_note_does_not_count_against_limit(monkeypatch):
@@ -270,7 +270,8 @@ def test_search_agents_offline_matched_agent_note_does_not_count_against_limit(m
 
     fake_identity = FakeIdentityManagerOffline(configs, routing_rules={"version": "1.0", "global_rules": []})
     monkeypatch.setattr(agent_search, "identity_mgr", fake_identity)
-    monkeypatch.setattr(agent_search, "discover_agents", _fake_discover_agents_all_configured)
+    # An offline match short-circuits before configuration readiness check; is_agent_configured must not be called
+    monkeypatch.setattr(agent_search, "is_agent_configured", _fail_configured)
     monkeypatch.setattr(agent_search, "embed_text", lambda *a, **k: [1.0, 0.0])
     monkeypatch.setattr(agent_search, "cosine", lambda a, b: 1.0 if b else 0.0)
 
@@ -291,6 +292,9 @@ def test_search_agents_offline_matched_agent_note_does_not_count_against_limit(m
     # 2 real alternatives (the caller's limit), plus the note = 3 total.
     assert len(results) == 3
     assert len(results[1:]) == 2
+    alternative_names = {r["name"] for r in results[1:]}
+    assert "troubleshooting-agent" not in alternative_names
+    assert alternative_names == {"ticket-summary-agent", "general-agent"}
 
 
 def test_search_agents_offline_takes_precedence_over_unconfigured_in_note_reason(monkeypatch):
@@ -311,14 +315,7 @@ def test_search_agents_offline_takes_precedence_over_unconfigured_in_note_reason
 
     fake_identity = FakeIdentityManagerOffline(configs, routing_rules={"version": "1.0", "global_rules": []})
     monkeypatch.setattr(agent_search, "identity_mgr", fake_identity)
-
-    async def fake_discover_agents_unconfigured(user_id=None):
-        return [
-            {"name": "troubleshooting-agent", "is_configured": False},
-            {"name": "ticket-summary-agent", "is_configured": True},
-        ]
-
-    monkeypatch.setattr(agent_search, "discover_agents", fake_discover_agents_unconfigured)
+    monkeypatch.setattr(agent_search, "is_agent_configured", _fail_configured)
     monkeypatch.setattr(agent_search, "embed_text", lambda *a, **k: [1.0, 0.0])
     monkeypatch.setattr(agent_search, "cosine", lambda a, b: 1.0 if b else 0.0)
 
@@ -335,8 +332,7 @@ def test_search_agents_offline_takes_precedence_over_unconfigured_in_note_reason
 
 
 def test_search_agents_excludes_disabled_agent_from_rule_eligibility(monkeypatch):
-    """A disabled agent's rules must never be evaluated, even with rules configured and
-    even though core.discovery.discover_agents doesn't know about the disabled set."""
+    """A disabled agent's rules must never be evaluated, even with rules configured."""
 
     class FakeIdentityManagerWithDisabled(FakeIdentityManagerAgentSearch):
         def get_disabled_standard_agents(self):
@@ -348,7 +344,7 @@ def test_search_agents_excludes_disabled_agent_from_rule_eligibility(monkeypatch
     }
     fake_identity = FakeIdentityManagerWithDisabled(configs, routing_rules={"version": "1.0", "global_rules": []})
     monkeypatch.setattr(agent_search, "identity_mgr", fake_identity)
-    monkeypatch.setattr(agent_search, "discover_agents", _fake_discover_agents_all_configured)
+    monkeypatch.setattr(agent_search, "is_agent_configured", _fake_is_agent_configured)
     monkeypatch.setattr(agent_search, "embed_text", lambda *a, **k: [1.0, 0.0])
     monkeypatch.setattr(agent_search, "cosine", lambda a, b: 1.0 if b else 0.0)
 
@@ -380,7 +376,7 @@ def test_search_agents_skips_rules_engine_when_none_configured(monkeypatch):
     }
     fake_identity = FakeIdentityManagerAgentSearch(configs, routing_rules={"version": "1.0", "global_rules": []})
     monkeypatch.setattr(agent_search, "identity_mgr", fake_identity)
-    monkeypatch.setattr(agent_search, "discover_agents", _fail_discover)
+    monkeypatch.setattr(agent_search, "is_agent_configured", _fail_configured)
     monkeypatch.setattr(agent_search, "embed_text", lambda *a, **k: [1.0, 0.0])
     monkeypatch.setattr(agent_search, "cosine", lambda a, b: 1.0)
 
@@ -399,7 +395,8 @@ def test_search_agents_semantic_fallback_on_null_match(monkeypatch):
     }
     fake_identity = FakeIdentityManagerAgentSearch(configs, routing_rules={"version": "1.0", "global_rules": []})
     monkeypatch.setattr(agent_search, "identity_mgr", fake_identity)
-    monkeypatch.setattr(agent_search, "discover_agents", _fake_discover_agents_all_configured)
+    # Due to inverted execution order, is_agent_configured must NOT be called on null rule match
+    monkeypatch.setattr(agent_search, "is_agent_configured", _fail_configured)
 
     async def fake_evaluate_rules(query, global_rules, eligible_agents):
         return None
@@ -432,10 +429,10 @@ def test_search_agents_fail_open_on_rule_engine_error(monkeypatch):
     fake_identity = FakeIdentityManagerAgentSearch(configs, routing_rules={"version": "1.0", "global_rules": []})
     monkeypatch.setattr(agent_search, "identity_mgr", fake_identity)
 
-    async def raising_discover_agents(user_id=None):
+    async def raising_is_agent_configured(agent_name, user_id=None):
         raise TimeoutError("simulated rules-engine/etcd timeout")
 
-    monkeypatch.setattr(agent_search, "discover_agents", raising_discover_agents)
+    monkeypatch.setattr(agent_search, "is_agent_configured", raising_is_agent_configured)
     monkeypatch.setattr(agent_search, "embed_text", lambda *a, **k: [1.0, 0.0])
     monkeypatch.setattr(agent_search, "cosine", lambda a, b: 1.0 if b else 0.0)
 
@@ -457,7 +454,7 @@ def test_search_agents_fail_open_when_routing_rules_fetch_raises(monkeypatch):
 
     fake_identity = RaisingIdentityManager(configs)
     monkeypatch.setattr(agent_search, "identity_mgr", fake_identity)
-    monkeypatch.setattr(agent_search, "discover_agents", _fail_discover)
+    monkeypatch.setattr(agent_search, "is_agent_configured", _fail_configured)
     monkeypatch.setattr(agent_search, "embed_text", lambda *a, **k: [1.0, 0.0])
     monkeypatch.setattr(agent_search, "cosine", lambda a, b: 1.0 if b else 0.0)
 
@@ -465,3 +462,283 @@ def test_search_agents_fail_open_when_routing_rules_fetch_raises(monkeypatch):
 
     names = {r["name"] for r in results}
     assert names == {"troubleshooting-agent", "ticket-summary-agent"}
+
+
+def test_resolve_rule_lock_calls_targeted_is_agent_configured(monkeypatch):
+    """_resolve_rule_lock must call targeted is_agent_configured on the matched agent
+    rather than triggering whole-catalog scans in discover_agents."""
+    configs = {
+        "troubleshooting-agent": _troubleshooting_cfg(),
+        "ticket-summary-agent": _case_summary_cfg(),
+    }
+    fake_identity = FakeIdentityManagerAgentSearch(configs, routing_rules={"version": "1.0", "global_rules": []})
+    monkeypatch.setattr(agent_search, "identity_mgr", fake_identity)
+
+    configured_calls = []
+
+    async def fake_is_agent_configured(agent_name, user_id=None):
+        configured_calls.append(agent_name)
+        return {"configured": True, "missing_secrets": [], "missing_variables": []}
+
+    monkeypatch.setattr(agent_search, "is_agent_configured", fake_is_agent_configured)
+    monkeypatch.setattr(agent_search, "embed_text", _fail_embed)
+
+    async def fake_evaluate_rules(query, global_rules, eligible_agents):
+        return RuleEvaluationResult(matched_agent="troubleshooting-agent", confidence=0.95, reasoning="matched")
+
+    monkeypatch.setattr(agent_search, "evaluate_rules", fake_evaluate_rules)
+
+    results = asyncio.run(agent_search.search_agents("Analyze PCAP", limit=1))
+    assert results[0]["name"] == "troubleshooting-agent"
+    assert configured_calls == ["troubleshooting-agent"]
+
+
+def test_search_agents_rule_lock_defers_embeddings_fetch(monkeypatch):
+    """Rule locks must not fetch all embeddings from etcd upfront."""
+    configs = {
+        "troubleshooting-agent": _troubleshooting_cfg(),
+        "ticket-summary-agent": _case_summary_cfg(),
+    }
+
+    class FakeIdentityEmbeddingsCheck(FakeIdentityManagerAgentSearch):
+        def get_all_agent_embeddings(self):
+            raise AssertionError("get_all_agent_embeddings should NOT be called when a rule locks")
+
+    fake_identity = FakeIdentityEmbeddingsCheck(configs, routing_rules={"version": "1.0", "global_rules": []})
+    monkeypatch.setattr(agent_search, "identity_mgr", fake_identity)
+    monkeypatch.setattr(agent_search, "is_agent_configured", _fake_is_agent_configured)
+    monkeypatch.setattr(agent_search, "embed_text", _fail_embed)
+
+    async def fake_evaluate_rules(query, global_rules, eligible_agents):
+        return RuleEvaluationResult(matched_agent="troubleshooting-agent", confidence=0.95, reasoning="matched")
+
+    monkeypatch.setattr(agent_search, "evaluate_rules", fake_evaluate_rules)
+
+    results = asyncio.run(agent_search.search_agents("Analyze PCAP", limit=1))
+    assert results[0]["name"] == "troubleshooting-agent"
+
+
+def test_identity_mgr_toggle_disabled_agents_atomic():
+    from core.auth import IdentityManager
+
+    class FakeEtcdClient:
+        def __init__(self):
+            self.storage = {}
+
+        def get(self, key):
+            val = self.storage.get(key)
+            return (val, None)
+
+        def put(self, key, val):
+            self.storage[key] = val.encode("utf-8") if isinstance(val, str) else val
+
+        def put_if_not_exists(self, key, val):
+            if key not in self.storage:
+                self.storage[key] = val
+                return True
+            return False
+
+        def replace(self, key, prev_val, new_val):
+            if self.storage.get(key) == prev_val:
+                self.storage[key] = new_val
+                return True
+            return False
+
+    mgr = IdentityManager.__new__(IdentityManager)
+    mgr.client = FakeEtcdClient()
+
+    # Initially empty, toggle should disable
+    is_disabled = mgr.toggle_disabled_standard_agent("agent-1")
+    assert is_disabled is True
+    assert mgr.get_disabled_standard_agents() == ["agent-1"]
+
+    # Explicit disable when already disabled
+    is_disabled = mgr.toggle_disabled_standard_agent("agent-1", disable=True)
+    assert is_disabled is True
+    assert mgr.get_disabled_standard_agents() == ["agent-1"]
+
+    # Toggle to enable
+    is_disabled = mgr.toggle_disabled_standard_agent("agent-1")
+    assert is_disabled is False
+    assert mgr.get_disabled_standard_agents() == []
+
+    # Explicit enable when already enabled
+    is_disabled = mgr.toggle_disabled_standard_agent("agent-1", disable=False)
+    assert is_disabled is False
+    assert mgr.get_disabled_standard_agents() == []
+
+    # Workflow toggle
+    is_wf_disabled = mgr.toggle_disabled_workflow("wf-1", disable=True)
+    assert is_wf_disabled is True
+    assert mgr.get_disabled_workflows() == ["wf-1"]
+
+    is_wf_disabled = mgr.toggle_disabled_workflow("wf-1", disable=False)
+    assert is_wf_disabled is False
+    assert mgr.get_disabled_workflows() == []
+
+
+def test_atomic_update_config_list_resolves_after_contention(monkeypatch):
+    """CAS should survive transient contention (another writer winning a handful of
+    races) by backing off and retrying, converging on the correct final list rather
+    than giving up or corrupting the write."""
+    import json
+    from core import auth as auth_module
+    from core.auth import IdentityManager
+
+    full_key = "/config/framework/disabled_standard_agents"
+
+    class ContendedEtcdClient:
+        def __init__(self, fail_replace_times):
+            self.storage = {full_key: json.dumps([]).encode("utf-8")}
+            self.fail_replace_times = fail_replace_times
+            self.replace_calls = 0
+            self.put_calls = []
+
+        def get(self, key):
+            return (self.storage.get(key), None)
+
+        def put(self, key, val):
+            self.put_calls.append((key, val))
+            self.storage[key] = val.encode("utf-8") if isinstance(val, str) else val
+
+        def put_if_not_exists(self, key, val):
+            if key not in self.storage:
+                self.storage[key] = val
+                return True
+            return False
+
+        def replace(self, key, prev_val, new_val):
+            self.replace_calls += 1
+            if self.replace_calls <= self.fail_replace_times:
+                # Simulate a concurrent writer winning the race out from under us.
+                self.storage[key] = json.dumps(["someone-else"]).encode("utf-8")
+                return False
+            if self.storage.get(key) == prev_val:
+                self.storage[key] = new_val
+                return True
+            return False
+
+    sleep_calls = []
+    monkeypatch.setattr(auth_module.time, "sleep", lambda s: sleep_calls.append(s))
+
+    mgr = IdentityManager.__new__(IdentityManager)
+    mgr.client = ContendedEtcdClient(fail_replace_times=5)
+
+    is_disabled = mgr.toggle_disabled_standard_agent("agent-x", disable=True)
+
+    assert is_disabled is True
+    # The concurrent writer's change ("someone-else") is preserved (no lost update)
+    # and our own update is correctly merged in once the CAS finally wins.
+    assert set(mgr.get_disabled_standard_agents()) == {"someone-else", "agent-x"}
+    # Backed off between each of the 5 lost races.
+    assert len(sleep_calls) == 5
+    assert all(0 <= s <= 0.02 for s in sleep_calls)
+    # Never fell back to a blind unconditional put() of the final key.
+    assert mgr.client.put_calls == []
+
+
+def test_atomic_update_config_list_exhaustion_raises_and_never_blind_overwrites(monkeypatch):
+    """When contention never resolves, the CAS loop must raise instead of falling
+    back to an unconditional put() (which would silently discard a concurrent
+    writer's change and falsely report success)."""
+    import json
+    from core import auth as auth_module
+    from core.auth import IdentityManager, EtcdContentionError
+
+    full_key = "/config/framework/disabled_standard_agents"
+
+    class AlwaysContendedEtcdClient:
+        def __init__(self):
+            self.storage = {full_key: json.dumps(["existing-agent"]).encode("utf-8")}
+            self.put_calls = []
+            self.replace_calls = 0
+
+        def get(self, key):
+            return (self.storage.get(key), None)
+
+        def put(self, key, val):
+            # Should never be called by _atomic_update_config_list -- there is no
+            # blind-overwrite fallback anymore.
+            self.put_calls.append((key, val))
+            self.storage[key] = val.encode("utf-8") if isinstance(val, str) else val
+
+        def put_if_not_exists(self, key, val):
+            if key not in self.storage:
+                self.storage[key] = val
+                return True
+            return False
+
+        def replace(self, key, prev_val, new_val):
+            self.replace_calls += 1
+            # Another writer always wins -- contention never resolves.
+            return False
+
+    monkeypatch.setattr(auth_module.time, "sleep", lambda s: None)
+
+    mgr = IdentityManager.__new__(IdentityManager)
+    client = AlwaysContendedEtcdClient()
+    mgr.client = client
+
+    # Call the CAS helper directly (not through the @retry_etcd()-wrapped
+    # toggle_disabled_standard_agent) so this test isolates the CAS loop's own
+    # 20-attempt exhaustion behavior from the outer retry_etcd decorator's separate
+    # (and much longer) retry-with-delay behavior around the whole call.
+    with pytest.raises(EtcdContentionError):
+        mgr._atomic_update_config_list("disabled_standard_agents", lambda cur: cur + ["agent-y"])
+
+    assert client.replace_calls == 20
+    # No blind overwrite: put() was never invoked, and the stored value is untouched.
+    assert client.put_calls == []
+    assert client.storage[full_key] == json.dumps(["existing-agent"]).encode("utf-8")
+
+    # Through the @retry_etcd()-wrapped public method, contention must fail fast rather
+    # than re-run the whole 20-attempt CAS loop up to 10 more times.
+    client.replace_calls = 0
+    with pytest.raises(EtcdContentionError):
+        mgr.toggle_disabled_standard_agent("agent-y", disable=True)
+    assert client.replace_calls == 20
+    assert client.put_calls == []
+
+
+def test_atomic_update_config_list_corrupt_json_defaults_to_empty_list(monkeypatch):
+    """Corrupt JSON or a non-list value stored under the key must still be treated
+    as an empty list (unchanged pre-existing behavior), not raise or crash."""
+    from core.auth import IdentityManager
+
+    full_key = "/config/framework/disabled_standard_agents"
+
+    class CorruptThenGoodEtcdClient:
+        def __init__(self, initial_raw):
+            self.storage = {full_key: initial_raw}
+
+        def get(self, key):
+            return (self.storage.get(key), None)
+
+        def put(self, key, val):
+            self.storage[key] = val.encode("utf-8") if isinstance(val, str) else val
+
+        def put_if_not_exists(self, key, val):
+            if key not in self.storage:
+                self.storage[key] = val
+                return True
+            return False
+
+        def replace(self, key, prev_val, new_val):
+            if self.storage.get(key) == prev_val:
+                self.storage[key] = new_val
+                return True
+            return False
+
+    # Case 1: corrupt (non-JSON) bytes stored.
+    mgr = IdentityManager.__new__(IdentityManager)
+    mgr.client = CorruptThenGoodEtcdClient(b"not-json-!!!")
+    is_disabled = mgr.toggle_disabled_standard_agent("agent-z", disable=True)
+    assert is_disabled is True
+    assert mgr.get_disabled_standard_agents() == ["agent-z"]
+
+    # Case 2: valid JSON but not a list (e.g. a dict).
+    mgr2 = IdentityManager.__new__(IdentityManager)
+    mgr2.client = CorruptThenGoodEtcdClient(b'{"not": "a list"}')
+    is_disabled2 = mgr2.toggle_disabled_standard_agent("agent-w", disable=True)
+    assert is_disabled2 is True
+    assert mgr2.get_disabled_standard_agents() == ["agent-w"]

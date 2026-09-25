@@ -166,6 +166,28 @@ variables:
 
 ---
 
+### Retries, timeouts, and idempotency
+
+**Transient retries** — when a tool exits non-zero and its `stderr` contains a known transient network keyword (`timeout`, `connection refused`, `econnrefused`, `eof`, `network is unreachable`, `temporary failure`), the Hub retries the invocation up to **3 attempts** via `stamina`. Re-executing a tool that already mutated external state can duplicate side effects (e.g. a second ticket), so tools with non-idempotent side effects (creates, updates, writes) should opt out with `retry_on_transient: false`. The first failed attempt then surfaces the error to the caller instead of re-running.
+
+> **Author guidance:** `retry_on_transient` defaults to `true`. If your tool creates, posts, updates, deletes, sends, comments, or otherwise has a non-idempotent side effect against a 3rd-party system (Issues, Slack, Support, SSH/infra operations, local writes, etc.), you must explicitly set `retry_on_transient: false` in that tool's `tool.yaml` entry — do not rely on the default. Read-only/query tools can safely leave it unset.
+
+**Timeouts** — every subprocess execution is bounded by `TOOL_EXECUTION_TIMEOUT` (default **300 s**). Override the default for a single tool with `timeout_seconds`. Timeouts are **immediately fatal — never retried**: a tool that hung for the full timeout is almost certainly stuck, and retrying would only multiply wall-clock time and side-effect risk. The failure is still recorded as a health event for the circuit breaker.
+
+```yaml
+- name: issues_create_ticket
+  version: 0.1.0
+  author: user@example.com
+  description: "Creates a Issues ticket."
+  runtime: python
+  entrypoint: create_ticket.py
+  rel_path: tools/issues
+  retry_on_transient: false      # Optional. Default true. Opt out for non-idempotent tools.
+  timeout_seconds: 600           # Optional. Defaults to TOOL_EXECUTION_TIMEOUT (300 s).
+```
+
+---
+
 ### Runtimes
 
 | Runtime | `entrypoint` | Notes |

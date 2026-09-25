@@ -190,3 +190,43 @@ def test_sync_agent_coerces_legacy_string_external_true(tmp_path):
     saved = fake_identity.saved_configs["some-agent"]
     assert saved["external"] is True
     assert saved["internal"] is False
+
+
+def test_sync_agent_overrides_mismatched_config_name_and_warns(tmp_path, capsys):
+    """config.yaml's name: must never silently diverge from the directory/registry
+    key -- a mismatch is a real lockout risk (see the WARNING comment in sync_agent
+    itself). The registry key always wins, and the override must be loud."""
+    agent_dir = tmp_path / "real-agent"
+    agent_dir.mkdir()
+    (agent_dir / "config.yaml").write_text(
+        'name: wrong-name\ntype: background_script\nexternal: "true"\ninternal: "true"\n'
+    )
+    fake_identity = FakeIdentityManagerSync()
+
+    sync_agent(fake_identity, agent_dir)
+
+    saved = fake_identity.saved_configs["real-agent"]
+    assert saved["name"] == "real-agent"
+
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "wrong-name" in out
+    assert "real-agent" in out
+
+
+def test_sync_agent_matching_config_name_produces_no_warning(tmp_path, capsys):
+    """The normal case -- config.yaml's name: already agrees with the directory/
+    registry key -- must stay silent; only a genuine mismatch should warn."""
+    agent_dir = _write_agent_config(
+        tmp_path,
+        'name: some-agent\ntype: background_script\nexternal: "true"\ninternal: "true"\n',
+    )
+    fake_identity = FakeIdentityManagerSync()
+
+    sync_agent(fake_identity, agent_dir)
+
+    saved = fake_identity.saved_configs["some-agent"]
+    assert saved["name"] == "some-agent"
+
+    out = capsys.readouterr().out
+    assert "WARNING" not in out

@@ -5,8 +5,8 @@ from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import templates, identity_mgr, CSRFRoute
 from core.discovery import discover_agents, discover_tools, get_agent_required_secrets, get_agent_required_variables, get_agent_secret_groups, get_tool_configuration_context, flatten_secret_group_keys
-from core.auth import is_admin
-from core.health import evaluate_health_status
+from core.auth import EtcdContentionError, is_admin
+from core.health import compute_agent_operational_status
 from core.models import Identity, IdentityType
 
 router = APIRouter(route_class=CSRFRoute)
@@ -45,15 +45,25 @@ async def agents(request: Request):
         
     admin_access = is_admin(request)
     agents = await discover_agents(user_id=user.get('sub'), include_background=False)
-    disabled_agents = identity_mgr.get_disabled_standard_agents()
+    disabled_agents = await asyncio.to_thread(identity_mgr.get_disabled_standard_agents)
+    # Needed for the Degraded cross-reference below -- discover_agents()'s own return
+    # shape doesn't carry allowed_tools/tool health, so this is a genuinely new read,
+    # not a duplicate of the double-bulk-fetch collapsed in core/gateway.py.
+    agent_configs = await asyncio.to_thread(identity_mgr.get_all_agent_configs)
+    tool_healths = await asyncio.to_thread(identity_mgr.get_all_health_statuses, "tool")
 
     # Enrich agents with disabled status
     for agent in agents:
         agent["is_disabled"] = agent["name"] in disabled_agents
         # This is an operational view of whether an agent is currently usable, so it
-        # shows the same cooldown-aware status (e.g. "Half-Open") that routing decisions
-        # actually honor, rather than the raw "Offline" discover_agents() returns.
-        agent["health"] = evaluate_health_status(agent.get("health") or {})
+        # shows the same cooldown-aware, tool-cross-referenced status (Half-Open /
+        # Degraded) that routing decisions and core/host.py's /health handler actually
+        # honor, rather than the raw "Offline" discover_agents() returns. Shared with
+        # core/gateway.py and core/host.py -- see core/health.py:compute_agent_operational_status.
+        cfg = agent_configs.get(agent["name"]) or {}
+        operational = compute_agent_operational_status(cfg, agent.get("health"), tool_healths)
+        agent["health"] = {**(agent.get("health") or {}), "status": operational["status"]}
+        agent["offline_tools"] = operational["offline_tools"]
 
     flash_msg = request.session.pop("flash_msg", None)
     
@@ -104,9 +114,9 @@ async def configure_agent_secrets(request: Request, agent_name: str):
     global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
     global_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
     
-    required_secrets = await get_agent_required_secrets(config)
-    required_variables = await get_agent_required_variables(config)
-    secret_groups = await get_agent_secret_groups(config)
+    required_secrets = await get_agent_required_secrets(config, strict=True)
+    required_variables = await get_agent_required_variables(config, strict=True)
+    secret_groups = await get_agent_secret_groups(config, strict=True)
     grouped_secret_keys = flatten_secret_group_keys(secret_groups)
 
     secrets_updated = False
@@ -140,15 +150,12 @@ async def toggle_agent_status(request: Request, agent_name: str):
         request.session["flash_msg"] = "Unauthorized access."
         return RedirectResponse(url='/agents', status_code=303)
         
-    disabled = identity_mgr.get_disabled_standard_agents()
-    if agent_name in disabled:
-        disabled.remove(agent_name)
-        action = "enabled"
-    else:
-        disabled.append(agent_name)
-        action = "disabled"
-        
-    identity_mgr.set_disabled_standard_agents(disabled)
+    try:
+        is_disabled = await asyncio.to_thread(identity_mgr.toggle_disabled_standard_agent, agent_name)
+    except EtcdContentionError:
+        request.session["flash_msg"] = f"Could not update agent '{agent_name}' due to concurrent changes. Please retry."
+        return RedirectResponse(url='/agents', status_code=303)
+    action = "disabled" if is_disabled else "enabled"
     request.session["flash_msg"] = f"Agent '{agent_name}' {action} successfully."
     return RedirectResponse(url='/agents', status_code=303)
 

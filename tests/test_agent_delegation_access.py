@@ -9,6 +9,7 @@ Covers:
     injecting targets with internal: True.
 """
 import asyncio
+import logging
 from types import SimpleNamespace
 from typing import Dict, Optional
 
@@ -50,6 +51,9 @@ def test_get_compiled_returns_none_for_external_false():
         "internal-worker": {"name": "internal-worker", "external": False, "internal": True},
     })
     registry = agent_factory.FrameworkAgentRegistry(fake_identity, FakeHealthMonitor())
+    registry._set_snapshot_for_testing({
+        "internal-worker": {"disabled": False, "offline": False, "external": False},
+    })
     _seed_compiled(registry, "internal-worker")
 
     assert registry.get_compiled("internal-worker") is None
@@ -60,6 +64,9 @@ def test_get_compiled_returns_compiled_for_external_true():
         "general-agent": {"name": "general-agent", "external": True, "internal": True},
     })
     registry = agent_factory.FrameworkAgentRegistry(fake_identity, FakeHealthMonitor())
+    registry._set_snapshot_for_testing({
+        "general-agent": {"disabled": False, "offline": False, "external": True},
+    })
     _seed_compiled(registry, "general-agent")
 
     assert registry.get_compiled("general-agent") is not None
@@ -210,20 +217,20 @@ def _setup_build_agent_common(monkeypatch):
     monkeypatch.setattr(memory_module, "get_memory_manager", lambda: SimpleNamespace(active_for=lambda cfg: False))
 
 
-def test_build_agent_skips_internal_false_a2a_target(monkeypatch, capsys):
+def test_build_agent_skips_internal_false_a2a_target(monkeypatch, caplog):
     _setup_build_agent_common(monkeypatch)
     monkeypatch.setattr(agent_factory, "get_identity_manager", lambda: FakeIdentityManagerA2A())
 
-    agent = asyncio.run(agent_factory.build_agent("triage-lead"))
+    with caplog.at_level(logging.WARNING, logger="core.agent_factory"):
+        agent = asyncio.run(agent_factory.build_agent("triage-lead"))
 
     subagent_caps = [c for c in agent.kwargs["capabilities"] if isinstance(c, FakeSubAgentCapability)]
     assert len(subagent_caps) == 1
     names = [sa["name"] for sa in subagent_caps[0].subagents]
     assert names == ["data-parser"]
 
-    captured = capsys.readouterr()
-    assert "front-door-bot" in captured.out
-    assert "internal=False" in captured.out
+    assert "front-door-bot" in caplog.text
+    assert "internal=False" in caplog.text
 
 
 def test_build_agent_injects_internal_true_a2a_target(monkeypatch):

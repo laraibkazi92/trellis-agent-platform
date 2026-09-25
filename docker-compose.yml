@@ -195,10 +195,17 @@ services:
   # (port 9999, for browsing banks/memories/entity graphs), plus an embedded Postgres
   # (data under /home/hindsight/.pg0). Gated at runtime by the admin 'agent_memory_enabled'
   # feature flag; agents opt in via `agent_memory: true`.
-  # NOTE: confirm env var names / ports against the pinned image tag (https://hindsight.vectorize.io).
+  # Server image tag MUST match requirements.txt's `hindsight-client` version — this is a
+  # single monorepo (github.com/vectorize-io/hindsight) that releases the Python client and
+  # this server image together under the same version number each release, and consecutive
+  # 0.8.x->0.9.x releases include real API-surface changes (e.g. knowledge-base route
+  # validation, recall response fields). Previously pinned to 0.8.1-slim against a client
+  # pinned to 0.9.1 -- a real 3-minor-version skew, not verified compatible. Confirmed via
+  # the GHCR registry (ghcr.io/v2/vectorize-io/hindsight/tags/list) that 0.9.1-slim is a
+  # real published tag matching the client pin exactly.
   # Slim variant: no bundled local ML models — relies on the Gemini API for LLM + embeddings.
   hindsight:
-    image: ghcr.io/vectorize-io/hindsight:0.8.1-slim
+    image: ghcr.io/vectorize-io/hindsight:0.9.1-slim
     container_name: hindsight
     environment:
       TZ: UTC

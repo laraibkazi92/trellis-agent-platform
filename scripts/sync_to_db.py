@@ -51,8 +51,23 @@ def sync_agent(identity_mgr, agent_dir, name=None, default_type=None):
         with open(config_path, "r") as f:
             config = yaml.safe_load(f)
             
-        if not config.get("name"):
-            config["name"] = name
+        # Registry key always wins: discover_agents()/Gateway's etcd lookups (health,
+        # config, use_agent()) are all keyed by this directory/registry name, so a
+        # config-internal name: that silently diverges from it causes a lookup miss --
+        # wrong-key decoration defaulting to "Online"/no-missing-secrets at search time,
+        # then a real failure at use_agent() invocation time (see
+        # rules_engine_hardening_plan.md §2D.3 item 1 / §2D.4a item 3). Backfilling an
+        # absent name: stays silent (the normal case); overriding a genuine mismatch is
+        # loud, not silent.
+        existing_name = config.get("name")
+        if existing_name and existing_name != name:
+            print(
+                f"  WARNING: agent '{name}' config.yaml sets name: '{existing_name}', which does not "
+                f"match its directory/registry key '{name}'. Overriding to '{name}' so discover_agents()/"
+                f"health lookups stay keyed consistently (see rules_engine_hardening_plan.md §2D.3 item 1 / "
+                f"§2D.4a item 3)."
+            )
+        config["name"] = name
         
         if "allowed_tools" not in config:
             config["allowed_tools"] = []

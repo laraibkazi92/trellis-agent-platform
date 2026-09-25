@@ -12,7 +12,7 @@ import asyncio
 import logging
 from typing import List, Dict, Any, Optional
 
-from core.auth import IdentityManager
+from core.auth import get_identity_manager
 from core.embeddings import embed_text, cosine
 from core.discovery import is_tool_configured
 
@@ -20,10 +20,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_LIMIT = int(os.getenv("TOOL_SEARCH_LIMIT", "8"))
 
-identity_mgr = IdentityManager(
-    host=os.getenv("ETCD_HOST", "127.0.0.1"),
-    port=int(os.getenv("ETCD_PORT", 2379)),
-)
+identity_mgr = get_identity_manager()
 
 
 def _keyword_rank_tools(query: str, candidates: List[Dict]) -> List[Dict]:
@@ -64,6 +61,28 @@ def _mcp_tool_parameters(input_schema: Dict) -> Dict[str, Any]:
             "required": prop_name in required,
         }
     return parameters
+
+
+def _missing_configuration_labels(status: Dict[str, Any]) -> List[str]:
+    """Shape-safe flattening of a readiness status's missing_* fields for display.
+
+    A bare string is a single label (not a character sequence); non-iterable
+    values (e.g. a malformed int) degrade to no labels instead of raising, and
+    non-string entries are stringified so the join can't fail.
+    """
+    labels: List[str] = []
+    for key in ("missing_secrets", "missing_variables"):
+        value = status.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            labels.append(value)
+            continue
+        try:
+            labels.extend(str(m) for m in value)
+        except TypeError:
+            continue
+    return labels
 
 
 async def search_tools(query: str, limit: int = DEFAULT_LIMIT, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -148,18 +167,26 @@ async def search_tools(query: str, limit: int = DEFAULT_LIMIT, user_id: Optional
 
     statuses = [None] * len(selected)
     if user_id is not None:
-        statuses = await asyncio.gather(*(is_tool_configured(c["name"], user_id) for c in selected))
+        statuses = await asyncio.gather(
+            *(is_tool_configured(c["name"], user_id) for c in selected),
+            return_exceptions=True,
+        )
 
     results = []
     for c, status in zip(selected, statuses):
         description = c["description"]
         configured = True
-        if status is not None:
-            configured = status["configured"]
-            if not configured:
-                missing = status["missing_secrets"] + status["missing_variables"]
-                missing_text = ", ".join(missing) if missing else "required configuration"
-                description = f"{description}\n\n[Missing configuration: {missing_text}. Configure at /configuration]"
+        if isinstance(status, BaseException):
+            logger.warning("Configuration check failed for tool %r: %s", c["name"], status)
+        elif status is not None:
+            if not isinstance(status, dict):
+                logger.warning("Malformed configuration status for tool %r: %r", c["name"], status)
+            else:
+                configured = bool(status.get("configured"))
+                if not configured:
+                    missing = _missing_configuration_labels(status)
+                    missing_text = ", ".join(missing) if missing else "required configuration"
+                    description = f"{description}\n\n[Missing configuration: {missing_text}. Configure at /configuration]"
         results.append({
             "name": c["name"],
             "description": description,
@@ -169,3 +196,104 @@ async def search_tools(query: str, limit: int = DEFAULT_LIMIT, user_id: Optional
             "source": c["source"],
         })
     return results
+
+
+async def is_tool_publicly_whitelisted(tool_name: str, identity_manager: Optional[Any] = None) -> bool:
+    """Authorization Guard for `use_tool`: check `public`/`public_tools` directly against
+    the tool's/MCP's own registry config, independent of `search_tools`.
+
+    Fails closed on anything unexpected (unknown tool, malformed `mcp__` name, non-`True`
+    `public` value, non-list `public_tools`) — mirrors the secure-by-default checks
+    already applied in `is_tool_configured`/`search_tools`.
+    """
+    mgr = identity_manager or identity_mgr
+    if tool_name.startswith("mcp__"):
+        parts = tool_name.split("__", 2)
+        if len(parts) != 3:
+            return False
+        _, server_name, sub_tool_name = parts
+        config = await asyncio.to_thread(mgr.get_mcp_config, server_name)
+        if not config:
+            return False
+        public_tools_raw = config.get("public_tools", [])
+        public_tools = set(public_tools_raw) if isinstance(public_tools_raw, list) else set()
+        return config.get("public") is True or sub_tool_name in public_tools
+
+    config = await asyncio.to_thread(mgr.get_tool_config, tool_name)
+    if not config:
+        return False
+    return config.get("public") is True
+
+
+async def execute_whitelisted_tool(
+    tool_name: str,
+    arguments: Dict[str, Any],
+    user_id: Optional[str],
+    *,
+    identity_manager=None,
+    is_configured=is_tool_configured,
+    get_hub_client_fn=None,
+    get_external_mcp_client_fn=None,
+) -> Any:
+    """Shared use_tool execution flow: whitelist check -> configuration check -> dispatch -> output extraction.
+
+    Returns the raw structured tool output, or a 'SYSTEM: ...' error string. Callers inject
+    their own module-level seams (`is_configured`, hub/external client getters) so existing
+    monkeypatch targets keep working; `identity_manager` defaults to this module's
+    `identity_mgr` (the `is_configured` default binds this module's name at def time).
+    """
+    mgr = identity_manager or identity_mgr
+
+    try:
+        whitelisted = await is_tool_publicly_whitelisted(tool_name, mgr)
+    except Exception as e:
+        logger.error("Error checking tool access for %r: %s", tool_name, e, exc_info=True)
+        return f"SYSTEM: Error checking tool access for '{tool_name}'. Please try again later."
+    if not whitelisted:
+        return f"SYSTEM: Access denied. Tool '{tool_name}' is internal and not exposed for direct execution."
+
+    try:
+        status = await is_configured(tool_name, user_id)
+    except Exception as e:
+        logger.error("Error checking configuration for tool %r: %s", tool_name, e, exc_info=True)
+        return f"SYSTEM: Error checking configuration for tool '{tool_name}'. Please try again later."
+    if not isinstance(status, dict):
+        logger.error("Malformed configuration status for tool %r: %r", tool_name, status)
+        return f"SYSTEM: Error checking configuration for tool '{tool_name}'. Please try again later."
+    if not status.get("configured"):
+        missing = _missing_configuration_labels(status)
+        missing_text = ", ".join(missing) if missing else "required configuration"
+        return f"SYSTEM: Tool '{tool_name}' requires configuration before it can be used. Missing: {missing_text}. Configure at /configuration"
+
+    try:
+        if tool_name.startswith("mcp__"):
+            _, server_name, sub_tool_name = tool_name.split("__", 2)
+            client = await get_external_mcp_client_fn(server_name, user_id)
+            result = await client.call_tool(sub_tool_name, arguments, raise_on_error=False)
+        else:
+            client = await get_hub_client_fn()
+            result = await client.call_tool(tool_name, {**arguments, "__user_id": user_id}, raise_on_error=False)
+    except Exception as e:
+        logger.error("Error executing tool %r: %s", tool_name, e, exc_info=True)
+        return f"SYSTEM: Error executing tool '{tool_name}'. Please try again later."
+
+    try:
+        return extract_tool_output(result)
+    except Exception as e:
+        logger.error("Error extracting output for tool %r: %s", tool_name, e, exc_info=True)
+        return f"SYSTEM: Error executing tool '{tool_name}'. Please try again later."
+
+
+def extract_tool_output(result: Any) -> Any:
+    """Unwrap a fastmcp `CallToolResult` into the raw structured value a direct caller
+    expects, preserving full stdout/JSON/error codes rather than pydantic-ai's
+    agent-facing `.content` (a list of MCP content blocks).
+    """
+    if result.data is not None:
+        return result.data
+    if result.structured_content is not None:
+        return result.structured_content
+    texts = [c.text for c in (result.content or []) if hasattr(c, "text")]
+    if texts:
+        return "\n".join(texts)
+    return None

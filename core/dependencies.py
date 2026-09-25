@@ -2,7 +2,7 @@ import os
 import re
 from fastapi.templating import Jinja2Templates
 from authlib.integrations.starlette_client import OAuth
-from core.auth import IdentityManager
+from core.auth import get_identity_manager
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -106,7 +106,4 @@ if HAS_GITHUB_AUTH:
 
 ALLOWED_DOMAINS = [d.strip().lower() for d in os.getenv("ALLOWED_DOMAINS", "").split(",") if d.strip()]
 
-identity_mgr = IdentityManager(
-    host=os.getenv("ETCD_HOST", "127.0.0.1"),
-    port=int(os.getenv("ETCD_PORT", 2379))
-)
+identity_mgr = get_identity_manager()

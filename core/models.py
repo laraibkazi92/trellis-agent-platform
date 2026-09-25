@@ -122,14 +122,34 @@ class AgentConfig(BaseModel):
     rules: List[AgentRule] = Field(default_factory=list, description="Declarative routing rules evaluated by the Trellis Rules Engine before semantic search.")
 
 
+def coerce_bool_flag(value, default: bool = True) -> bool:
+    """Normalize a raw config value (bool, YAML/string, or missing) to a real bool.
+
+    Handles legacy config.yaml values that were YAML-quoted as strings (e.g. "false")
+    instead of real booleans, so downstream checks always operate on genuine bools.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "yes", "1", "on"):
+            return True
+        if v in ("false", "no", "0", "off"):
+            return False
+        return default
+    return bool(value)
+
+
 def is_agent_external(cfg: Optional[dict]) -> bool:
     """True unless the config explicitly sets external: false. Fail-open on missing/malformed values."""
-    return (cfg or {}).get("external", True) is not False
+    return coerce_bool_flag((cfg or {}).get("external"), default=True)
 
 
 def is_agent_internal(cfg: Optional[dict]) -> bool:
     """True unless the config explicitly sets internal: false. Fail-open on missing/malformed values."""
-    return (cfg or {}).get("internal", True) is not False
+    return coerce_bool_flag((cfg or {}).get("internal"), default=True)
 
 
 BACKGROUND_AGENT_TYPES = ("background_agent", "background_script")
@@ -144,28 +164,6 @@ def is_routable_agent_type(name: str, cfg: Optional[dict]) -> bool:
     own additional filters (external/internal, disabled, offline, etc.).
     """
     return name != "supervisor" and (cfg or {}).get("type") not in BACKGROUND_AGENT_TYPES
-
-
-def coerce_bool_flag(value, default: bool = True) -> bool:
-    """Normalize a raw config value (bool, YAML/string, or missing) to a real bool.
-
-    Handles legacy config.yaml values that were YAML-quoted as strings (e.g. "false")
-    instead of real booleans, so downstream `is not False` / `is False` identity
-    checks always operate on genuine bools once a config has passed through a write path
-    that calls this.
-    """
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        v = value.strip().lower()
-        if v in ("true", "yes", "1", "on"):
-            return True
-        if v in ("false", "no", "0", "off"):
-            return False
-        return default
-    return bool(value)
 
 class MCPToolDefinition(BaseModel):
     name: str
@@ -200,3 +198,5 @@ class ToolConfig(BaseModel):
     optional_secrets: Optional[List[str]] = Field(default_factory=list, description="Secrets injected when present but not required for the tool to run.")
     variables: Optional[Union[List[str], Dict[str, List[str]]]] = Field(default_factory=list)
     secret_groups: Optional[List[Dict[str, Any]]] = Field(default_factory=list, description="UI hint for /configuration: renders a set of optional_secrets as a single card with a selector (e.g. an environment dropdown) instead of flat rows. Each group: {label, select_label, options: [{value, label, fields: [{key, label, type}]}]}.")
+    timeout_seconds: Optional[int] = Field(default=None, description="Per-tool subprocess execution timeout in seconds. Overrides the TOOL_EXECUTION_TIMEOUT env default (300s) when set. Timeouts are immediately fatal (never retried).")
+    retry_on_transient: bool = Field(default=True, description="Allow automatic retry (up to 3 attempts) when the tool fails fast with a transient network error. Set false for tools with non-idempotent side effects (creates/updates/writes) so a transient failure surfaces to the caller instead of re-executing.")

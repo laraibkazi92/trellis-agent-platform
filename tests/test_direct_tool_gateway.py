@@ -23,6 +23,7 @@ subprocess execution, no secret mutation), and skips itself automatically if the
 etcd-backed registry isn't reachable, so the rest of the suite still passes standalone.
 """
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -240,7 +241,7 @@ class TestUnconfiguredToolDiagnostics:
         assert result.startswith("SYSTEM: Tool 'opsctl' requires configuration before it can be used.")
         assert "EXAMPLE-API_PRODUCTION_PASSWORD" in result
 
-    def test_gateway_use_tool_catches_configuration_guard_exception(self, monkeypatch):
+    def test_gateway_use_tool_catches_configuration_guard_exception(self, monkeypatch, caplog):
         """Even if the configuration check itself blows up, use_tool must degrade to a
         SYSTEM error string rather than propagate — the gateway is a public entrypoint."""
         monkeypatch.setattr(gateway.identity_mgr, "get_tool_config", lambda name: {"name": name, "public": True})
@@ -251,9 +252,12 @@ class TestUnconfiguredToolDiagnostics:
         monkeypatch.setattr(gateway, "is_tool_configured", raising_is_tool_configured)
         user_id_var.set("user-1")
 
-        result = asyncio.run(gateway.use_tool(FakeContext(), "opsctl", {"args": ["--help"]}))
-        assert result.startswith("SYSTEM: Error checking configuration for tool 'opsctl'")
-        assert "etcd unreachable" in result
+        with caplog.at_level(logging.ERROR, logger="core.tool_search"):
+            result = asyncio.run(gateway.use_tool(FakeContext(), "opsctl", {"args": ["--help"]}))
+
+        assert result == "SYSTEM: Error checking configuration for tool 'opsctl'. Please try again later."
+        assert "etcd unreachable" not in result
+        assert "etcd unreachable" in caplog.text
 
     def test_search_tools_annotates_unconfigured_results_instead_of_raising(self, monkeypatch):
         _patch_search_registry(monkeypatch)

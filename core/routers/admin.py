@@ -8,17 +8,14 @@ import asyncio
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import templates, CSRFRoute
-from core.auth import IdentityManager
+from core.auth import get_identity_manager
 from core.health import HealthMonitor
 from core.models import Identity, IdentityType, is_agent_internal, coerce_bool_flag
 from core.rules_engine import RULES_EVALUATION_TIMEOUT as RULES_EVALUATION_TIMEOUT_DEFAULT
 
 router = APIRouter(route_class=CSRFRoute)
 
-identity_mgr = IdentityManager(
-    host=os.getenv("ETCD_HOST", "127.0.0.1"),
-    port=int(os.getenv("ETCD_PORT", 2379))
-)
+identity_mgr = get_identity_manager()
 health_monitor = HealthMonitor(identity_mgr)
 
 GITHUB_REPO = os.getenv("GITHUB_REPO", "") # e.g. user/repo

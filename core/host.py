@@ -31,10 +31,32 @@ from core.health import HealthMonitor, compute_agent_operational_status
 from core.background.webhooks import router as webhooks_router
 from core.tasks import run_background_agent
 
+_background_tasks: set[asyncio.Task] = set()
+
+def _spawn_background(coro, name: str) -> asyncio.Task:
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+    def _done(t: asyncio.Task):
+        _background_tasks.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            logger.error("Background task %s failed: %s", name, t.exception())
+    task.add_done_callback(_done)
+    return task
+
+async def _drain_background_tasks(timeout: float = 5.0) -> None:
+    pending = {t for t in _background_tasks if not t.done()}
+    if not pending:
+        return
+    _, still_pending = await asyncio.wait(pending, timeout=timeout)
+    for task in still_pending:
+        task.cancel()
+    if still_pending:
+        logger.warning("Cancelled %d background task(s) that did not finish within %.1fs", len(still_pending), timeout)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _main_loop, _watch_id, _agent_watch_id, _memory_watch_id
-    print("Worker starting up...")
+    logger.info("Worker starting up...")
     _main_loop = asyncio.get_running_loop()
     app.state.http_client = httpx.AsyncClient(timeout=30.0)
     _watch_id = identity_mgr.client.add_watch_prefix_callback("/registry/mcps/", on_mcp_change)
@@ -42,10 +64,11 @@ async def lifespan(app: FastAPI):
     _memory_watch_id = identity_mgr.client.add_watch_prefix_callback("/config/framework/agent_memory_enabled", on_memory_flag_change)
     await get_hub_client()
     await discover_external_mcps()
-    asyncio.create_task(prewarm_agents())
-    print("Worker startup complete.")
+    _spawn_background(prewarm_agents(), "prewarm_agents")
+    logger.info("Worker startup complete.")
     yield
-    print("Worker shutting down...")
+    logger.info("Worker shutting down...")
+    await _drain_background_tasks()
     if _watch_id:
         identity_mgr.client.cancel_watch(_watch_id)
     if _agent_watch_id:
@@ -151,7 +174,7 @@ def on_memory_flag_change(event):
 
 @app.get("/health")
 async def health():
-    disabled = identity_mgr.get_disabled_standard_agents()
+    disabled = await asyncio.to_thread(identity_mgr.get_disabled_standard_agents)
     configs = await asyncio.to_thread(identity_mgr.get_all_agent_configs)
     agent_healths = await asyncio.to_thread(identity_mgr.get_all_health_statuses, "agent")
     tool_healths = await asyncio.to_thread(identity_mgr.get_all_health_statuses, "tool")
@@ -177,7 +200,7 @@ async def chat_completions(request: ChatRequest):
     if request.model == "auto":
         request = ChatRequest(model="supervisor", messages=request.messages)
 
-    disabled = identity_mgr.get_disabled_standard_agents()
+    disabled = await asyncio.to_thread(identity_mgr.get_disabled_standard_agents)
     if request.model in disabled:
         raise HTTPException(status_code=404, detail="Agent disabled")
 
@@ -188,7 +211,8 @@ async def chat_completions(request: ChatRequest):
     if request.model != "supervisor" and not is_agent_external(cfg_data):
         raise HTTPException(status_code=403, detail=f"Access denied: Agent '{request.model}' is internal and cannot be called directly.")
 
-    if health_monitor.get_status("agent", request.model).get("status") == "Offline":
+    agent_health = await asyncio.to_thread(health_monitor.get_status, "agent", request.model)
+    if agent_health.get("status") == "Offline":
         raise HTTPException(status_code=503, detail="Agent offline")
 
     agent = await get_agent(request.model)
@@ -206,7 +230,7 @@ async def chat_completions(request: ChatRequest):
     captured_user_id = user_id_var.get()
     
     async def handle_success(result, user_id):
-        health_monitor.record_event("agent", request.model, is_success=True)
+        await asyncio.to_thread(health_monitor.record_event, "agent", request.model, True)
         if user_id and hasattr(result, 'usage'):
             u = result.usage
             if callable(u):
@@ -220,13 +244,13 @@ async def chat_completions(request: ChatRequest):
                 except Exception as e:
                     logger.error(f"Failed to record token usage for {user_id}: {e}")
         memory_mgr = get_memory_manager()
-        if memory_mgr.active_for(cfg_data):
+        if await asyncio.to_thread(memory_mgr.active_for, cfg_data):
             try:
-                asyncio.create_task(memory_mgr.retain(
+                _spawn_background(memory_mgr.retain(
                     bank=request.model,
                     user_msg=request.messages[-1].content,
                     agent_output=result.output,
-                ))
+                ), f"memory_retain:{request.model}")
             except Exception as e:
                 logger.error(f"Failed to retain memory for {request.model}: {e}")
 
@@ -282,8 +306,8 @@ async def chat_completions(request: ChatRequest):
             except Exception as e:
                 if not task.done():
                     task.cancel()
-                health_monitor.record_event("agent", request.model, is_success=False, error_details=str(e))
-                yield json.dumps({"error": str(e)}) + "\n"
+                await asyncio.to_thread(health_monitor.record_event, "agent", request.model, False, str(e))
+                yield json.dumps({"error": "Internal error while running the agent."}) + "\n"
             finally:
                 if not task.done():
                     task.cancel()
@@ -295,5 +319,6 @@ async def chat_completions(request: ChatRequest):
         await handle_success(result, captured_user_id)
         return {"choices": [{"message": {"role": "assistant", "content": result.output}}]}
     except Exception as e:
-        health_monitor.record_event("agent", request.model, is_success=False, error_details=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        await asyncio.to_thread(health_monitor.record_event, "agent", request.model, False, str(e))
+        logger.exception("Agent '%s' execution failed", request.model)
+        raise HTTPException(status_code=500, detail="Internal error while running the agent.")

@@ -1,14 +1,14 @@
 import os
 import asyncio
+import logging
 from typing import List, Dict, Optional
-from core.auth import IdentityManager
+from core.auth import get_identity_manager
 from core.models import BACKGROUND_AGENT_TYPES, Identity, IdentityType
 
-# Initialize IdentityManager locally for discovery purposes
-identity_mgr = IdentityManager(
-    host=os.getenv("ETCD_HOST", "127.0.0.1"),
-    port=int(os.getenv("ETCD_PORT", 2379))
-)
+logger = logging.getLogger(__name__)
+
+# Bind the shared IdentityManager singleton for discovery purposes
+identity_mgr = get_identity_manager()
 
 def _resolve_requirements(req_data, is_background: bool) -> List[str]:
     """Resolves requirements based on agent context (background vs standard)."""
@@ -25,112 +25,56 @@ def _resolve_requirements(req_data, is_background: bool) -> List[str]:
         return result
     return []
 
-async def get_agent_required_secrets(config: Dict) -> List[str]:
-    """Helper to determine all required secrets for an agent based on its config, tools, and MCPs."""
-    required = set()
-    is_background = config.get("type") in BACKGROUND_AGENT_TYPES
-    
-    # 1. Include secrets explicitly declared in agent/workflow config
-    if config.get("secrets"):
-        required.update(_resolve_requirements(config.get("secrets"), is_background))
-        
-    # 2. Aggregate secrets from allowed tools
-    allowed_tools = config.get("allowed_tools", [])
-    for tool_name in allowed_tools:
-        tool_config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
-        if tool_config and tool_config.get("secrets"):
-            resolved = _resolve_requirements(tool_config.get("secrets"), is_background)
-            required.update(resolved)
-        elif tool_name.startswith("mcp__"):
-            parts = tool_name.split("__")
-            if len(parts) >= 3:
-                mcp_name = parts[1]
-                mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
-                if mcp_config and mcp_config.get("secrets"):
-                    resolved = _resolve_requirements(mcp_config.get("secrets"), is_background)
-                    required.update(resolved)
-            
-    allowed_mcps = config.get("allowed_mcps", [])
-    for mcp_name in allowed_mcps:
-        mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
-        if mcp_config and mcp_config.get("secrets"):
-            resolved = _resolve_requirements(mcp_config.get("secrets"), is_background)
-            required.update(resolved)
-            
-    return sorted(list(required))
+async def get_agent_required_secrets(config: Dict, strict: bool = False) -> List[str]:
+    """Helper to determine all required secrets for an agent based on its config, tools, and MCPs.
 
-async def get_agent_optional_secrets(config: Dict) -> List[str]:
-    """Helper to determine all optional secrets for an agent's allowed MCPs.
+    Delegates to the shared :func:`_resolve_agent_requirements` algorithm via
+    :func:`_fetch_agent_tool_mcp_configs`. Fail-soft by default: failed tool/MCP
+    lookups are dropped instead of raising on the first failure -- the same
+    tolerance :func:`is_agent_configured` already had. Pass ``strict=True`` to
+    re-raise a failed tool/MCP lookup instead (preserving the pre-refactor
+    behavior); the default fails soft.
+    """
+    tool_configs, mcp_configs = await _fetch_agent_tool_mcp_configs(config, strict=strict)
+    return sorted(_resolve_agent_requirements(config, tool_configs, mcp_configs)["required_secrets"])
+
+async def get_agent_optional_secrets(config: Dict, strict: bool = False) -> List[str]:
+    """Helper to determine all optional secrets for an agent's allowed tools and MCPs.
 
     Optional secrets are informational — their absence does not block the agent
     from being configured. When present they are injected into the MCP process env.
+
+    Delegates to the shared :func:`_resolve_agent_requirements` algorithm via
+    :func:`_fetch_agent_tool_mcp_configs`. Fail-soft by default: failed tool/MCP
+    lookups are dropped instead of raising on the first failure -- the same
+    tolerance :func:`is_agent_configured` already had. Pass ``strict=True`` to
+    re-raise a failed tool/MCP lookup instead (preserving the pre-refactor
+    behavior); the default fails soft.
     """
-    optional = set()
-    is_background = config.get("type") in BACKGROUND_AGENT_TYPES
+    tool_configs, mcp_configs = await _fetch_agent_tool_mcp_configs(config, strict=strict)
+    return sorted(_resolve_agent_requirements(config, tool_configs, mcp_configs)["optional_secrets"])
 
-    allowed_mcps = config.get("allowed_mcps", [])
-    for mcp_name in allowed_mcps:
-        mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
-        if mcp_config and mcp_config.get("optional_secrets"):
-            resolved = _resolve_requirements(mcp_config.get("optional_secrets"), is_background)
-            optional.update(resolved)
-
-    allowed_tools = config.get("allowed_tools", [])
-    for tool_name in allowed_tools:
-        if tool_name.startswith("mcp__"):
-            parts = tool_name.split("__")
-            if len(parts) >= 3:
-                mcp_name = parts[1]
-                mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
-                if mcp_config and mcp_config.get("optional_secrets"):
-                    resolved = _resolve_requirements(mcp_config.get("optional_secrets"), is_background)
-                    optional.update(resolved)
-        else:
-            tool_config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
-            if tool_config and tool_config.get("optional_secrets"):
-                resolved = _resolve_requirements(tool_config.get("optional_secrets"), is_background)
-                optional.update(resolved)
-
-    return sorted(list(optional))
-
-async def get_agent_secret_groups(config: Dict) -> List[Dict]:
+async def get_agent_secret_groups(config: Dict, strict: bool = False) -> List[Dict]:
     """Helper to determine all secret-group credential sets (e.g. netctl's
     per-environment username/password dropdown) declared by an agent's
     directly-attached tools and MCPs.
 
     An ``mcp__``-prefixed ``allowed_tools`` entry resolves to its owning MCP's
     ``secret_groups``, exactly as :func:`get_agent_required_secrets` already resolves
-    that same entry's ``secrets`` -- fixed as part of Phase C (see
+    that same entry's ``secrets`` — fixed as part of Phase C (see
     ``__spec_docs/rules_engine_hardening_plan.md`` §2C.3), since this function's caller
     (``core/routers/marketplace.py``'s configure-agent save handler) is the only way a
     user can satisfy a secret_groups requirement that :func:`is_agent_configured`/
-    :func:`discover_agents` now (correctly, post-Phase-C) gate on; before this fix, an
-    agent referencing such an MCP only via ``allowed_tools`` (not ``allowed_mcps``)
-    would be reported "not configured" with no way to ever configure it, since the
-    save handler could never see that group's fields to persist.
+    :func:`discover_agents` now (correctly, post-Phase-C) gate on.
+
+    Resolves via the shared :func:`_resolve_agent_requirements` helper. Fail-soft by
+    default: failed tool/MCP lookups are dropped instead of raising on the first
+    failure -- the same tolerance :func:`is_agent_configured` already had. Pass
+    ``strict=True`` to re-raise a failed tool/MCP lookup instead (preserving the
+    pre-refactor behavior); the default fails soft.
     """
-    groups: List[Dict] = []
-
-    allowed_tools = config.get("allowed_tools", [])
-    for tool_name in allowed_tools:
-        if tool_name.startswith("mcp__"):
-            parts = tool_name.split("__")
-            if len(parts) >= 3:
-                mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, parts[1])
-                if mcp_config and mcp_config.get("secret_groups"):
-                    groups.extend(mcp_config.get("secret_groups"))
-            continue
-        tool_config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
-        if tool_config and tool_config.get("secret_groups"):
-            groups.extend(tool_config.get("secret_groups"))
-
-    allowed_mcps = config.get("allowed_mcps", [])
-    for mcp_name in allowed_mcps:
-        mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
-        if mcp_config and mcp_config.get("secret_groups"):
-            groups.extend(mcp_config.get("secret_groups"))
-
-    return groups
+    tool_configs, mcp_configs = await _fetch_agent_tool_mcp_configs(config, strict=strict)
+    return _resolve_agent_requirements(config, tool_configs, mcp_configs)["secret_groups"]
 
 def flatten_secret_group_keys(secret_groups: List[Dict]) -> set:
     """Flattens a list of secret_groups into the set of underlying secret keys."""
@@ -167,39 +111,18 @@ def _unsatisfied_secret_group_keys(secret_groups: List[Dict], available_secrets:
                         missing.append(field["key"])
     return missing
 
-async def get_agent_required_variables(config: Dict) -> List[str]:
-    """Helper to determine all required non-sensitive variables for an agent based on its config, tools, and MCPs."""
-    required = set()
-    is_background = config.get("type") in BACKGROUND_AGENT_TYPES
-    
-    # 1. Include variables explicitly declared in agent/workflow config
-    if config.get("variables"):
-        required.update(_resolve_requirements(config.get("variables"), is_background))
+async def get_agent_required_variables(config: Dict, strict: bool = False) -> List[str]:
+    """Helper to determine all required non-sensitive variables for an agent based on its config, tools, and MCPs.
 
-    # 2. Aggregate variables from allowed tools
-    allowed_tools = config.get("allowed_tools", [])
-    for tool_name in allowed_tools:
-        tool_config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
-        if tool_config and tool_config.get("variables"):
-            resolved = _resolve_requirements(tool_config.get("variables"), is_background)
-            required.update(resolved)
-        elif tool_name.startswith("mcp__"):
-            parts = tool_name.split("__")
-            if len(parts) >= 3:
-                mcp_name = parts[1]
-                mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
-                if mcp_config and mcp_config.get("variables"):
-                    resolved = _resolve_requirements(mcp_config.get("variables"), is_background)
-                    required.update(resolved)
-            
-    allowed_mcps = config.get("allowed_mcps", [])
-    for mcp_name in allowed_mcps:
-        mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
-        if mcp_config and mcp_config.get("variables"):
-            resolved = _resolve_requirements(mcp_config.get("variables"), is_background)
-            required.update(resolved)
-            
-    return sorted(list(required))
+    Delegates to the shared :func:`_resolve_agent_requirements` algorithm via
+    :func:`_fetch_agent_tool_mcp_configs`. Fail-soft by default: failed tool/MCP
+    lookups are dropped instead of raising on the first failure -- the same
+    tolerance :func:`is_agent_configured` already had. Pass ``strict=True`` to
+    re-raise a failed tool/MCP lookup instead (preserving the pre-refactor
+    behavior); the default fails soft.
+    """
+    tool_configs, mcp_configs = await _fetch_agent_tool_mcp_configs(config, strict=strict)
+    return sorted(_resolve_agent_requirements(config, tool_configs, mcp_configs)["required_variables"])
 
 def _resolve_agent_requirements(
     config: Dict,
@@ -309,7 +232,7 @@ def _evaluate_agent_configuration(
     }
 
 
-async def _fetch_agent_tool_mcp_configs(config: Dict) -> "tuple[Dict[str, Dict], Dict[str, Dict]]":
+async def _fetch_agent_tool_mcp_configs(config: Dict, strict: bool = False) -> "tuple[Dict[str, Dict], Dict[str, Dict]]":
     """Fetch just the tool/mcp configs this one agent's ``allowed_tools``/``allowed_mcps``
     reference, keyed the same way :func:`discover_agents`'s bulk
     ``all_tool_configs``/``all_mcp_configs`` are -- so both can be handed to the same
@@ -317,7 +240,7 @@ async def _fetch_agent_tool_mcp_configs(config: Dict) -> "tuple[Dict[str, Dict],
     this is the single-agent path, called from a point-of-use context where fetching
     the entire catalog's tool/mcp configs would be wasted work.
     """
-    tool_configs: Dict[str, Dict] = {}
+    direct_tools: List[str] = []
     mcp_names = set(config.get("allowed_mcps", []))
 
     for tool_name in config.get("allowed_tools", []):
@@ -326,20 +249,41 @@ async def _fetch_agent_tool_mcp_configs(config: Dict) -> "tuple[Dict[str, Dict],
             if len(parts) >= 3:
                 mcp_names.add(parts[1])
             continue
-        tool_config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
-        if tool_config:
-            tool_configs[tool_name] = tool_config
+        direct_tools.append(tool_name)
+
+    tool_configs: Dict[str, Dict] = {}
+    if direct_tools:
+        tool_results = await asyncio.gather(
+            *(asyncio.to_thread(identity_mgr.get_tool_config, t) for t in direct_tools),
+            return_exceptions=True,
+        )
+        for t_name, t_cfg in zip(direct_tools, tool_results):
+            if isinstance(t_cfg, BaseException):
+                if strict:
+                    raise t_cfg
+                logger.warning("Dropping failed %s config lookup for %r: %s", "tool", t_name, t_cfg)
+            elif t_cfg:
+                tool_configs[t_name] = t_cfg
 
     mcp_configs: Dict[str, Dict] = {}
-    for mcp_name in mcp_names:
-        mcp_config = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
-        if mcp_config:
-            mcp_configs[mcp_name] = mcp_config
+    if mcp_names:
+        sorted_mcps = sorted(mcp_names)
+        mcp_results = await asyncio.gather(
+            *(asyncio.to_thread(identity_mgr.get_mcp_config, m) for m in sorted_mcps),
+            return_exceptions=True,
+        )
+        for m_name, m_cfg in zip(sorted_mcps, mcp_results):
+            if isinstance(m_cfg, BaseException):
+                if strict:
+                    raise m_cfg
+                logger.warning("Dropping failed %s config lookup for %r: %s", "mcp", m_name, m_cfg)
+            elif m_cfg:
+                mcp_configs[m_name] = m_cfg
 
     return tool_configs, mcp_configs
 
 
-async def is_agent_configured(agent_name: str, user_id: str) -> Dict:
+async def is_agent_configured(agent_name: str, user_id: Optional[str] = None) -> Dict:
     """Check if a specific agent is configured for a user.
 
     Returns a dict with keys:
@@ -361,8 +305,10 @@ async def is_agent_configured(agent_name: str, user_id: str) -> Dict:
     resolved = _resolve_agent_requirements(config, tool_configs, mcp_configs)
 
     system_identity = Identity(id="system", type=IdentityType.SYSTEM)
-    global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
-    global_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
+    global_secrets, global_variables = await asyncio.gather(
+        asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets"),
+        asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables"),
+    )
 
     grouped_keys = flatten_secret_group_keys(resolved["secret_groups"])
     user_required_secrets = [s for s in resolved["required_secrets"] if s not in global_secrets and s not in grouped_keys]
@@ -378,10 +324,21 @@ async def is_agent_configured(agent_name: str, user_id: str) -> Dict:
     if not user_required_secrets and not user_required_variables and not user_optional_secrets and not resolved["secret_groups"]:
         return {"configured": True, "missing_secrets": [], "missing_variables": [], "optional_missing_secrets": []}
 
-    identity = Identity.from_string(user_id) if not is_background else Identity(id=agent_name, type=IdentityType.WORKFLOW)
+    if is_background:
+        identity = Identity(id=agent_name, type=IdentityType.WORKFLOW)
+    elif user_id:
+        identity = Identity.from_string(user_id)
+    else:
+        identity = None
 
-    ident_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "secrets")
-    ident_variables = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "variables")
+    if identity:
+        ident_secrets, ident_variables = await asyncio.gather(
+            asyncio.to_thread(identity_mgr.get_identity_config, identity, "secrets"),
+            asyncio.to_thread(identity_mgr.get_identity_config, identity, "variables"),
+        )
+    else:
+        ident_secrets = {}
+        ident_variables = {}
 
     # Pass the raw (unfiltered) resolved requirements plus the real global dicts --
     # `_evaluate_agent_configuration` does its own global/grouped-key exclusion, so
@@ -406,15 +363,34 @@ async def is_agent_configured(agent_name: str, user_id: str) -> Dict:
         "optional_missing_secrets": evaluated["optional_missing_secrets"],
     }
 
-async def discover_agents(user_id: Optional[str] = None, include_background: bool = False) -> List[Dict]:
-    """Scan etcd registry for agents using optimized bulk fetching."""
+async def discover_agents(
+    user_id: Optional[str] = None,
+    include_background: bool = False,
+    agent_configs: Optional[Dict[str, Dict]] = None,
+    agent_health: Optional[Dict[str, Dict]] = None,
+) -> List[Dict]:
+    """Scan etcd registry for agents using optimized bulk fetching.
+
+    ``agent_configs``/``agent_health`` may be passed in by a caller that already did
+    this exact bulk fetch for its own purposes (e.g. ``core/gateway.py``'s
+    ``_get_visible_agents()``, which also needs them directly to compute per-agent
+    operational status) -- this avoids fetching the whole catalog's configs/health
+    twice in the same request. Fetched internally, as before, when omitted.
+
+    Background agents' per-identity secrets/variables are prefetched concurrently
+    before the scan loop; if either fetch fails for an identity, both fall back to
+    ``{}`` for that identity (fail-soft -- the legacy per-agent awaits propagated
+    the exception).
+    """
     agents = []
-    
+
     # Bulk fetch everything needed for agents
-    agent_configs = await asyncio.to_thread(identity_mgr.get_all_agent_configs)
+    if agent_configs is None:
+        agent_configs = await asyncio.to_thread(identity_mgr.get_all_agent_configs)
+    if agent_health is None:
+        agent_health = await asyncio.to_thread(identity_mgr.get_all_health_statuses, "agent")
     agent_skills = await asyncio.to_thread(identity_mgr.get_all_agent_skills)
-    agent_health = await asyncio.to_thread(identity_mgr.get_all_health_statuses, "agent")
-    
+
     system_identity = Identity(id="system", type=IdentityType.SYSTEM)
     # Cache global secrets and variables once per discovery
     global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
@@ -431,6 +407,32 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
     # Pre-fetch tool and MCP configs to speed up secret resolution
     all_tool_configs = await asyncio.to_thread(identity_mgr.get_all_tool_configs)
     all_mcp_configs = await asyncio.to_thread(identity_mgr.get_all_mcp_configs)
+
+    bg_config_secrets: Dict[str, Dict] = {}
+    bg_config_variables: Dict[str, Dict] = {}
+    if include_background:
+        bg_identities = [
+            Identity(id=n, type=IdentityType.WORKFLOW)
+            for n, c in agent_configs.items()
+            if n != "supervisor" and c.get("type") in BACKGROUND_AGENT_TYPES
+        ]
+        if bg_identities:
+            identity_results = await asyncio.gather(
+                *(asyncio.gather(
+                    asyncio.to_thread(identity_mgr.get_identity_config, ident, "secrets"),
+                    asyncio.to_thread(identity_mgr.get_identity_config, ident, "variables"),
+                ) for ident in bg_identities),
+                return_exceptions=True,
+            )
+            for ident, result in zip(bg_identities, identity_results):
+                if isinstance(result, BaseException):
+                    logger.warning("Dropping failed identity lookup for %r: %s", ident.id, result)
+                    bg_config_secrets[ident.id] = {}
+                    bg_config_variables[ident.id] = {}
+                    continue
+                s, v = result
+                bg_config_secrets[ident.id] = {} if not s else s
+                bg_config_variables[ident.id] = {} if not v else v
 
     for name, config in agent_configs.items():
         if name == "supervisor":
@@ -455,11 +457,8 @@ async def discover_agents(user_id: Optional[str] = None, include_background: boo
         current_config_variables = {}
 
         if is_background:
-            # We still might need to fetch individual workflow configs if they aren't standard agents,
-            # but usually they are in the same registry.
-            agent_identity = Identity(id=name, type=IdentityType.WORKFLOW)
-            current_config_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, agent_identity, "secrets")
-            current_config_variables = await asyncio.to_thread(identity_mgr.get_identity_config, agent_identity, "variables")
+            current_config_secrets = bg_config_secrets.get(name, {})
+            current_config_variables = bg_config_variables.get(name, {})
         else:
             current_config_secrets = human_user_secrets
             current_config_variables = human_user_variables

@@ -21,8 +21,8 @@ import asyncio
 import logging
 from typing import List, Dict, Optional, Set, Tuple
 
-from core.auth import IdentityManager, user_id_var
-from core.discovery import discover_agents
+from core.auth import get_identity_manager, user_id_var
+from core.discovery import is_agent_configured
 from core.embeddings import embed_text, cosine
 from core.health import evaluate_health_status
 from core.models import is_agent_external, is_routable_agent_type
@@ -32,10 +32,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_LIMIT = int(os.getenv("AGENT_SEARCH_LIMIT", "8"))
 
-identity_mgr = IdentityManager(
-    host=os.getenv("ETCD_HOST", "127.0.0.1"),
-    port=int(os.getenv("ETCD_PORT", 2379)),
-)
+identity_mgr = get_identity_manager()
 
 
 def _keyword_rank(query: str, candidates: List[Dict]) -> List[Dict]:
@@ -126,14 +123,10 @@ async def _resolve_rule_lock(
         routing_rules_doc = await asyncio.to_thread(identity_mgr.get_routing_rules)
         global_rules = (routing_rules_doc or {}).get("global_rules", [])
 
-        # Cheap pre-check against configs already fetched by the caller, before paying
-        # for the bulk discover_agents() configuration-readiness resolve below -- the
-        # common case (no rules authored anywhere) should never pay that cost.
+        # Cheap pre-check against configs already fetched by the caller -- the
+        # common case (no rules authored anywhere) should never pay any evaluation cost.
         if not global_rules and not any(cfg.get("rules") for cfg in configs.values()):
             return None, None
-
-        discovered = await discover_agents(user_id=user_id_var.get())
-        configured_agents = {a["name"]: a.get("is_configured", True) for a in discovered}
 
         eligible_agents = filter_eligible_agents(configs, disabled)
         rule_result = await evaluate_rules(query, global_rules, eligible_agents)
@@ -150,7 +143,12 @@ async def _resolve_rule_lock(
         evaluated_status = evaluated.get("status", "Online")
         if evaluated_status == "Offline":
             return None, {"name": matched_name, "reason": "offline", "reason_status": "Offline"}
-        if configured_agents.get(matched_name) is False:
+
+        # Configuration readiness is checked ONLY after a confident match occurs and
+        # the matched agent is not offline. Targeted single-agent evaluation via
+        # is_agent_configured avoids a whole-catalog discover_agents scan.
+        status_dict = await is_agent_configured(matched_name, user_id=user_id_var.get())
+        if status_dict.get("configured") is False:
             return None, {"name": matched_name, "reason": "not configured", "reason_status": "Unconfigured"}
 
         return {
@@ -191,20 +189,32 @@ async def search_agents(query: str, limit: int = DEFAULT_LIMIT, include_disabled
     readable by a caller that only looks at ``description``, ignoring this flag.
     """
     configs = await asyncio.to_thread(identity_mgr.get_all_agent_configs)
-    embeddings = await asyncio.to_thread(identity_mgr.get_all_agent_embeddings)
     disabled = set(await asyncio.to_thread(identity_mgr.get_disabled_standard_agents))
     try:
         health = await asyncio.to_thread(identity_mgr.get_all_health_statuses, "agent")
     except Exception:
         health = {}
 
-    candidates = _build_candidates(configs, embeddings, disabled, health, include_disabled)
-    if not candidates:
+    # Quick check: are there any external routable candidates?
+    has_routable = any(
+        is_routable_agent_type(name, cfg) and is_agent_external(cfg) and (include_disabled or name not in disabled)
+        for name, cfg in configs.items()
+    )
+    if not has_routable:
         return []
 
     locked, unavailable_note = await _resolve_rule_lock(query, configs, health, disabled)
     if locked:
         return [locked]
+
+    # Defer embeddings fetch until semantic fallback is actually needed
+    embeddings = await asyncio.to_thread(identity_mgr.get_all_agent_embeddings)
+    candidates = _build_candidates(configs, embeddings, disabled, health, include_disabled)
+
+    if unavailable_note:
+        # The unavailable matched agent should not appear in the ranked fallback alternatives
+        # beneath the note that explicitly announces it is unavailable and shows next-best alternatives.
+        candidates = [c for c in candidates if c["name"] != unavailable_note["name"]]
 
     ranked = await _rank_candidates(query, candidates)
     selected = ranked if limit is None or limit <= 0 else ranked[:limit]

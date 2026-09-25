@@ -1,23 +1,26 @@
 import json
 import os
+import logging
 import httpx
 import yaml
 import asyncio
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import uvicorn
 import aiofiles
 from contextlib import asynccontextmanager
 from fastmcp import FastMCP, Context
-from mcp.types import TextContent, ToolAnnotations
-from core.auth import AuthMiddleware, IdentityManager, auth_token_var, user_id_var
+from mcp.types import ToolAnnotations
+from core.auth import AuthMiddleware, get_identity_manager, auth_token_var, user_id_var
 from fastapi.middleware.cors import CORSMiddleware
 from core.discovery import discover_agents, is_agent_configured, is_tool_configured
 from core.agent_search import search_agents as _search_agents_ranked, DEFAULT_LIMIT as AGENT_SEARCH_LIMIT
-from core.tool_search import search_tools as _search_tools_ranked, DEFAULT_LIMIT as TOOL_SEARCH_LIMIT
+from core.tool_search import search_tools as _search_tools_ranked, DEFAULT_LIMIT as TOOL_SEARCH_LIMIT, execute_whitelisted_tool
 from core.agent_factory import get_hub_client, get_external_mcp_client
 from core.models import is_agent_external, is_routable_agent_type
 from core.health import compute_agent_operational_status
+
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app):
@@ -52,10 +55,7 @@ BASE_DIR = Path(__file__).parent.parent
 AGENTS_DIR = BASE_DIR / "agents"
 HOST_URL = os.getenv("HOST_URL", "http://localhost:8000")
 
-identity_mgr = IdentityManager(
-    host=os.getenv("ETCD_HOST", "127.0.0.1"),
-    port=int(os.getenv("ETCD_PORT", 2379))
-)
+identity_mgr = get_identity_manager()
 
 async def get_agent_description(config: dict, skills_path: Path) -> str:
     """Extracts description from config.yaml or the first paragraph of the skills.md file."""
@@ -73,7 +73,114 @@ async def get_agent_description(config: dict, skills_path: Path) -> str:
         pass
     return "No description available."
 
-async def _get_visible_agents() -> List[Dict]:
+async def _check_host_liveness_error() -> Optional[Dict]:
+    try:
+        if hasattr(app, "state") and hasattr(app.state, "http_client"):
+            resp = await app.state.http_client.get(f"{HOST_URL}/health", timeout=5.0)
+        else:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(f"{HOST_URL}/health", timeout=5.0)
+        if resp.status_code != 200:
+            return {"name": "Error", "description": f"Host API unreachable (HTTP {resp.status_code})"}
+    except Exception as e:
+        logger.error(f"Error checking Host liveness: {e}", exc_info=True)
+        return {"name": "Error", "description": "Host API temporarily unreachable. Please try again later."}
+    return None
+
+async def _decorate_visible_subset(
+    names: List[str],
+    user_id: Optional[str],
+    disabled_agents,
+    agent_configs: Dict,
+    agent_healths: Dict,
+    tool_healths: Dict,
+) -> List[Dict]:
+    """Ranked-subset-only decoration path (no catalog discovery, bulk skills, or
+    identity-secret fetches). Names failing the catalog checks are omitted. Per-name
+    readiness failures fail open with ``configured=True``, and skills for agents with
+    empty config descriptions are fetched concurrently with per-name fail-soft: one
+    agent's skills-fetch exception no longer bubbles to the caller's ``Failed to verify
+    agent configurations`` sentinel and instead falls back to
+    ``"No description available."`` for that name only.
+    """
+    surviving = []
+    for name in names:
+        cfg = agent_configs.get(name)
+        if not cfg:
+            continue
+        if name in disabled_agents:
+            continue
+        if not is_routable_agent_type(name, cfg):
+            continue
+        if not is_agent_external(cfg):
+            continue
+        surviving.append(name)
+
+    if not surviving:
+        return []
+
+    statuses = await asyncio.gather(
+        *(is_agent_configured(n, user_id) for n in surviving),
+        return_exceptions=True,
+    )
+
+    needs_skills = [name for name in surviving if not (agent_configs.get(name) or {}).get("description")]
+    skills_by_name: Dict[str, str] = {}
+    if needs_skills:
+        skill_results = await asyncio.gather(
+            *(asyncio.to_thread(identity_mgr.get_agent_skills, n) for n in needs_skills),
+            return_exceptions=True,
+        )
+        for name, skills in zip(needs_skills, skill_results):
+            if isinstance(skills, Exception):
+                logger.warning(f"Error fetching skills for agent '{name}': {skills}")
+            elif isinstance(skills, str) and skills:
+                skills_by_name[name] = skills
+
+    agents = []
+    for name, status in zip(surviving, statuses):
+        cfg = agent_configs.get(name) or {}
+        description = cfg.get("description")
+        if not description:
+            skills = skills_by_name.get(name)
+            paragraphs = [p.strip() for p in (skills or "").split("\n\n") if p.strip() and not p.strip().startswith("#")]
+            if paragraphs:
+                description = paragraphs[0]
+        if not description:
+            description = "No description available."
+
+        if isinstance(status, Exception) or not isinstance(status, dict):
+            logger.warning(f"Error checking configuration for agent '{name}': {status}")
+            configured = True
+        else:
+            configured = status.get("configured", True)
+            if not configured:
+                missing = []
+                if status.get("missing_secrets"):
+                    missing.append(f"secrets: {', '.join(status['missing_secrets'])}")
+                if status.get("missing_variables"):
+                    missing.append(f"variables: {', '.join(status['missing_variables'])}")
+                config_note = f" [NOT CONFIGURED — missing {'; '.join(missing)}. Configure at /agents/{name}/configure]" if missing else f" [NOT CONFIGURED — configure at /agents/{name}/configure]"
+                description += config_note
+
+        if configured:
+            operational = compute_agent_operational_status(cfg, agent_healths.get(name), tool_healths)
+            status_str = operational["status"]
+            if status_str == "Offline":
+                description += " [STATUS: OFFLINE - DO NOT ROUTE REQUESTS HERE]"
+                configured = False
+            elif status_str == "Degraded":
+                description += f" [STATUS: DEGRADED - Offline tools: {', '.join(operational['offline_tools'])}]"
+
+        agents.append({
+            "name": name,
+            "description": description,
+            "configured": configured,
+        })
+
+    return agents
+
+async def _get_visible_agents(names: Optional[List[str]] = None) -> List[Dict]:
     """Internal: agents visible to the current user, with health-decorated descriptions.
 
     Applies the same filtering the old public ``list_agents`` tool did (disabled /
@@ -86,39 +193,65 @@ async def _get_visible_agents() -> List[Dict]:
     from etcd via the same Phase A/B/C shared helpers Host's own ``/health`` handler
     uses (``is_routable_agent_type``, ``is_agent_external``, ``discover_agents``'s
     configuration-readiness fields, ``evaluate_health_status``). A cheap
-    status-code-only ping to Host's ``/health`` is still done first, purely as a
-    liveness gate: Host and Gateway are separate processes, and if Host is down that
-    must still fail loudly and immediately here, exactly as before — only the JSON
-    body is no longer parsed or depended on.
+    status-code-only ping to Host's ``/health`` is still done, purely as a liveness
+    gate: Host and Gateway are separate processes, and if Host is down that must still
+    fail loudly and clearly here, exactly as before — only the JSON body is no longer
+    parsed or depended on.
+
+    The bulk etcd fetch below (``agent_configs``/``agent_healths``) runs once and is
+    handed into ``discover_agents()`` instead of each doing its own independent bulk
+    fetch of the same whole-catalog data — this used to be two non-atomic snapshots of
+    overlapping etcd state per call (see rules_engine_hardening_plan.md §2D.4a's "double
+    bulk-fetch" note); collapsing it to one also means this etcd read now happens before
+    the Host liveness ping rather than after. That reorder is benign: if etcd itself is
+    down, the previous code already surfaced that via ``discover_agents()``'s own
+    internal fetch failing *before* the liveness ping ever ran (``discover_agents()`` was
+    already the first thing this function did), so "etcd down" was never actually
+    guaranteed to be caught by the liveness check first. The only observable difference
+    is the exact error string returned when Host is unreachable but etcd is fine (a few
+    extra etcd reads now happen first) — every failure path still returns the same
+    ``[{"name": "Error", ...}]`` shape immediately, with no partial/decorated data ever
+    returned.
+
+    When ``names`` is provided, only those agents are decorated — the cheap ranked-subset
+    path used by ``search_agents``: it skips ``discover_agents``, the bulk skills fetch,
+    and identity secret fetches entirely. Names failing the catalog checks (unknown,
+    disabled, non-routable, internal) are omitted; the caller's "decorate, never
+    re-exclude" fallback handles them. A per-agent ``is_agent_configured`` failure fails
+    open with ``configured=True`` rather than returning the all-or-nothing Error sentinel.
     """
     user_id = user_id_var.get()
 
     try:
-        discovered_agents = await discover_agents(user_id=user_id)
-    except Exception as e:
-        print(f"Error checking agent configurations: {e}")
-        return [{"name": "Error", "description": f"Failed to verify agent configurations: {e}"}]
-
-    try:
-        if hasattr(app, "state") and hasattr(app.state, "http_client"):
-            resp = await app.state.http_client.get(f"{HOST_URL}/health", timeout=5.0)
-        else:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(f"{HOST_URL}/health", timeout=5.0)
-        if resp.status_code != 200:
-            return [{"name": "Error", "description": f"Host API unreachable (HTTP {resp.status_code})"}]
-    except Exception as e:
-        print(f"Error checking Host liveness: {e}")
-        return [{"name": "Error", "description": f"Host API unreachable ({str(e)})"}]
-
-    try:
-        disabled_agents = identity_mgr.get_disabled_standard_agents()
+        disabled_agents = await asyncio.to_thread(identity_mgr.get_disabled_standard_agents)
         agent_configs = await asyncio.to_thread(identity_mgr.get_all_agent_configs)
         agent_healths = await asyncio.to_thread(identity_mgr.get_all_health_statuses, "agent")
         tool_healths = await asyncio.to_thread(identity_mgr.get_all_health_statuses, "tool")
     except Exception as e:
-        print(f"Error computing agent status from etcd: {e}")
-        return [{"name": "Error", "description": f"Failed to compute agent status: {e}"}]
+        logger.error(f"Error computing agent status from etcd: {e}", exc_info=True)
+        return [{"name": "Error", "description": "Failed to compute agent status. Please try again later."}]
+
+    if names is not None:
+        liveness_error = await _check_host_liveness_error()
+        if liveness_error:
+            return [liveness_error]
+        try:
+            return await _decorate_visible_subset(
+                names, user_id, disabled_agents, agent_configs, agent_healths, tool_healths
+            )
+        except Exception as e:
+            logger.error(f"Error decorating ranked agent subset: {e}", exc_info=True)
+            return [{"name": "Error", "description": "Failed to verify agent configurations. Please try again later."}]
+
+    try:
+        discovered_agents = await discover_agents(user_id=user_id, agent_configs=agent_configs, agent_health=agent_healths)
+    except Exception as e:
+        logger.error(f"Error checking agent configurations: {e}", exc_info=True)
+        return [{"name": "Error", "description": "Failed to verify agent configurations. Please try again later."}]
+
+    liveness_error = await _check_host_liveness_error()
+    if liveness_error:
+        return [liveness_error]
 
     agents = []
 
@@ -148,7 +281,7 @@ async def _get_visible_agents() -> List[Dict]:
                 missing.append(f"secrets: {', '.join(agent_dict['missing_secrets'])}")
             if agent_dict.get("missing_variables"):
                 missing.append(f"variables: {', '.join(agent_dict['missing_variables'])}")
-            config_note = f" [NOT CONFIGURED — missing {'; '.join(missing)}. Configure at /agents/{agent_name}/configure]" if missing else " [NOT CONFIGURED — configure at /agents/{agent_name}/configure]"
+            config_note = f" [NOT CONFIGURED — missing {'; '.join(missing)}. Configure at /agents/{agent_name}/configure]" if missing else f" [NOT CONFIGURED — configure at /agents/{agent_name}/configure]"
             description += config_note
         else:
             # Shared with core/host.py's /health handler -- see
@@ -158,6 +291,7 @@ async def _get_visible_agents() -> List[Dict]:
             status = operational["status"]
             if status == "Offline":
                 description += " [STATUS: OFFLINE - DO NOT ROUTE REQUESTS HERE]"
+                is_configured = False
             elif status == "Degraded":
                 description += f" [STATUS: DEGRADED - Offline tools: {', '.join(operational['offline_tools'])}]"
 
@@ -205,7 +339,7 @@ async def search_agents(ctx: Context, query: str, limit: int = AGENT_SEARCH_LIMI
         return []
 
     await ctx.report_progress(1, 2, message="Annotating results...")
-    visible = await _get_visible_agents()
+    visible = await _get_visible_agents(names=[r["name"] for r in ranked])
     if len(visible) == 1 and visible[0].get("name") == "Error":
         # Host is unreachable or etcd decoration failed -- surface that clearly rather
         # than silently falling back to undecorated ranked results.
@@ -223,13 +357,14 @@ async def search_agents(ctx: Context, query: str, limit: int = AGENT_SEARCH_LIMI
             # why the routing-policy match was skipped. The matched agent's own name
             # still resolves in `visible` (it isn't disabled/internal/background), so
             # naively decorating this the same way as a real candidate would silently
-            # overwrite that sentence with the agent's own catalog description. Only
-            # the `configured` flag is taken from the lookup; the description is left
-            # untouched.
+            # overwrite that sentence with the agent's own catalog description. Because
+            # the agent is currently unavailable (offline or not configured), its
+            # `configured` flag is set to False so MCP clients and LLMs never attempt
+            # to route requests to it.
             results.append({
                 "name": r["name"],
                 "description": r["description"],
-                "configured": agent.get("configured", True) if agent else True,
+                "configured": False,
             })
         elif agent:
             results.append({
@@ -245,7 +380,7 @@ async def search_agents(ctx: Context, query: str, limit: int = AGENT_SEARCH_LIMI
             results.append({
                 "name": r["name"],
                 "description": r["description"],
-                "configured": True,
+                "configured": False if r.get("status") == "Offline" else True,
             })
 
     names = [r["name"] for r in results]
@@ -288,8 +423,8 @@ async def use_agent(ctx: Context, agent_name: str, prompt: str) -> str:
                 parts.append(f"Configure it at: /agents/{agent_name}/configure")
                 return " ".join(parts)
         except Exception as e:
-            print(f"Error checking agent configuration for '{agent_name}': {e}")
-            return f"SYSTEM: Error checking agent configuration for '{agent_name}': {e}"
+            logger.error(f"Error checking agent configuration for '{agent_name}': {e}", exc_info=True)
+            return f"SYSTEM: Error checking agent configuration for '{agent_name}'. Please try again later."
 
     headers = {}
     if token:
@@ -324,7 +459,7 @@ async def use_agent(ctx: Context, agent_name: str, prompt: str) -> str:
                         elif "error" in data:
                             return f"SYSTEM: Agent '{agent_name}' execution failed: {data['error']}"
                     except json.JSONDecodeError as e:
-                        print(f"Warning: Failed to parse JSON from agent stream: {e}. Raw line: {line}")
+                        logger.warning(f"Failed to parse JSON from agent stream: {e}. Raw line: {line}")
             return f"SYSTEM: Agent '{agent_name}' returned no content."
 
         if hasattr(app, "state") and hasattr(app.state, "http_client"):
@@ -341,58 +476,12 @@ async def use_agent(ctx: Context, agent_name: str, prompt: str) -> str:
             return f"SYSTEM: The agent '{agent_name}' is currently offline due to technical failures and cannot process requests."
         if e.response.status_code == 404:
             return f"SYSTEM: The agent '{agent_name}' was not found or is disabled."
-        return f"SYSTEM: Error calling agent '{agent_name}': {e.response.text}"
+        error_body = e.response.text[:2048]
+        logger.error(f"Error calling agent '{agent_name}' (HTTP {e.response.status_code}): {error_body}", exc_info=True)
+        return f"SYSTEM: Error calling agent '{agent_name}'. Please try again later."
     except Exception as e:
-        return f"SYSTEM: Failed to connect to agent '{agent_name}': {str(e)}"
-
-async def _is_tool_publicly_whitelisted(tool_name: str) -> bool:
-    """Authorization Guard for `use_tool`: check `public`/`public_tools` directly against
-    the tool's/MCP's own registry config, independent of `search_tools`. This must not
-    assume every whitelisted tool was necessarily discoverable via search — an MCP server
-    without a static `tools:` list in its `mcp.yaml` never surfaces in `search_tools`
-    output even once marked public (see core/tool_search.py), but its whitelisted tools
-    must still be directly executable here.
-
-    Fails closed on anything unexpected (unknown tool, malformed `mcp__` name, non-`True`
-    `public` value, non-list `public_tools`) — mirrors the secure-by-default checks
-    already applied in `is_tool_configured`/`search_tools`.
-    """
-    if tool_name.startswith("mcp__"):
-        parts = tool_name.split("__", 2)
-        if len(parts) != 3:
-            return False
-        _, server_name, sub_tool_name = parts
-        config = await asyncio.to_thread(identity_mgr.get_mcp_config, server_name)
-        if not config:
-            return False
-        public_tools_raw = config.get("public_tools", [])
-        public_tools = set(public_tools_raw) if isinstance(public_tools_raw, list) else set()
-        return config.get("public") is True or sub_tool_name in public_tools
-
-    config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
-    if not config:
-        return False
-    return config.get("public") is True
-
-
-def _extract_tool_output(result: Any) -> Any:
-    """Unwrap a fastmcp `CallToolResult` into the raw structured value a direct caller
-    expects, preserving full stdout/JSON/error codes rather than pydantic-ai's
-    agent-facing `.content` (a list of MCP content blocks).
-
-    Local hub tools (see core/hub.py's `run_tool`) return a plain dict (e.g.
-    `{"stdout", "stderr", "exit_code"}`) which FastMCP surfaces as `structured_content`/
-    `data` — prefer those. Falls back to joined text content for tools that only ever
-    emit unstructured text.
-    """
-    if result.data is not None:
-        return result.data
-    if result.structured_content is not None:
-        return result.structured_content
-    texts = [c.text for c in (result.content or []) if isinstance(c, TextContent)]
-    if texts:
-        return "\n".join(texts)
-    return None
+        logger.error(f"Failed to connect to agent '{agent_name}': {str(e)}", exc_info=True)
+        return f"SYSTEM: Failed to connect to agent '{agent_name}'. Please try again later."
 
 
 @mcp.tool(
@@ -444,37 +533,19 @@ async def use_tool(ctx: Context, tool_name: str, arguments: Dict[str, Any]) -> A
     user_id = user_id_var.get()
 
     await ctx.report_progress(0, 3, message=f"Checking access for: {tool_name}")
-    try:
-        whitelisted = await _is_tool_publicly_whitelisted(tool_name)
-    except Exception as e:
-        return f"SYSTEM: Error checking tool access for '{tool_name}': {e}"
-    if not whitelisted:
-        return f"SYSTEM: Access denied. Tool '{tool_name}' is internal and not exposed for direct execution."
-
     await ctx.report_progress(1, 3, message=f"Checking configuration for: {tool_name}")
-    try:
-        status = await is_tool_configured(tool_name, user_id)
-    except Exception as e:
-        return f"SYSTEM: Error checking configuration for tool '{tool_name}': {e}"
-    if not status["configured"]:
-        missing = status["missing_secrets"] + status["missing_variables"]
-        missing_text = ", ".join(missing) if missing else "required configuration"
-        return f"SYSTEM: Tool '{tool_name}' requires configuration before it can be used. Missing: {missing_text}. Configure at /configuration"
-
     await ctx.report_progress(2, 3, message=f"Executing {tool_name}...")
-    try:
-        if tool_name.startswith("mcp__"):
-            _, server_name, sub_tool_name = tool_name.split("__", 2)
-            client = await get_external_mcp_client(server_name, user_id)
-            result = await client.call_tool(sub_tool_name, arguments, raise_on_error=False)
-        else:
-            client = await get_hub_client()
-            result = await client.call_tool(tool_name, {**arguments, "__user_id": user_id}, raise_on_error=False)
-    except Exception as e:
-        return f"SYSTEM: Error executing tool '{tool_name}': {e}"
-
-    output = _extract_tool_output(result)
-    await ctx.report_progress(3, 3, message=f"Tool '{tool_name}' execution complete.")
+    output = await execute_whitelisted_tool(
+        tool_name,
+        arguments,
+        user_id,
+        identity_manager=identity_mgr,
+        is_configured=is_tool_configured,
+        get_hub_client_fn=get_hub_client,
+        get_external_mcp_client_fn=get_external_mcp_client,
+    )
+    if not (isinstance(output, str) and output.startswith("SYSTEM:")):
+        await ctx.report_progress(3, 3, message=f"Tool '{tool_name}' execution complete.")
     return output
 
 

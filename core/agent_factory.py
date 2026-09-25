@@ -2,7 +2,10 @@ import os
 import yaml
 import asyncio
 import copy
+import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Union
@@ -24,11 +27,13 @@ from pydantic_ai_backends import ConsoleCapability, LocalBackend
 from pydantic_ai_shields import CostTracking, ToolGuard
 from pydantic_ai_rlm import create_rlm_toolset
 
-from core.auth import IdentityManager, user_id_var
+from core.auth import EtcdContentionError, IdentityManager, get_identity_manager, user_id_var
 from core.models import AgentConfig, MCPConfig, is_agent_external, is_agent_internal
-from core.health import HealthMonitor
+from core.health import HealthMonitor, evaluate_health_status, DEFAULT_HEALTH_COOLDOWN_SECONDS
 from core.discovery import is_agent_configured
-from core.tool_search import DEFAULT_LIMIT as TOOL_SEARCH_LIMIT
+from core.tool_search import DEFAULT_LIMIT as TOOL_SEARCH_LIMIT, execute_whitelisted_tool
+
+logger = logging.getLogger(__name__)
 
 # Shared global states and caches
 _hub_client: Optional[FastMCPClient] = None
@@ -54,26 +59,104 @@ class SupervisorDeps:
         return SupervisorDeps()
 
 
+try:
+    REGISTRY_REFRESH_TIMEOUT = max(0.1, float(os.getenv("FRAMEWORK_REGISTRY_REFRESH_TIMEOUT", "5")))
+except (TypeError, ValueError):
+    REGISTRY_REFRESH_TIMEOUT = 5.0
+
+
+class _RegistryEligibilitySnapshot:
+    """Thread-refreshed {name: {"disabled", "offline", "external"}} eligibility view.
+
+    get_compiled() must stay sync (vendored DynamicAgentRegistry API) and therefore
+    cannot await asyncio.to_thread; it reads this snapshot instead of etcd.
+    Fail-open: on refresh error the previous snapshot is kept; names absent from the
+    snapshot fall through to super().get_compiled() (same as today's missing-config path).
+    """
+    try:
+        TTL = max(1.0, float(os.getenv("FRAMEWORK_REGISTRY_SNAPSHOT_TTL", "15")))
+    except (TypeError, ValueError):
+        TTL = 15.0
+
+    def __init__(self, identity_mgr, health_monitor):
+        self._identity_mgr = identity_mgr
+        self._health_monitor = health_monitor
+        self._entries = {}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+
+    def get(self, name):  # -> Optional[Dict[str, bool]]
+        return self._entries.get(name)
+
+    def set_for_testing(self, entries):
+        self._entries = dict(entries)
+
+    def refresh(self) -> None:
+        try:
+            configs = self._identity_mgr.get_all_agent_configs() or {}
+            healths = self._identity_mgr.get_all_health_statuses("agent") or {}
+            disabled = set(self._identity_mgr.get_disabled_standard_agents() or [])
+            cooldown = getattr(self._health_monitor, "cooldown_seconds", DEFAULT_HEALTH_COOLDOWN_SECONDS)
+            entries = {}
+            for name, cfg in configs.items():
+                entries[name] = {
+                    "disabled": name in disabled,
+                    "offline": evaluate_health_status(healths.get(name) or {}, cooldown).get("status") == "Offline",
+                    "external": is_agent_external(cfg),
+                }
+            for name in disabled:
+                entries.setdefault(name, {"disabled": True, "offline": False, "external": True})
+            self._entries = entries
+        except Exception as e:
+            if self._entries:
+                logger.warning("Registry eligibility snapshot refresh failed (keeping previous snapshot): %s", e)
+            else:
+                logger.warning("Registry eligibility snapshot refresh failed (no previous snapshot; routing stays unrestricted): %s", e)
+
+    def start(self) -> None:
+        # Lazily start one daemon thread; the thread performs the first refresh
+        # itself so the event loop is never blocked by snapshot I/O.
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._thread = threading.Thread(target=self._run, name="framework-registry-snapshot", daemon=True)
+            self._thread.start()
+
+    def _run(self) -> None:
+        self.refresh()
+        while not self._stop.wait(self.TTL):
+            self.refresh()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
 class FrameworkAgentRegistry(DynamicAgentRegistry):
     """DynamicAgentRegistry backed by the framework's agent cache.
 
     Overrides get_compiled() to return None for disabled or offline agents so
-    the supervisor's task() tool never routes to them.
+    the supervisor's task() tool never routes to them. Eligibility is read from a
+    thread-refreshed snapshot because get_compiled() is sync by vendored API
+    contract and cannot await an off-loop etcd lookup.
     """
     def __init__(self, identity_mgr: "IdentityManager", health_monitor: "HealthMonitor"):
         super().__init__()
         self._identity_mgr = identity_mgr
         self._health_monitor = health_monitor
+        self._snapshot = _RegistryEligibilitySnapshot(identity_mgr, health_monitor)
 
     def get_compiled(self, name: str) -> Optional[CompiledSubAgent]:
-        if name in self._identity_mgr.get_disabled_standard_agents():
-            return None
-        if self._health_monitor.get_status("agent", name).get("status") == "Offline":
-            return None
-        cfg = self._identity_mgr.get_agent_config(name)
-        if cfg and not is_agent_external(cfg):
+        entry = self._snapshot.get(name)
+        if entry is not None and (entry.get("disabled") or entry.get("offline") or not entry.get("external", True)):
             return None
         return super().get_compiled(name)
+
+    def _set_snapshot_for_testing(self, entries):
+        self._snapshot.set_for_testing(entries)
+
+    def _refresh_snapshot(self):
+        self._snapshot.refresh()
 
 
 _supervisor_registry: Optional[FrameworkAgentRegistry] = None
@@ -83,18 +166,37 @@ def get_supervisor_registry() -> FrameworkAgentRegistry:
     global _supervisor_registry
     if _supervisor_registry is None:
         _supervisor_registry = FrameworkAgentRegistry(get_identity_manager(), get_health_monitor())
+        _supervisor_registry._snapshot.start()
     return _supervisor_registry
 
 
-_identity_mgr: Optional[IdentityManager] = None
-def get_identity_manager() -> IdentityManager:
-    global _identity_mgr
-    if _identity_mgr is None:
-        _identity_mgr = IdentityManager(
-            host=os.getenv("ETCD_HOST", "127.0.0.1"),
-            port=int(os.getenv("ETCD_PORT", 2379))
+_registry_refresh_executor: Optional[ThreadPoolExecutor] = None
+
+
+def _get_registry_refresh_executor() -> ThreadPoolExecutor:
+    global _registry_refresh_executor
+    if _registry_refresh_executor is None:
+        _registry_refresh_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="registry-refresh")
+    return _registry_refresh_executor
+
+
+async def _refresh_registry_snapshot_bounded() -> None:
+    """Refresh the supervisor eligibility snapshot without letting degraded etcd
+    stall manage_agent: bounded wait, fail-open (the TTL refresh catches up)."""
+    registry = get_supervisor_registry()
+    loop = asyncio.get_running_loop()
+    try:
+        await asyncio.wait_for(
+            loop.run_in_executor(_get_registry_refresh_executor(), registry._refresh_snapshot),
+            timeout=REGISTRY_REFRESH_TIMEOUT,
         )
-    return _identity_mgr
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Registry snapshot refresh timed out after %.1fs; routing will reflect the toggle within the TTL (%.0fs).",
+            REGISTRY_REFRESH_TIMEOUT,
+            _RegistryEligibilitySnapshot.TTL,
+        )
+
 
 _health_monitor: Optional[HealthMonitor] = None
 def get_health_monitor() -> HealthMonitor:
@@ -210,7 +312,7 @@ async def get_hub_client() -> FastMCPClient:
     global _hub_client, _hub_tools_cache
     if _hub_client is None:
         identity_mgr = get_identity_manager()
-        hub_url = identity_mgr.get_config("HUB_URL", DEFAULT_HUB_URL)
+        hub_url = await asyncio.to_thread(identity_mgr.get_config, "HUB_URL", DEFAULT_HUB_URL)
         _hub_client = FastMCPClient(hub_url)
         await _hub_client.__aenter__()
         _hub_tools_cache = await _hub_client.list_tools()
@@ -253,7 +355,7 @@ async def discover_external_mcps(force: bool = False):
                 tools = await client.list_tools()
                 new_mcp_tools[name] = tools
         except Exception as e:
-            print(f"Failed to discover tools for MCP '{name}': {e}")
+            logger.error(f"Failed to discover tools for MCP '{name}': {e}")
             
     _external_mcp_tools = new_mcp_tools
     _last_discovery_time = now
@@ -264,7 +366,7 @@ def _register_mcp_tool(agent: Agent, mcp_tool: Any):
     
     async def tool_wrapper(ctx: RunContext[None], **kwargs: Any) -> Any:
         health_monitor = get_health_monitor()
-        if health_monitor.get_status("tool", safe_mcp_tool.name).get("status") == "Offline":
+        if (await asyncio.to_thread(health_monitor.get_status, "tool", safe_mcp_tool.name)).get("status") == "Offline":
             return "SYSTEM: Tool offline."
         kwargs["__user_id"] = user_id_var.get()
         client = await get_hub_client()
@@ -291,7 +393,7 @@ def _register_external_mcp_tool(agent: Agent, mcp_name: str, mcp_tool: Any, pref
 
     async def tool_wrapper(ctx: RunContext[None], **kwargs: Any) -> Any:
         health_monitor = get_health_monitor()
-        if health_monitor.get_status("tool", safe_mcp_tool.name).get("status") == "Offline":
+        if (await asyncio.to_thread(health_monitor.get_status, "tool", safe_mcp_tool.name)).get("status") == "Offline":
             return "SYSTEM: Tool offline."
         user_id = user_id_var.get()
         if not user_id: raise Exception("No user_id found")
@@ -366,7 +468,7 @@ async def build_agent(agent_name: str) -> Agent:
         target_cfg = await asyncio.to_thread(identity_mgr.get_agent_config, target)
         if target_cfg:
             if not is_agent_internal(target_cfg):
-                print(
+                logger.warning(
                     f"Agent '{agent_name}' attempted to configure A2A delegation to "
                     f"'{target}', but '{target}' has internal=False. Skipping."
                 )
@@ -405,12 +507,12 @@ async def build_agent(agent_name: str) -> Agent:
     # Gated by the admin 'agent_memory_enabled' feature flag AND the agent's config.
     from core.memory import get_memory_manager
     memory_mgr = get_memory_manager()
-    if memory_mgr.active_for(config):
+    if await asyncio.to_thread(memory_mgr.active_for, config):
         memory_bank = config.name
 
         @agent.instructions
         async def _recall_memory(ctx: RunContext[None]) -> str:
-            if not memory_mgr.is_globally_enabled():
+            if not await asyncio.to_thread(memory_mgr.is_globally_enabled):
                 return ""
             query = _latest_user_text(ctx)
             if not query:
@@ -497,7 +599,7 @@ def evict_agent(agent_name: str, _visited: Optional[set] = None) -> None:
         identity_mgr = get_identity_manager()
         all_configs = identity_mgr.get_all_agent_configs()
     except Exception as e:
-        print(f"evict_agent: failed to fetch agent configs for reverse-dependency propagation: {e}")
+        logger.error(f"evict_agent: failed to fetch agent configs for reverse-dependency propagation: {e}")
         return
 
     for other_name, cfg in (all_configs or {}).items():
@@ -514,7 +616,7 @@ async def prewarm_agents() -> None:
     try:
         agent_names = await asyncio.to_thread(identity_mgr.list_agents)
     except Exception as e:
-        print(f"Prewarm: failed to list agents: {e}")
+        logger.error(f"Prewarm: failed to list agents: {e}")
         return
     for name in agent_names:
         try:
@@ -523,53 +625,7 @@ async def prewarm_agents() -> None:
                 continue
             await get_agent(name)
         except Exception as e:
-            print(f"Prewarm: skipping '{name}': {e}")
-
-
-async def _is_tool_publicly_whitelisted(tool_name: str) -> bool:
-    """Authorization Guard for the supervisor's `use_tool`: check `public`/`public_tools`
-    directly against the tool's/MCP's own registry config.
-
-    Deliberately mirrors `core.gateway._is_tool_publicly_whitelisted` rather than importing
-    it — `core/gateway.py` already imports `get_hub_client`/`get_external_mcp_client` from
-    this module, so importing back from `gateway.py` here would create a circular import.
-    Fails closed on anything unexpected (unknown tool, malformed `mcp__` name, non-`True`
-    `public` value, non-list `public_tools`), matching `is_tool_configured`'s secure-by-default
-    behavior.
-    """
-    identity_mgr = get_identity_manager()
-    if tool_name.startswith("mcp__"):
-        parts = tool_name.split("__", 2)
-        if len(parts) != 3:
-            return False
-        _, server_name, sub_tool_name = parts
-        config = await asyncio.to_thread(identity_mgr.get_mcp_config, server_name)
-        if not config:
-            return False
-        public_tools_raw = config.get("public_tools", [])
-        public_tools = set(public_tools_raw) if isinstance(public_tools_raw, list) else set()
-        return config.get("public") is True or sub_tool_name in public_tools
-
-    config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
-    if not config:
-        return False
-    return config.get("public") is True
-
-
-def _extract_tool_output(result: Any) -> Any:
-    """Unwrap a fastmcp `CallToolResult` into the raw structured value a direct caller
-    expects (mirrors `core.gateway._extract_tool_output` — see that function's docstring
-    for why `.data`/`.structured_content` are preferred over pydantic-ai's agent-facing
-    `.content`)."""
-    from mcp.types import TextContent
-    if result.data is not None:
-        return result.data
-    if result.structured_content is not None:
-        return result.structured_content
-    texts = [c.text for c in (result.content or []) if isinstance(c, TextContent)]
-    if texts:
-        return "\n".join(texts)
-    return None
+            logger.error(f"Prewarm: skipping '{name}': {e}")
 
 
 def _register_admin_tools(agent: Agent):
@@ -581,43 +637,54 @@ def _register_admin_tools(agent: Agent):
             "Find the specialized agents most relevant to a request. Returns a ranked "
             "shortlist of {name, description, status, configured}. Use this to pick an "
             "agent name, then call task(subagent_type, description) to run it. "
-            "Agents with configured=false are missing credentials — do not delegate to them. "
+            "Do not delegate to agents where configured=false or status='Offline'. "
             "Disabled agents (status='disabled') can be re-enabled with manage_agent. "
             "Does not return the full catalog — search with a focused query."
         ),
     )
     async def search_agents(query: str, limit: int = 8) -> List[Dict]:
         from core.agent_search import search_agents as _search
-        from core.discovery import discover_agents
+        from core.discovery import is_agent_configured
         # include_disabled=True so manage_agent can still locate disabled agents to re-enable.
         results = await _search(query, limit=limit, include_disabled=True)
         user_id = user_id_var.get()
         if user_id and results:
-            discovered = await discover_agents(user_id=user_id)
-            config_lookup = {a["name"]: a for a in discovered}
+            active_items = []
             for r in results:
-                agent_dict = config_lookup.get(r["name"], {})
-                is_configured = agent_dict.get("is_configured", True)
-                r["configured"] = is_configured
-                # search_agents()'s "unavailable match" note (Phase E of
-                # rules_engine_hardening_plan.md, E1/E3) is already a final,
-                # self-contained sentence -- appending our own "[NOT CONFIGURED ...]"
-                # tag onto it here would produce a redundant, and sometimes
-                # self-contradictory (e.g. "...currently offline... [NOT CONFIGURED
-                # ...]"), description. Mirrors the same guard in
-                # core/gateway.py:search_agents.
-                if not is_configured and not r.get("unavailable_match"):
-                    missing = []
-                    if agent_dict.get("missing_secrets"):
-                        missing.append(f"secrets: {', '.join(agent_dict['missing_secrets'])}")
-                    if agent_dict.get("missing_variables"):
-                        missing.append(f"variables: {', '.join(agent_dict['missing_variables'])}")
-                    note = (
-                        f" [NOT CONFIGURED — missing {'; '.join(missing)}. Configure at /agents/{r['name']}/configure]"
-                        if missing else
-                        f" [NOT CONFIGURED — configure at /agents/{r['name']}/configure]"
-                    )
-                    r["description"] = r.get("description", "") + note
+                if r.get("unavailable_match") or r.get("status") == "Offline":
+                    r["configured"] = False
+                else:
+                    active_items.append(r)
+
+            if active_items:
+                statuses = await asyncio.gather(
+                    *(is_agent_configured(r["name"], user_id) for r in active_items),
+                    return_exceptions=True,
+                )
+                for r, status_dict in zip(active_items, statuses):
+                    if isinstance(status_dict, Exception) or not isinstance(status_dict, dict):
+                        r["configured"] = True
+                        continue
+                    is_configured = status_dict.get("configured", True)
+                    r["configured"] = is_configured
+                    if not is_configured:
+                        missing = []
+                        if status_dict.get("missing_secrets"):
+                            missing.append(f"secrets: {', '.join(status_dict['missing_secrets'])}")
+                        if status_dict.get("missing_variables"):
+                            missing.append(f"variables: {', '.join(status_dict['missing_variables'])}")
+                        note = (
+                            f" [NOT CONFIGURED — missing {'; '.join(missing)}. Configure at /agents/{r['name']}/configure]"
+                            if missing else
+                            f" [NOT CONFIGURED — configure at /agents/{r['name']}/configure]"
+                        )
+                        r["description"] = r.get("description", "") + note
+        else:
+            for r in results:
+                if r.get("unavailable_match") or r.get("status") == "Offline":
+                    r["configured"] = False
+                else:
+                    r["configured"] = True
         return results
 
     @agent.tool_plain(
@@ -650,59 +717,36 @@ def _register_admin_tools(agent: Agent):
     )
     async def use_tool(tool_name: str, arguments: Dict[str, Any]) -> Any:
         user_id = user_id_var.get()
-
-        try:
-            whitelisted = await _is_tool_publicly_whitelisted(tool_name)
-        except Exception as e:
-            return f"SYSTEM: Error checking tool access for '{tool_name}': {e}"
-        if not whitelisted:
-            return f"SYSTEM: Access denied. Tool '{tool_name}' is internal and not exposed for direct execution."
-
-        try:
-            from core.discovery import is_tool_configured
-            status = await is_tool_configured(tool_name, user_id)
-        except Exception as e:
-            return f"SYSTEM: Error checking configuration for tool '{tool_name}': {e}"
-        if not status["configured"]:
-            missing = status["missing_secrets"] + status["missing_variables"]
-            missing_text = ", ".join(missing) if missing else "required configuration"
-            return f"SYSTEM: Tool '{tool_name}' requires configuration before it can be used. Missing: {missing_text}. Configure at /configuration"
-
-        try:
-            if tool_name.startswith("mcp__"):
-                _, server_name, sub_tool_name = tool_name.split("__", 2)
-                client = await get_external_mcp_client(server_name, user_id)
-                result = await client.call_tool(sub_tool_name, arguments, raise_on_error=False)
-            else:
-                client = await get_hub_client()
-                result = await client.call_tool(tool_name, {**arguments, "__user_id": user_id}, raise_on_error=False)
-        except Exception as e:
-            return f"SYSTEM: Error executing tool '{tool_name}': {e}"
-
-        return _extract_tool_output(result)
+        from core.discovery import is_tool_configured
+        return await execute_whitelisted_tool(
+            tool_name,
+            arguments,
+            user_id,
+            identity_manager=get_identity_manager(),
+            is_configured=is_tool_configured,
+            get_hub_client_fn=get_hub_client,
+            get_external_mcp_client_fn=get_external_mcp_client,
+        )
 
     @agent.tool_plain(name="manage_agent", description="Enable, disable or reload an agent.")
     async def manage_agent(name: str, action: str) -> str:
+        if action not in ("disable", "enable", "reload"):
+            return f"SYSTEM: Unknown action '{action}'. Supported actions: disable, enable, reload."
         cfg = await asyncio.to_thread(identity_mgr.get_agent_config, name)
-        is_workflow = cfg and cfg.get("type") in ("background_agent", "background_script")
-        
-        if is_workflow:
-            disabled = identity_mgr.get_disabled_workflows()
-        else:
-            disabled = identity_mgr.get_disabled_standard_agents()
+        is_workflow = bool(cfg and cfg.get("type") in ("background_agent", "background_script"))
 
-        if action == "disable" and name not in disabled:
-            disabled.append(name)
-            if is_workflow:
-                identity_mgr.set_disabled_workflows(disabled)
-            else:
-                identity_mgr.set_disabled_standard_agents(disabled)
+        toggle = identity_mgr.toggle_disabled_workflow if is_workflow else identity_mgr.toggle_disabled_standard_agent
+        try:
+            await asyncio.to_thread(toggle, name, action == "disable")
+        except EtcdContentionError:
+            # The list was not modified; report in-band so the turn (and agent health) survives.
+            return f"SYSTEM: Could not {action} agent '{name}' due to concurrent changes. Please retry."
+
+        if action == "disable":
+            await _refresh_registry_snapshot_bounded()
             return f"Agent {name} disabled."
-        elif action in ("enable", "reload") and name in disabled:
-            disabled.remove(name)
-            if is_workflow:
-                identity_mgr.set_disabled_workflows(disabled)
-            else:
-                identity_mgr.set_disabled_standard_agents(disabled)
+        elif action in ("enable", "reload"):
+            if action == "reload":
+                await asyncio.to_thread(evict_agent, name)
+            await _refresh_registry_snapshot_bounded()
             return f"Agent {name} enabled."
-        return f"Action {action} applied to {name}."

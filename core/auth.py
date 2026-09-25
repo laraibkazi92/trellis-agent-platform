@@ -2,6 +2,7 @@ import json
 import secrets
 import logging
 import time
+import random
 import re
 import contextvars
 import asyncio
@@ -23,6 +24,13 @@ logger = logging.getLogger(__name__)
 
 auth_token_var = contextvars.ContextVar("auth_token", default=None)
 user_id_var = contextvars.ContextVar("user_id", default=None)
+
+
+class EtcdContentionError(RuntimeError):
+    """Raised when an etcd compare-and-swap loop (see
+    IdentityManager._atomic_update_config_list) exhausts its retry budget due to
+    sustained write contention. Callers must treat this as a failed update -- the
+    list was NOT modified -- rather than assume success."""
 
 def _get_encryption_key() -> bytes:
     import base64
@@ -63,6 +71,10 @@ def retry_etcd(max_retries=10, delay=2):
             for attempt in range(max_retries):
                 try:
                     return func(self, *args, **kwargs)
+                except EtcdContentionError:
+                    # The CAS loop already spent its own backoff-driven retry budget; re-running
+                    # it here would only multiply attempts (and hold the caller for ~20s).
+                    raise
                 except Exception as e:
                     # Fast-fail immediately on non-transient resource exhaustion (e.g. gRPC message > 4MB)
                     err_str = str(e)
@@ -312,44 +324,141 @@ class IdentityManager:
         """Set a framework configuration value."""
         self.client.put(f"/config/framework/{key}", json.dumps(value))
 
-    @retry_etcd()
     def get_disabled_agents(self) -> List[str]:
-        """Retrieve the list of disabled agents (Legacy: maps to standard agents)."""
+        """Retrieve the list of disabled agents (Legacy: maps to standard agents).
+
+        Not itself @retry_etcd()-decorated: relies on get_disabled_standard_agents()'s
+        own retry, which itself relies on get_config()'s retry. This method used to be
+        a third @retry_etcd() layer on top of both -- three nested retry layers multiply
+        worst-case retry time (10x10x10 attempts, ~2000+s) instead of adding to it -- see
+        get_agent_memory_enabled above for the same (now-normalized) pattern."""
         return self.get_disabled_standard_agents()
 
-    @retry_etcd()
     def set_disabled_agents(self, agents: List[str]) -> None:
-        """Set the list of disabled agents (Legacy: maps to standard agents)."""
+        """Set the list of disabled agents (Legacy: maps to standard agents).
+
+        Not itself @retry_etcd()-decorated -- see get_disabled_agents above."""
         self.set_disabled_standard_agents(agents)
 
-    @retry_etcd()
     def get_disabled_standard_agents(self) -> List[str]:
-        """Retrieve the list of disabled standard agents."""
+        """Retrieve the list of disabled standard agents.
+
+        Not itself @retry_etcd()-decorated: get_config() already retries. Stacking a
+        second retry layer on top of it multiplies worst-case retry time (10x10 attempts,
+        ~200+s) instead of adding to it -- see get_agent_memory_enabled above for the
+        same pattern."""
         return self.get_config("disabled_standard_agents", [])
 
-    @retry_etcd()
     def set_disabled_standard_agents(self, agents: List[str]) -> None:
-        """Set the list of disabled standard agents."""
+        """Set the list of disabled standard agents.
+
+        Not itself @retry_etcd()-decorated -- see get_disabled_standard_agents above."""
         self.set_config("disabled_standard_agents", agents)
 
-    @retry_etcd()
     def get_disabled_workflows(self) -> List[str]:
-        """Retrieve the list of disabled workflows."""
+        """Retrieve the list of disabled workflows.
+
+        Not itself @retry_etcd()-decorated: get_config() already retries. Stacking a
+        second retry layer on top of it multiplies worst-case retry time (10x10 attempts,
+        ~200+s) instead of adding to it -- see get_agent_memory_enabled above for the
+        same pattern."""
         return self.get_config("disabled_workflows", [])
 
-    @retry_etcd()
     def set_disabled_workflows(self, workflows: List[str]) -> None:
-        """Set the list of disabled workflows."""
+        """Set the list of disabled workflows.
+
+        Not itself @retry_etcd()-decorated -- see get_disabled_workflows above."""
         self.set_config("disabled_workflows", workflows)
 
-    @retry_etcd()
-    def get_agent_memory_enabled(self) -> bool:
-        """Retrieve the global agent-memory feature flag (admin master switch)."""
-        return bool(self.get_config("agent_memory_enabled", False))
+    def _atomic_update_config_list(self, key: str, update_fn) -> List[str]:
+        """Atomically update a JSON list in /config/framework/{key} using Compare-And-Swap (CAS).
+
+        Runs synchronously (etcd calls block) -- callers dispatch it via
+        asyncio.to_thread, so the time.sleep() backoff below never blocks the event loop.
+
+        Raises EtcdContentionError if the CAS loop exhausts its retry budget without
+        ever winning the compare-and-swap. There is intentionally no blind-overwrite
+        fallback: a plain put() here would silently clobber a concurrent writer's
+        change and report success for an update that never safely applied.
+        """
+        full_key = f"/config/framework/{key}"
+        max_attempts = 20
+        for attempt in range(max_attempts):
+            raw_val, _ = self.client.get(full_key)
+            if raw_val is None:
+                initial_list = update_fn([])
+                new_bytes = json.dumps(initial_list).encode('utf-8')
+                if self.client.put_if_not_exists(full_key, new_bytes):
+                    return initial_list
+            else:
+                try:
+                    current_list = json.loads(raw_val.decode('utf-8'))
+                    if not isinstance(current_list, list):
+                        current_list = []
+                except Exception:
+                    current_list = []
+                updated_list = update_fn(list(current_list))
+                new_bytes = json.dumps(updated_list).encode('utf-8')
+                if self.client.replace(full_key, raw_val, new_bytes):
+                    return updated_list
+            # Lost the CAS race -- another writer won. Back off briefly (jittered,
+            # capped small) before retrying so contention doesn't burn through all
+            # 20 attempts in milliseconds.
+            if attempt < max_attempts - 1:
+                backoff = min(0.01, 0.002 * (2 ** attempt)) + random.uniform(0, 0.003)
+                time.sleep(backoff)
+        raise EtcdContentionError(
+            f"Failed to atomically update '{full_key}' after {max_attempts} attempts "
+            "due to sustained write contention. The list was not modified."
+        )
 
     @retry_etcd()
+    def toggle_disabled_standard_agent(self, name: str, disable: Optional[bool] = None) -> bool:
+        """Atomically add or remove an agent from disabled_standard_agents using CAS.
+        If disable is None, toggles. If True, disables. If False, enables.
+        Returns True if the agent is now disabled, False if enabled."""
+        def _update(current: List[str]) -> List[str]:
+            res = list(current)
+            should_disable = (name not in res) if disable is None else disable
+            if should_disable and name not in res:
+                res.append(name)
+            elif not should_disable and name in res:
+                res.remove(name)
+            return res
+
+        final_list = self._atomic_update_config_list("disabled_standard_agents", _update)
+        return name in final_list
+
+    @retry_etcd()
+    def toggle_disabled_workflow(self, name: str, disable: Optional[bool] = None) -> bool:
+        """Atomically add or remove a workflow from disabled_workflows using CAS.
+        If disable is None, toggles. If True, disables. If False, enables.
+        Returns True if the workflow is now disabled, False if enabled."""
+        def _update(current: List[str]) -> List[str]:
+            res = list(current)
+            should_disable = (name not in res) if disable is None else disable
+            if should_disable and name not in res:
+                res.append(name)
+            elif not should_disable and name in res:
+                res.remove(name)
+            return res
+
+        final_list = self._atomic_update_config_list("disabled_workflows", _update)
+        return name in final_list
+
+    def get_agent_memory_enabled(self) -> bool:
+        """Retrieve the global agent-memory feature flag (admin master switch).
+
+        Not itself @retry_etcd()-decorated: get_config() already retries. Stacking a
+        second retry layer on top of it multiplies worst-case retry time (10x10 attempts,
+        ~200+s) instead of adding to it -- see get_rules_evaluation_timeout below for the
+        same pattern."""
+        return bool(self.get_config("agent_memory_enabled", False))
+
     def set_agent_memory_enabled(self, enabled: bool) -> None:
-        """Set the global agent-memory feature flag (admin master switch)."""
+        """Set the global agent-memory feature flag (admin master switch).
+
+        Not itself @retry_etcd()-decorated -- see get_agent_memory_enabled above."""
         self.set_config("agent_memory_enabled", bool(enabled))
 
     def get_rules_evaluation_timeout(self) -> Optional[float]:
@@ -359,9 +468,9 @@ class IdentityManager:
 
         Not itself @retry_etcd()-decorated: get_config() already retries. Stacking a
         second retry layer on top of it multiplies worst-case retry time (10x10 attempts)
-        instead of adding to it -- see get_agent_memory_enabled/set_agent_memory_enabled
-        above for the same (pre-existing) pattern; not fixed here to keep this change
-        scoped to the Rules Engine."""
+        instead of adding to it -- get_agent_memory_enabled/set_agent_memory_enabled above
+        were normalized to this same single-retry-layer pattern (they used to double up
+        the decorator; fixed alongside this rules-engine work)."""
         value = self.get_config("rules_evaluation_timeout", None)
         return float(value) if value is not None else None
 
@@ -376,9 +485,14 @@ class IdentityManager:
         """Remove the admin override, reverting to the RULES_EVALUATION_TIMEOUT env var default."""
         self.client.delete("/config/framework/rules_evaluation_timeout")
 
-    @retry_etcd()
     def get_app_config(self) -> Dict[str, Any]:
-        """Retrieve the application configuration for whitelabeling."""
+        """Retrieve the application configuration for whitelabeling.
+
+        Not itself @retry_etcd()-decorated: get_config() already retries, and this
+        method calls it once per whitelabel key (5 keys). Stacking a second retry layer
+        on top would multiply worst-case retry time per key (10x10 attempts per key,
+        ~200+s each, ~1000+s total) instead of adding to it -- see get_agent_memory_enabled
+        above for the same pattern."""
         # Start with environment variables as defaults
         config = {
             "APP_NAME": os.getenv("APP_NAME", "Trellis"),
@@ -719,9 +833,13 @@ class IdentityManager:
                     logger.warning(f"Failed to decode v2 key record: {e}")
         return keys
 
-    @retry_etcd()
     def toggle_user_ban(self, user_id: str, is_banned: bool) -> None:
-        """Toggle ban status for a user."""
+        """Toggle ban status for a user.
+
+        Not itself @retry_etcd()-decorated: get_user()/upsert_user() already retry
+        independently. Stacking a third retry layer on top of both multiplies worst-case
+        retry time (10x(10+10) attempts, ~400+s) instead of adding to it -- see
+        get_agent_memory_enabled above for the same pattern."""
         user = self.get_user(user_id)
         if user:
             user["is_banned"] = is_banned
@@ -957,6 +1075,18 @@ class IdentityManager:
         return value is not None
 
 
+_identity_manager: Optional[IdentityManager] = None
+
+def get_identity_manager() -> IdentityManager:
+    global _identity_manager
+    if _identity_manager is None:
+        _identity_manager = IdentityManager(
+            host=os.getenv("ETCD_HOST", "127.0.0.1"),
+            port=int(os.getenv("ETCD_PORT", 2379))
+        )
+    return _identity_manager
+
+
 class AuthMiddleware:
     def __init__(self, app, identity_mgr: IdentityManager):
         self.app = app
@@ -1069,11 +1199,6 @@ def is_admin(request: Request) -> bool:
         
     admin_users = [u.strip() for u in os.getenv("ADMIN_USERS", "").split(",") if u.strip()]
     return user.get("email") in admin_users
-
-def get_identity_mgr():
-    """Helper to get the global IdentityManager instance."""
-    from core.dependencies import identity_mgr
-    return identity_mgr
 
 async def get_current_user(request: Request):
     """Helper to get the current user from the session, enforcing ban status."""

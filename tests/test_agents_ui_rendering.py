@@ -44,7 +44,7 @@ def _base_agent(name, **overrides):
     return agent
 
 
-def _render(agents):
+def _render(agents, is_admin=False):
     context = {
         "request": _FakeRequest(),
         "user": {"name": "Test User", "sub": "test-user"},
@@ -52,7 +52,7 @@ def _render(agents):
         "flash_msg": None,
         "public_host_url": "http://localhost:8000",
         "public_mcp_url": "http://localhost:8002/mcp",
-        "is_admin": False,
+        "is_admin": is_admin,
         "csrf_token": "test-csrf-token",
         "app_name": "Trellis",
         "app_accent_color": "#0055FF",
@@ -71,6 +71,13 @@ def _connect_modal_block(html, agent_name):
 
 def _card_block(html, agent_name):
     marker = f'data-agent-name="{agent_name}"'
+    start = html.index(marker)
+    end = html.index(f'id="connect-{agent_name}"', start)
+    return html[start:end]
+
+
+def _configure_modal_block(html, agent_name):
+    marker = f'id="configure-{agent_name}"'
     start = html.index(marker)
     end = html.index(f'id="connect-{agent_name}"', start)
     return html[start:end]
@@ -204,3 +211,156 @@ def test_multi_agent_render_scopes_badges_and_modals_independently():
     assert "curl -X POST" not in internal_modal
     assert "Direct API invocation disabled" not in general_modal
     assert "curl -X POST" in general_modal
+
+
+# --- Health status badges (Offline / Degraded / Half-Open) ------------------
+#
+# core/routers/marketplace.py's agents() route now decorates agent["health"]["status"]
+# via core.health.compute_agent_operational_status (shared with core/host.py and
+# core/gateway.py), which can return "Degraded" in addition to the pre-existing
+# Offline/Half-Open/Online values -- see rules_engine_hardening_plan.md's review
+# finding that the marketplace UI never surfaced Degraded, and its own prior note
+# that Half-Open had no explicit on-page label at all (just the absence of the
+# red Offline badge). "Half-Open" is intentionally relabeled "RECOVERING" here --
+# the raw circuit-breaker term isn't meaningful to a non-admin end user.
+
+def test_offline_badge_still_renders_as_error():
+    agents = [_base_agent("broken-agent", health={"status": "Offline", "consecutive_failures": 12})]
+    html = _render(agents)
+    card = _card_block(html, "broken-agent")
+
+    assert "ERROR" in card
+    assert "DEGRADED" not in card
+    assert "RECOVERING" not in card
+
+
+def test_degraded_badge_renders_with_offline_tool_names():
+    agents = [_base_agent("tool-dependent-agent", health={"status": "Degraded"}, offline_tools=["netctl"])]
+    html = _render(agents)
+    card = _card_block(html, "tool-dependent-agent")
+
+    assert "DEGRADED" in card
+    assert "netctl" in card
+    assert "ERROR" not in card
+
+
+def test_half_open_status_renders_as_recovering_not_raw_label():
+    agents = [_base_agent("recovered-agent", health={"status": "Half-Open"})]
+    html = _render(agents)
+    card = _card_block(html, "recovered-agent")
+
+    assert "RECOVERING" in card
+    assert "Half-Open" not in card
+    assert "Half Open" not in card
+    assert "ERROR" not in card
+    assert "DEGRADED" not in card
+
+
+def test_online_agent_shows_no_health_badge():
+    agents = [_base_agent("healthy-agent", health={"status": "Online"})]
+    html = _render(agents)
+    card = _card_block(html, "healthy-agent")
+
+    assert "ERROR" not in card
+    assert "DEGRADED" not in card
+    assert "RECOVERING" not in card
+
+
+def test_degraded_badge_uses_distinct_color_from_unconfigured_badge():
+    """The DEGRADED badge and the pre-existing orange UNCONFIGURED badge render in the
+    same row -- they must be visually distinguishable by more than reading the text,
+    so DEGRADED deliberately uses violet, not amber (too close to orange)."""
+    agents = [_base_agent(
+        "needs-work-agent",
+        is_configured=False,
+        required_secrets=["API_KEY"],
+        missing_secrets=["API_KEY"],
+        health={"status": "Degraded"},
+        offline_tools=["netctl"],
+    )]
+    html = _render(agents)
+    card = _card_block(html, "needs-work-agent")
+
+    assert "UNCONFIGURED" in card
+    assert "DEGRADED" in card
+    assert "border-orange-500" in card
+    assert "bg-violet-100" in card
+    assert "bg-amber-100" not in card
+
+
+# --- Admin "Health Issues" panel (status-aware) ------------------------------
+#
+# The panel used to be one-size-fits-all ("Health Issues (Failures: N)") regardless
+# of status. For a Degraded agent, N is the AGENT's own failure count, which is
+# typically 0 -- the actual problem is a dependent TOOL being offline, which the old
+# panel never mentioned at all. It's now split by status: Degraded shows which
+# tool(s) are offline with a per-tool reset action; Half-Open ("Recovering") gets its
+# own framing; Offline keeps the original agent-level failures/reset behavior.
+
+def test_admin_panel_shows_offline_tools_and_reset_for_degraded():
+    agents = [_base_agent(
+        "tool-dependent-agent",
+        health={"status": "Degraded", "consecutive_failures": 0},
+        offline_tools=["netctl", "logs"],
+    )]
+    html = _render(agents, is_admin=True)
+    modal = _configure_modal_block(html, "tool-dependent-agent")
+
+    assert "Dependent Tool(s) Offline" in modal
+    assert "netctl" in modal
+    assert "logs" in modal
+    assert '/reset-health/tool/netctl' in modal
+    assert '/reset-health/tool/logs' in modal
+    assert "Health Issues (Failures:" not in modal
+
+
+def test_admin_panel_shows_recovering_framing_for_half_open():
+    agents = [_base_agent(
+        "recovered-agent",
+        health={"status": "Half-Open", "consecutive_failures": 12, "last_error": "connection reset"},
+    )]
+    html = _render(agents, is_admin=True)
+    modal = _configure_modal_block(html, "recovered-agent")
+
+    assert "Recovering" in modal
+    assert "connection reset" in modal
+    assert '/reset-health/agent/recovered-agent' in modal
+    assert "Dependent Tool(s) Offline" not in modal
+
+
+def test_admin_panel_keeps_original_offline_behavior():
+    agents = [_base_agent(
+        "broken-agent",
+        health={"status": "Offline", "consecutive_failures": 7, "last_error": "timeout"},
+    )]
+    html = _render(agents, is_admin=True)
+    modal = _configure_modal_block(html, "broken-agent")
+
+    assert "Health Issues (Failures: 7)" in modal
+    assert "timeout" in modal
+    assert '/reset-health/agent/broken-agent' in modal
+    assert "Dependent Tool(s) Offline" not in modal
+    assert "Recovering" not in modal
+
+
+def test_admin_panel_hidden_for_online_agent():
+    agents = [_base_agent("healthy-agent", health={"status": "Online"})]
+    html = _render(agents, is_admin=True)
+    modal = _configure_modal_block(html, "healthy-agent")
+
+    assert "Health Issues" not in modal
+    assert "Dependent Tool(s) Offline" not in modal
+    assert "Recovering" not in modal
+
+
+def test_admin_panel_not_shown_to_non_admin():
+    agents = [_base_agent(
+        "tool-dependent-agent",
+        health={"status": "Degraded"},
+        offline_tools=["netctl"],
+        required_secrets=["API_KEY"],
+    )]
+    html = _render(agents, is_admin=False)
+    modal = _configure_modal_block(html, "tool-dependent-agent")
+
+    assert "Dependent Tool(s) Offline" not in modal

@@ -8,10 +8,16 @@ from typing import Dict, Any, List, Optional, Literal
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, ValidationError
-from core.auth import get_current_user, is_admin
+from core.auth import EtcdContentionError, get_current_user, is_admin
 from core.dependencies import templates, identity_mgr, CSRFRoute
 from core.routers.admin import sanitize_name, commit_to_github
-from core.discovery import get_agent_required_secrets, get_agent_required_variables
+from core.discovery import (
+    discover_agents,
+    get_agent_required_secrets,
+    get_agent_required_variables,
+    get_agent_secret_groups,
+    flatten_secret_group_keys,
+)
 from core.models import Identity, IdentityType
 
 from datetime import datetime
@@ -78,65 +84,56 @@ async def workflows_view(request: Request):
         return RedirectResponse(url="/login")
         
     agent_names = await asyncio.to_thread(identity_mgr.list_agents)
-    disabled_workflows = identity_mgr.get_disabled_workflows()
-    system_identity = Identity(id="system", type=IdentityType.SYSTEM)
-    global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
-    global_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
-    
+    disabled_workflows = await asyncio.to_thread(identity_mgr.get_disabled_workflows)
+
+    # Configuration readiness (is_configured / missing_secrets / missing_variables /
+    # secret_groups) is derived from the same shared discovery pipeline discover_agents()
+    # and is_agent_configured() use elsewhere (core/discovery.py's
+    # _resolve_agent_requirements/_evaluate_agent_configuration -- see
+    # __spec_docs/completed/rules_engine_hardening_plan.md §2C). This view previously
+    # hand-rolled its own required_secrets/required_variables-only check that ignored
+    # secret_groups entirely, so a workflow whose only requirement was an unsatisfied
+    # secret_group option incorrectly showed as configured here while is_agent_configured()
+    # correctly reported it as not configured. all_agent_configs is fetched once and handed
+    # to discover_agents (via its agent_configs param) to avoid a redundant second bulk fetch.
+    all_agent_configs = await asyncio.to_thread(identity_mgr.get_all_agent_configs)
+    discovered_agents = await discover_agents(include_background=True, agent_configs=all_agent_configs)
+    discovered_by_name = {a["name"]: a for a in discovered_agents}
+
     workflows_list = []
     for name in agent_names:
-        config_data = await asyncio.to_thread(identity_mgr.get_agent_config, name)
-        if config_data and config_data.get("type") in ("background_agent", "background_script"):
-            # Determine configuration status
-            required_secrets = await get_agent_required_secrets(config_data)
-            required_variables = await get_agent_required_variables(config_data)
-            
-            is_configured = True
-            missing_secrets = []
-            missing_variables = []
-            
-            # We filter out globals from required
-            user_required_secrets = [s for s in required_secrets if s not in global_secrets]
-            user_required_variables = [s for s in required_variables if s not in global_variables]
-            
-            agent_identity = Identity(id=name, type=IdentityType.WORKFLOW)
-            current_config_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, agent_identity, "secrets")
-            current_config_variables = await asyncio.to_thread(identity_mgr.get_identity_config, agent_identity, "variables")
+        config_data = all_agent_configs.get(name)
+        if not config_data or config_data.get("type") not in ("background_agent", "background_script"):
+            continue
 
-            if user_required_secrets:
-                for s in user_required_secrets:
-                    if s not in current_config_secrets:
-                        is_configured = False
-                        missing_secrets.append(s)
-            
-            if user_required_variables:
-                for v in user_required_variables:
-                    if v not in current_config_variables:
-                        is_configured = False
-                        missing_variables.append(v)
-            
-            workflows_list.append({
-                "name": name,
-                "config": config_data,
-                "status": "Disabled by Admin" if name in disabled_workflows else "active",
-                "is_disabled": name in disabled_workflows,
-                "description": config_data.get("description", ""),
-                "trigger": config_data.get("trigger", {}),
-                "is_configured": is_configured,
-                "required_secrets": user_required_secrets,
-                "required_variables": user_required_variables,
-                "missing_secrets": missing_secrets,
-                "missing_variables": missing_variables,
-                "current_variables": current_config_variables,
-                "is_running": False,
-                "run_stats": {
-                    "pending": 0,
-                    "processing": 0,
-                    "completed": 0,
-                    "failed": 0
-                }
-            })
+        discovered = discovered_by_name.get(name)
+        if discovered is None:
+            # discover_agents only ever excludes "supervisor", so this shouldn't happen for
+            # a background_agent/background_script config -- fail closed rather than crash.
+            continue
 
+        workflows_list.append({
+            "name": name,
+            "config": config_data,
+            "status": "Disabled by Admin" if name in disabled_workflows else "active",
+            "is_disabled": name in disabled_workflows,
+            "description": config_data.get("description", ""),
+            "trigger": config_data.get("trigger", {}),
+            "is_configured": discovered["is_configured"],
+            "required_secrets": discovered["required_secrets"],
+            "required_variables": discovered["required_variables"],
+            "missing_secrets": discovered["missing_secrets"],
+            "missing_variables": discovered["missing_variables"],
+            "current_variables": discovered["current_variables"],
+            "secret_groups": discovered["secret_groups"],
+            "is_running": False,
+            "run_stats": {
+                "pending": 0,
+                "processing": 0,
+                "completed": 0,
+                "failed": 0
+            }
+        })
 
     workflows_list.sort(key=lambda x: x["name"].lower())
     all_mcps = await asyncio.to_thread(identity_mgr.list_mcps)
@@ -230,19 +227,21 @@ async def configure_background_agent_secrets(request: Request, agent_name: str):
     global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
     global_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
     
-    required_secrets = await get_agent_required_secrets(config)
-    required_variables = await get_agent_required_variables(config)
-    
+    required_secrets = await get_agent_required_secrets(config, strict=True)
+    required_variables = await get_agent_required_variables(config, strict=True)
+    secret_groups = await get_agent_secret_groups(config, strict=True)
+    grouped_secret_keys = flatten_secret_group_keys(secret_groups)
+
     secrets_updated = False
     variables_updated = False
-    
+
     for key, value in form.items():
         if key in ("csrf_token",):
             continue
-            
+
         val_str = str(value).strip()
-        
-        if key in required_secrets and key not in global_secrets:
+
+        if (key in required_secrets or key in grouped_secret_keys) and key not in global_secrets:
             if val_str: # only update secret if not empty
                 current_secrets[key] = val_str
                 secrets_updated = True
@@ -514,15 +513,12 @@ async def toggle_workflow_status(request: Request, agent_name: str):
         request.session["flash_msg"] = "Unauthorized access."
         return RedirectResponse(url='/workflows', status_code=303)
         
-    disabled = identity_mgr.get_disabled_workflows()
-    if agent_name in disabled:
-        disabled.remove(agent_name)
-        action = "enabled"
-    else:
-        disabled.append(agent_name)
-        action = "disabled"
-        
-    identity_mgr.set_disabled_workflows(disabled)
+    try:
+        is_disabled = await asyncio.to_thread(identity_mgr.toggle_disabled_workflow, agent_name)
+    except EtcdContentionError:
+        request.session["flash_msg"] = f"Could not update workflow '{agent_name}' due to concurrent changes. Please retry."
+        return RedirectResponse(url='/workflows', status_code=303)
+    action = "disabled" if is_disabled else "enabled"
     request.session["flash_msg"] = f"Workflow '{agent_name}' {action} successfully."
     return RedirectResponse(url='/workflows', status_code=303)
 

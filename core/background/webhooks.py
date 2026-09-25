@@ -2,19 +2,18 @@ import hmac
 import hashlib
 import json
 import logging
+import asyncio
 import time
 from typing import Optional, Dict, Any, Callable
 from fastapi import APIRouter, Request, HTTPException, Depends
-from core.auth import IdentityManager
-from core.tasks import run_background_agent
+from core.auth import get_identity_manager
+from core.tasks import run_background_agent, run_background_script
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/webhooks", tags=["Webhooks"])
 
-def get_identity_mgr():
-    from core.host import identity_mgr
-    return identity_mgr
+identity_mgr = get_identity_manager()
 
 def validate_github(payload_body: bytes, secret: str, request: Request) -> bool:
     signature_header = request.headers.get("X-Hub-Signature-256")
@@ -118,14 +117,12 @@ VALIDATORS: Dict[str, Callable] = {
 
 @router.post("/{agent_name}")
 async def receive_webhook(agent_name: str, request: Request):
-    identity_mgr = get_identity_mgr()
-    import asyncio
     config_data = await asyncio.to_thread(identity_mgr.get_agent_config, agent_name)
     
     if not config_data or config_data.get("type") not in ("background_agent", "background_script"):
         raise HTTPException(status_code=404, detail="Background agent not found")
         
-    disabled_workflows = identity_mgr.get_disabled_workflows()
+    disabled_workflows = await asyncio.to_thread(identity_mgr.get_disabled_workflows)
     if agent_name in disabled_workflows:
         raise HTTPException(status_code=403, detail="Workflow disabled by admin")
         
@@ -173,7 +170,6 @@ async def receive_webhook(agent_name: str, request: Request):
         
         # Queue task with Taskiq
         if config_data.get("type") == "background_script":
-            from core.tasks import run_background_script
             kiq_msg = await run_background_script.kiq(
                 agent_name=agent_name, 
                 prompt=xml_payload, 

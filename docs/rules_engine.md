@@ -198,11 +198,10 @@ health cooldown evaluation, configuration-readiness resolution):
   Supervisor tool), so its wording is never overwritten or double-annotated. It's still fully readable
   on its own if a consumer only looks at `description` and ignores the flag.
 
-  > **Note:** the matched-but-unavailable agent is *not* filtered out of the ranked semantic-fallback
-  > pool below the note — it can legitimately appear a second time among the alternatives, with its own
-  > ordinary (undecorated) description, if it ranks well on its own. This is intentional, not a bug: the
-  > note explains why the *rules-engine lock* didn't fire; the fallback ranking is a wholly separate
-  > mechanism free to still surface the same agent as one candidate among several.
+  > **Note:** the matched-but-unavailable agent *is* filtered out of the ranked semantic-fallback pool
+  > below the note (`core/agent_search.py:search_agents`, per spec §10.5) — it will not appear a
+  > second time among the alternatives. The note is the only place that agent is surfaced in the
+  > response; the fallback ranking runs over the remaining candidates only.
 
 An administratively **disabled** agent never reaches this check at all — it's excluded from
 eligibility outright (see [Readiness Gating](#readiness-gating) above), so no note is ever produced
@@ -248,6 +247,11 @@ Environment variables (`core/rules_engine.py`):
 | `RULES_EVALUATION_TIMEOUT` | `2.5` (seconds) | Hard timeout on the LLM call before failing open. |
 | `RULES_EVALUATION_MODEL` | `gemini-2.5-flash` | Model used for the structured decider. |
 
+An admin-configured timeout (set via `/admin`, persisted in etcd) takes precedence over the
+`RULES_EVALUATION_TIMEOUT` env var default when present. The request path never blocks on etcd to
+read it — it uses the last-known cached value (starting at the env var default) and refreshes it
+in the background every 30 seconds, so a change made in `/admin` can take up to that long to apply.
+
 Identical queries are memoized in-process for 60 seconds (keyed on the query text **and** a hash of
 the current rule catalog, so an edited rule invalidates the cache immediately even within the TTL
 window) — repeated identical queries do not re-invoke the LLM.
@@ -292,7 +296,7 @@ change (see `docs/agents.md`).
    `do_not_use_when: executive ticket summary` should disqualify it, and the query should resolve to
    `ticket-summary-agent` or fall through to semantic ranking.
 3. **Fail-open resilience**: set `RULES_EVALUATION_TIMEOUT=0.001` and repeat query 1. Expect
-   `[RulesEngine] Evaluation timed out after 0.001s; failing open to semantic search`, and a normal,
+   `[RulesEngine] Evaluation timed out; failing open to semantic search`, and a normal,
    successful vector-search result with no error surfaced to the caller.
 4. **Administrative disablement**: disable `troubleshooting-agent` and repeat query 1. Its rules must
    not be evaluated at all — the query should fall through to remaining eligible agents, with no
@@ -305,8 +309,8 @@ change (see `docs/agents.md`).
 Grep targets when debugging in production:
 
 - `[RulesEngine] Matched rule for agent: ...` — a rule lock fired (info level).
-- `[RulesEngine] Evaluation timed out after ...` / `Evaluation failed with error ...` — the LLM call
-  itself failed open (warning level, from `evaluate_rules`).
+- `[RulesEngine] Evaluation timed out; failing open to semantic search` / `Evaluation failed with
+  error ...` — the LLM call itself failed open (warning level, from `evaluate_rules`).
 - `[RulesEngine] Unexpected error resolving rule lock ...` — eligibility resolution (etcd/discovery)
   failed open, distinct from an LLM-call failure (warning level, from `search_agents`'s integration
   layer).
@@ -321,10 +325,15 @@ Grep targets when debugging in production:
   shows up as routine fail-open-via-timeout rather than an outage. Keep the number of rules per agent
   small and specific (see [Writing Good Rules](#writing-good-rules)); if this becomes a bottleneck,
   monitor the timeout warning log volume as a leading indicator.
-- Rule evaluation adds one extra bulk agent-discovery pass (to resolve which agents are currently
-  configured/healthy) on top of what `search_agents()` already fetches, but **only** when at least
-  one rule exists anywhere in the deployment — a zero-rules deployment (the default, out of the box)
-  pays no extra cost per query.
+- Rules are evaluated *before* any discovery work: `_resolve_rule_lock()` (`core/agent_search.py`)
+  only needs the agent configs `search_agents()` already fetched plus the routing-rules doc, and if
+  no rule clearly matches (the common case), no bulk discovery pass is paid at all — the function
+  returns `(None, None)` straight from the LLM decider's "no match" result. Only when the LLM
+  decider returns a confident match that also isn't Offline does a single **targeted**
+  `is_agent_configured(matched_name)` call run, to check that one agent's configuration readiness —
+  never a whole-catalog scan. The bulk agent-embeddings fetch (`get_all_agent_embeddings`), needed
+  for ranked semantic fallback, is deferred and skipped entirely whenever a rule lock is honored
+  (per spec §9.1/§10.4/§10.6) — it's only paid for once ranking is actually needed.
 - A rule lock **always** returns exactly one result — the locked agent — regardless of the caller's
   `limit`, including `limit <= 0`. This is intentional: the point of a deterministic lock is one
   authoritative answer, never a muddied top-N, and the caller has no way to override it (there is no

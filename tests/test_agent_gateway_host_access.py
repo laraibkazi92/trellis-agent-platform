@@ -13,6 +13,8 @@ Covers:
     external: False, and proceeding normally for external: True.
 """
 import asyncio
+import logging
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -146,7 +148,7 @@ def test_get_visible_agents_omits_external_false(monkeypatch):
         {"name": "data-parser", "description": "parses input", "type": "user_agent", "is_configured": True, "external": False},
     ]
 
-    async def fake_discover_agents(user_id=None):
+    async def fake_discover_agents(user_id=None, agent_configs=None, agent_health=None):
         return discovered
 
     monkeypatch.setattr(gateway, "discover_agents", fake_discover_agents)
@@ -169,10 +171,11 @@ def test_get_visible_agents_fails_on_host_liveness_error_status(monkeypatch):
         {"name": "general-agent", "description": "does stuff", "type": "user_agent", "is_configured": True, "external": True},
     ]
 
-    async def fake_discover_agents(user_id=None):
+    async def fake_discover_agents(user_id=None, agent_configs=None, agent_health=None):
         return discovered
 
     monkeypatch.setattr(gateway, "discover_agents", fake_discover_agents)
+    _patch_gateway_etcd(monkeypatch)
     monkeypatch.setattr(gateway, "app", SimpleNamespace(state=SimpleNamespace(
         http_client=FakeHTTPClient(status_code=503)
     )), raising=False)
@@ -183,13 +186,14 @@ def test_get_visible_agents_fails_on_host_liveness_error_status(monkeypatch):
     assert visible == [{"name": "Error", "description": "Host API unreachable (HTTP 503)"}]
 
 
-def test_get_visible_agents_fails_on_host_liveness_exception(monkeypatch):
-    """Host unreachable at the transport level also fails clearly, as before."""
+def test_get_visible_agents_fails_on_host_liveness_exception(monkeypatch, caplog):
+    """Host unreachable at the transport level also fails clearly, as before --
+    with a stable generic description (raw detail only in the logs)."""
     discovered = [
         {"name": "general-agent", "description": "does stuff", "type": "user_agent", "is_configured": True, "external": True},
     ]
 
-    async def fake_discover_agents(user_id=None):
+    async def fake_discover_agents(user_id=None, agent_configs=None, agent_health=None):
         return discovered
 
     class RaisingClient:
@@ -197,16 +201,18 @@ def test_get_visible_agents_fails_on_host_liveness_exception(monkeypatch):
             raise ConnectionError("connection refused")
 
     monkeypatch.setattr(gateway, "discover_agents", fake_discover_agents)
+    _patch_gateway_etcd(monkeypatch)
     monkeypatch.setattr(gateway, "app", SimpleNamespace(state=SimpleNamespace(
         http_client=RaisingClient()
     )), raising=False)
     user_id_var.set("user-1")
 
-    visible = asyncio.run(gateway._get_visible_agents())
+    with caplog.at_level(logging.ERROR, logger="core.gateway"):
+        visible = asyncio.run(gateway._get_visible_agents())
 
-    assert len(visible) == 1
-    assert visible[0]["name"] == "Error"
-    assert "Host API unreachable" in visible[0]["description"]
+    assert visible == [{"name": "Error", "description": "Host API temporarily unreachable. Please try again later."}]
+    assert "connection refused" not in visible[0]["description"]
+    assert "connection refused" in caplog.text
 
 
 def test_get_visible_agents_annotates_offline_status_from_etcd(monkeypatch):
@@ -215,7 +221,7 @@ def test_get_visible_agents_annotates_offline_status_from_etcd(monkeypatch):
         {"name": "general-agent", "description": "does stuff", "type": "user_agent", "is_configured": True, "external": True},
     ]
 
-    async def fake_discover_agents(user_id=None):
+    async def fake_discover_agents(user_id=None, agent_configs=None, agent_health=None):
         return discovered
 
     monkeypatch.setattr(gateway, "discover_agents", fake_discover_agents)
@@ -233,6 +239,7 @@ def test_get_visible_agents_annotates_offline_status_from_etcd(monkeypatch):
 
     assert len(visible) == 1
     assert "[STATUS: OFFLINE" in visible[0]["description"]
+    assert visible[0]["configured"] is False
 
 
 def test_get_visible_agents_annotates_degraded_status_from_offline_tool(monkeypatch):
@@ -243,7 +250,7 @@ def test_get_visible_agents_annotates_degraded_status_from_offline_tool(monkeypa
         {"name": "general-agent", "description": "does stuff", "type": "user_agent", "is_configured": True, "external": True},
     ]
 
-    async def fake_discover_agents(user_id=None):
+    async def fake_discover_agents(user_id=None, agent_configs=None, agent_health=None):
         return discovered
 
     monkeypatch.setattr(gateway, "discover_agents", fake_discover_agents)
@@ -264,15 +271,19 @@ def test_get_visible_agents_annotates_degraded_status_from_offline_tool(monkeypa
     assert "netctl" in visible[0]["description"]
 
 
-def test_get_visible_agents_fails_gracefully_on_etcd_error_after_liveness_check(monkeypatch):
-    """A transient etcd failure while computing per-agent decoration (after the Host
-    liveness ping has already succeeded) must degrade to the same friendly error shape
-    as every other failure path here, not propagate as a raw exception."""
+def test_get_visible_agents_fails_gracefully_on_etcd_error_after_liveness_check(monkeypatch, caplog):
+    """A transient etcd failure while computing per-agent decoration must degrade to the
+    same friendly error shape as every other failure path here, not propagate as a raw
+    exception. (The decoration bulk-fetch now runs before the Host liveness ping --
+    see _get_visible_agents' docstring on collapsing the double bulk-fetch -- so this
+    failure surfaces before the liveness check is ever reached rather than after it;
+    the guarantee this test pins down, that the failure degrades gracefully instead of
+    crashing, is unchanged.)"""
     discovered = [
         {"name": "general-agent", "description": "does stuff", "type": "user_agent", "is_configured": True, "external": True},
     ]
 
-    async def fake_discover_agents(user_id=None):
+    async def fake_discover_agents(user_id=None, agent_configs=None, agent_health=None):
         return discovered
 
     def _raise_timeout():
@@ -286,11 +297,14 @@ def test_get_visible_agents_fails_gracefully_on_etcd_error_after_liveness_check(
     )), raising=False)
     user_id_var.set("user-1")
 
-    visible = asyncio.run(gateway._get_visible_agents())
+    with caplog.at_level(logging.ERROR, logger="core.gateway"):
+        visible = asyncio.run(gateway._get_visible_agents())
 
     assert len(visible) == 1
     assert visible[0]["name"] == "Error"
-    assert "Failed to compute agent status" in visible[0]["description"]
+    assert visible[0]["description"] == "Failed to compute agent status. Please try again later."
+    assert "etcd transient timeout fetching agent configs" not in visible[0]["description"]
+    assert "etcd transient timeout fetching agent configs" in caplog.text
 
 
 def test_get_visible_agents_defaults_to_online_when_decoration_data_missing(monkeypatch):
@@ -300,7 +314,7 @@ def test_get_visible_agents_defaults_to_online_when_decoration_data_missing(monk
         {"name": "general-agent", "description": "does stuff", "type": "user_agent", "is_configured": True, "external": True},
     ]
 
-    async def fake_discover_agents(user_id=None):
+    async def fake_discover_agents(user_id=None, agent_configs=None, agent_health=None):
         return discovered
 
     monkeypatch.setattr(gateway, "discover_agents", fake_discover_agents)
@@ -340,7 +354,7 @@ def test_gateway_search_agents_passes_callers_real_limit(monkeypatch):
         captured["limit"] = limit
         return [{"name": "general-agent", "description": "handles stuff", "status": "Online"}]
 
-    async def fake_visible():
+    async def fake_visible(names=None):
         return [{"name": "general-agent", "description": "handles stuff", "configured": True}]
 
     monkeypatch.setattr(gateway, "_search_agents_ranked", fake_ranked)
@@ -365,7 +379,7 @@ def test_gateway_search_agents_decorates_never_excludes(monkeypatch):
             {"name": "undecorated-agent", "description": "own description", "status": "Online"},
         ]
 
-    async def fake_visible():
+    async def fake_visible(names=None):
         return [{"name": "decorated-agent", "description": "richly annotated description", "configured": False}]
 
     monkeypatch.setattr(gateway, "_search_agents_ranked", fake_ranked)
@@ -401,7 +415,7 @@ def test_gateway_search_agents_preserves_unavailable_match_note(monkeypatch):
             {"name": "ticket-summary-agent", "description": "raw description", "status": "Online"},
         ]
 
-    async def fake_visible():
+    async def fake_visible(names=None):
         return [
             {
                 "name": "troubleshooting-agent",
@@ -431,11 +445,95 @@ def test_gateway_search_agents_preserves_unavailable_match_note(monkeypatch):
     }
 
 
+def test_gateway_search_agents_unavailable_match_offline_agent_reports_configured_false(monkeypatch):
+    """An agent that is matched but offline must report configured=False on its note item
+    in Gateway MCP even if its credentials are configured, so callers never invoke an offline agent."""
+    async def fake_ranked(query, limit=None, include_disabled=False):
+        return [
+            {
+                "name": "troubleshooting-agent",
+                "description": "The routing policy identified 'troubleshooting-agent' as the best "
+                                "match for this query, but it is currently offline. Showing "
+                                "next-best alternatives below.",
+                "status": "Offline",
+                "unavailable_match": True,
+            },
+            {"name": "ticket-summary-agent", "description": "raw description", "status": "Online"},
+        ]
+
+    async def fake_visible(names=None):
+        return [
+            {
+                "name": "troubleshooting-agent",
+                "description": "Specialized troubleshooting agent.",
+                "configured": True,  # Credentials set, but agent is offline
+            },
+            {"name": "ticket-summary-agent", "description": "richly annotated description", "configured": True},
+        ]
+
+    monkeypatch.setattr(gateway, "_search_agents_ranked", fake_ranked)
+    monkeypatch.setattr(gateway, "_get_visible_agents", fake_visible)
+
+    ctx = FakeContext()
+    results = asyncio.run(gateway.search_agents(ctx, "find something", limit=5))
+
+    assert results[0]["configured"] is False
+    assert results[0]["name"] == "troubleshooting-agent"
+    assert "currently offline" in results[0]["description"]
+    assert results[1]["configured"] is True
+
+
+def test_gateway_search_agents_ordinary_offline_candidate_reports_configured_false(monkeypatch):
+    """An ordinary candidate that is offline must report configured=False in Gateway search_agents."""
+    async def fake_ranked(query, limit=None, include_disabled=False):
+        return [
+            {"name": "offline-agent", "description": "raw description", "status": "Offline"},
+            {"name": "online-agent", "description": "raw description", "status": "Online"},
+        ]
+
+    async def fake_visible(names=None):
+        return [
+            {"name": "offline-agent", "description": "Offline agent [STATUS: OFFLINE]", "configured": False},
+            {"name": "online-agent", "description": "Online agent", "configured": True},
+        ]
+
+    monkeypatch.setattr(gateway, "_search_agents_ranked", fake_ranked)
+    monkeypatch.setattr(gateway, "_get_visible_agents", fake_visible)
+
+    ctx = FakeContext()
+    results = asyncio.run(gateway.search_agents(ctx, "find something", limit=5))
+
+    assert results[0]["name"] == "offline-agent"
+    assert results[0]["configured"] is False
+    assert results[1]["name"] == "online-agent"
+    assert results[1]["configured"] is True
+
+
+def test_gateway_search_agents_offline_fallback_miss_reports_configured_false(monkeypatch):
+    """If an offline agent misses visible_by_name decoration lookup, the fallback still reports configured=False."""
+    async def fake_ranked(query, limit=None, include_disabled=False):
+        return [
+            {"name": "unregistered-offline", "description": "fallback desc", "status": "Offline"},
+        ]
+
+    async def fake_visible(names=None):
+        return []
+
+    monkeypatch.setattr(gateway, "_search_agents_ranked", fake_ranked)
+    monkeypatch.setattr(gateway, "_get_visible_agents", fake_visible)
+
+    ctx = FakeContext()
+    results = asyncio.run(gateway.search_agents(ctx, "find something", limit=5))
+
+    assert results[0]["name"] == "unregistered-offline"
+    assert results[0]["configured"] is False
+
+
 def test_gateway_search_agents_returns_empty_when_nothing_ranked(monkeypatch):
     async def fake_ranked(query, limit=None, include_disabled=False):
         return []
 
-    async def _fail_visible():
+    async def _fail_visible(names=None):
         raise AssertionError("_get_visible_agents should not be called when nothing was ranked")
 
     monkeypatch.setattr(gateway, "_search_agents_ranked", fake_ranked)
@@ -455,7 +553,7 @@ def test_gateway_search_agents_surfaces_host_error_sentinel(monkeypatch):
     async def fake_ranked(query, limit=None, include_disabled=False):
         return [{"name": "general-agent", "description": "handles stuff", "status": "Online"}]
 
-    async def fake_visible():
+    async def fake_visible(names=None):
         return [{"name": "Error", "description": "Host API unreachable (HTTP 503)"}]
 
     monkeypatch.setattr(gateway, "_search_agents_ranked", fake_ranked)
@@ -557,8 +655,7 @@ def test_chat_completions_exempts_supervisor(monkeypatch):
 
     monkeypatch.setattr(host, "get_agent", fake_get_agent)
 
-    import core.memory as memory_module
-    monkeypatch.setattr(memory_module, "get_memory_manager", lambda: SimpleNamespace(active_for=lambda cfg: False))
+    monkeypatch.setattr(host, "get_memory_manager", lambda: SimpleNamespace(active_for=lambda cfg: False))
 
     request = _make_request("supervisor")
 
@@ -585,11 +682,478 @@ def test_chat_completions_allows_external_true(monkeypatch):
 
     monkeypatch.setattr(host, "get_agent", fake_get_agent)
 
-    import core.memory as memory_module
-    monkeypatch.setattr(memory_module, "get_memory_manager", lambda: SimpleNamespace(active_for=lambda cfg: False))
+    monkeypatch.setattr(host, "get_memory_manager", lambda: SimpleNamespace(active_for=lambda cfg: False))
 
     request = _make_request("general-agent")
 
     result = asyncio.run(host.chat_completions(request))
 
     assert result["choices"][0]["message"]["content"] == "general reply"
+
+
+# --- Phase 3 (Cycle 4): ranked-subset decoration (I1) --------------------------
+#
+# `_get_visible_agents(names=[...])` must decorate the ranked subset using only the
+# four bulk etcd getters + Host liveness ping + targeted per-name calls -- never the
+# full-catalog `discover_agents()` / `get_all_agent_skills()` paths. `names=None`
+# preserves the original full-catalog behavior.
+
+def test_search_agents_decoration_avoids_catalog_discovery(monkeypatch):
+    """`search_agents` decorates ranked names from the subset path only: the
+    full-catalog `discover_agents()` and bulk `get_all_agent_skills()` must never
+    fire, and the decorated description comes from the etcd config, not the raw
+    ranked result."""
+    async def fake_ranked(query, limit=None, include_disabled=False):
+        return [{"name": "general-agent", "description": "raw description", "status": "Online"}]
+
+    async def _fail_if_called(*args, **kwargs):
+        raise AssertionError("must not be called on the subset path")
+
+    monkeypatch.setattr(gateway, "_search_agents_ranked", fake_ranked)
+    monkeypatch.setattr(gateway, "discover_agents", _fail_if_called)
+    monkeypatch.setattr(gateway.identity_mgr, "get_all_agent_skills", _fail_if_called)
+
+    _patch_gateway_etcd(monkeypatch, agent_configs={
+        "general-agent": {
+            "name": "general-agent",
+            "description": "Rich catalog description",
+            "type": "user_agent",
+            "external": True,
+        },
+    })
+
+    async def fake_is_agent_configured(agent_name, user_id):
+        return {"configured": True, "missing_secrets": [], "missing_variables": []}
+
+    monkeypatch.setattr(gateway, "is_agent_configured", fake_is_agent_configured)
+    monkeypatch.setattr(gateway, "app", SimpleNamespace(state=SimpleNamespace(
+        http_client=FakeHTTPClient()
+    )), raising=False)
+    user_id_var.set("user-1")
+
+    results = asyncio.run(gateway.search_agents(FakeContext(), "find something"))
+
+    assert results == [{
+        "name": "general-agent",
+        "description": "Rich catalog description",
+        "configured": True,
+    }]
+
+
+def test_get_visible_agents_subset_decorates_only_requested_names(monkeypatch):
+    """The subset path omits unrequested agents, decorates only the requested names,
+    and appends the verbatim NOT CONFIGURED note from `is_agent_configured`'s
+    missing-secrets output; `names=None` still returns the full catalog."""
+    requested = []
+
+    async def fake_is_agent_configured(agent_name, user_id):
+        requested.append(agent_name)
+        if agent_name == "b":
+            return {"configured": False, "missing_secrets": ["B_KEY"], "missing_variables": []}
+        return {"configured": True, "missing_secrets": [], "missing_variables": []}
+
+    _patch_gateway_etcd(monkeypatch, agent_configs={
+        "a": {"name": "a", "description": "Agent A", "type": "user_agent", "external": True},
+        "b": {"name": "b", "description": "Agent B", "type": "user_agent", "external": True},
+        "c": {"name": "c", "description": "Agent C", "type": "user_agent", "external": True},
+    })
+
+    async def _fail_if_called(*args, **kwargs):
+        raise AssertionError("discover_agents must not be called on the subset path")
+
+    monkeypatch.setattr(gateway, "discover_agents", _fail_if_called)
+    monkeypatch.setattr(gateway, "is_agent_configured", fake_is_agent_configured)
+    monkeypatch.setattr(gateway, "app", SimpleNamespace(state=SimpleNamespace(
+        http_client=FakeHTTPClient()
+    )), raising=False)
+    user_id_var.set("user-1")
+
+    visible = asyncio.run(gateway._get_visible_agents(names=["a", "b"]))
+
+    assert len(visible) == 2
+    assert sorted(a["name"] for a in visible) == ["a", "b"]
+    assert sorted(requested) == ["a", "b"]
+    a_entry = next(a for a in visible if a["name"] == "a")
+    b_entry = next(a for a in visible if a["name"] == "b")
+    assert a_entry["configured"] is True
+    assert b_entry["configured"] is False
+    assert b_entry["description"].endswith(
+        " [NOT CONFIGURED — missing secrets: B_KEY. Configure at /agents/b/configure]"
+    )
+
+    # Regression pin: names=None still takes the full-catalog discover_agents() path.
+    async def fake_discover_agents(user_id=None, agent_configs=None, agent_health=None):
+        return [
+            {"name": "a", "description": "Agent A", "type": "user_agent", "is_configured": True, "external": True},
+            {"name": "b", "description": "Agent B", "type": "user_agent", "is_configured": True, "external": True},
+            {"name": "c", "description": "Agent C", "type": "user_agent", "is_configured": True, "external": True},
+        ]
+
+    monkeypatch.setattr(gateway, "discover_agents", fake_discover_agents)
+
+    full = asyncio.run(gateway._get_visible_agents())
+
+    assert sorted(a["name"] for a in full) == ["a", "b", "c"]
+    assert sorted(requested) == ["a", "b"]
+
+
+def test_get_visible_agents_subset_is_agent_configured_exception_fails_open(monkeypatch):
+    """A per-agent readiness-check exception must fail open (configured=True, no NOT
+    CONFIGURED note) rather than dropping the agent or failing the whole subset."""
+    _patch_gateway_etcd(monkeypatch, agent_configs={
+        "a": {"name": "a", "description": "Agent A", "type": "user_agent", "external": True},
+    })
+
+    async def _fail_if_called(*args, **kwargs):
+        raise AssertionError("discover_agents must not be called on the subset path")
+
+    async def raising_is_agent_configured(agent_name, user_id):
+        raise RuntimeError("etcd unreachable")
+
+    monkeypatch.setattr(gateway, "discover_agents", _fail_if_called)
+    monkeypatch.setattr(gateway, "is_agent_configured", raising_is_agent_configured)
+    monkeypatch.setattr(gateway, "app", SimpleNamespace(state=SimpleNamespace(
+        http_client=FakeHTTPClient()
+    )), raising=False)
+    user_id_var.set("user-1")
+
+    visible = asyncio.run(gateway._get_visible_agents(names=["a"]))
+
+    assert len(visible) == 1
+    assert visible[0]["name"] == "a"
+    assert visible[0]["configured"] is True
+    assert "[NOT CONFIGURED" not in visible[0]["description"]
+
+
+def test_get_visible_agents_subset_omits_ineligible_names(monkeypatch):
+    """Names failing the catalog checks (unknown, disabled, non-routable, internal) are
+    omitted from the ranked subset; only eligible names come back."""
+    _patch_gateway_etcd(
+        monkeypatch,
+        disabled=["disabled-agent"],
+        agent_configs={
+            "disabled-agent": {"name": "disabled-agent", "description": "D", "type": "user_agent", "external": True},
+            "background-agent": {"name": "background-agent", "description": "B", "type": "background_agent", "external": True},
+            "internal-agent": {"name": "internal-agent", "description": "I", "type": "user_agent", "external": False},
+            "good-agent": {"name": "good-agent", "description": "G", "type": "user_agent", "external": True},
+        },
+    )
+
+    async def fake_is_agent_configured(agent_name, user_id):
+        return {"configured": True, "missing_secrets": [], "missing_variables": []}
+
+    monkeypatch.setattr(gateway, "is_agent_configured", fake_is_agent_configured)
+    monkeypatch.setattr(gateway, "app", SimpleNamespace(state=SimpleNamespace(
+        http_client=FakeHTTPClient()
+    )), raising=False)
+    user_id_var.set("user-1")
+
+    visible = asyncio.run(gateway._get_visible_agents(
+        names=["unknown-agent", "disabled-agent", "background-agent", "internal-agent", "good-agent"]
+    ))
+
+    assert [a["name"] for a in visible] == ["good-agent"]
+
+
+def test_get_visible_agents_subset_annotates_offline_and_degraded(monkeypatch):
+    """Offline/Degraded decoration is computed per requested name from the bulk etcd
+    health maps, exactly as the full-catalog path does."""
+    from datetime import datetime, timezone
+
+    _patch_gateway_etcd(
+        monkeypatch,
+        agent_configs={
+            "offline-agent": {"name": "offline-agent", "description": "Offline", "type": "user_agent", "external": True, "allowed_tools": []},
+            "degraded-agent": {"name": "degraded-agent", "description": "Degraded", "type": "user_agent", "external": True, "allowed_tools": ["t1"]},
+            "ok-agent": {"name": "ok-agent", "description": "OK", "type": "user_agent", "external": True, "allowed_tools": []},
+        },
+        agent_health={
+            "offline-agent": {"status": "Offline", "last_failure_time": datetime.now(timezone.utc).isoformat()},
+        },
+        tool_health={"t1": {"status": "Offline"}},
+    )
+
+    async def fake_is_agent_configured(agent_name, user_id):
+        return {"configured": True, "missing_secrets": [], "missing_variables": []}
+
+    monkeypatch.setattr(gateway, "is_agent_configured", fake_is_agent_configured)
+    monkeypatch.setattr(gateway, "app", SimpleNamespace(state=SimpleNamespace(
+        http_client=FakeHTTPClient()
+    )), raising=False)
+    user_id_var.set("user-1")
+
+    visible = asyncio.run(gateway._get_visible_agents(
+        names=["offline-agent", "degraded-agent", "ok-agent"]
+    ))
+    by_name = {a["name"]: a for a in visible}
+
+    assert by_name["offline-agent"]["configured"] is False
+    assert by_name["offline-agent"]["description"].endswith(" [STATUS: OFFLINE - DO NOT ROUTE REQUESTS HERE]")
+    assert by_name["degraded-agent"]["configured"] is True
+    assert by_name["degraded-agent"]["description"].endswith(" [STATUS: DEGRADED - Offline tools: t1]")
+    assert by_name["ok-agent"]["configured"] is True
+
+
+def test_get_visible_agents_subset_uses_targeted_skills_for_empty_description(monkeypatch):
+    """A requested agent with no config description falls back to its own skills.md
+    first paragraph via a targeted per-name fetch, never the full-catalog bulk fetch."""
+    calls = []
+
+    def fake_get_agent_skills(name):
+        calls.append(name)
+        return "# Header\n\nFirst real paragraph.\n\nSecond."
+
+    async def _fail_if_called(*args, **kwargs):
+        raise AssertionError("get_all_agent_skills must not be called on the subset path")
+
+    async def fake_is_agent_configured(agent_name, user_id):
+        return {"configured": True, "missing_secrets": [], "missing_variables": []}
+
+    _patch_gateway_etcd(monkeypatch, agent_configs={
+        "skills-agent": {"name": "skills-agent", "type": "user_agent", "external": True},
+    })
+    monkeypatch.setattr(gateway.identity_mgr, "get_agent_skills", fake_get_agent_skills)
+    monkeypatch.setattr(gateway.identity_mgr, "get_all_agent_skills", _fail_if_called)
+    monkeypatch.setattr(gateway, "is_agent_configured", fake_is_agent_configured)
+    monkeypatch.setattr(gateway, "app", SimpleNamespace(state=SimpleNamespace(
+        http_client=FakeHTTPClient()
+    )), raising=False)
+    user_id_var.set("user-1")
+
+    visible = asyncio.run(gateway._get_visible_agents(names=["skills-agent"]))
+
+    assert len(visible) == 1
+    assert visible[0]["description"] == "First real paragraph."
+    assert calls == ["skills-agent"]
+
+
+def test_get_visible_agents_subset_fetches_skills_concurrently(monkeypatch):
+    """Two requested agents with no config description must have their skills fetched
+    concurrently: both fake lookups rendezvous at a shared ``threading.Barrier(2)`` that
+    only releases once both are in flight. A sequential implementation would block on
+    the first ``barrier.wait()``, hit the 2s timeout, and both descriptions would fall
+    back to 'No description available.' instead of both agents coming back decorated."""
+    loop_thread_id = threading.get_ident()
+    barrier = threading.Barrier(2, timeout=2)
+    released = []
+
+    def fake_get_agent_skills(name):
+        barrier.wait()
+        released.append((name, threading.get_ident()))
+        return f"Skills for {name}."
+
+    async def fake_is_agent_configured(agent_name, user_id):
+        return {"configured": True, "missing_secrets": [], "missing_variables": []}
+
+    _patch_gateway_etcd(monkeypatch, agent_configs={
+        "skills-a": {"name": "skills-a", "type": "user_agent", "external": True},
+        "skills-b": {"name": "skills-b", "type": "user_agent", "external": True},
+    })
+    monkeypatch.setattr(gateway.identity_mgr, "get_agent_skills", fake_get_agent_skills)
+    monkeypatch.setattr(gateway, "is_agent_configured", fake_is_agent_configured)
+    monkeypatch.setattr(gateway, "app", SimpleNamespace(state=SimpleNamespace(
+        http_client=FakeHTTPClient()
+    )), raising=False)
+    user_id_var.set("user-1")
+
+    visible = asyncio.run(gateway._get_visible_agents(names=["skills-a", "skills-b"]))
+    by_name = {a["name"]: a for a in visible}
+
+    assert sorted(by_name) == ["skills-a", "skills-b"]
+    assert by_name["skills-a"]["description"] == "Skills for skills-a."
+    assert by_name["skills-b"]["description"] == "Skills for skills-b."
+    assert {name for name, _ in released} == {"skills-a", "skills-b"}
+    assert all(thread_id != loop_thread_id for _, thread_id in released)
+
+
+def test_get_visible_agents_subset_returns_generic_error_sentinel_on_decoration_failure(monkeypatch, caplog):
+    """An unexpected exception while decorating the ranked subset must degrade to the
+    generic 'Failed to verify agent configurations' sentinel, keeping the raw detail
+    out of the returned description and only in the logs."""
+    _patch_gateway_etcd(monkeypatch, agent_configs={
+        "a": {"name": "a", "description": "Agent A", "type": "user_agent", "external": True},
+    })
+
+    def _raise_decoration(*args, **kwargs):
+        raise RuntimeError("decoration exploded")
+
+    monkeypatch.setattr(gateway, "is_routable_agent_type", _raise_decoration)
+    monkeypatch.setattr(gateway, "app", SimpleNamespace(state=SimpleNamespace(
+        http_client=FakeHTTPClient()
+    )), raising=False)
+    user_id_var.set("user-1")
+
+    with caplog.at_level(logging.ERROR, logger="core.gateway"):
+        visible = asyncio.run(gateway._get_visible_agents(names=["a"]))
+
+    assert visible == [{"name": "Error", "description": "Failed to verify agent configurations. Please try again later."}]
+    assert "decoration exploded" not in visible[0]["description"]
+    assert "decoration exploded" in caplog.text
+
+
+def test_get_visible_agents_full_path_returns_generic_error_sentinel_when_discover_fails(monkeypatch, caplog):
+    """A failure inside the full-catalog discover_agents() path must also degrade to the
+    generic sentinel, with the raw detail logged rather than returned."""
+    async def raising_discover_agents(user_id=None, agent_configs=None, agent_health=None):
+        raise RuntimeError("discover exploded")
+
+    _patch_gateway_etcd(monkeypatch)
+    monkeypatch.setattr(gateway, "discover_agents", raising_discover_agents)
+    monkeypatch.setattr(gateway, "app", SimpleNamespace(state=SimpleNamespace(
+        http_client=FakeHTTPClient()
+    )), raising=False)
+    user_id_var.set("user-1")
+
+    with caplog.at_level(logging.ERROR, logger="core.gateway"):
+        visible = asyncio.run(gateway._get_visible_agents())
+
+    assert visible == [{"name": "Error", "description": "Failed to verify agent configurations. Please try again later."}]
+    assert "discover exploded" not in visible[0]["description"]
+    assert "discover exploded" in caplog.text
+
+
+def test_get_visible_agents_subset_skills_failure_degrades_only_that_name(monkeypatch, caplog):
+    """One agent's skills-fetch failure must degrade only that name to the generic
+    fallback description, never the whole subset to the Error sentinel."""
+    def fake_get_agent_skills(name):
+        if name == "b":
+            raise RuntimeError("skills exploded")
+        return "# H\n\nParagraph A."
+
+    async def fake_is_agent_configured(agent_name, user_id):
+        return {"configured": True, "missing_secrets": [], "missing_variables": []}
+
+    _patch_gateway_etcd(monkeypatch, agent_configs={
+        "a": {"name": "a", "type": "user_agent", "external": True},
+        "b": {"name": "b", "type": "user_agent", "external": True},
+    })
+    monkeypatch.setattr(gateway.identity_mgr, "get_agent_skills", fake_get_agent_skills)
+    monkeypatch.setattr(gateway, "is_agent_configured", fake_is_agent_configured)
+    monkeypatch.setattr(gateway, "app", SimpleNamespace(state=SimpleNamespace(
+        http_client=FakeHTTPClient()
+    )), raising=False)
+    user_id_var.set("user-1")
+
+    with caplog.at_level(logging.WARNING, logger="core.gateway"):
+        visible = asyncio.run(gateway._get_visible_agents(names=["a", "b"]))
+
+    by_name = {a["name"]: a for a in visible}
+    assert by_name["a"]["description"] == "Paragraph A."
+    assert by_name["b"]["description"] == "No description available."
+    assert not (len(visible) == 1 and visible[0]["name"] == "Error")
+    assert "skills exploded" in caplog.text
+
+
+# --- Phase 5 (Cycle 4): chat_completions 500 detail leak ------------------------
+
+def test_chat_completions_500_hides_internal_detail(monkeypatch, caplog):
+    """An execution failure must surface a generic 500 detail -- the raw exception
+    text stays in logs / health records, never in the API response (Task 5.4)."""
+    monkeypatch.setattr(host.identity_mgr, "get_disabled_standard_agents", lambda: [])
+    monkeypatch.setattr(
+        host.identity_mgr,
+        "get_agent_config",
+        lambda name: {"name": name, "type": "user_agent", "external": True},
+    )
+    monkeypatch.setattr(host.health_monitor, "get_status", lambda kind, name: {"status": "Online"})
+
+    recorded_events = []
+
+    def fake_record_event(entity_type, name, is_success, error_details=None):
+        recorded_events.append((entity_type, name, is_success, error_details))
+
+    monkeypatch.setattr(host.health_monitor, "record_event", fake_record_event)
+
+    async def fake_get_agent(name):
+        class FailingAgent:
+            async def run(self, *args, **kwargs):
+                raise RuntimeError("secret-ish detail")
+        return FailingAgent()
+
+    monkeypatch.setattr(host, "get_agent", fake_get_agent)
+
+    monkeypatch.setattr(host, "get_memory_manager", lambda: SimpleNamespace(active_for=lambda cfg: False))
+
+    request = _make_request("general-agent")
+
+    with caplog.at_level(logging.ERROR, logger="core.host"):
+        with pytest.raises(host.HTTPException) as exc_info:
+            asyncio.run(host.chat_completions(request))
+
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.detail == "Internal error while running the agent."
+    assert "secret-ish detail" not in exc_info.value.detail
+    assert "execution failed" in caplog.text
+    assert any(
+        event[0] == "agent" and event[1] == "general-agent" and event[2] is False
+        for event in recorded_events
+    )
+
+
+def test_chat_completions_get_agent_failure_is_not_wrapped(monkeypatch):
+    """`get_agent` runs before the execution try/except, so its failures must
+    propagate as-is instead of being converted into a generic 500."""
+    monkeypatch.setattr(host.identity_mgr, "get_disabled_standard_agents", lambda: [])
+    monkeypatch.setattr(
+        host.identity_mgr,
+        "get_agent_config",
+        lambda name: {"name": name, "type": "user_agent", "external": True},
+    )
+    monkeypatch.setattr(host.health_monitor, "get_status", lambda kind, name: {"status": "Online"})
+
+    async def fake_get_agent(name):
+        raise RuntimeError("build failed")
+
+    monkeypatch.setattr(host, "get_agent", fake_get_agent)
+
+    request = _make_request("general-agent")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(host.chat_completions(request))
+
+    assert not isinstance(exc_info.value, host.HTTPException)
+    assert str(exc_info.value) == "build failed"
+
+
+# --- Shutdown drain (_background_tasks) ----------------------------------------
+
+def test_host_drain_background_tasks_waits_for_completion():
+    completed = []
+
+    async def work():
+        await asyncio.sleep(0.01)
+        completed.append(True)
+        return "done"
+
+    async def _scenario():
+        task = host._spawn_background(work(), "test-host-drain-complete")
+        await host._drain_background_tasks(timeout=5.0)
+        return task
+
+    task = asyncio.run(_scenario())
+
+    assert completed == [True]
+    assert task.done()
+    assert not task.cancelled()
+    assert task.result() == "done"
+    assert task not in host._background_tasks
+
+
+def test_host_drain_background_tasks_cancels_hung_task():
+    started = asyncio.Event()
+
+    async def work():
+        started.set()
+        await asyncio.sleep(60)
+
+    async def _scenario():
+        task = host._spawn_background(work(), "test-host-drain-hang")
+        await asyncio.wait_for(started.wait(), timeout=2)
+        await host._drain_background_tasks(timeout=0.05)
+        await asyncio.gather(task, return_exceptions=True)
+        return task
+
+    task = asyncio.run(_scenario())
+
+    assert task.cancelled()
+    assert task not in host._background_tasks

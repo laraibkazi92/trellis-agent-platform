@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -25,7 +26,7 @@ class FakeCallToolResult:
 
 
 class FakeTextContent:
-    """Duck-types mcp.types.TextContent (only `.text` is read by _extract_tool_output)."""
+    """Duck-types mcp.types.TextContent (only `.text` is read by extract_tool_output)."""
 
     def __init__(self, text):
         self.text = text
@@ -224,7 +225,6 @@ def test_use_tool_falls_back_to_text_content_when_unstructured(monkeypatch):
         return fake_client
 
     monkeypatch.setattr(gateway, "get_hub_client", fake_get_hub_client)
-    monkeypatch.setattr(gateway, "TextContent", FakeTextContent)
     user_id_var.set("user-1")
 
     ctx = FakeContext()
@@ -233,7 +233,7 @@ def test_use_tool_falls_back_to_text_content_when_unstructured(monkeypatch):
     assert result == "plain text output"
 
 
-def test_use_tool_surfaces_execution_errors(monkeypatch):
+def test_use_tool_surfaces_execution_errors(monkeypatch, caplog):
     monkeypatch.setattr(gateway.identity_mgr, "get_tool_config", lambda name: {"name": name, "public": True})
 
     async def fake_configured(tool_name, user_id=None):
@@ -248,7 +248,9 @@ def test_use_tool_surfaces_execution_errors(monkeypatch):
     user_id_var.set("user-1")
 
     ctx = FakeContext()
-    result = asyncio.run(gateway.use_tool(ctx, "opsctl", {"args": ["--help"]}))
+    with caplog.at_level(logging.ERROR, logger="core.tool_search"):
+        result = asyncio.run(gateway.use_tool(ctx, "opsctl", {"args": ["--help"]}))
 
-    assert result.startswith("SYSTEM: Error executing tool 'opsctl'")
-    assert "hub unreachable" in result
+    assert result == "SYSTEM: Error executing tool 'opsctl'. Please try again later."
+    assert "hub unreachable" not in result
+    assert "hub unreachable" in caplog.text

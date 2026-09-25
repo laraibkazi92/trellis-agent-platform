@@ -143,7 +143,7 @@ async def run_background_script(
         if not config_data:
             raise ValueError(f"Workflow '{agent_name}' configuration not found in etcd.")
             
-        disabled_workflows = identity_mgr.get_disabled_workflows()
+        disabled_workflows = await asyncio.to_thread(identity_mgr.get_disabled_workflows)
         if agent_name in disabled_workflows:
             raise ValueError(f"Workflow '{agent_name}' is currently disabled.")
         
@@ -180,21 +180,21 @@ async def run_background_script(
         from core.discovery import get_agent_required_secrets, get_agent_required_variables
         
         # Scoped Secret Injection (Aggregated from config + allowed tools/mcps)
-        secret_keys = await get_agent_required_secrets(config_data)
+        secret_keys = await get_agent_required_secrets(config_data, strict=True)
         if secret_keys:
-            secrets = identity_mgr.get_resolved_config(user_id, "secrets", keys=secret_keys)
+            secrets = await asyncio.to_thread(identity_mgr.get_resolved_config, user_id, "secrets", keys=secret_keys)
             safe_secrets = {str(k): str(v) for k, v in secrets.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
             env.update(safe_secrets)
             
         # Scoped Variable Injection (Aggregated from config + allowed tools/mcps)
-        variable_keys = await get_agent_required_variables(config_data)
+        variable_keys = await get_agent_required_variables(config_data, strict=True)
         if variable_keys:
-            variables = identity_mgr.get_resolved_config(user_id, "variables", keys=variable_keys)
+            variables = await asyncio.to_thread(identity_mgr.get_resolved_config, user_id, "variables", keys=variable_keys)
             safe_vars = {str(k): str(v) for k, v in variables.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
             env.update(safe_vars)
 
-        env["FRAMEWORK_EXECUTION_TOKEN"] = identity_mgr.generate_execution_token(user_id)
-        framework_url = identity_mgr.get_config("HOST_URL", os.getenv("HOST_URL", "http://localhost:8000"))
+        env["FRAMEWORK_EXECUTION_TOKEN"] = await asyncio.to_thread(identity_mgr.generate_execution_token, user_id)
+        framework_url = await asyncio.to_thread(identity_mgr.get_config, "HOST_URL", os.getenv("HOST_URL", "http://localhost:8000"))
         env["FRAMEWORK_API_URL"] = framework_url
 
         process = await asyncio.create_subprocess_exec(
@@ -326,7 +326,7 @@ async def run_background_agent(
             raise ValueError(f"Agent '{agent_name}' configuration not found in etcd.")
             
         # Check if agent is disabled
-        disabled_workflows = identity_mgr.get_disabled_workflows()
+        disabled_workflows = await asyncio.to_thread(identity_mgr.get_disabled_workflows)
         if agent_name in disabled_workflows:
             raise ValueError(f"Agent '{agent_name}' is currently disabled.")
         
@@ -366,7 +366,7 @@ async def run_background_agent(
         # task lifetime; gated by feature flag + agent config, and fail-open internally).
         from core.memory import get_memory_manager
         memory_mgr = get_memory_manager()
-        if memory_mgr.active_for(config_data):
+        if await asyncio.to_thread(memory_mgr.active_for, config_data):
             await memory_mgr.retain(bank=agent_name, user_msg=prompt, agent_output=result.output)
 
         # Log usage
