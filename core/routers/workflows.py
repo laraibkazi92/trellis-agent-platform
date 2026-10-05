@@ -184,9 +184,6 @@ async def workflows_view(request: Request):
             w_item["runs_error"] = str(e)
             
         for run in agent_runs:
-            # Sync /v1/chat/completions runs share this keyspace but are not background executions
-            if (run.get("metadata") or {}).get("source") == "sync":
-                continue
             state = run.get("state")
             if state in queue:
                 queue[state].append(run)

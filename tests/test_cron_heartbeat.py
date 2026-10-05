@@ -176,8 +176,7 @@ def test_non_background_agents_are_not_dispatched(monkeypatch):
     assert agent_task.calls == []
     assert script_task.calls == []
     assert pycron_fake.seen == []  # cron evaluation is never reached
-    # Non-background agents are still pruned (sync chats record under them).
-    assert mgr.pruned == [("chatty", 100), ("untyped", 100)]
+    assert mgr.pruned == []  # pruning is also gated on background type
 
 
 def test_agent_without_cron_trigger_is_not_dispatched(monkeypatch):
@@ -199,9 +198,8 @@ def test_prune_runs_at_minute_zero_with_keep_100(monkeypatch):
     )
     _run_heartbeat(monkeypatch, mgr, matching={"0 5 * * *"}, minute_zero=True)
 
-    # Every non-disabled agent is pruned regardless of type (sync runs live in
-    # the same keyspace), cron trigger or not.
-    assert mgr.pruned == [(_AGENT, 100), ("no-trigger", 100), ("chatty", 100)]
+    # Every non-disabled background agent/script is pruned, cron or not.
+    assert mgr.pruned == [(_AGENT, 100), ("no-trigger", 100)]
 
 
 def test_prune_skipped_when_minute_nonzero(monkeypatch):
