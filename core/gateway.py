@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from fastmcp import FastMCP, Context
 from mcp.types import ToolAnnotations
 from core.auth import AuthMiddleware, get_identity_manager, auth_token_var, user_id_var
+from core.devmode import enforce_dev_mode_safety
 from fastapi.middleware.cors import CORSMiddleware
 from core.discovery import discover_agents, is_agent_configured, is_tool_configured
 from core.agent_search import search_agents as _search_agents_ranked, DEFAULT_LIMIT as AGENT_SEARCH_LIMIT
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app):
+    enforce_dev_mode_safety("gateway")
     app.state.http_client = httpx.AsyncClient(timeout=30.0)
     yield
     await app.state.http_client.aclose()
@@ -54,8 +56,6 @@ if hasattr(mcp, "_app"):
         allow_headers=["*"],
     )
 
-BASE_DIR = Path(__file__).parent.parent
-AGENTS_DIR = BASE_DIR / "agents"
 HOST_URL = os.getenv("HOST_URL", "http://localhost:8000")
 
 identity_mgr = get_identity_manager()
@@ -190,8 +190,7 @@ async def _get_visible_agents(names: Optional[List[str]] = None) -> List[Dict]:
     offline / background / unconfigured), scoped to the calling user. No longer exposed
     as an MCP tool — clients use ``search_agents`` instead to avoid dumping every agent.
 
-    Per Phase D of the Trellis Rules Engine hardening plan
-    (``__spec_docs/rules_engine_hardening_plan.md``), per-agent status/decoration is no
+    Per Phase D of the Trellis Rules Engine hardening plan, per-agent status/decoration is no
     longer derived from the Host's ``/health`` JSON body — it's computed directly here
     from etcd via the same Phase A/B/C shared helpers Host's own ``/health`` handler
     uses (``is_routable_agent_type``, ``is_agent_external``, ``discover_agents``'s
@@ -329,8 +328,7 @@ async def search_agents(ctx: Context, query: str, limit: int = AGENT_SEARCH_LIMI
     """
     await ctx.report_progress(0, 2, message=f"Searching agents for: '{query}'")
 
-    # Per Phase E of the Trellis Rules Engine hardening plan
-    # (__spec_docs/rules_engine_hardening_plan.md, E4), _search_agents_ranked is called
+    # Per Phase E of the Trellis Rules Engine hardening plan (E4), _search_agents_ranked is called
     # directly with the caller's real limit -- nothing downstream re-excludes on it
     # anymore, so the old limit=0-then-intersect-then-truncate dance is no longer
     # needed. _get_visible_agents() is used purely to annotate results (the

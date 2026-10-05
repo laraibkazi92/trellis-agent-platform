@@ -109,8 +109,8 @@ async def _resolve_rule_lock(
     agent is currently offline or unconfigured -- the two are mutually exclusive, and
     both are ``None`` when no rule fires at all.
 
-    Per Phase E of the Trellis Rules Engine hardening plan
-    (``__spec_docs/rules_engine_hardening_plan.md``, E2/E3), ``filter_eligible_agents``
+    Per Phase E of the Trellis Rules Engine hardening plan (items E2/E3),
+    ``filter_eligible_agents``
     no longer considers health or configuration-readiness -- the LLM decider reasons
     purely on declarative rule content, blind to availability. Availability is checked
     here, only *after* a confident match, using the same Phase B/C unified evaluators

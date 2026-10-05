@@ -172,7 +172,7 @@ async def tools(request: Request):
     user_id = user.get('sub')
 
     # Publicly-exposed local tools are callable directly via the MCP gateway/supervisor's
-    # search_tools/use_tool (see __spec_docs/direct_tool_gateway_execution_spec.md) —
+    # search_tools/use_tool (which execute tools at the gateway without an agent hop) —
     # highlight them and let the user configure their own credentials right here, since
     # they're no longer necessarily reachable only through an agent's "Configure Agent"
     # flow. Scoped to local tools only: MCP-sourced tools are whitelisted per-server via

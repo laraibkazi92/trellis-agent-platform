@@ -2,6 +2,10 @@ x-common-env: &common-env
   ETCD_HOST: etcd
   ETCD_PORT: 2379
   DEV_MODE: ${DEV_MODE:-false}
+  # Shared bind-host for the DEV_MODE safety guard (core/devmode.py) and the
+  # published-port mappings below. Set HOST_BIND=127.0.0.1 in .env when running
+  # DEV_MODE=true so unauthenticated services stay loopback-only.
+  HOST_BIND: ${HOST_BIND:-0.0.0.0}
   TZ: UTC
 
 services:
@@ -115,7 +119,7 @@ services:
     container_name: etcd-server
     command: etcd --advertise-client-urls http://etcd:2379 --listen-client-urls http://0.0.0.0:2379 --data-dir /etcd-data
     ports:
-      - "2379:2379"
+      - "${HOST_BIND:-0.0.0.0}:2379:2379"
     volumes:
       - etcd-data:/etcd-data
     restart: unless-stopped
@@ -129,7 +133,7 @@ services:
     image: redis:alpine
     container_name: redis-server
     ports:
-      - "6379:6379"
+      - "${HOST_BIND:-0.0.0.0}:6379:6379"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -228,8 +232,8 @@ services:
       # no extra model/key/cost — recall still fuses the semantic/BM25/graph/temporal strategies.
       HINDSIGHT_API_RERANKER_PROVIDER: ${HINDSIGHT_RERANKER_PROVIDER:-rrf}
     ports:
-      - "8888:8888"   # API server (used internally by the framework)
-      - "9999:9999"   # Control Plane web UI — browse to http://localhost:9999
+      - "${HOST_BIND:-0.0.0.0}:8888:8888"   # API server (used internally by the framework)
+      - "${HOST_BIND:-0.0.0.0}:9999:9999"   # Control Plane web UI — browse to http://localhost:9999
     volumes:
       - hindsight-data:/home/hindsight/.pg0
     restart: unless-stopped
@@ -263,8 +267,8 @@ services:
     build: ./gateway
     container_name: nginx-gateway
     ports:
-      - "80:80"
-      - "443:443"
+      - "${HOST_BIND:-0.0.0.0}:80:80"
+      - "${HOST_BIND:-0.0.0.0}:443:443"
     environment:
       # Set SSL_ENABLED=True in your .env to enable HTTPS
       - SSL_ENABLED=${SSL_ENABLED:-False}

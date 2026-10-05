@@ -3,7 +3,7 @@
 
 import os
 from fastapi import APIRouter, Request, Depends
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
 from core.discovery import discover_agents, discover_tools
@@ -12,13 +12,9 @@ from core.routers.auth import require_auth
 
 router = APIRouter()
 
-# Setup Jinja2 templates (temporarily return json if template missing)
-# Phase 4 will fully build status.html, for now we will just prepare the API/Router
+# Setup Jinja2 templates
 templates_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "templates")
-try:
-    templates = Jinja2Templates(directory=templates_dir)
-except Exception:
-    templates = None
+templates = Jinja2Templates(directory=templates_dir)
 
 from datetime import datetime, timedelta, timezone
 
@@ -75,7 +71,6 @@ def generate_30_day_timeline(events, current_status):
 
 @router.get("/status", response_class=HTMLResponse)
 async def status_page(request: Request, user=Depends(require_auth)):
-    from core.discovery import discover_agents, discover_tools
     agents = await discover_agents()
     tools = await discover_tools()
     
@@ -124,19 +119,8 @@ async def status_page(request: Request, user=Depends(require_auth)):
         "total_entities": total_entities
     }
     
-    # Temporarily return JSON if the template doesn't exist yet (Phase 4 creates it)
-    if templates and os.path.exists(os.path.join(templates_dir, "status.html")):
-        return templates.TemplateResponse(
-            request=request,
-            name="status.html", 
-            context=context
-        )
-    else:
-        # Before Phase 4, return JSON to verify aggregation works
-        return JSONResponse({
-            "overall_status": overall_status,
-            "offline_count": offline_count,
-            "total_entities": total_entities,
-            "agents": agents,
-            "tools": tools
-        })
+    return templates.TemplateResponse(
+        request=request,
+        name="status.html",
+        context=context
+    )

@@ -18,15 +18,19 @@ def migrate():
     client = mgr.client
 
     # 1. Migrate Global Secrets & Variables
+    # Read straight from the legacy /config/framework/* keys (what the removed
+    # global secrets/variables accessors used to wrap) and write into the
+    # identity-model path for the SYSTEM identity.
     logger.info("Migrating Global Secrets and Variables...")
-    global_secrets = mgr.get_global_secrets()
+    system_identity = Identity(id="system", type=IdentityType.SYSTEM)
+    global_secrets = mgr._get_kv("/config/framework/global_secrets", decrypt=True) or {}
     if global_secrets:
-        mgr.save_identity_config(Identity(id="system", type=IdentityType.SYSTEM), "secrets", global_secrets)
+        mgr.save_identity_config(system_identity, "secrets", global_secrets)
         logger.info("  - Migrated Global Secrets")
 
-    global_variables = mgr.get_global_variables()
+    global_variables = mgr._get_kv("/config/framework/global_variables") or {}
     if global_variables:
-        mgr.save_identity_config(Identity(id="system", type=IdentityType.SYSTEM), "variables", global_variables)
+        mgr.save_identity_config(system_identity, "variables", global_variables)
         logger.info("  - Migrated Global Variables")
 
     # 2. Migrate User Secrets & Variables

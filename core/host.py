@@ -29,6 +29,7 @@ from fastmcp import Client as FastMCPClient
 from fastmcp.client import StdioTransport, SSETransport, StreamableHttpTransport
 
 from core.auth import AuthMiddleware, IdentityManager, user_id_var
+from core.devmode import enforce_dev_mode_safety
 from core.models import AgentConfig, MCPConfig, is_agent_external, is_routable_agent_type
 from core.health import HealthMonitor, compute_agent_operational_status
 from core.background.webhooks import router as webhooks_router
@@ -59,6 +60,7 @@ async def _drain_background_tasks(timeout: float = 5.0) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _main_loop, _watch_id, _agent_watch_id, _memory_watch_id
+    enforce_dev_mode_safety("host")
     logger.info("Worker starting up...")
     _main_loop = asyncio.get_running_loop()
     app.state.http_client = httpx.AsyncClient(timeout=30.0)
@@ -121,7 +123,6 @@ app.add_middleware(AuthMiddleware, identity_mgr=identity_mgr)
 health_monitor = get_health_monitor()
 
 BASE_DIR = Path(__file__).parent.parent
-AGENTS_DIR = BASE_DIR / "agents"
 INTERNAL_ASSETS_DIR = BASE_DIR / "core" / "assets"
 
 class ChatMessage(BaseModel):

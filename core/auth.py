@@ -14,7 +14,6 @@ import jwt
 import os
 from typing import Dict, List, Optional, Any, Union
 from functools import wraps
-import warnings
 
 from core.models import Identity, IdentityType
 
@@ -180,60 +179,6 @@ class IdentityManager:
         if value:
             return json.loads(value.decode('utf-8'))
         return None
-
-    def get_user_secrets(self, user_id: str) -> Dict[str, str]:
-        """Retrieve user-specific secrets. @deprecated: Use get_identity_config"""
-        warnings.warn("get_user_secrets is deprecated, use get_identity_config", DeprecationWarning, stacklevel=2)
-        return self._get_kv(f"/users/secrets/{user_id}", decrypt=True) or {}
-
-    def save_user_secrets(self, user_id: str, secrets_data: Dict[str, str]) -> None:
-        """Save user-specific secrets securely using encryption. @deprecated: Use save_identity_config"""
-        warnings.warn("save_user_secrets is deprecated, use save_identity_config", DeprecationWarning, stacklevel=2)
-        self._set_kv(f"/users/secrets/{user_id}", secrets_data, encrypt=True)
-
-    def get_global_secrets(self) -> Dict[str, str]:
-        """Retrieve system-wide global secrets. @deprecated: Use get_identity_config"""
-        warnings.warn("get_global_secrets is deprecated, use get_identity_config", DeprecationWarning, stacklevel=2)
-        return self._get_kv("/config/framework/global_secrets", decrypt=True) or {}
-
-    def save_global_secrets(self, secrets_data: Dict[str, str]) -> None:
-        """Save system-wide global secrets securely using encryption. @deprecated: Use save_identity_config"""
-        warnings.warn("save_global_secrets is deprecated, use save_identity_config", DeprecationWarning, stacklevel=2)
-        self._set_kv("/config/framework/global_secrets", secrets_data, encrypt=True)
-
-    def get_resolved_secrets(self, user_id: str) -> Dict[str, str]:
-        """Retrieve user secrets merged with global secrets (user takes precedence). @deprecated: Use get_resolved_config"""
-        warnings.warn("get_resolved_secrets is deprecated, use get_resolved_config", DeprecationWarning, stacklevel=2)
-        user_secrets = self.get_user_secrets(user_id)
-        global_secrets = self.get_global_secrets()
-        return {**global_secrets, **user_secrets}
-
-    def get_user_variables(self, user_id: str) -> Dict[str, str]:
-        """Retrieve user-specific non-sensitive configuration variables. @deprecated: Use get_identity_config"""
-        warnings.warn("get_user_variables is deprecated, use get_identity_config", DeprecationWarning, stacklevel=2)
-        return self._get_kv(f"/users/variables/{user_id}") or {}
-
-    def save_user_variables(self, user_id: str, variables_data: Dict[str, str]) -> None:
-        """Save user-specific non-sensitive configuration variables. @deprecated: Use save_identity_config"""
-        warnings.warn("save_user_variables is deprecated, use save_identity_config", DeprecationWarning, stacklevel=2)
-        self._set_kv(f"/users/variables/{user_id}", variables_data)
-
-    def get_global_variables(self) -> Dict[str, str]:
-        """Retrieve system-wide global non-sensitive configuration variables. @deprecated: Use get_identity_config"""
-        warnings.warn("get_global_variables is deprecated, use get_identity_config", DeprecationWarning, stacklevel=2)
-        return self._get_kv("/config/framework/global_variables") or {}
-
-    def save_global_variables(self, variables_data: Dict[str, str]) -> None:
-        """Save system-wide global non-sensitive configuration variables. @deprecated: Use save_identity_config"""
-        warnings.warn("save_global_variables is deprecated, use save_identity_config", DeprecationWarning, stacklevel=2)
-        self._set_kv("/config/framework/global_variables", variables_data)
-
-    def get_resolved_variables(self, user_id: str) -> Dict[str, str]:
-        """Retrieve user variables merged with global variables (user takes precedence). @deprecated: Use get_resolved_config"""
-        warnings.warn("get_resolved_variables is deprecated, use get_resolved_config", DeprecationWarning, stacklevel=2)
-        user_variables = self.get_user_variables(user_id)
-        global_variables = self.get_global_variables()
-        return {**global_variables, **user_variables}
 
     @retry_etcd()
     def create_key(self, user_id: str, key_name: str) -> str:

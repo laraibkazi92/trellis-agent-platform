@@ -92,8 +92,8 @@ async def workflows_view(request: Request):
     # Configuration readiness (is_configured / missing_secrets / missing_variables /
     # secret_groups) is derived from the same shared discovery pipeline discover_agents()
     # and is_agent_configured() use elsewhere (core/discovery.py's
-    # _resolve_agent_requirements/_evaluate_agent_configuration -- see
-    # __spec_docs/completed/rules_engine_hardening_plan.md §2C). This view previously
+    # _resolve_agent_requirements/_evaluate_agent_configuration -- rules engine
+    # hardening plan §2C). This view previously
     # hand-rolled its own required_secrets/required_variables-only check that ignored
     # secret_groups entirely, so a workflow whose only requirement was an unsatisfied
     # secret_group option incorrectly showed as configured here while is_agent_configured()

@@ -15,6 +15,7 @@ from typing import Dict, Any, Optional
 from fastmcp import FastMCP
 from core.models import ToolConfig
 from core.auth import get_identity_manager
+from core.devmode import enforce_dev_mode_safety
 
 from core.health import HealthMonitor
 
@@ -393,6 +394,9 @@ def register_tools():
         logger.info(f"Registered tool: {name}")
 
 if __name__ == "__main__":
+    # Startup gate: refuse to serve an unauthenticated DEV_MODE instance on a
+    # remotely reachable bind host (see core/devmode.py).
+    enforce_dev_mode_safety("hub")
     register_tools()
     import uvicorn
     app = _LifespanDrainWrapper(mcp.http_app(host_origin_protection=False))

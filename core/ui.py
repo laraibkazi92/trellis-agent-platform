@@ -6,6 +6,8 @@ from fastapi import FastAPI
 from starlette.middleware.sessions import SessionMiddleware
 from dotenv import load_dotenv
 
+from core.devmode import enforce_dev_mode_safety
+
 load_dotenv()
 
 DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
@@ -32,6 +34,10 @@ if not DEV_MODE:
     
     if missing:
         raise ValueError(f"Missing required environment variables for UI: {', '.join(missing)}")
+
+# Startup gate: refuse to serve an unauthenticated DEV_MODE instance on a
+# remotely reachable bind host (see core/devmode.py).
+enforce_dev_mode_safety("ui")
 
 from core.routers import auth, marketplace, profile, admin, configuration, docs, status, workflows, api, reports, mcp_oauth
 from fastapi.middleware.cors import CORSMiddleware

@@ -64,8 +64,8 @@ async def get_agent_secret_groups(config: Dict, strict: bool = False) -> List[Di
 
     An ``mcp__``-prefixed ``allowed_tools`` entry resolves to its owning MCP's
     ``secret_groups``, exactly as :func:`get_agent_required_secrets` already resolves
-    that same entry's ``secrets`` — fixed as part of Phase C (see
-    ``__spec_docs/rules_engine_hardening_plan.md`` §2C.3), since this function's caller
+    that same entry's ``secrets`` — fixed as part of Phase C (§2C.3 of the rules
+    engine hardening plan), since this function's caller
     (``core/routers/marketplace.py``'s configure-agent save handler) is the only way a
     user can satisfy a secret_groups requirement that :func:`is_agent_configured`/
     :func:`discover_agents` now (correctly, post-Phase-C) gate on.
@@ -208,8 +208,8 @@ def _evaluate_agent_configuration(
     ``is_agent_configured`` nor ``discover_agents`` performed this group-satisfaction
     check at all, so an agent depending on a tool/MCP with ``secret_groups`` where the
     user has configured zero complete option could incorrectly report
-    ``is_configured: True`` (see ``__spec_docs/rules_engine_hardening_plan.md`` §4
-    finding 5) -- this function fixes that for both callers at once.
+    ``is_configured: True`` (rules engine hardening plan §4, finding 5) --
+    this function fixes that for both callers at once.
     """
     grouped_keys = flatten_secret_group_keys(secret_groups)
 
@@ -552,8 +552,8 @@ async def is_tool_configured(tool_name: str, user_id: Optional[str] = None) -> D
 
     A tool declaring ``secret_groups`` (e.g. opsctl/netctl's per-environment credential picker)
     is only considered configured once at least one option's full field set is present —
-    see :func:`_unsatisfied_secret_group_keys`. As of Phase C (see
-    ``__spec_docs/rules_engine_hardening_plan.md``), :func:`is_agent_configured` and
+    see :func:`_unsatisfied_secret_group_keys`. As of Phase C of the rules engine
+    hardening plan, :func:`is_agent_configured` and
     :func:`discover_agents` apply this same group-satisfaction check via
     :func:`_evaluate_agent_configuration`, so all three configuration-readiness checks now
     agree on secret_groups semantics.

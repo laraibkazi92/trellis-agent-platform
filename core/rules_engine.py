@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Trellis Rules Engine: deterministic, declarative routing evaluated before
-semantic vector search (see ``__spec_docs/rules_engine_spec.md``).
+semantic vector search.
 
 Phase 2 scope: readiness gating (:func:`filter_eligible_agents`) and prompt
 catalog compilation (:func:`compile_rules_prompt`, :func:`has_active_rules`).
@@ -51,18 +51,16 @@ def filter_eligible_agents(
     (``external: False``), administratively disabled agents, and agents with no
     declared ``rules`` (nothing to contribute to rule evaluation).
 
-    Per Phase E of the Trellis Rules Engine hardening plan
-    (``__spec_docs/rules_engine_hardening_plan.md``, E2), health and
+    Per Phase E of the Trellis Rules Engine hardening plan (E2), health and
     configuration-readiness are deliberately NOT considered here -- the LLM decider
     reasons purely on declarative rule content, blind to availability. A confident
     match on an offline or unconfigured agent is not excluded from eligibility;
     instead it's caught as a separate, post-match concern by
     :func:`core.agent_search._resolve_rule_lock`, which falls through to semantic
     ranking with an "unavailable match" note rather than hiding the agent's rules
-    from evaluation outright. This deliberately supersedes the original spec's
-    "must never evaluate rules for an unconfigured/offline agent" principle
-    (``__spec_docs/completed/rules_engine_spec.md`` §1.2), per an explicit,
-    recorded user decision.
+    from evaluation outright. This deliberately supersedes the original rules engine
+    spec's "must never evaluate rules for an unconfigured/offline agent" principle
+    (§1.2), per an explicit, recorded user decision.
     """
     eligible: Dict[str, Dict] = {}
     for name, cfg in configs.items():
