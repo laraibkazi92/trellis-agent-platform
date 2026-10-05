@@ -74,7 +74,25 @@ services:
     container_name: tool-hub
     command: python core/hub.py
     restart: unless-stopped
-    privileged: true
+    # Least-privilege sandbox: the hub wraps every tool execution in bubblewrap
+    # (core/hub.py: --ro-bind / /, --unshare-user/pid/ipc/uts, --die-with-parent).
+    # What bwrap needs inside a container, and nothing more (empirically verified
+    # with the exact syscall sequence bwrap uses under this Docker daemon):
+    #   - SYS_ADMIN: docker's default seccomp profile gates clone(CLONE_NEWUSER)
+    #     on this capability; full `privileged: true` is NOT required.
+    #   - SETFCAP: the hub runs as root and bwrap writes an identity uid_map
+    #     (0->0); the kernel requires CAP_SETFCAP for a root process to map its
+    #     own uid into a new user namespace.
+    #   - systempaths=unconfined: docker's masked /proc submounts (/proc/sys,
+    #     /proc/bus, ...) leave /proc not "fully visible", so the kernel rejects
+    #     bwrap's fresh proc mount with "Mount too revealing". This only skips
+    #     path masking — it grants no capabilities.
+    #   - no-new-privileges: tools cannot regain privileges via setuid/file caps.
+    # Escape hatch: if tool execution still fails with bwrap/userns errors on an
+    # exotic host, restoring `privileged: true` locally still works.
+    cap_drop: [ALL]
+    cap_add: [SYS_ADMIN, SETFCAP]
+    security_opt: ["no-new-privileges:true", "systempaths=unconfined"]
     env_file:
       - .env
     depends_on:
