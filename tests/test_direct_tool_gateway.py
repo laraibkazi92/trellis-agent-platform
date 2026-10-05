@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 """Phase 6 — Comprehensive Verification & Regression Test Suite for Direct Tool Gateway
 Execution (see __spec_docs/direct_tool_gateway_execution_spec.md).
 

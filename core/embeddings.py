@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 """Lightweight text-embedding helper backed by Google Gemini.
 
 Used to power semantic agent discovery (see ``core.agent_search``). Embeddings are

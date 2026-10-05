@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 """Semantic agent discovery shared by the gateway MCP and the Supervisor agent.
 
 Both the public ``search_agents`` gateway tool and the Supervisor's internal routing

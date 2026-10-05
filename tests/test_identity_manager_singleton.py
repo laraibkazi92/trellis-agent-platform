@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 """Regression tests for cycle-4 Phase 6 (I8) — IdentityManager singleton consolidation.
 
 Before: six core modules each constructed their own module-level `IdentityManager`

@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for Phase 2 of __spec_docs/cycle4_hub_agent_factory_hardening_plan.md.
 
 Covers core/agent_factory.py hardening:

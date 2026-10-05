@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 """Integration tests for the Trellis Rules Engine wiring — see
 __spec_docs/rules_engine_spec.md and, for the Phase E behavior below,
 __spec_docs/rules_engine_hardening_plan.md.

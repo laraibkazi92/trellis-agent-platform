@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 from fastapi import FastAPI
 from starlette.middleware.sessions import SessionMiddleware

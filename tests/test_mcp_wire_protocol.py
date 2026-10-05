@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 """Real MCP wire-protocol smoke test for core/gateway.py's FastMCP server.
 
 Every other test in this repo (e.g. tests/test_agent_gateway_host_access.py) calls

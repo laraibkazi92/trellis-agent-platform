@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for Phase 4 (Admin Panel & Agent Editor Configuration) — see
 __spec_docs/internal_external_agents_spec.md.
 

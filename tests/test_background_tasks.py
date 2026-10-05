@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 """Regression tests for Phase 5 (Cycle 4) Task 5.1 — fire-and-forget safety.
 
 Both `core.hub` and `core.host` must expose a module-level `_background_tasks`

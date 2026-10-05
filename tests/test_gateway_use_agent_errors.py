@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 """Gateway MCP error sanitization (Workstream A hardening cycle).
 
 The externally exposed /mcp surface must never interpolate raw exception text

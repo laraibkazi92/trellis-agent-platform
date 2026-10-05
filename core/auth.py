@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import secrets
 import logging
@@ -118,7 +121,7 @@ class IdentityManager:
 
     def get_identity_config(self, identity: Union[Identity, str], category: str, keys: Optional[List[str]] = None) -> Dict[str, Any]:
         """
-        Enterprise-grade config resolver.
+        Scoped config resolver.
         Fetches secrets or variables for any identity (User, Agent, System).
         """
         if isinstance(identity, str):

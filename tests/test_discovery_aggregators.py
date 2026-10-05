@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 """Phase 4 regression tests — see __spec_docs/cycle4_hub_agent_factory_hardening_plan.md
 "Phase 4: Discovery — collapse legacy requirement aggregators (I3 + I9-discovery)".
 

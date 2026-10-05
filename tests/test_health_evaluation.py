@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for the Phase B consolidation: core.health.evaluate_health_status is now
 the single, shared, pure derivation of cooldown-aware status used by
 HealthMonitor._evaluate_status, core.rules_engine.filter_eligible_agents, and the

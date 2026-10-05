@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 """Semantic tool discovery for Direct Tool Gateway Execution (see ``core.gateway.search_tools``).
 
 Mirrors ``core.agent_search``: ranks publicly-whitelisted tools via Gemini embeddings

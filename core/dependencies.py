@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import re
 from fastapi.templating import Jinja2Templates
@@ -28,7 +31,7 @@ def whitelabel_context(request):
         "app_logo_url": os.getenv("APP_LOGO_URL", "").strip(),
         "app_login_logo_url": os.getenv("APP_LOGIN_LOGO_URL", "").strip(),
         "app_login_title": os.getenv("APP_LOGIN_TITLE", "Welcome Back").strip(),
-        "app_login_subtitle": os.getenv("APP_LOGIN_SUBTITLE", "Sign in to your enterprise workspace").strip(),
+        "app_login_subtitle": os.getenv("APP_LOGIN_SUBTITLE", "Sign in to your workspace").strip(),
         "app_login_disclaimer": os.getenv("APP_LOGIN_DISCLAIMER", "This system is for authorized use only. All activities are monitored and logged for security and compliance purposes.").strip(),
         "app_accent_color": _validate_hex_color(os.getenv("APP_ACCENT_COLOR", "#0055FF"), "#0055FF"),
         "app_accent_color_dark": _validate_hex_color(os.getenv("APP_ACCENT_COLOR_DARK", "#3377FF"), "#3377FF"),

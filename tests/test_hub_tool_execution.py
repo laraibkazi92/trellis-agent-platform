@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 """Regression tests for core.hub.run_tool (cycle-4 Phase 1).
 
 Pins the contracts introduced by the Hub hardening plan:

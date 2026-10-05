@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 from core.models import ToolConfig, MCPConfig, is_routable_agent_type
 
 

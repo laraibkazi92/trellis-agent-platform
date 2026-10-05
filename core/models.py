@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 from pydantic import BaseModel, Field
 from typing import List, Optional, Literal, Dict, Any, Union
 from enum import Enum

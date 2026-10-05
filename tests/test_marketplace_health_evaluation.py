@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for Phase B: core.routers.marketplace.agents() (the /agents route backing
 templates/agents.html) now overwrites each agent's `health` field with the shared
 cooldown-aware evaluation (core.health.evaluate_health_status) before it reaches the

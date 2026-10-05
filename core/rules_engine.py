@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 """Trellis Rules Engine: deterministic, declarative routing evaluated before
 semantic vector search (see ``__spec_docs/rules_engine_spec.md``).
 

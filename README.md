@@ -1,4 +1,4 @@
-# Trellis: Agent Framework
+# Trellis: Agent Platform
 
 A scalable, multi-agent orchestration framework built with FastAPI, PydanticAI, FastMCP, and etcd. It provides an OpenAI-compatible gateway, dynamic tool execution, and an external MCP gateway for seamless integration with clients like Claude Desktop.
 
@@ -88,4 +88,5 @@ claude mcp add --transport http trellis http://localhost:8002/mcp --header "Auth
 5. Manage third-party credentials via the **Tool Secrets** UI.
 
 ## License
-MIT
+
+This project is licensed under the [Apache-2.0](LICENSE).

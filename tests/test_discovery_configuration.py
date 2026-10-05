@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 """Phase C regression tests — see __spec_docs/rules_engine_hardening_plan.md §2C.
 
 Before Phase C, neither `is_agent_configured` nor `discover_agents` ever called

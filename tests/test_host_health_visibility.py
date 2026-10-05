@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for the GET /health route in core.host excluding external: False agents.
 
 See __spec_docs/internal_external_agents_spec.md — /health is reachable without

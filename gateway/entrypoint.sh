@@ -1,4 +1,7 @@
 #!/bin/sh
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 set -e
 
 SSL_ENABLED=${SSL_ENABLED:-False}

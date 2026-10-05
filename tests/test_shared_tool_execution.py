@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for `core.tool_search.execute_whitelisted_tool` (Cycle 4, Phase 3, Task 3.2).
 
 The shared executor deduplicates the gateway/supervisor `use_tool` flows:

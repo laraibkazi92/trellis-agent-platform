@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for core/routers/workflows.py's use of the shared discovery configuration-
 readiness pipeline (see __spec_docs/completed/rules_engine_hardening_plan.md §2C).
 
