@@ -409,6 +409,22 @@ class IdentityManager:
         Not itself @retry_etcd()-decorated -- see get_agent_memory_enabled above."""
         self.set_config("agent_memory_enabled", bool(enabled))
 
+    def get_agent_memory_isolated_per_user(self) -> bool:
+        """Retrieve the per-user agent-memory isolation flag. When on, memory banks
+        are keyed "{agent_name}:{user_id}" instead of the agent name alone.
+
+        Not itself @retry_etcd()-decorated: get_config() already retries. Stacking a
+        second retry layer on top of it multiplies worst-case retry time (10x10 attempts,
+        ~200+s) instead of adding to it -- see get_agent_memory_enabled above for the
+        same pattern."""
+        return bool(self.get_config("agent_memory_isolated_per_user", False))
+
+    def set_agent_memory_isolated_per_user(self, enabled: bool) -> None:
+        """Set the per-user agent-memory isolation flag.
+
+        Not itself @retry_etcd()-decorated -- see get_agent_memory_isolated_per_user above."""
+        self.set_config("agent_memory_isolated_per_user", bool(enabled))
+
     def get_rules_evaluation_timeout(self) -> Optional[float]:
         """Retrieve the admin-configured Trellis Rules Engine LLM evaluation timeout
         (seconds), or None if never set -- callers fall back to the

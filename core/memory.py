@@ -8,10 +8,11 @@ This is a framework-level concern. Business logic only opts in via `agent_memory
 in an agent's config.yaml, and an admin master switch (the `agent_memory_enabled`
 framework feature flag, toggled from the admin dashboard) gates the whole feature.
 
-Scope: memory is per-agent and SHARED across all users. The Hindsight "bank" key is the
-agent name, so an agent accumulates institutional knowledge across every user that talks
-to it. This is intentional and is the single place to change if per-user isolation is ever
-required (e.g. bank=f"{agent_name}:{user_id}").
+Scope: memory is per-agent. By default the Hindsight "bank" key is the agent name, so
+an agent accumulates institutional knowledge across every user that talks to it. Admins
+can flip the `agent_memory_isolated_per_user` framework flag to key banks as
+"{agent_name}:{user_id}" instead, giving each user a private memory (runs without a
+user identity degrade to the shared agent bank). Existing shared banks are not migrated.
 
 Every operation is fail-open: a Hindsight outage, a missing client library, or an API
 mismatch degrades to "no memory" and never breaks an agent run.
@@ -23,6 +24,9 @@ from typing import Any, Optional, Union
 
 # Framework feature flag key (etcd: /config/framework/agent_memory_enabled)
 MEMORY_FLAG_KEY = "agent_memory_enabled"
+
+# Framework feature flag key (etcd: /config/framework/agent_memory_isolated_per_user)
+MEMORY_ISOLATION_FLAG_KEY = "agent_memory_isolated_per_user"
 
 # The global flag is cached briefly so the recall instruction does not hit etcd on every
 # run. Toggling the flag from the admin dashboard takes effect within this many seconds.
@@ -41,6 +45,8 @@ class MemoryManager:
         self._client: Any = None
         self._flag_cache: Optional[bool] = None
         self._flag_ts: float = 0.0
+        self._isolation_flag_cache: Optional[bool] = None
+        self._isolation_flag_ts: float = 0.0
 
     # --- Client management -------------------------------------------------
 
@@ -64,6 +70,26 @@ class MemoryManager:
                 self._flag_cache = False
             self._flag_ts = now
         return self._flag_cache
+
+    def is_isolated_per_user(self) -> bool:
+        """True if per-user memory isolation is on. Cached for a short TTL."""
+        now = time.monotonic()
+        if self._isolation_flag_cache is None or (now - self._isolation_flag_ts) > _FLAG_TTL_SECONDS:
+            try:
+                self._isolation_flag_cache = bool(self._identity_mgr.get_config(MEMORY_ISOLATION_FLAG_KEY, False))
+            except Exception as e:
+                print(f"[memory] failed reading isolation flag, defaulting off: {e}")
+                self._isolation_flag_cache = False
+            self._isolation_flag_ts = now
+        return self._isolation_flag_cache
+
+    def bank_for(self, agent_name: str, user_id: Optional[str]) -> str:
+        """Resolve the Hindsight bank key for a run. With per-user isolation on and a
+        known user, memories live in "{agent_name}:{user_id}"; otherwise the bank is
+        the shared agent name (runs without a user identity degrade to shared)."""
+        if self.is_isolated_per_user() and user_id:
+            return f"{agent_name}:{user_id}"
+        return agent_name
 
     def active_for(self, agent_config: Union[dict, Any]) -> bool:
         """Memory is active for an agent only if the master switch is on AND the agent

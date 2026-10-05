@@ -116,10 +116,13 @@ Can also be toggled per-agent in the agent editor UI. The LLM/embedding model Hi
 uses for extraction is configured via `HINDSIGHT_LLM_*` env vars (see `.env.example`),
 independent of the agent's own `model`.
 
-> ⚠️ **Scope:** Memory is keyed by agent name and **shared across all users** of that agent.
+> ⚠️ **Scope:** Memory is keyed by agent name and **shared across all users** of that agent by default.
 > The agent builds institutional knowledge over time, but one user's context can surface in
-> another user's session. Do not enable it for agents handling user-private data unless that
-> sharing is acceptable.
+> another user's session. An admin can flip the **Per-User Memory Isolation** flag
+> (Admin Dashboard → Feature Flags) to key banks as `agent:userid` instead — each user then
+> gets a fresh private bank, and runs without a user identity (background workflows) fall
+> back to the shared bank. Existing shared banks are **not** migrated. Do not enable memory
+> for agents handling user-private data unless isolation is on or that sharing is acceptable.
 
 **`thinking_level`**: Controls reasoning depth and token cost. `none` is fastest; `high` enables deep chain-of-thought. Match to task complexity.
 

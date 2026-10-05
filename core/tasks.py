@@ -374,7 +374,8 @@ async def run_background_agent(
         from core.memory import get_memory_manager
         memory_mgr = get_memory_manager()
         if await asyncio.to_thread(memory_mgr.active_for, config_data):
-            await memory_mgr.retain(bank=agent_name, user_msg=prompt, agent_output=result.output)
+            bank = await asyncio.to_thread(memory_mgr.bank_for, agent_name, user_id)
+            await memory_mgr.retain(bank=bank, user_msg=prompt, agent_output=result.output)
 
         # Log usage
         usage_data = {}

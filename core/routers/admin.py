@@ -123,6 +123,7 @@ async def admin_dashboard(request: Request):
     flash_msg = request.session.pop("flash_msg", None)
 
     agent_memory_enabled = await asyncio.to_thread(identity_mgr.get_agent_memory_enabled)
+    agent_memory_isolated = await asyncio.to_thread(identity_mgr.get_agent_memory_isolated_per_user)
     rules_evaluation_timeout_override = await asyncio.to_thread(identity_mgr.get_rules_evaluation_timeout)
 
     return templates.TemplateResponse(
@@ -138,7 +139,8 @@ async def admin_dashboard(request: Request):
                 "total_agents": len(agents)
             },
             "feature_flags": {
-                "agent_memory_enabled": agent_memory_enabled
+                "agent_memory_enabled": agent_memory_enabled,
+                "agent_memory_isolated_per_user": agent_memory_isolated,
             },
             "rules_engine": {
                 "timeout_override": rules_evaluation_timeout_override,
@@ -163,6 +165,21 @@ async def toggle_agent_memory_flag(request: Request, enabled: str = Form(...)):
 
     state_str = "enabled" if should_enable else "disabled"
     request.session["flash_msg"] = f"Agent Memory {state_str} globally. Changes take effect within ~20 seconds."
+    return RedirectResponse(url='/admin', status_code=303)
+
+@router.post("/admin/feature-flags/agent-memory-isolation")
+async def toggle_agent_memory_isolation(request: Request, enabled: str = Form(...)):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    should_enable = enabled.lower() == 'true'
+    await asyncio.to_thread(identity_mgr.set_agent_memory_isolated_per_user, should_enable)
+
+    state_str = "enabled" if should_enable else "disabled"
+    request.session["flash_msg"] = (
+        f"Per-user memory isolation {state_str}. New memories use per-user banks "
+        "(agent:userid); existing shared banks are not migrated."
+    )
     return RedirectResponse(url='/admin', status_code=303)
 
 @router.post("/admin/rules-engine/timeout")

@@ -59,7 +59,7 @@ async def _drain_background_tasks(timeout: float = 5.0) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _main_loop, _watch_id, _agent_watch_id, _memory_watch_id
+    global _main_loop, _watch_id, _agent_watch_id, _memory_watch_id, _memory_isolation_watch_id
     enforce_dev_mode_safety("host")
     logger.info("Worker starting up...")
     _main_loop = asyncio.get_running_loop()
@@ -67,6 +67,7 @@ async def lifespan(app: FastAPI):
     _watch_id = identity_mgr.client.add_watch_prefix_callback("/registry/mcps/", on_mcp_change)
     _agent_watch_id = identity_mgr.client.add_watch_prefix_callback("/registry/agents/", on_agent_change)
     _memory_watch_id = identity_mgr.client.add_watch_prefix_callback("/config/framework/agent_memory_enabled", on_memory_flag_change)
+    _memory_isolation_watch_id = identity_mgr.client.add_watch_prefix_callback("/config/framework/agent_memory_isolated_per_user", on_memory_flag_change)
     await get_hub_client()
     await discover_external_mcps()
     _spawn_background(prewarm_agents(), "prewarm_agents")
@@ -80,6 +81,8 @@ async def lifespan(app: FastAPI):
         identity_mgr.client.cancel_watch(_agent_watch_id)
     if _memory_watch_id:
         identity_mgr.client.cancel_watch(_memory_watch_id)
+    if _memory_isolation_watch_id:
+        identity_mgr.client.cancel_watch(_memory_isolation_watch_id)
     hub_client = await get_hub_client()
     if hub_client:
         await hub_client.__aexit__(None, None, None)
@@ -138,6 +141,7 @@ _main_loop: Optional[asyncio.AbstractEventLoop] = None
 _watch_id: Any = None
 _agent_watch_id: Any = None
 _memory_watch_id: Any = None
+_memory_isolation_watch_id: Any = None
 
 def on_mcp_change(event):
     for ev in event.events:
@@ -163,12 +167,15 @@ def on_agent_change(event):
 
 
 def on_memory_flag_change(event):
-    """Evict all cached agents when the agent_memory_enabled flag toggles.
+    """Evict all cached agents when an agent-memory flag toggles
+    (agent_memory_enabled or agent_memory_isolated_per_user).
 
-    When the flag is disabled: F-01's runtime guard stops recall immediately;
+    When the master flag is disabled: F-01's runtime guard stops recall immediately;
     eviction ensures agents also rebuild cleanly on next request.
-    When the flag is enabled: eviction forces a rebuild so agents with
+    When the master flag is enabled: eviction forces a rebuild so agents with
     agent_memory=true get their @agent.instructions callback wired in.
+    For the isolation flag the recall closure re-resolves the bank per run anyway;
+    eviction just keeps cached builds from outliving the flag transition.
     """
     from core.agent_factory import _agent_cache
     for name in list(_agent_cache.keys()):
@@ -278,7 +285,7 @@ async def chat_completions(request: ChatRequest):
         if await asyncio.to_thread(memory_mgr.active_for, cfg_data):
             try:
                 _spawn_background(memory_mgr.retain(
-                    bank=request.model,
+                    bank=await asyncio.to_thread(memory_mgr.bank_for, request.model, user_id),
                     user_msg=request.messages[-1].content,
                     agent_output=result.output,
                 ), f"memory_retain:{request.model}")

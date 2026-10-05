@@ -494,7 +494,6 @@ async def build_agent(agent_name: str) -> Agent:
     from core.memory import get_memory_manager
     memory_mgr = get_memory_manager()
     if await asyncio.to_thread(memory_mgr.active_for, config):
-        memory_bank = config.name
 
         @agent.instructions
         async def _recall_memory(ctx: RunContext[None]) -> str:
@@ -503,7 +502,11 @@ async def build_agent(agent_name: str) -> Agent:
             query = _latest_user_text(ctx)
             if not query:
                 return ""
-            return await memory_mgr.recall(bank=memory_bank, query=query)
+            # Bank is resolved at recall time, not build time: the isolation flag can
+            # flip while this cached agent lives, and the user comes from the request
+            # context (user_id_var), which is only known per-run.
+            bank = await asyncio.to_thread(memory_mgr.bank_for, config.name, user_id_var.get())
+            return await memory_mgr.recall(bank=bank, query=query)
 
     # 5. Hub Tools (skipping native console tools)
     hub_client = await get_hub_client()
