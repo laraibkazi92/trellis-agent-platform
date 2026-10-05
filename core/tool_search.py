@@ -147,12 +147,9 @@ async def search_tools(query: str, limit: int = DEFAULT_LIMIT, user_id: Optional
                 "parameters": _mcp_tool_parameters(t.get("inputSchema", {})),
                 "status": "Online",
                 "source": mcp_name,
-                # No embedding is ever indexed for individual MCP tools today (see
-                # scripts/sync_to_db.py) — this is always None, falling back to
-                # cosine(_, None) == 0.0 under embedding ranking (or the keyword fallback
-                # otherwise). Keyed by the prefixed name so that if/when MCP tool
-                # embeddings are added later, this lookup is already correct rather than
-                # colliding with an unrelated local tool of the same bare name.
+                # Indexed at sync time (scripts/sync_to_db.py sync_mcp) under this same
+                # prefixed name — the `use_tool` execution form — so MCP tools rank by
+                # cosine like local tools; a missing/stale vector degrades to 0.0.
                 "_vec": embeddings.get(prefixed_name),
             })
 

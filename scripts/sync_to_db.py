@@ -126,6 +126,36 @@ def sync_agent(identity_mgr, agent_dir, name=None, default_type=None):
         
     return name
 
+def sync_mcp(identity_mgr, config):
+    """Persist one MCP config and index an embedding per tool it declares.
+
+    Tool embeddings are saved under the ``mcp__{server}__{tool}`` prefixed name --
+    the same ``use_tool`` execution form ``core/tool_search.py`` looks embeddings up
+    by -- so MCP tools rank via cosine exactly like local workspace tools.
+    """
+    name = config["name"]
+    identity_mgr.save_mcp_config(name, config)
+    print(f"  Saved config for MCP: {name}")
+
+    for tool in config.get("tools") or []:
+        tool_name = tool.get("name", "")
+        if not tool_name:
+            continue
+        properties = (tool.get("inputSchema") or {}).get("properties") or {}
+        input_keys = ", ".join(
+            f"{key}:{spec.get('type', 'string')}" if isinstance(spec, dict) else str(key)
+            for key, spec in properties.items()
+        )
+        parts = [tool_name, tool.get("description", ""), input_keys]
+        embedding_name = f"mcp__{name}__{tool_name}"
+        vector = embed_text("\n".join(p for p in parts if p), task_type="retrieval_document")
+        if vector:
+            identity_mgr.save_tool_embedding(embedding_name, vector)
+            print(f"  Indexed embedding for MCP tool: {embedding_name}")
+        else:
+            print(f"  Skipped embedding for MCP tool: {embedding_name} (embeddings unavailable)")
+
+
 def main():
     identity_mgr = IdentityManager(
         host=os.getenv("ETCD_HOST", "127.0.0.1"),
@@ -238,11 +268,9 @@ def main():
             for config in mcp_configs:
                 if not config.get("name"):
                     config["name"] = mcp_dir.name
-                
-                name = config["name"]
-                identity_mgr.save_mcp_config(name, config)
-                seen_mcps.add(name)
-                print(f"  Saved config for MCP: {name}")
+                 
+                sync_mcp(identity_mgr, config)
+                seen_mcps.add(config["name"])
 
     # 2. Prune obsolete items
     print("\nPruning obsolete entries from etcd...")
