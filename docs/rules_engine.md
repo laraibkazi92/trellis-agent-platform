@@ -255,7 +255,8 @@ read it — it uses the last-known cached value (starting at the env var default
 in the background every 30 seconds, so a change made in `/admin` can take up to that long to apply.
 Admin etcd overrides for the decider's provider/base_url (`rules_evaluation_provider`,
 `rules_evaluation_base_url` via `IdentityManager`) follow the same cached background-refresh
-pattern and take precedence over the env var defaults.
+pattern and take precedence over the env var defaults. There is no dashboard field for
+these yet — set the etcd keys directly to use them.
 
 Identical queries are memoized in-process for 60 seconds (keyed on the query text **and** a hash of
 the current rule catalog, so an edited rule invalidates the cache immediately even within the TTL

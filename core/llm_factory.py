@@ -10,6 +10,7 @@ environment variables (GEMINI_API_KEY/GOOGLE_API_KEY, OPENAI_API_KEY,
 ANTHROPIC_API_KEY) at construction time. Ollama needs no key.
 """
 import logging
+import os
 from typing import Optional
 
 from pydantic_ai.models import Model
@@ -105,7 +106,9 @@ def resolve_model(provider: str, model: str, base_url: Optional[str] = None) -> 
             from anthropic import AsyncAnthropic
             return AnthropicModel(model, provider=AnthropicProvider(anthropic_client=AsyncAnthropic()))
     if resolved == "ollama":
-        return OllamaModel(model, provider=OllamaProvider(base_url=base_url or DEFAULT_OLLAMA_BASE_URL))
+        return OllamaModel(model, provider=OllamaProvider(
+            base_url=base_url or os.getenv("OLLAMA_BASE_URL") or DEFAULT_OLLAMA_BASE_URL
+        ))
     if not (base_url or "").strip():
         raise ProviderConfigError(
             "Provider 'openai-compatible' requires a base_url pointing at the compatible endpoint."

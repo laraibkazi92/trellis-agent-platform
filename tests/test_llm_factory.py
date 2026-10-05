@@ -84,7 +84,14 @@ def test_agent_config_allows_none_and_empty_provider():
 
 @pytest.mark.parametrize("provider", ALLOWED_PROVIDERS)
 def test_agent_config_accepts_every_valid_provider(provider):
-    assert AgentConfig(name="a", model="m", provider=provider).provider == provider
+    # openai-compatible is the only provider that requires a base_url at load time.
+    base_url = "http://compat:8000/v1" if provider == "openai-compatible" else None
+    assert AgentConfig(name="a", model="m", provider=provider, base_url=base_url).provider == provider
+
+
+def test_agent_config_rejects_openai_compatible_without_base_url():
+    with pytest.raises(ValueError, match="base_url"):
+        AgentConfig(name="a", model="m", provider="openai-compatible")
 
 
 def test_agent_config_normalizes_provider_and_base_url():
@@ -140,13 +147,16 @@ def test_resolve_model_infers_provider_when_none():
 # --- build_model_settings ------------------------------------------------------
 
 def test_settings_google_pro_budgets():
-    for level, budget in GEMINI_2_5_PRO_BUDGETS.items():
+    # Pinned literals: a silent change to the budget table must fail here.
+    expected = {"low": 1024, "medium": 8192, "high": 16384}
+    for level, budget in expected.items():
         s = build_model_settings("google", "gemini-2.5-pro", level)
         assert s["google_thinking_config"] == {"thinking_budget": budget, "include_thoughts": False}
 
 
 def test_settings_google_flash_budgets():
-    for level, budget in GEMINI_2_5_FLASH_BUDGETS.items():
+    expected = {"low": 1024, "medium": 4096, "high": 8192}
+    for level, budget in expected.items():
         s = build_model_settings("google", "gemini-2.5-flash", level)
         assert s["google_thinking_config"] == {"thinking_budget": budget, "include_thoughts": False}
 
@@ -228,15 +238,39 @@ def test_rules_engine_provider_env_then_etcd_precedence(monkeypatch):
     assert rules_engine._resolve_evaluation_base_url() == "http://etcd-host:8000/v1"
 
 
-def test_rules_engine_provider_uninferrable_model_falls_back_to_google(monkeypatch, caplog):
+def test_rules_engine_provider_uninferrable_model_raises(monkeypatch):
+    """No vendor guessing: an uninferrable model must raise ProviderConfigError
+    (evaluate_rules catches it and fails open) rather than silently egressing
+    the query and rule catalog to a default provider."""
     monkeypatch.setattr(rules_engine, "_cached_provider_override", None, raising=False)
     monkeypatch.setattr(rules_engine, "_model_overrides_checked_at", rules_engine.time.monotonic(), raising=False)
     monkeypatch.setattr(rules_engine, "RULES_EVALUATION_PROVIDER", "")
     monkeypatch.setattr(rules_engine, "RULES_EVALUATION_MODEL", "llama3.1")
 
-    with caplog.at_level("WARNING", logger="core.rules_engine"):
-        assert rules_engine._resolve_evaluation_provider() == "google"
-    assert "Cannot infer LLM provider" in caplog.text
+    with pytest.raises(ProviderConfigError):
+        rules_engine._resolve_evaluation_provider()
+
+
+def test_rules_engine_decider_pins_low_effort_for_reasoning_providers(monkeypatch):
+    """OpenAI/Anthropic reasoning models default to medium effort, which would
+    blow the sub-3s evaluation timeout — the decider must pin 'low'."""
+    class FakeAgent:
+        def __init__(self, model, **kwargs):
+            self.model = model
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(rules_engine, "Agent", FakeAgent)
+    for provider in ("openai", "anthropic"):
+        monkeypatch.setattr(rules_engine, "_cached_provider_override", provider, raising=False)
+        monkeypatch.setattr(rules_engine, "_cached_base_url_override", None, raising=False)
+        monkeypatch.setattr(rules_engine, "_model_overrides_checked_at", rules_engine.time.monotonic(), raising=False)
+        monkeypatch.setattr(rules_engine, "RULES_EVALUATION_MODEL", "claude-sonnet-4-5" if provider == "anthropic" else "gpt-5.6-sol")
+
+        agent = rules_engine._build_evaluation_agent()
+        settings = agent.kwargs["model_settings"]
+        assert settings is not None
+        expected_key = "anthropic_effort" if provider == "anthropic" else "openai_reasoning_effort"
+        assert settings[expected_key] == "low"
 
 
 def test_rules_engine_build_evaluation_agent_uses_resolved_provider(monkeypatch):

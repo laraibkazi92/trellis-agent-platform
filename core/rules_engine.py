@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Set
 from cachetools import TTLCache
 from pydantic_ai import Agent
 from pydantic_ai.models.google import GoogleModelSettings
+from pydantic_ai.settings import ModelSettings
 
 from core.auth import get_identity_manager
 from core.llm_factory import (
@@ -285,20 +286,17 @@ def _kick_model_overrides_refresh() -> None:
 
 def _resolve_evaluation_provider() -> str:
     """Admin etcd override > RULES_EVALUATION_PROVIDER env var > inference from the
-    configured model name. A model name that matches no known prefix falls back to
-    the historical hard-coded 'google' provider (warned) rather than breaking rule
-    evaluation outright -- the run then fails at API-call time and evaluate_rules
-    fails open, exactly as it did before multi-provider support."""
+    configured model name. A model name that matches no known prefix raises
+    ProviderConfigError rather than guessing a vendor -- silently defaulting to
+    'google' would egress the untrusted query and the full rule catalog to the
+    wrong provider's API before failing. evaluate_rules catches the error and
+    fails open to semantic search, matching the engine's fail-open design."""
     _kick_model_overrides_refresh()
     if _cached_provider_override:
         return _cached_provider_override
     if RULES_EVALUATION_PROVIDER:
         return RULES_EVALUATION_PROVIDER
-    try:
-        return infer_provider(RULES_EVALUATION_MODEL)
-    except ProviderConfigError as e:
-        logger.warning(f"[RulesEngine] {e}; defaulting the evaluation model to provider 'google'")
-        return "google"
+    return infer_provider(RULES_EVALUATION_MODEL)
 
 
 def _resolve_evaluation_base_url() -> Optional[str]:
@@ -356,11 +354,15 @@ def _build_evaluation_agent() -> Agent:
     if provider == "google":
         # Gemini thinking is explicitly zeroed out to keep the decider deterministic
         # and cheap (preserved from the pre-multi-provider implementation).
-        model_settings: Optional[GoogleModelSettings] = GoogleModelSettings(
+        model_settings: Optional[ModelSettings] = GoogleModelSettings(
             google_thinking_config={"thinking_budget": 0, "include_thoughts": False}
         )
+    elif provider in ("openai", "anthropic"):
+        # Their reasoning models default to medium effort, which blows the
+        # sub-3s evaluation timeout; pin the cheapest effort instead.
+        model_settings = build_model_settings(provider, RULES_EVALUATION_MODEL, "low")
     else:
-        model_settings = build_model_settings(provider, RULES_EVALUATION_MODEL, "none")
+        model_settings = None
     return Agent(
         model,
         output_type=RuleEvaluationResult,

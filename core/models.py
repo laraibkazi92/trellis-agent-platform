@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Laraib Kazi
 # SPDX-License-Identifier: Apache-2.0
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Optional, Literal, Dict, Any, Union
 from enum import Enum
 
@@ -150,6 +150,16 @@ class AgentConfig(BaseModel):
     @classmethod
     def _strip_base_url(cls, value: Optional[str]) -> Optional[str]:
         return (value or "").strip() or None
+
+    @model_validator(mode="after")
+    def _require_base_url_for_openai_compatible(self) -> "AgentConfig":
+        """Surface the openai-compatible base_url requirement at config-load time
+        instead of failing later inside resolve_model mid-build."""
+        if self.provider == "openai-compatible" and not self.base_url:
+            raise ValueError(
+                "Provider 'openai-compatible' requires a base_url pointing at the compatible endpoint."
+            )
+        return self
 
 
 def coerce_bool_flag(value, default: bool = True) -> bool:

@@ -231,6 +231,10 @@ def test_build_agent_skips_internal_false_a2a_target(monkeypatch, caplog):
     assert len(subagent_caps) == 1
     names = [sa["name"] for sa in subagent_caps[0].subagents]
     assert names == ["data-parser"]
+    # build_agent must hand the capability a resolved Model instance, not a bare
+    # model-name string (subagents-pydantic-ai raises on strings under pydantic-ai 2.31).
+    from pydantic_ai.models import Model as _Model
+    assert isinstance(subagent_caps[0].default_model, _Model)
 
     assert "front-door-bot" in caplog.text
     assert "internal=False" in caplog.text
