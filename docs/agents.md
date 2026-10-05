@@ -120,9 +120,10 @@ independent of the agent's own `model`.
 > The agent builds institutional knowledge over time, but one user's context can surface in
 > another user's session. An admin can flip the **Per-User Memory Isolation** flag
 > (Admin Dashboard → Feature Flags) to key banks as `agent:userid` instead — each user then
-> gets a fresh private bank, and runs without a user identity (background workflows) fall
-> back to the shared bank. Existing shared banks are **not** migrated. Do not enable memory
-> for agents handling user-private data unless isolation is on or that sharing is acceptable.
+> gets a fresh private bank, and background/workflow runs key by their workflow identity
+> (e.g. `agent:svc_agent_<name>`, `agent:webhook`), never into any user's bank. Existing
+> shared banks are **not** migrated. Do not enable memory for agents handling user-private
+> data unless isolation is on or that sharing is acceptable.
 
 **`thinking_level`**: Controls reasoning depth and token cost. `none` is fastest; `high` enables deep chain-of-thought. Match to task complexity.
 

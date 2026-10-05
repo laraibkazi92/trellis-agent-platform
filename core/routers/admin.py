@@ -178,7 +178,8 @@ async def toggle_agent_memory_isolation(request: Request, enabled: str = Form(..
     state_str = "enabled" if should_enable else "disabled"
     request.session["flash_msg"] = (
         f"Per-user memory isolation {state_str}. New memories use per-user banks "
-        "(agent:userid); existing shared banks are not migrated."
+        "(agent:userid); background runs key by workflow identity; existing "
+        "shared banks are not migrated."
     )
     return RedirectResponse(url='/admin', status_code=303)
 

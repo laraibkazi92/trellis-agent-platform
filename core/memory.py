@@ -11,8 +11,9 @@ framework feature flag, toggled from the admin dashboard) gates the whole featur
 Scope: memory is per-agent. By default the Hindsight "bank" key is the agent name, so
 an agent accumulates institutional knowledge across every user that talks to it. Admins
 can flip the `agent_memory_isolated_per_user` framework flag to key banks as
-"{agent_name}:{user_id}" instead, giving each user a private memory (runs without a
-user identity degrade to the shared agent bank). Existing shared banks are not migrated.
+"{agent_name}:{user_id}" instead, giving each user a private memory
+(background/workflow runs key by their workflow identity, e.g.
+"{agent_name}:svc_agent_{name}"). Existing shared banks are not migrated.
 
 Every operation is fail-open: a Hindsight outage, a missing client library, or an API
 mismatch degrades to "no memory" and never breaks an agent run.
@@ -83,10 +84,17 @@ class MemoryManager:
             self._isolation_flag_ts = now
         return self._isolation_flag_cache
 
+    def invalidate_flag_caches(self) -> None:
+        """Drop cached flag values so the next read hits etcd immediately
+        (called from the etcd watch callback when a flag is toggled)."""
+        self._flag_cache = None
+        self._isolation_flag_cache = None
+
     def bank_for(self, agent_name: str, user_id: Optional[str]) -> str:
         """Resolve the Hindsight bank key for a run. With per-user isolation on and a
         known user, memories live in "{agent_name}:{user_id}"; otherwise the bank is
-        the shared agent name (runs without a user identity degrade to shared)."""
+        the shared agent name. Background/workflow identities (svc_agent_*, webhook)
+        key their own workflow bank — never into any user's bank."""
         if self.is_isolated_per_user() and user_id:
             return f"{agent_name}:{user_id}"
         return agent_name

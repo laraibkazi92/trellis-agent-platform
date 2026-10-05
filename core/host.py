@@ -33,7 +33,7 @@ from core.devmode import enforce_dev_mode_safety
 from core.models import AgentConfig, MCPConfig, is_agent_external, is_routable_agent_type
 from core.health import HealthMonitor, compute_agent_operational_status
 from core.background.webhooks import router as webhooks_router
-from core.tasks import run_background_agent, _truncate_output, MAX_RUN_ERROR_CHARS
+from core.tasks import _truncate_output, MAX_RUN_ERROR_CHARS
 
 _background_tasks: set[asyncio.Task] = set()
 
@@ -175,11 +175,14 @@ def on_memory_flag_change(event):
     When the master flag is enabled: eviction forces a rebuild so agents with
     agent_memory=true get their @agent.instructions callback wired in.
     For the isolation flag the recall closure re-resolves the bank per run anyway;
-    eviction just keeps cached builds from outliving the flag transition.
+    eviction just keeps cached builds from outliving the flag transition. The
+    MemoryManager's TTL-cached flag values are also dropped so rebuilt agents
+    observe the new flag immediately instead of after the cache TTL.
     """
     from core.agent_factory import _agent_cache
     for name in list(_agent_cache.keys()):
         evict_agent(name)
+    get_memory_manager().invalidate_flag_caches()
     if _main_loop and not _main_loop.is_closed():
         asyncio.run_coroutine_threadsafe(prewarm_agents(), _main_loop)
 
@@ -245,7 +248,12 @@ async def chat_completions(request: ChatRequest):
 
     async def record_run_state(state: str, metadata: Dict):
         try:
-            await asyncio.to_thread(identity_mgr.record_agent_run_state, request.model, run_id, state, metadata)
+            # Capped so a degraded etcd (retry_etcd can spin ~20s) cannot stall
+            # the chat hot path; a missed record is preferable to a slow reply.
+            await asyncio.wait_for(
+                asyncio.to_thread(identity_mgr.record_agent_run_state, request.model, run_id, state, metadata),
+                timeout=3.0,
+            )
         except Exception as e:
             logger.error(f"Failed to record {state} state for {request.model} sync run {run_id}: {e}")
 
@@ -344,9 +352,18 @@ async def chat_completions(request: ChatRequest):
                 result = MockResult(final_text, usage)
                 await handle_success(result, captured_user_id)
                 yield json.dumps({"choices": [{"message": {"role": "assistant", "content": final_text}}]}) + "\n"
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, GeneratorExit):
                 if not task.done():
                     task.cancel()
+                # Client disconnected mid-stream: fire-and-forget a terminal record
+                # so the run is not stranded in "processing" (spawned rather than
+                # awaited -- awaits are unsafe once the generator is cancelled).
+                _spawn_background(record_run_state("cancelled", {
+                    "prompt": truncated_prompt,
+                    "user_id": captured_user_id,
+                    "error": "client disconnected mid-stream",
+                    "source": "sync"
+                }), f"sync_run_cancel:{run_id}")
                 raise
             except Exception as e:
                 if not task.done():

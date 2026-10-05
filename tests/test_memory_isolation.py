@@ -4,7 +4,7 @@
 """Tests for the per-user agent-memory isolation option.
 
 Covers:
-  - MemoryManager.is_isolated_per_user(): TTL caching + fail-closed on etcd read errors.
+  - MemoryManager.is_isolated_per_user(): TTL caching + fail-open to the shared bank on etcd read errors.
   - MemoryManager.bank_for(): shared agent bank vs "{agent}:{user}" keyed bank, and the
     degradation to the shared bank when no user identity is in scope (workflow/system runs).
   - recall/retain round-trips carrying the isolated bank id into the Hindsight client.
@@ -107,7 +107,7 @@ def test_isolation_flag_cache_expires_after_ttl(monkeypatch):
     assert len(ident.get_config_calls) == 2
 
 
-def test_isolation_flag_fails_closed_on_etcd_read_error():
+def test_isolation_flag_fails_open_to_shared_bank_on_etcd_read_error():
     mgr = MemoryManager(_FakeIdentityMgr(error=RuntimeError("etcd unavailable")))
     assert mgr.is_isolated_per_user() is False
     # The failed read is cached too: a second rapid call stays False without re-raising.
@@ -128,7 +128,9 @@ def test_bank_for_combines_agent_and_user_when_isolation_on():
 
 
 def test_bank_for_degrades_to_shared_bank_without_user():
-    """Workflow/system identities without user context fall back to the shared bank."""
+    """A missing/empty user identity cannot key a private bank and degrades to the
+    shared agent bank (workflow identities like svc_agent_*/webhook are truthy and
+    get their own workflow-keyed bank instead)."""
     mgr = _isolated_mgr(config={MEMORY_ISOLATION_FLAG_KEY: True})
     assert mgr.bank_for("agent-a", None) == "agent-a"
     assert mgr.bank_for("agent-a", "") == "agent-a"
