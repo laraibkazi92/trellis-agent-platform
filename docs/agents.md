@@ -86,7 +86,7 @@ name: my-agent                    # Required. Unique snake-case identifier. Used
 version: 0.1.0                    # Required. Semantic version string.
 author: user@example.com          # Required. Creator email or name.
 description: "Does X and Y."      # Required. Shown in the UI. LLM uses this for routing decisions.
-model: gemini-3-flash-preview     # Required. LLM model identifier (see supported models below).
+model: gemini-3-flash-preview     # Required. LLM model identifier.
 thinking_level: medium            # Required. One of: none, low, medium, high.
 allowed_tools:                    # Required. Tool names this agent may call. Use [] for no tools.
   - get_system_time
@@ -121,12 +121,6 @@ independent of the agent's own `model`.
 **`allowed_mcps`**: Must exactly match the `name` in each `mcp.yaml`. All tools from that MCP server become available to the agent. Tool names are prefixed `mcp__{mcp_name}__{tool_name}` internally.
 
 **`a2a_access`**: Enables Agent-to-Agent delegation. The agent can call listed agents as sub-tasks (as if calling a tool). Keep this list small and intentional — the supervisor does not use `a2a_access`; it discovers and delegates dynamically via `search_agents` + `delegate`.
-
-**Supported models** (examples):
-- `gemini-3-flash-preview` — fast, cost-efficient
-- `gemini-3.1-pro-preview` — more capable reasoning
-- `claude-sonnet-4-6` — Anthropic Sonnet
-- `claude-opus-4-8` — Anthropic Opus
 
 ---
 

@@ -14,8 +14,8 @@ The framework relies on a microservice architecture with `etcd` acting as the ce
 
 ## Core Concepts & Terminology
 
-- **Agents**: Defined in `/agents` with a `config.yaml` and specialized `skills.md`.
-- **Tools**: Polyglot standalone scripts defined in `/tools` using `tool.yaml` configurations.
+- **Agents**: Defined in `workspace/agents/` with a `config.yaml` and specialized `skills.md`.
+- **Tools**: Polyglot standalone scripts defined in `workspace/tools/` using `tool.yaml` configurations.
 - **API Keys**: Inbound authentication tokens used to access the framework via API or MCP endpoints.
 - **Tool Secrets**: Outbound, third-party credentials (e.g., Issues, Support, OpenAI) securely stored for use by Agents and Tools.
 
@@ -73,11 +73,13 @@ claude mcp add --transport http trellis http://localhost:8002/mcp --header "Auth
 ## Directory Structure
 
 - `core/`: Framework logic, auth, routers, and host/hub/gateway/ui services.
-- `agents/`: Directory-based agent definitions (each needs `config.yaml`).
-- `tools/`: Polyglot tool definitions (each needs `tool.yaml` and logic).
+- `data/`: Persistent runtime data.
+- `docs/`: Developer guides for agents, tools, workflows, and MCP.
+- `gateway/`: Nginx gateway configuration.
 - `scripts/`: Operational scripts like `sync_to_db.py`.
 - `templates/`: HTML templates for the Dashboard UI.
-- `__spec_docs/`: Architectural specifications and plans.
+- `tests/`: Test suite.
+- `workspace/`: Agent, tool, and workflow content — `agents/`, `tools/`, `mcps/`, `workflows/`, and `shared/`.
 
 ## Development Workflow
 

@@ -1,8 +1,14 @@
 # Contributing to Trellis
 
-Thanks for helping build Trellis! This guide covers the practical bits; the
+Thanks for your interest in Trellis! This guide covers the practical bits; the
 developer guides for building agents, tools, MCP servers, and workflows live in
 [`docs/`](docs/).
+
+## Contribution posture
+
+Trellis is currently maintainer-led. External code contributions are limited
+pending contribution terms. Issues, discussions, and feedback are always
+welcome — if you spot a bug or have an idea, please open an issue.
 
 ## Getting set up
 
@@ -31,24 +37,17 @@ each `docs/*.md` guide — please read the one matching your change.
 
 ## Before you open a PR
 
-1. **Add the license header** to every new source file:
-   ```
-   # Copyright (C) 2026 Laraib Kazi
-   # SPDX-License-Identifier: Apache-2.0
-   ```
-   (`<!-- -->` wrapped for HTML templates.)
-2. **Run the tests** relevant to your change:
+1. **Run the tests** relevant to your change:
    ```bash
    python -m pytest tests/
    ```
-3. **Update docs** if you change behavior — `docs/` and `README.md` are part of
+2. **Update docs** if you change behavior — `docs/` and `README.md` are part of
    the product.
 
 ## Scope
 
-This repository is the complete, open-source product — everything you need to
-run Trellis. If you're unsure whether a change fits, open an issue and ask
-before building.
+This repository is the complete product — everything you need to run Trellis.
+If you're unsure whether a change fits, open an issue and ask before building.
 
 ## Reporting security issues
 

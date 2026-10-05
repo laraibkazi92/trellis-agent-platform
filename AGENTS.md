@@ -16,9 +16,10 @@
 
 ## 📂 Key Directories
 - `core/`: Service implementations, routers, and auth (`core/auth.py` -> `IdentityManager`).
-- `agents/`: User-facing agent definitions (`user_agent`) (requires `config.yaml` and `skills.md`).
+- `workspace/agents/`: User-facing agent definitions (`user_agent`) (requires `config.yaml` and `skills.md`).
 - `workspace/workflows/`: Background workflows containing `background_agent` and `background_script` definitions.
-- `tools/`: Tool logic. Each directory requires a `tool.yaml` (list of tool objects) and entrypoint wrappers.
+- `workspace/tools/`: Tool logic. Each directory requires a `tool.yaml` (list of tool objects) and entrypoint wrappers.
+- `workspace/mcps/`: External MCP server registrations (`mcp.yaml`).
 - `scripts/`: Operational utilities (e.g., `sync_to_db.py`).
 
 ## 💻 Development Workflow
