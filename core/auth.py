@@ -433,6 +433,38 @@ class IdentityManager:
         """Remove the admin override, reverting to the RULES_EVALUATION_TIMEOUT env var default."""
         self.client.delete("/config/framework/rules_evaluation_timeout")
 
+    def get_rules_evaluation_provider(self) -> Optional[str]:
+        """Retrieve the admin-configured provider for the Rules Engine LLM decider,
+        or None if never set -- callers fall back to the RULES_EVALUATION_PROVIDER
+        env var / model-name inference in that case.
+
+        Not itself @retry_etcd()-decorated: get_config() already retries -- see
+        get_rules_evaluation_timeout above for the single-retry-layer rationale."""
+        value = self.get_config("rules_evaluation_provider", None)
+        return str(value) if value is not None else None
+
+    def set_rules_evaluation_provider(self, provider: str) -> None:
+        """Set the admin-configured provider for the Rules Engine LLM decider.
+
+        Not itself @retry_etcd()-decorated -- see get_rules_evaluation_provider above."""
+        self.set_config("rules_evaluation_provider", str(provider))
+
+    def get_rules_evaluation_base_url(self) -> Optional[str]:
+        """Retrieve the admin-configured base_url for the Rules Engine LLM decider
+        (used by 'openai-compatible'/'ollama' providers), or None if never set --
+        callers fall back to the RULES_EVALUATION_BASE_URL env var in that case.
+
+        Not itself @retry_etcd()-decorated: get_config() already retries -- see
+        get_rules_evaluation_timeout above for the single-retry-layer rationale."""
+        value = self.get_config("rules_evaluation_base_url", None)
+        return str(value) if value is not None else None
+
+    def set_rules_evaluation_base_url(self, base_url: str) -> None:
+        """Set the admin-configured base_url for the Rules Engine LLM decider.
+
+        Not itself @retry_etcd()-decorated -- see get_rules_evaluation_base_url above."""
+        self.set_config("rules_evaluation_base_url", str(base_url))
+
     def get_app_config(self) -> Dict[str, Any]:
         """Retrieve the application configuration for whitelabeling.
 

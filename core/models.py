@@ -1,9 +1,14 @@
 # Copyright (C) 2026 Laraib Kazi
 # SPDX-License-Identifier: Apache-2.0
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Literal, Dict, Any, Union
 from enum import Enum
+
+# LLM providers core/llm_factory.py can resolve. `openai-compatible` targets any
+# OpenAI-compatible endpoint via `base_url`.
+ALLOWED_PROVIDERS = ("google", "openai", "anthropic", "ollama", "openai-compatible")
+
 
 class IdentityType(str, Enum):
     USER = "user"
@@ -116,6 +121,8 @@ class AgentConfig(BaseModel):
     type: Literal['user_agent', 'background_agent', 'background_script'] = 'user_agent'
     model: Optional[str] = None
     thinking_level: Optional[Literal['none', 'low', 'medium', 'high', 'n/a']] = None
+    provider: Optional[str] = Field(default=None, description="LLM provider. None infers from the model name prefix (gemini*/claude*/gpt-*/o1*/o3*/o4*/chatgpt*).")
+    base_url: Optional[str] = Field(default=None, description="Custom API endpoint. Required for 'openai-compatible', optional for 'ollama'.")
     a2a_access: List[str] = Field(default_factory=list, description="List of other agents this agent can call.")
     allowed_tools: List[str] = Field(default_factory=list, description="List of MCP tools this agent is allowed to use.")
     allowed_mcps: List[str] = Field(default_factory=list, description="List of MCP servers this agent is allowed to connect to.")
@@ -123,6 +130,26 @@ class AgentConfig(BaseModel):
     external: bool = Field(default=True, description="Available for direct consumption by users, Host API, Gateway MCP, and Supervisor agent.")
     internal: bool = Field(default=True, description="Available to be called by other specialized agents via a2a_access.")
     rules: List[AgentRule] = Field(default_factory=list, description="Declarative routing rules evaluated by the Trellis Rules Engine before semantic search.")
+
+    @field_validator("provider")
+    @classmethod
+    def _validate_provider(cls, value: Optional[str]) -> Optional[str]:
+        """Reject unknown providers at config load; empty string counts as unset (inferred)."""
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if not normalized:
+            return None
+        if normalized not in ALLOWED_PROVIDERS:
+            raise ValueError(
+                f"Unknown provider '{value}'. Valid providers: {', '.join(ALLOWED_PROVIDERS)}."
+            )
+        return normalized
+
+    @field_validator("base_url")
+    @classmethod
+    def _strip_base_url(cls, value: Optional[str]) -> Optional[str]:
+        return (value or "").strip() or None
 
 
 def coerce_bool_flag(value, default: bool = True) -> bool:

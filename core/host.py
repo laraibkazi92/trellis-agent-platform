@@ -22,7 +22,6 @@ from pydantic import BaseModel
 import httpx
 from contextlib import asynccontextmanager
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart, TextPart
 
 from fastmcp import Client as FastMCPClient

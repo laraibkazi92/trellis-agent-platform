@@ -98,6 +98,10 @@ def _isolate_rules_engine(monkeypatch):
     monkeypatch.setattr(rules_engine, "Agent", FakeAgent)
     monkeypatch.setattr(rules_engine, "_cached_timeout_override", None)
     monkeypatch.setattr(rules_engine, "_timeout_override_checked_at", rules_engine.time.monotonic())
+    # Same pre-seed for the provider/base_url override cache (see comment above).
+    monkeypatch.setattr(rules_engine, "_cached_provider_override", None, raising=False)
+    monkeypatch.setattr(rules_engine, "_cached_base_url_override", None, raising=False)
+    monkeypatch.setattr(rules_engine, "_model_overrides_checked_at", rules_engine.time.monotonic(), raising=False)
     rules_engine._query_result_cache.clear()
     rules_engine._in_flight_evaluations.clear()
     FakeAgent.behavior = None

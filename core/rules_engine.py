@@ -20,9 +20,15 @@ from typing import Dict, List, Optional, Set
 
 from cachetools import TTLCache
 from pydantic_ai import Agent
-from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
+from pydantic_ai.models.google import GoogleModelSettings
 
 from core.auth import get_identity_manager
+from core.llm_factory import (
+    ProviderConfigError,
+    build_model_settings,
+    infer_provider,
+    resolve_model,
+)
 from core.models import RuleEvaluationResult, is_agent_external, is_routable_agent_type
 
 logger = logging.getLogger(__name__)
@@ -186,6 +192,8 @@ RULES_CONFIDENCE_THRESHOLD = float(os.getenv("RULES_CONFIDENCE_THRESHOLD", "0.8"
 # override lookup itself fails/times out -- see _resolve_evaluation_timeout below.
 RULES_EVALUATION_TIMEOUT = float(os.getenv("RULES_EVALUATION_TIMEOUT", "2.5"))
 RULES_EVALUATION_MODEL = os.getenv("RULES_EVALUATION_MODEL", "gemini-2.5-flash")
+RULES_EVALUATION_PROVIDER = os.getenv("RULES_EVALUATION_PROVIDER", "")
+RULES_EVALUATION_BASE_URL = os.getenv("RULES_EVALUATION_BASE_URL", "")
 
 # The admin-configured timeout override is read from etcd via a fire-and-forget
 # background refresh, never awaited by the request path. IMPORTANT: asyncio.wait_for()
@@ -237,6 +245,67 @@ def _resolve_evaluation_timeout() -> float:
 
     return _cached_timeout_override if _cached_timeout_override is not None else RULES_EVALUATION_TIMEOUT
 
+# The evaluation model's provider/base_url overrides follow the same fire-and-forget
+# background-refresh pattern as the timeout above (same etcd-blip rationale): the
+# request path reads the last-known cached value and never blocks on etcd. A separate
+# cache/refresh cycle from the timeout's so each stays independently mockable.
+_model_overrides_checked_at: float = 0.0
+_model_overrides_refresh_in_flight: bool = False
+_cached_provider_override: Optional[str] = None
+_cached_base_url_override: Optional[str] = None
+
+
+def _refresh_model_overrides_sync() -> None:
+    """Runs in a thread-pool worker via loop.run_in_executor -- never awaited directly."""
+    global _cached_provider_override, _cached_base_url_override
+    global _model_overrides_checked_at, _model_overrides_refresh_in_flight
+    try:
+        _cached_provider_override = identity_mgr.get_rules_evaluation_provider()
+        _cached_base_url_override = identity_mgr.get_rules_evaluation_base_url()
+    except Exception as e:
+        logger.warning(f"[RulesEngine] Failed to refresh model provider/base_url overrides from etcd: {e}; retaining previous cache")
+    finally:
+        _model_overrides_checked_at = time.monotonic()
+        _model_overrides_refresh_in_flight = False
+
+
+def _kick_model_overrides_refresh() -> None:
+    global _model_overrides_refresh_in_flight
+    now = time.monotonic()
+    stale = (now - _model_overrides_checked_at) >= _TIMEOUT_OVERRIDE_TTL_SECONDS
+    if stale and not _model_overrides_refresh_in_flight:
+        _model_overrides_refresh_in_flight = True
+        try:
+            asyncio.get_running_loop().run_in_executor(None, _refresh_model_overrides_sync)
+        except RuntimeError:
+            # No running loop (e.g. called from sync code/tests) -- skip this refresh
+            # cycle rather than block; the next call from an async context will retry.
+            _model_overrides_refresh_in_flight = False
+
+
+def _resolve_evaluation_provider() -> str:
+    """Admin etcd override > RULES_EVALUATION_PROVIDER env var > inference from the
+    configured model name. A model name that matches no known prefix falls back to
+    the historical hard-coded 'google' provider (warned) rather than breaking rule
+    evaluation outright -- the run then fails at API-call time and evaluate_rules
+    fails open, exactly as it did before multi-provider support."""
+    _kick_model_overrides_refresh()
+    if _cached_provider_override:
+        return _cached_provider_override
+    if RULES_EVALUATION_PROVIDER:
+        return RULES_EVALUATION_PROVIDER
+    try:
+        return infer_provider(RULES_EVALUATION_MODEL)
+    except ProviderConfigError as e:
+        logger.warning(f"[RulesEngine] {e}; defaulting the evaluation model to provider 'google'")
+        return "google"
+
+
+def _resolve_evaluation_base_url() -> Optional[str]:
+    """Admin etcd override > RULES_EVALUATION_BASE_URL env var > None."""
+    _kick_model_overrides_refresh()
+    return _cached_base_url_override or RULES_EVALUATION_BASE_URL or None
+
 # Exact-match query result cache: avoids re-invoking the LLM for a repeated
 # identical query. Keyed on (query, catalog_hash) rather than query alone so a
 # rule-set change (an agent's rules edited, an agent losing/gaining
@@ -281,10 +350,17 @@ def _build_evaluation_agent() -> Agent:
     Not module-cached: construction is cheap (no network I/O), and a fresh instance
     keeps this function trivially mockable in tests via ``monkeypatch.setattr(Agent)``.
     """
-    model = GoogleModel(RULES_EVALUATION_MODEL)
-    model_settings = GoogleModelSettings(
-        google_thinking_config={"thinking_budget": 0, "include_thoughts": False}
-    )
+    provider = _resolve_evaluation_provider()
+    base_url = _resolve_evaluation_base_url()
+    model = resolve_model(provider, RULES_EVALUATION_MODEL, base_url)
+    if provider == "google":
+        # Gemini thinking is explicitly zeroed out to keep the decider deterministic
+        # and cheap (preserved from the pre-multi-provider implementation).
+        model_settings: Optional[GoogleModelSettings] = GoogleModelSettings(
+            google_thinking_config={"thinking_budget": 0, "include_thoughts": False}
+        )
+    else:
+        model_settings = build_model_settings(provider, RULES_EVALUATION_MODEL, "none")
     return Agent(
         model,
         output_type=RuleEvaluationResult,

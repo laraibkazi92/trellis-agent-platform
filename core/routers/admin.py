@@ -13,7 +13,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import templates, CSRFRoute
 from core.auth import get_identity_manager
 from core.health import HealthMonitor
-from core.models import Identity, IdentityType, is_agent_internal, coerce_bool_flag
+from core.models import Identity, IdentityType, is_agent_internal, coerce_bool_flag, ALLOWED_PROVIDERS
 from core.rules_engine import RULES_EVALUATION_TIMEOUT as RULES_EVALUATION_TIMEOUT_DEFAULT
 
 router = APIRouter(route_class=CSRFRoute)
@@ -587,6 +587,16 @@ async def save_agent(request: Request, name: str):
     LITE_MODELS = {"gemini-3.1-flash-lite-preview", "gemini-2.5-flash-lite"}
     if config["model"] and config["model"] in LITE_MODELS:
         config["thinking_level"] = "n/a"
+
+    # Multi-provider support: empty provider means "infer from the model name".
+    provider = (form.get("provider") or "").strip().lower()
+    if provider and provider not in ALLOWED_PROVIDERS:
+        request.session["flash_msg"] = (
+            f"Invalid provider '{provider}'. Must be one of: {', '.join(ALLOWED_PROVIDERS)}."
+        )
+        return RedirectResponse(url=f'/editor/agent/{safe_name}', status_code=303)
+    config["provider"] = provider or None
+    config["base_url"] = (form.get("base_url") or "").strip() or None
     
     config["version"] = form.get("version")
     config["description"] = form.get("description")

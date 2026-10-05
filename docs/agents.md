@@ -88,6 +88,13 @@ author: user@example.com          # Required. Creator email or name.
 description: "Does X and Y."      # Required. Shown in the UI. LLM uses this for routing decisions.
 model: gemini-3-flash-preview     # Required. LLM model identifier.
 thinking_level: medium            # Required. One of: none, low, medium, high.
+provider: google                  # Optional. One of: google, openai, anthropic, ollama,
+                                  #   openai-compatible. Omitted/empty infers from the model
+                                  #   name prefix (gemini* → google, claude* → anthropic,
+                                  #   gpt-*/o1*/o3*/o4*/chatgpt* → openai); anything else
+                                  #   fails at build time with a config error.
+base_url: http://localhost:11434/v1  # Optional. Custom API endpoint. Required for
+                                  #   openai-compatible, optional for ollama.
 allowed_tools:                    # Required. Tool names this agent may call. Use [] for no tools.
   - get_system_time
   - tl_issues_fetch
@@ -115,6 +122,8 @@ independent of the agent's own `model`.
 > sharing is acceptable.
 
 **`thinking_level`**: Controls reasoning depth and token cost. `none` is fastest; `high` enables deep chain-of-thought. Match to task complexity.
+
+**`provider` / `base_url`**: Which LLM vendor serves `model`. API keys come from the standard environment variables (`GEMINI_API_KEY`/`GOOGLE_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` — see `.env.example`); Ollama needs none. `thinking_level` maps per provider: Gemini uses token budgets/levels, Anthropic maps to `anthropic_effort`, OpenAI to `openai_reasoning_effort`; Ollama and `openai-compatible` run with their own defaults. `openai-compatible` points `base_url` at any OpenAI-compatible endpoint (vLLM, LiteLLM, Ollama's `/v1`, …). Both fields can also be set in the admin agent editor.
 
 **`allowed_tools`**: Must exactly match the `name` field in each tool's `tool.yaml`. The hub exposes only listed tools to this agent.
 

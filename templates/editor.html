@@ -202,6 +202,9 @@
                     <div>
                         <label class="form-label">Model Engine</label>
                         <select name="model" id="modelSelect" class="form-input">
+                            {% if config.model and config.model not in ['gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite-preview', 'gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro'] %}
+                            <option value="{{ config.model }}" selected>{{ config.model }} (custom)</option>
+                            {% endif %}
                             <option value="gemini-3.1-pro-preview" {% if config.model == 'gemini-3.1-pro-preview' %}selected{% endif %}>gemini-3.1-pro-preview</option>
                             <option value="gemini-3-flash-preview" {% if config.model == 'gemini-3-flash-preview' %}selected{% endif %}>gemini-3-flash-preview (default)</option>
                             <option value="gemini-3.1-flash-lite-preview" {% if config.model == 'gemini-3.1-flash-lite-preview' %}selected{% endif %}>gemini-3.1-flash-lite-preview</option>
@@ -219,6 +222,24 @@
                             <option value="high" {% if config.thinking_level == 'high' %}selected{% endif %}>High</option>
                             <option value="n/a" {% if config.thinking_level == 'n/a' %}selected{% endif %} hidden>N/A</option>
                         </select>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-8">
+                    <div>
+                        <label class="form-label">Provider</label>
+                        <select name="provider" id="providerSelect" class="form-input">
+                            <option value="" {% if not config.provider %}selected{% endif %}>Auto (infer from model name)</option>
+                            <option value="google" {% if config.provider == 'google' %}selected{% endif %}>Google (Gemini)</option>
+                            <option value="openai" {% if config.provider == 'openai' %}selected{% endif %}>OpenAI</option>
+                            <option value="anthropic" {% if config.provider == 'anthropic' %}selected{% endif %}>Anthropic</option>
+                            <option value="ollama" {% if config.provider == 'ollama' %}selected{% endif %}>Ollama</option>
+                            <option value="openai-compatible" {% if config.provider == 'openai-compatible' %}selected{% endif %}>OpenAI-compatible</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="form-label">Base URL</label>
+                        <input type="text" name="base_url" id="baseUrlInput" value="{{ config.base_url or '' }}" class="form-input" placeholder="Required for openai-compatible (e.g. http://localhost:11434/v1)">
                     </div>
                 </div>
 

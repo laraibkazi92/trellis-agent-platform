@@ -17,7 +17,6 @@ from asyncache import cached
 from cachetools import TTLCache
 
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 
 from fastmcp import Client as FastMCPClient
 from fastmcp.client import StdioTransport, SSETransport, StreamableHttpTransport
@@ -31,6 +30,7 @@ from pydantic_ai_shields import CostTracking, ToolGuard
 from pydantic_ai_rlm import create_rlm_toolset
 
 from core.auth import EtcdContentionError, IdentityManager, get_identity_manager, user_id_var
+from core.llm_factory import build_model_settings, resolve_model, resolve_provider
 from core.models import AgentConfig, MCPConfig, is_agent_external, is_agent_internal
 from core.health import HealthMonitor, evaluate_health_status, DEFAULT_HEALTH_COOLDOWN_SECONDS
 from core.discovery import is_agent_configured
@@ -210,14 +210,6 @@ def get_health_monitor() -> HealthMonitor:
 
 DEFAULT_HUB_URL = os.getenv("HUB_URL", "http://localhost:8001/mcp")
 
-GEMINI_2_5_PRO_MODELS = {"gemini-2.5-pro"}
-GEMINI_2_5_FLASH_MODELS = {"gemini-2.5-flash"}
-LITE_MODELS = {"gemini-3.1-flash-lite-preview", "gemini-2.5-flash-lite"}
-GEMINI_3_MODELS = {"gemini-3.1-pro-preview", "gemini-3-flash-preview"}
-
-GEMINI_2_5_PRO_BUDGETS = {"low": 1024, "medium": 8192, "high": 16384}
-GEMINI_2_5_FLASH_BUDGETS = {"low": 1024, "medium": 4096, "high": 8192}
-
 def _latest_user_text(ctx: RunContext) -> str:
     """Best-effort extraction of the current user prompt from a RunContext, used to query
     agent memory. Defensive across pydantic-ai versions; returns "" if not found."""
@@ -232,19 +224,6 @@ def _latest_user_text(ctx: RunContext) -> str:
                 if isinstance(content, str) and content.strip():
                     return content
     return ""
-
-def _get_model_settings(model_name: str, thinking_level: str) -> Optional[GoogleModelSettings]:
-    if not thinking_level or thinking_level in ("none", "n/a"): return None
-    if model_name in LITE_MODELS: return None
-    if model_name in GEMINI_2_5_PRO_MODELS:
-        budget = GEMINI_2_5_PRO_BUDGETS.get(thinking_level.lower(), 8192)
-        return GoogleModelSettings(google_thinking_config={"thinking_budget": budget, "include_thoughts": False})
-    elif model_name in GEMINI_2_5_FLASH_MODELS:
-        budget = GEMINI_2_5_FLASH_BUDGETS.get(thinking_level.lower(), 4096)
-        return GoogleModelSettings(google_thinking_config={"thinking_budget": budget, "include_thoughts": False})
-    elif model_name in GEMINI_3_MODELS:
-        return GoogleModelSettings(google_thinking_config={"thinking_level": thinking_level.lower(), "include_thoughts": False})
-    return None
 
 def _inject_config(
     env: Optional[Dict[str, str]], 
@@ -441,8 +420,9 @@ async def build_agent(agent_name: str) -> Agent:
             raise Exception(f"Agent '{agent_name}' not found")
             
     config = AgentConfig(**config_data)
-    model = GoogleModel(config.model)
-    model_settings = _get_model_settings(config.model, config.thinking_level)
+    provider = resolve_provider(config.provider, config.model)
+    model = resolve_model(provider, config.model, config.base_url)
+    model_settings = build_model_settings(provider, config.model, config.thinking_level)
     
     capabilities = []
     toolsets = []
@@ -484,14 +464,17 @@ async def build_agent(agent_name: str) -> Agent:
             ))
 
     if subagent_configs:
-        capabilities.append(SubAgentCapability(subagents=subagent_configs, default_model=config.model))
+        # default_model must be a resolved Model instance: pydantic-ai's infer_model
+        # only accepts "provider:model" strings, so a bare name like "gemini-2.5-pro"
+        # would raise UserError at subagent compile time.
+        capabilities.append(SubAgentCapability(subagents=subagent_configs, default_model=model))
 
     # 5. Supervisor delegation toolset — task/check_task/wait_tasks/cancel etc.
     if agent_name == "supervisor":
         toolsets.append(create_subagent_toolset(
             subagents=[],
             include_general_purpose=False,
-            default_model=config.model,
+            default_model=model,
             max_nesting_depth=0,
             registry=get_supervisor_registry(),
         ))
