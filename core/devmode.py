@@ -14,6 +14,12 @@ def enforce_dev_mode_safety(service_name: str) -> None:
 
     DEV_MODE disables all authentication, so it must only ever serve loopback
     traffic unless the operator explicitly opts in via DEV_MODE_ALLOW_REMOTE_BIND.
+
+    Semantics of the checked value: under docker compose, HOST_BIND is the host
+    address the published ports bind to (container-internal binds stay 0.0.0.0
+    by design, which is safe behind loopback-published ports). For direct
+    invocations (``python core/hub.py`` / ``core/gateway.py``), BIND_HOST is the
+    server's actual bind address. Either is accepted; default is 0.0.0.0.
     """
     if os.getenv("DEV_MODE", "false").lower() != "true":
         return

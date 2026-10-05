@@ -58,14 +58,23 @@ externalDependencies:
     url: http://my-hindsight:8888
 ```
 
-**Option B — subcharts.** Add them to your own values file when installing,
-e.g. with `helm upgrade --install`:
+**Option B — subcharts.** Declare them in `Chart.yaml`'s `dependencies:`
+list (the chart ships none) and fetch the tarballs into `charts/`:
 
-```bash
-helm dependency add charts/trellis oci://registry-1.docker.io/bitnamicharts/etcd
+```yaml
+# Chart.yaml
+dependencies:
+  - name: etcd
+    repository: oci://registry-1.docker.io/bitnamicharts
+    version: 11.x.x
 ```
 
-…or manage them as separate releases. Because the chart renders
+```bash
+helm dependency update charts/trellis
+```
+
+…or manage them as separate releases. Either way, point
+`externalDependencies.*` at the resulting service names. Because the chart renders
 `ETCD_HOST`/`ETCD_PORT`/`REDIS_URL`/`HINDSIGHT_URL` into a ConfigMap, any
 source works as long as the addresses resolve from the Trellis pods.
 
@@ -74,11 +83,12 @@ source works as long as the addresses resolve from the Trellis pods.
 See `values.yaml` for the full list with comments.
 
 - `secrets.*` — rendered into a Secret (`SESSION_SECRET`, `ENCRYPTION_KEY`,
-  `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`). **Change
-  `sessionSecret` from its `change-me` default.** Empty values are omitted; if
-  you blank all of them the Secret is not rendered and pods referencing it via
-  `envFrom` will not start — keep at least one set or manage the Secret
-  yourself.
+  `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`). **Set
+  `sessionSecret` explicitly — it ships empty, and outside DEV_MODE the app
+  refuses to start without `SESSION_SECRET` (or `ENCRYPTION_KEY`) set.** Empty
+  values are omitted; if you blank all of them the Secret is not rendered and
+  pods referencing it via `envFrom` will not start — keep at least one set or
+  manage the Secret yourself.
 - `config.*` — non-secret env (DEV_MODE, TZ, CORS, ADMIN_USERS, public URLs).
 - `ingress.enabled` — routes `<host>/` to the nginx edge gateway.
 - `resources` — applied to every deployment (single block for simplicity).

@@ -37,7 +37,6 @@ services:
 # Non-secret configuration → rendered into the <release>-env ConfigMap.
 config:
   devMode: "false"
-  hostBind: 0.0.0.0
   tz: UTC
   corsAllowedOrigins: ""
   adminUsers: ""
@@ -45,9 +44,12 @@ config:
   publicMcpUrl: "http://localhost/mcp"
 
 # Secret configuration → rendered into the <release> Secret (stringData).
-# CHANGE sessionSecret before any real deployment. Empty values omit the key.
+# sessionSecret ships EMPTY on purpose — an explicit value must be provided for
+# every real deployment (outside DEV_MODE the app refuses to start without
+# SESSION_SECRET; ENCRYPTION_KEY falls back to it when unset). Empty values
+# omit the key.
 secrets:
-  sessionSecret: "change-me"
+  sessionSecret: ""
   encryptionKey: ""
   geminiApiKey: ""
   openaiApiKey: ""

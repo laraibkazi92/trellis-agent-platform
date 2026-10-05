@@ -5,7 +5,9 @@
 
 Small day-to-day operations that don't need the Dashboard UI or docker compose:
 scaffolding a workspace, syncing the registry, and inspecting recent agent runs.
-Stdlib only — no third-party dependencies are required for `init`/`sync`.
+Only `init` runs on the stdlib alone; `sync` (via scripts/sync_to_db.py, which
+imports yaml and core.auth) and `logs` (via core.auth) need the framework's
+dependencies installed.
 """
 
 import argparse
@@ -103,7 +105,10 @@ def cmd_sync(args) -> int:
         import sync_to_db
     except ImportError as exc:
         return _fail(f"cannot import scripts/sync_to_db.py: {exc}")
-    sync_to_db.main()
+    try:
+        sync_to_db.main()
+    except Exception as exc:
+        return _fail(f"sync failed: {exc.__class__.__name__}: {exc}")
     return 0
 
 

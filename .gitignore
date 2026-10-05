@@ -30,4 +30,5 @@ workspace/tools/netctl-cli/*.tar.gz
 workspace/tools/opsctl/.venv/
 workspace/tools/opsctl/*.whl
 
-.DS_Store.venv/
+.DS_Store
+.venv/

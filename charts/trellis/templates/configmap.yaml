@@ -14,7 +14,6 @@ data:
   {{- end }}
   HINDSIGHT_URL: {{ .Values.externalDependencies.hindsight.url | quote }}
   DEV_MODE: {{ .Values.config.devMode | quote }}
-  HOST_BIND: {{ .Values.config.hostBind | quote }}
   TZ: {{ .Values.config.tz | quote }}
   HOST_URL: {{ printf "http://%s-host:%v" (include "trellis.fullname" .) .Values.services.host | quote }}
   HUB_URL: {{ printf "http://%s-hub:%v/mcp" (include "trellis.fullname" .) .Values.services.hub | quote }}

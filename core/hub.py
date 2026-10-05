@@ -400,4 +400,4 @@ if __name__ == "__main__":
     register_tools()
     import uvicorn
     app = _LifespanDrainWrapper(mcp.http_app(host_origin_protection=False))
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host=os.getenv("BIND_HOST", "0.0.0.0"), port=8001)

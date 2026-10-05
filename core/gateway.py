@@ -553,4 +553,4 @@ async def use_tool(ctx: Context, tool_name: str, arguments: Dict[str, Any]) -> A
 if __name__ == "__main__":
     app = mcp.http_app()
     app.add_middleware(AuthMiddleware, identity_mgr=identity_mgr)
-    uvicorn.run(app, host="0.0.0.0", port=8002)
+    uvicorn.run(app, host=os.getenv("BIND_HOST", "0.0.0.0"), port=8002)

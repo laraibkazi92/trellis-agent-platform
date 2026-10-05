@@ -1,6 +1,6 @@
 # CLI Guide
 
-`scripts/trellis` is a stdlib-only operator CLI for the small day-to-day operations that don't need the Dashboard UI or `docker compose`: scaffolding a workspace, syncing the registry, and inspecting recent agent runs.
+`scripts/trellis` is an operator CLI for the small day-to-day operations that don't need the Dashboard UI or `docker compose`: scaffolding a workspace, syncing the registry, and inspecting recent agent runs. Only `init` runs on the stdlib alone — `sync` (via `scripts/sync_to_db.py`, which imports `yaml` and `core.auth`) and `logs` (via `core.auth`) need the framework's dependencies installed, so run them with the project's Python (virtualenv or framework container).
 
 Run it with the project's Python:
 
