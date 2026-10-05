@@ -1,0 +1,48 @@
+{{- if and .Values.ingress.enabled .Values.ingress.hosts }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "trellis.fullname" . }}
+  labels:
+    {{- include "trellis.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    {{- if kindIs "string" . }}
+    - host: {{ . | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname := include "trellis.fullname" $ }}{{ $fullname }}-gateway
+                port:
+                  number: {{ $.Values.services.gateway }}
+    {{- else }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path | default "/" }}
+            pathType: {{ .pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ $fullname := include "trellis.fullname" $ }}{{ $fullname }}-gateway
+                port:
+                  number: {{ $.Values.services.gateway }}
+          {{- end }}
+    {{- end }}
+    {{- end }}
+{{- end }}

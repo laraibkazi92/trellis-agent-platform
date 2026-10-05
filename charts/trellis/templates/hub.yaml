@@ -1,0 +1,71 @@
+{{- $component := "hub" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "trellis.fullname" . }}-{{ $component }}
+  labels:
+    {{- include "trellis.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "trellis.selectorLabels" (dict "ctx" . "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "trellis.selectorLabels" (dict "ctx" . "component" $component) | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ $component }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Mirrors docker-compose.yml (hub.command).
+          command: ["python", "core/hub.py"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.services.hub }}
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "trellis.fullname" . }}-env
+            - secretRef:
+                name: {{ include "trellis.fullname" . }}
+          # Least-privilege sandbox, mirroring the hub's compose caps: bwrap
+          # (core/hub.py) needs SYS_ADMIN + SETFCAP to build its per-tool user
+          # namespace. Note: compose's `systempaths=unconfined` (unmasking
+          # docker's masked /proc submounts) has no direct Kubernetes
+          # equivalent — see the chart README if tool execution hits
+          # bwrap/userns errors on your nodes.
+          securityContext:
+            capabilities:
+              drop: ["ALL"]
+              add: ["SYS_ADMIN", "SETFCAP"]
+            allowPrivilegeEscalation: false
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "trellis.workspaceVolumeMount" (dict "ctx" .) | nindent 12 }}
+      volumes:
+        {{- include "trellis.workspaceVolume" (dict "ctx" .) | nindent 8 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "trellis.fullname" . }}-{{ $component }}
+  labels:
+    {{- include "trellis.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.services.hub }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "trellis.selectorLabels" (dict "ctx" . "component" $component) | nindent 4 }}

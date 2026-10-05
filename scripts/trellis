@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+"""Operator CLI for the Trellis agent platform.
+
+Small day-to-day operations that don't need the Dashboard UI or docker compose:
+scaffolding a workspace, syncing the registry, and inspecting recent agent runs.
+Stdlib only — no third-party dependencies are required for `init`/`sync`.
+"""
+
+import argparse
+import os
+import shutil
+import sys
+import threading
+from pathlib import Path
+
+__version__ = "0.1.0"
+
+# Repo root (this script lives in <repo>/scripts/). Locates .env.example,
+# scripts/sync_to_db.py, and the `core` package regardless of the caller's cwd.
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+WORKSPACE_SUBDIRS = ("agents", "tools", "mcps", "workflows", "shared")
+
+# Hard ceiling for a single etcd read. pyetcd exposes no client-side timeout
+# and IdentityManager's retry decorator re-runs failed ops (10 attempts, 2s
+# apart), so an unreachable etcd would otherwise stall `trellis logs` for
+# ~20s+ per call — or hang outright on a blackholed address.
+ETCD_TIMEOUT_SECONDS = 5
+
+
+def _fail(message: str) -> int:
+    print(f"error: {message}", file=sys.stderr)
+    return 1
+
+
+def cmd_init(args) -> int:
+    target = Path(args.path).resolve()
+    workspace = target / "workspace"
+
+    created = []
+    skipped = []
+    try:
+        for sub in WORKSPACE_SUBDIRS:
+            sub_dir = workspace / sub
+            if sub_dir.exists():
+                skipped.append(sub_dir)
+                continue
+            sub_dir.mkdir(parents=True)
+            (sub_dir / ".gitkeep").write_text("")
+            created.append(sub_dir)
+
+        env_target = target / ".env"
+        env_copied = False
+        if env_target.exists():
+            skipped.append(env_target)
+        else:
+            env_example = BASE_DIR / ".env.example"
+            if env_example.exists():
+                shutil.copyfile(env_example, env_target)
+                env_copied = True
+    except OSError as exc:
+        return _fail(f"cannot scaffold in {target}: {exc}")
+
+    if created:
+        print("Created:")
+        for path in created:
+            print(f"  {path}")
+    if skipped:
+        print("Already exist (left untouched — init never overwrites):")
+        for path in skipped:
+            print(f"  {path}")
+
+    print()
+    if env_copied:
+        print("!!! IMPORTANT: a fresh .env was copied from .env.example.")
+        print("!!! Open it now and fill in your real values (GEMINI_API_KEY,")
+        print("!!! SESSION_SECRET, ADMIN_USERS, ...) before starting the stack.")
+        print()
+    print("Next steps:")
+    print(f"  1. cd {target}")
+    if env_copied:
+        print("  2. Edit .env and fill in your API keys and secrets.")
+    else:
+        print("  2. Make sure .env exists and is filled in (see .env.example).")
+    print("  3. Add agents under workspace/agents/ (config.yaml + skills.md).")
+    print("  4. Start the stack and sync the registry:")
+    print("       docker compose up -d --build")
+    print("     (or, against an already-running etcd: python scripts/trellis sync)")
+    return 0
+
+
+def cmd_sync(args) -> int:
+    # Delegate to scripts/sync_to_db.py's main() so behavior stays identical
+    # to `python scripts/sync_to_db.py`. That module inserts the repo root
+    # into sys.path itself for its `core.*` imports; we only additionally put
+    # scripts/ on sys.path so the module resolves regardless of cwd.
+    for path in (str(BASE_DIR / "scripts"), str(BASE_DIR)):
+        if path not in sys.path:
+            sys.path.insert(0, path)
+    try:
+        import sync_to_db
+    except ImportError as exc:
+        return _fail(f"cannot import scripts/sync_to_db.py: {exc}")
+    sync_to_db.main()
+    return 0
+
+
+def _run_with_timeout(label: str, func, *args, timeout: float = ETCD_TIMEOUT_SECONDS):
+    """Run an etcd read with a hard wall-clock timeout.
+
+    Runs func on a daemon thread and joins with a timeout. On timeout the
+    thread is abandoned (daemon threads die with the process) so the CLI can
+    exit immediately instead of hanging. Exceptions from func are re-raised
+    on the calling thread.
+    """
+    box = {}
+
+    def _worker():
+        try:
+            box["value"] = func(*args)
+        except BaseException as exc:  # re-raised on the caller's thread below
+            box["error"] = exc
+
+    worker = threading.Thread(target=_worker, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        endpoint = f"{os.getenv('ETCD_HOST', '127.0.0.1')}:{os.getenv('ETCD_PORT', '2379')}"
+        print(f"error: timed out after {timeout:.0f}s while {label}.", file=sys.stderr)
+        print(
+            f"       etcd at {endpoint} did not answer. Check that the stack is"
+            " running and that ETCD_HOST/ETCD_PORT",
+            file=sys.stderr,
+        )
+        print("       point at it, then retry.", file=sys.stderr)
+        sys.exit(1)
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def _flatten(text, width: int) -> str:
+    """Single-line snippet of at most `width` characters."""
+    if not text:
+        return ""
+    flat = " ".join(str(text).split())
+    if len(flat) <= width:
+        return flat
+    return flat[:width] + "..."
+
+
+def _run_field(run: dict, *names):
+    """First non-empty value among `names`, preferring the run's metadata dict."""
+    meta = run.get("metadata") or {}
+    for name in names:
+        for source in (meta, run):
+            if source.get(name):
+                return source[name]
+    return None
+
+
+def cmd_logs(args) -> int:
+    if str(BASE_DIR) not in sys.path:
+        sys.path.insert(0, str(BASE_DIR))
+    try:
+        from core.auth import get_identity_manager
+    except ImportError as exc:
+        return _fail(
+            f"cannot import core.auth ({exc}) — run this command from the project"
+            " virtualenv or inside a framework container"
+        )
+
+    endpoint = f"{os.getenv('ETCD_HOST', '127.0.0.1')}:{os.getenv('ETCD_PORT', '2379')}"
+    manager = get_identity_manager()
+    try:
+        if args.agent:
+            agent_names = [args.agent]
+        else:
+            agent_names = sorted(
+                _run_with_timeout("listing agents", manager.list_agents)
+            )
+        runs_by_agent = {
+            name: _run_with_timeout(
+                f"fetching runs for '{name}'", manager.get_agent_runs, name, args.limit
+            )
+            for name in agent_names
+        }
+    except Exception as exc:
+        return _fail(
+            f"cannot read from etcd at {endpoint} ({exc.__class__.__name__}: {exc})."
+            " Check that the stack is running and that ETCD_HOST/ETCD_PORT point"
+            " at it."
+        )
+
+    if not agent_names:
+        print("No agents found in the registry.")
+        return 0
+
+    shown = 0
+    for name in agent_names:
+        runs = runs_by_agent.get(name) or []
+        if not runs:
+            if args.agent:
+                print(f"No runs found for agent '{name}'.")
+            continue
+        if not args.agent:
+            print(f"{name}:")
+        for run in runs:
+            shown += 1
+            run_id = str(run.get("run_id", "?"))
+            state = run.get("state", "?")
+            updated = run.get("updated_at") or run.get("timestamp") or "?"
+            if args.agent:
+                print(f"--- run {run_id}")
+                print(f"    state:   {state}")
+                print(f"    updated: {updated}")
+                prompt = _run_field(run, "prompt")
+                output = _run_field(run, "output")
+                error = _run_field(run, "error")
+                if prompt:
+                    print(f"    prompt:  {_flatten(prompt, 400)}")
+                if output:
+                    print(f"    output:  {_flatten(output, 400)}")
+                if error:
+                    print(f"    error:   {_flatten(error, 400)}")
+            else:
+                snippet = _run_field(run, "error", "output", "prompt") or ""
+                print(
+                    f"  {run_id[:8]}  {state:<10}  {updated}  {_flatten(snippet, 60)}"
+                )
+
+    if not args.agent and shown == 0:
+        print("No runs recorded yet.")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="trellis",
+        description=(
+            "Operator CLI for the Trellis agent platform: scaffold a workspace,"
+            " sync the registry, and inspect recent agent runs."
+        ),
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
+
+    p_init = sub.add_parser(
+        "init", help="scaffold a workspace layout in PATH (never overwrites)"
+    )
+    p_init.add_argument(
+        "path", nargs="?", default=".", help="target directory (default: current)"
+    )
+    p_init.set_defaults(func=cmd_init)
+
+    p_sync = sub.add_parser(
+        "sync", help="sync workspace/ contents into the etcd registry"
+    )
+    p_sync.set_defaults(func=cmd_sync)
+
+    p_logs = sub.add_parser("logs", help="list recent agent runs from the registry")
+    p_logs.add_argument(
+        "agent", nargs="?", default=None, help="show detailed lines for one agent"
+    )
+    p_logs.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="maximum number of runs to show per agent (default: 20)",
+    )
+    p_logs.set_defaults(func=cmd_logs)
+
+    return parser
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

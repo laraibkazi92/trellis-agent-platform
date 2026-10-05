@@ -88,6 +88,7 @@ claude mcp add --transport http trellis http://localhost:8002/mcp --header "Auth
 3. Agents are defined with configurations and skills. See [Building Agents](docs/agents.md).
 4. Run `docker compose up -d --build` to push changes to etcd.
 5. Manage third-party credentials via the **Tool Secrets** UI.
+6. Operate the stack from the terminal with the `trellis` CLI (`scripts/trellis init|sync|logs`). See [CLI Guide](docs/cli.md).
 
 ## License
 

@@ -1,0 +1,24 @@
+{{/*
+  The nginx edge entrypoint, generated from the repo's gateway/entrypoint.sh
+  (kept as a byte-identical copy in charts/trellis/files/ — update that copy
+  when gateway/entrypoint.sh changes). The script is Docker-compose-shaped, so
+  three adaptations are applied at render time:
+    - the DNS resolver (127.0.0.11 = Docker embedded DNS) → values .gateway.dnsResolver
+    - upstream hostnames (ui/host/gateway) → this chart's service names
+  The routing logic, SSL handling, and SSE/streaming settings are untouched.
+*/}}
+{{- $fullname := include "trellis.fullname" . }}
+{{- $ep := .Files.Get "files/gateway-entrypoint.sh" }}
+{{- $ep = $ep | replace "resolver 127.0.0.11" (printf "resolver %s" .Values.gateway.dnsResolver) }}
+{{- $ep = $ep | replace "http://ui:8080" (printf "http://%s-ui:%v" $fullname .Values.services.ui) }}
+{{- $ep = $ep | replace "http://host:8000" (printf "http://%s-host:%v" $fullname .Values.services.host) }}
+{{- $ep = $ep | replace "http://gateway:8002" (printf "http://%s-mcp-gateway:%v" $fullname .Values.services.mcpGateway) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "trellis.fullname" . }}-gateway-entrypoint
+  labels:
+    {{- include "trellis.labels" . | nindent 4 }}
+data:
+  entrypoint.sh: |
+{{ $ep | nindent 4 }}
