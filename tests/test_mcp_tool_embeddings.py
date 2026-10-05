@@ -31,17 +31,42 @@ MCP_CONFIG = {
     ],
 }
 
+# What real registration paths persist: transport/command/args/env/secrets but no
+# tools list -- neither mcp.yaml nor marketplace add_mcp / admin save_mcp writes one.
+TOOLS_LESS_CONFIG = {
+    "name": "example-mcp",
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@example/example-mcp-server"],
+    "env": {"API_TOKEN": "{MY_API_KEY}"},
+}
+
+
+class FakeClient:
+    """Records raw etcd key deletions (the prune path talks to the client directly)."""
+
+    def __init__(self):
+        self.deleted = []
+
+    def delete(self, key):
+        self.deleted.append(key)
+
 
 class FakeIdentityManager:
     def __init__(self):
         self.saved_mcps = {}
         self.saved_tool_embeddings = {}
+        self.client = FakeClient()
+        self.deleted_mcp_embeddings = []
 
     def save_mcp_config(self, name, config):
         self.saved_mcps[name] = config
 
     def save_tool_embedding(self, name, vector):
         self.saved_tool_embeddings[name] = vector
+
+    def delete_mcp_tool_embeddings(self, mcp_name):
+        self.deleted_mcp_embeddings.append(mcp_name)
 
 
 def _patch_registry(monkeypatch, tool_configs=None, mcp_configs=None, embeddings=None):
@@ -87,6 +112,91 @@ def test_sync_mcp_skips_embeddings_when_unavailable(monkeypatch):
 
     assert set(mgr.saved_mcps) == {"example-mcp"}
     assert mgr.saved_tool_embeddings == {}
+
+
+def test_sync_mcp_skips_discovery_when_tools_declared(monkeypatch):
+    """A hand-declared tools list is the fast path: sync must not connect anywhere."""
+    mgr = FakeIdentityManager()
+    monkeypatch.setattr(
+        sync_to_db, "_discover_mcp_tools", lambda config: (_ for _ in ()).throw(AssertionError("must not discover"))
+    )
+    monkeypatch.setattr(sync_to_db, "embed_text", lambda text, task_type: [1.0, 0.0, 0.0])
+
+    sync_to_db.sync_mcp(mgr, MCP_CONFIG)
+
+    assert set(mgr.saved_tool_embeddings) == {
+        "mcp__example-mcp__clusters_get_all",
+        "mcp__example-mcp__connector_restart",
+    }
+
+
+def test_sync_mcp_discovers_tools_when_config_has_none(monkeypatch):
+    """No writer persists a tools list, so sync must live-discover one, persist it
+    back into the etcd config, and index an embedding per discovered tool."""
+    mgr = FakeIdentityManager()
+    discovered = [
+        {
+            "name": "logs_search",
+            "description": "Search logs.",
+            "inputSchema": {"properties": {"q": {"type": "string"}}},
+        },
+        {"name": "logs_tail", "description": "Tail logs.", "inputSchema": {}},
+    ]
+    monkeypatch.setattr(sync_to_db, "_discover_mcp_tools", lambda config: discovered)
+    monkeypatch.setattr(sync_to_db, "embed_text", lambda text, task_type: [1.0, 0.0, 0.0])
+
+    sync_to_db.sync_mcp(mgr, dict(TOOLS_LESS_CONFIG))
+
+    persisted = mgr.saved_mcps["example-mcp"]
+    assert persisted["tools"] == discovered
+    assert set(mgr.saved_tool_embeddings) == {
+        "mcp__example-mcp__logs_search",
+        "mcp__example-mcp__logs_tail",
+    }
+
+
+def test_sync_mcp_discovery_failure_is_non_fatal(monkeypatch):
+    """An unreachable server must not fail the sync: config saved unchanged, no
+    embeddings, no crash -- the runtime still discovers live."""
+    mgr = FakeIdentityManager()
+    monkeypatch.setattr(sync_to_db, "_discover_mcp_tools", lambda config: None)
+    monkeypatch.setattr(sync_to_db, "embed_text", lambda text, task_type: [1.0, 0.0, 0.0])
+
+    config = dict(TOOLS_LESS_CONFIG)
+    sync_to_db.sync_mcp(mgr, config)
+
+    assert mgr.saved_mcps["example-mcp"] == config
+    assert "tools" not in mgr.saved_mcps["example-mcp"]
+    assert mgr.saved_tool_embeddings == {}
+
+
+def test_discover_mcp_tools_returns_none_for_unusable_transports():
+    # No command to spawn/connect to.
+    assert sync_to_db._discover_mcp_tools({"name": "x", "transport": "stdio"}) is None
+    # Unknown transport type.
+    assert (
+        sync_to_db._discover_mcp_tools({"name": "x", "transport": "carrier-pigeon", "command": "coop"}) is None
+    )
+
+
+def test_discover_mcp_tools_tolerates_unspawnable_command():
+    assert (
+        sync_to_db._discover_mcp_tools(
+            {"name": "broken", "transport": "stdio", "command": "/nonexistent/trellis-test-mcp-binary"}
+        )
+        is None
+    )
+
+
+# --- obsolescence prune (scripts/sync_to_db.py prune_obsolete_mcps) --------------------
+
+def test_prune_obsolete_mcp_deletes_config_and_tool_embeddings():
+    mgr = FakeIdentityManager()
+
+    sync_to_db.prune_obsolete_mcps(mgr, existing_mcps={"gone-mcp", "kept-mcp"}, seen_mcps={"kept-mcp"})
+
+    assert mgr.client.deleted == ["/registry/mcps/gone-mcp/config"]
+    assert mgr.deleted_mcp_embeddings == ["gone-mcp"]
 
 
 # --- search path (core/tool_search.py search_tools) ----------------------------------

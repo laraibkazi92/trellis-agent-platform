@@ -1,6 +1,7 @@
 # Copyright (C) 2026 Laraib Kazi
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import os
 import sys
 
@@ -39,6 +40,11 @@ def _warn_unknown_rule_keys(model_cls, raw_rules, context):
                     "fields are silently dropped, not an error."
                 )
 MCPS_DIR = WORKSPACE_DIR / "mcps"
+
+# Hard budget for live-discovering one MCP server's tools at sync time: generous
+# enough for a first-run `npx` download, short enough that one unreachable server
+# can't stall the whole registry sync.
+MCP_DISCOVERY_TIMEOUT_SECONDS = 20
 
 # Supervisor is an internal core agent
 SUPERVISOR_DIR = BASE_DIR / "core" / "assets" / "supervisor"
@@ -126,14 +132,90 @@ def sync_agent(identity_mgr, agent_dir, name=None, default_type=None):
         
     return name
 
+def _discover_mcp_tools(config):
+    """Live-discover an MCP server's tool catalog from the sync environment.
+
+    Mirrors the runtime discovery in ``core/agent_factory.discover_external_mcps``
+    (not the user-scoped ``get_external_mcp_client``, which injects user secrets the
+    sync environment doesn't have): a stdio config spawns the command with its raw
+    args/env; http/sse configs connect to ``command`` as a URL. Returns a plain list
+    of ``{name, description, inputSchema}`` dicts ready to persist under the config's
+    ``tools`` key, or ``None`` when the transport is unusable or the server can't be
+    reached within MCP_DISCOVERY_TIMEOUT_SECONDS -- sync must never fail hard on
+    this, the runtime still discovers live as a fallback.
+    """
+    # Lazy so the script's import cost is unchanged when every config declares tools.
+    from fastmcp import Client as FastMCPClient
+    from fastmcp.client import StdioTransport, SSETransport, StreamableHttpTransport
+
+    name = config.get("name")
+    command = config.get("command")
+    if not command:
+        return None
+
+    transport_type = (config.get("transport") or "stdio").lower()
+    if transport_type == "stdio":
+        # The MCP SDK merges this env over the safe inherited defaults (PATH etc.).
+        transport = StdioTransport(
+            command=command, args=config.get("args") or [], env=config.get("env") or {}, keep_alive=False
+        )
+    elif transport_type in ("http", "streamable-http"):
+        transport = StreamableHttpTransport(url=command, headers=config.get("env") or {})
+    elif transport_type == "sse":
+        transport = SSETransport(url=command, headers=config.get("env") or {})
+    else:
+        print(f"  WARNING: MCP '{name}' has unsupported transport '{transport_type}'; skipping tool discovery.")
+        return None
+
+    async def _list_tools():
+        client = FastMCPClient(transport)
+        async with client:
+            tools = await client.list_tools()
+        # MCP SDK v2 exposes the schema as `input_schema`; older versions only as
+        # `inputSchema` (a deprecated property on v2 that warns when read). Probe
+        # the modern name first.
+        return [
+            {
+                "name": tool.name,
+                "description": tool.description or "",
+                "inputSchema": getattr(tool, "input_schema", None) or getattr(tool, "inputSchema", None) or {},
+            }
+            for tool in tools
+        ]
+
+    try:
+        return asyncio.run(asyncio.wait_for(_list_tools(), timeout=MCP_DISCOVERY_TIMEOUT_SECONDS))
+    except Exception as e:
+        print(
+            f"  WARNING: could not discover tools for MCP '{name}' within "
+            f"{MCP_DISCOVERY_TIMEOUT_SECONDS}s ({e}); saving config without a tools "
+            "list and skipping MCP tool embeddings. The runtime will still discover "
+            "this server live."
+        )
+        return None
+
 def sync_mcp(identity_mgr, config):
     """Persist one MCP config and index an embedding per tool it declares.
 
     Tool embeddings are saved under the ``mcp__{server}__{tool}`` prefixed name --
     the same ``use_tool`` execution form ``core/tool_search.py`` looks embeddings up
     by -- so MCP tools rank via cosine exactly like local workspace tools.
+
+    No registration path (mcp.yaml, marketplace add_mcp, admin save_mcp) persists a
+    ``tools`` list, so when it's absent we live-discover the server's catalog and
+    persist it back into the config. Later syncs index straight from it, and the
+    runtime's discovery fast-path (``discover_external_mcps``' ``if config.tools:``)
+    skips reconnecting. Discovery failure is non-fatal: the config is saved
+    unchanged and embeddings are simply skipped.
     """
     name = config["name"]
+
+    if not config.get("tools"):
+        discovered = _discover_mcp_tools(config)
+        if discovered:
+            config["tools"] = discovered
+            print(f"  Discovered and persisted {len(discovered)} tools for MCP: {name}")
+
     identity_mgr.save_mcp_config(name, config)
     print(f"  Saved config for MCP: {name}")
 
@@ -155,6 +237,18 @@ def sync_mcp(identity_mgr, config):
         else:
             print(f"  Skipped embedding for MCP tool: {embedding_name} (embeddings unavailable)")
 
+
+def prune_obsolete_mcps(identity_mgr, existing_mcps, seen_mcps):
+    """Delete registry entries for MCPs that no longer exist under workspace/mcps/.
+
+    Alongside the config, prefix-delete the ``mcp__{name}__*`` tool embeddings
+    sync_mcp indexed for the server (via IdentityManager.delete_mcp_tool_embeddings)
+    -- otherwise the vectors outlive the config and keep surfacing in tool search
+    as ghost hits for a server nobody can call anymore."""
+    for mcp in existing_mcps - seen_mcps:
+        print(f"  Deleting obsolete MCP: {mcp}")
+        identity_mgr.client.delete(f"/registry/mcps/{mcp}/config")
+        identity_mgr.delete_mcp_tool_embeddings(mcp)
 
 def main():
     identity_mgr = IdentityManager(
@@ -285,10 +379,8 @@ def main():
         print(f"  Deleting obsolete tool: {tool}")
         identity_mgr.client.delete(f"/registry/tools/{tool}/config")
         identity_mgr.client.delete(f"/registry/tools/{tool}/embedding")
-        
-    for mcp in existing_mcps - seen_mcps:
-        print(f"  Deleting obsolete MCP: {mcp}")
-        identity_mgr.client.delete(f"/registry/mcps/{mcp}/config")
+
+    prune_obsolete_mcps(identity_mgr, existing_mcps, seen_mcps)
 
     print("\nSync complete.")
 

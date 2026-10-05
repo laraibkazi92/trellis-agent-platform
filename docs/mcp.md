@@ -27,6 +27,7 @@ The `mcp.yaml` defines how the Universal Agent Host (`core/host.py`) connects to
 - `args` (Optional): A list of arguments to pass to the command (only applicable for `stdio`).
 - `env` (Optional): A dictionary of environment variables (for `stdio`) or HTTP headers (for `sse`).
 - `secrets` (Optional): A list of required user secrets. These will automatically appear in the UI's Secret Manager.
+- `tools` (Optional): A static list of tool definitions (`name`, `description`, `inputSchema`) exposed by the server. You normally don't write this by hand: when it's absent, the registry sync live-connects to the server (spawning the `stdio` command or opening the HTTP URL, with a ~20s budget), discovers its tools, and persists the discovered list into the registry config automatically. That list then feeds the runtime's discovery fast-path and the semantic tool-search index (`mcp__{server}__{tool}` embeddings). Hand-listing `tools` in `mcp.yaml` skips discovery entirely — useful when the server can't be reached from the sync environment; if discovery fails, the config is still saved and the runtime falls back to live discovery.
 
 ## Secure Secret Management
 
@@ -77,7 +78,11 @@ docker compose up -d --build
 The output will confirm that your MCP server has been registered:
 ```text
 Syncing MCPs to etcd...
+  Discovered and persisted 3 tools for MCP: logs
   Saved config for MCP: logs
+  Indexed embedding for MCP tool: mcp__logs__search_logs
 ```
+
+If the server can't be reached from the sync environment, you'll see a `WARNING: could not discover tools...` line instead; the config is still saved and the runtime discovers the server live.
 
 After syncing, head over to the **Secrets** tab in the UI to populate any required keys. Agents will automatically discover and load the tools from your registered MCP servers.

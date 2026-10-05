@@ -672,6 +672,16 @@ class IdentityManager:
         return deleted
 
     @retry_etcd()
+    def delete_mcp_tool_embeddings(self, mcp_name: str) -> None:
+        """Prefix-delete the tool embeddings indexed for one MCP server's tools.
+
+        Registry sync saves those vectors under the ``use_tool`` name
+        ``mcp__{server}__{tool}`` -- i.e. ``/registry/tools/mcp__{server}__{tool}/embedding``
+        -- so an MCP pruned from the registry must also clear that key range, or its
+        embeddings outlive the config and keep ranking in tool search as ghosts."""
+        self.client.delete_prefix(f"/registry/tools/mcp__{mcp_name}__/embedding")
+
+    @retry_etcd()
     def save_routing_rules(self, rules_data: Dict[str, Any]) -> None:
         """Persist the central Trellis Rules Engine cross-agent overrides."""
         self.client.put("/registry/routing_rules", json.dumps(rules_data))
