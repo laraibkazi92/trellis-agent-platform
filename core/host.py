@@ -6,6 +6,7 @@ import os
 import yaml
 import asyncio
 import logging
+from uuid import uuid4
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,7 @@ from core.devmode import enforce_dev_mode_safety
 from core.models import AgentConfig, MCPConfig, is_agent_external, is_routable_agent_type
 from core.health import HealthMonitor, compute_agent_operational_status
 from core.background.webhooks import router as webhooks_router
-from core.tasks import run_background_agent
+from core.tasks import run_background_agent, _truncate_output, MAX_RUN_ERROR_CHARS
 
 _background_tasks: set[asyncio.Task] = set()
 
@@ -231,21 +232,48 @@ async def chat_completions(request: ChatRequest):
         return await agent.run(request.messages[-1].content, message_history=history, deps=run_deps)
 
     captured_user_id = user_id_var.get()
-    
+
+    run_id = uuid4().hex
+    truncated_prompt = _truncate_output(request.messages[-1].content, max_chars=8192)
+
+    async def record_run_state(state: str, metadata: Dict):
+        try:
+            await asyncio.to_thread(identity_mgr.record_agent_run_state, request.model, run_id, state, metadata)
+        except Exception as e:
+            logger.error(f"Failed to record {state} state for {request.model} sync run {run_id}: {e}")
+
+    # Recorded before the agent runs so in-flight sync requests are observable
+    await record_run_state("processing", {"prompt": truncated_prompt, "user_id": captured_user_id, "source": "sync"})
+
+    async def record_run_failure(error: Exception):
+        await record_run_state("failed", {
+            "prompt": truncated_prompt,
+            "user_id": captured_user_id,
+            "error": str(error)[:MAX_RUN_ERROR_CHARS],
+            "source": "sync"
+        })
+
     async def handle_success(result, user_id):
         await asyncio.to_thread(health_monitor.record_event, "agent", request.model, True)
-        if user_id and hasattr(result, 'usage'):
+        usage_data = {}
+        if hasattr(result, 'usage'):
             u = result.usage
             if callable(u):
                 u = u()
             if u:
                 input_tokens = getattr(u, 'input_tokens', 0) or 0
                 output_tokens = getattr(u, 'output_tokens', 0) or 0
-                try:
-                    await asyncio.to_thread(identity_mgr.record_usage, user_id, input_tokens, output_tokens)
-                    await asyncio.to_thread(identity_mgr.record_agent_usage, user_id, request.model, input_tokens, output_tokens)
-                except Exception as e:
-                    logger.error(f"Failed to record token usage for {user_id}: {e}")
+                usage_data = {
+                    "request_tokens": input_tokens,
+                    "response_tokens": output_tokens,
+                    "total_tokens": input_tokens + output_tokens
+                }
+                if user_id:
+                    try:
+                        await asyncio.to_thread(identity_mgr.record_usage, user_id, input_tokens, output_tokens)
+                        await asyncio.to_thread(identity_mgr.record_agent_usage, user_id, request.model, input_tokens, output_tokens)
+                    except Exception as e:
+                        logger.error(f"Failed to record token usage for {user_id}: {e}")
         memory_mgr = get_memory_manager()
         if await asyncio.to_thread(memory_mgr.active_for, cfg_data):
             try:
@@ -256,6 +284,13 @@ async def chat_completions(request: ChatRequest):
                 ), f"memory_retain:{request.model}")
             except Exception as e:
                 logger.error(f"Failed to retain memory for {request.model}: {e}")
+        await record_run_state("completed", {
+            "prompt": truncated_prompt,
+            "user_id": user_id,
+            "output": _truncate_output(str(result.output) if result.output else ""),
+            "usage": usage_data,
+            "source": "sync"
+        })
 
     if request.stream:
         async def event_generator():
@@ -310,6 +345,7 @@ async def chat_completions(request: ChatRequest):
                 if not task.done():
                     task.cancel()
                 await asyncio.to_thread(health_monitor.record_event, "agent", request.model, False, str(e))
+                await record_run_failure(e)
                 yield json.dumps({"error": "Internal error while running the agent."}) + "\n"
             finally:
                 if not task.done():
@@ -323,5 +359,6 @@ async def chat_completions(request: ChatRequest):
         return {"choices": [{"message": {"role": "assistant", "content": result.output}}]}
     except Exception as e:
         await asyncio.to_thread(health_monitor.record_event, "agent", request.model, False, str(e))
+        await record_run_failure(e)
         logger.exception("Agent '%s' execution failed", request.model)
         raise HTTPException(status_code=500, detail="Internal error while running the agent.")

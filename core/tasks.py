@@ -64,15 +64,19 @@ async def dynamic_cron_heartbeat():
             continue
             
         config_data = await asyncio.to_thread(identity_mgr.get_agent_config, name)
-        if not config_data or config_data.get("type") not in ("background_agent", "background_script"):
+        if not config_data:
             continue
-            
-        # Periodic pruning of historical workflow runs (runs once per hour at minute 0)
+
+        # Periodic pruning of historical runs — every agent type, since sync
+        # chats record runs under user agents too (runs once per hour at minute 0)
         if now.minute == 0:
             try:
                 await asyncio.to_thread(identity_mgr.prune_agent_runs, name, 100)
             except Exception as e:
                 print(f"Failed to periodically prune runs for {name}: {e}")
+
+        if config_data.get("type") not in ("background_agent", "background_script"):
+            continue
 
         trigger = config_data.get("trigger")
         if trigger and trigger.get("type") == "cron":

@@ -643,6 +643,7 @@ def test_chat_completions_denies_external_false(monkeypatch):
 def test_chat_completions_exempts_supervisor(monkeypatch):
     monkeypatch.setattr(host.identity_mgr, "get_disabled_standard_agents", lambda: [])
     monkeypatch.setattr(host.identity_mgr, "get_agent_config", lambda name: {"name": name, "type": "user_agent", "external": False})
+    monkeypatch.setattr(host.identity_mgr, "record_agent_run_state", lambda *a, **k: True)
     monkeypatch.setattr(host.health_monitor, "get_status", lambda kind, name: {"status": "Online"})
     monkeypatch.setattr(host.health_monitor, "record_event", lambda *a, **k: None)
 
@@ -670,6 +671,7 @@ def test_chat_completions_exempts_supervisor(monkeypatch):
 def test_chat_completions_allows_external_true(monkeypatch):
     monkeypatch.setattr(host.identity_mgr, "get_disabled_standard_agents", lambda: [])
     monkeypatch.setattr(host.identity_mgr, "get_agent_config", lambda name: {"name": name, "type": "user_agent", "external": True})
+    monkeypatch.setattr(host.identity_mgr, "record_agent_run_state", lambda *a, **k: True)
     monkeypatch.setattr(host.health_monitor, "get_status", lambda kind, name: {"status": "Online"})
     monkeypatch.setattr(host.health_monitor, "record_event", lambda *a, **k: None)
 
@@ -1058,6 +1060,7 @@ def test_chat_completions_500_hides_internal_detail(monkeypatch, caplog):
         "get_agent_config",
         lambda name: {"name": name, "type": "user_agent", "external": True},
     )
+    monkeypatch.setattr(host.identity_mgr, "record_agent_run_state", lambda *a, **k: True)
     monkeypatch.setattr(host.health_monitor, "get_status", lambda kind, name: {"status": "Online"})
 
     recorded_events = []
