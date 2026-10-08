@@ -6,12 +6,14 @@ developer guides for building agents, tools, MCP servers, and workflows live in
 
 ## Contribution posture
 
-Trellis is currently maintainer-led. External code contributions are limited
-pending contribution terms. Issues, discussions, and feedback are always
-welcome — if you spot a bug or have an idea, please open an issue.
+Trellis is maintainer-led: maintainers decide what gets merged and own the
+roadmap. Code contributions — bug fixes, improvements, docs, and tests — are
+welcome. If you are planning anything larger than a small fix, please open an
+issue first so we can align on the approach before you build.
 
-Any contributions accepted into this repository are licensed under the
-[Apache-2.0](LICENSE) license.
+By submitting a pull request, you agree that your contributions are licensed
+under the [Apache-2.0](LICENSE) license, the same as the rest of the project.
+There is no CLA to sign.
 
 ## Getting set up
 
@@ -46,6 +48,9 @@ each `docs/*.md` guide — please read the one matching your change.
    ```
 2. **Update docs** if you change behavior — `docs/` and `README.md` are part of
    the product.
+3. **Add the standard header** to new source files:
+   `Copyright (C) 2026 Laraib Kazi` / `SPDX-License-Identifier: Apache-2.0`
+   (see any file in `core/` for the format).
 
 ## Scope
 
