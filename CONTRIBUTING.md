@@ -10,6 +10,9 @@ Trellis is currently maintainer-led. External code contributions are limited
 pending contribution terms. Issues, discussions, and feedback are always
 welcome — if you spot a bug or have an idea, please open an issue.
 
+Any contributions accepted into this repository are licensed under the
+[Apache-2.0](LICENSE) license.
+
 ## Getting set up
 
 ```bash
