@@ -32,3 +32,4 @@ workspace/tools/opsctl/*.whl
 
 .DS_Store
 .venv/
+.codegraph
