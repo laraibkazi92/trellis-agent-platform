@@ -1,0 +1,17 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+#
+# Example agent. Copy this directory, rename it, and edit to add your own.
+# See docs/agents.md for every available field.
+
+name: demo-assistant
+version: 0.1.0
+author: trellis@example.com
+description: "A minimal example assistant that answers questions and can analyze text with the text_stats tool."
+model: gemini-3-flash-preview
+provider: google
+thinking_level: low
+tags:
+  - demo
+allowed_tools:
+  - text_stats

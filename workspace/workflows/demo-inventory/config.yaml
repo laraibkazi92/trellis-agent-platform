@@ -1,0 +1,23 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+#
+# Example background-script workflow. It runs as an ordinary Python process on
+# a cron schedule — no LLM, no secrets. See docs/workflows.md.
+#
+# Trigger manually without waiting for the schedule:
+#   curl -X POST http://localhost:8000/admin/workflows/demo-inventory/trigger \
+#     -H "Authorization: Bearer YOUR_API_KEY"
+
+name: demo-inventory
+version: 0.1.0
+author: trellis@example.com
+description: "Example workflow: prints an inventory of the workspace (agents, tools, workflows, and MCP servers) on a daily schedule."
+type: background_script
+runtime: python
+entrypoint: pipeline.py
+tags:
+  - demo
+  - reporting
+trigger:
+  type: cron
+  expression: "0 9 * * *"   # every day at 09:00 UTC

@@ -1,0 +1,39 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+#
+# Example tool suite. A tool.yaml is a YAML list — one entry per tool, so a
+# single directory can define several related tools. See docs/tools.md.
+#
+# This tool has no secrets and no third-party dependencies, so it runs on a
+# fresh install with nothing to configure. Copy this directory as a starting
+# point for your own tools.
+
+- name: text_stats
+  version: 0.1.0
+  author: trellis@example.com
+  description: "Computes basic statistics for a block of text — character, word, and line counts plus the most frequent words. Use for quick text analysis; it calls no external service."
+  runtime: python
+  entrypoint: text_stats.py
+  rel_path: tools/demo
+  inputs:
+    text:
+      type: string
+      description: "The text to analyze."
+      required: true
+    top_n:
+      type: number
+      description: "How many of the most frequent words to return. Defaults to 5."
+      required: false
+  outputs:
+    characters:
+      type: number
+      description: "Total number of characters."
+    words:
+      type: number
+      description: "Total number of whitespace-separated words."
+    lines:
+      type: number
+      description: "Total number of lines."
+    top_words:
+      type: array
+      description: "The `top_n` most frequent words as objects: {word, count}, most frequent first."
