@@ -1,0 +1,44 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+#
+# CI v1: run the test suite on every push/PR to main.
+# The suite is fully self-contained (mocked; no etcd/redis/LLM needed) — the
+# TestLiveRegistry probes self-skip when no etcd is reachable, which is the
+# normal case on a clean runner. Image publishing stays manual for now
+# (scripts/publish_images.sh); automate it here only after that's revisited.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Test suite (Python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run the test suite
+        run: python -m pytest tests/ -q
