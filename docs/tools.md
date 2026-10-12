@@ -52,7 +52,7 @@ Check the tool's `tool.yaml` for required `inputs`, `secrets`, and `variables` b
 
 ### Sandbox Model
 
-Every tool invocation runs inside a bubblewrap (bwrap) sandbox: read-only root bind, a writable bind for `/app/workspace`, tmpfs `/tmp`, and unshared user/pid/ipc/uts namespaces. The hub container itself is least-privilege — all capabilities dropped except `SYS_ADMIN` + `SETFCAP` (the minimum bwrap needs to create its user namespace as root), with unmasked system paths (so the kernel permits a fresh `/proc` inside the sandbox) and `no-new-privileges` — so tools cannot write outside the workspace/tmp or regain privileges via setuid binaries or file capabilities.
+Every tool invocation runs inside a bubblewrap (bwrap) sandbox: read-only root bind, a writable bind for `/app/workspace`, tmpfs `/tmp`, and unshared user/pid/ipc/uts namespaces. The hub container itself is least-privilege — all capabilities dropped except `SYS_ADMIN` + `SETFCAP` (the minimum bwrap needs to create its user namespace as root), with unmasked system paths (so the kernel permits a fresh `/proc` inside the sandbox), an unrestricted seccomp filter (so bwrap's `pivot_root` isn't blocked from building the sandbox root) and `no-new-privileges` — so tools cannot write outside the workspace/tmp or regain privileges via setuid binaries or file capabilities.
 
 ### Directory Structure
 

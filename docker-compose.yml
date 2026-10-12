@@ -85,14 +85,21 @@ services:
     #     own uid into a new user namespace.
     #   - systempaths=unconfined: docker's masked /proc submounts (/proc/sys,
     #     /proc/bus, ...) leave /proc not "fully visible", so the kernel rejects
-    #     bwrap's fresh proc mount with "Mount too revealing". This only skips
-    #     path masking — it grants no capabilities.
+    #     bwrap's fresh proc mount with "Operation not permitted". This only
+    #     skips path masking — it grants no capabilities.
+    #   - seccomp=unconfined: docker's default seccomp profile blocks
+    #     pivot_root(2), which bwrap calls to build the sandbox root; without it
+    #     EVERY tool invocation dies with "bwrap: pivot_root: Operation not
+    #     permitted". Disabling the filter is the standard requirement for
+    #     running bwrap (itself a sandbox) inside a container — the capabilities
+    #     above plus bwrap's own ro-bind/namespace isolation are what confine the
+    #     tool.
     #   - no-new-privileges: tools cannot regain privileges via setuid/file caps.
     # Escape hatch: if tool execution still fails with bwrap/userns errors on an
     # exotic host, restoring `privileged: true` locally still works.
     cap_drop: [ALL]
     cap_add: [SYS_ADMIN, SETFCAP]
-    security_opt: ["no-new-privileges:true", "systempaths=unconfined"]
+    security_opt: ["no-new-privileges:true", "systempaths=unconfined", "seccomp=unconfined"]
     env_file:
       - .env
     depends_on:
