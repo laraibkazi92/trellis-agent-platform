@@ -1,0 +1,45 @@
+{# Filterable "Allowed MCP Tools" checkbox list shared by editor.html and
+   background_workflows.html. `selected` is the list of already-allowed tool names;
+   `id_suffix` scopes the input ids/labels per workflow (None on editor.html);
+   `modal=true` adds the modal-tool-checkbox class; `search_class` carries the
+   page-specific styling of the filter input. The body begins on the same line as the
+   {% macro %} tag so the call site controls the leading newline. #}
+{% macro tool_picker(tools, selected, id_suffix=None, modal=false, search_class='form-input mb-4 !border-b-0') %}                        <input type="text" id="toolSearch{% if id_suffix %}-{{ id_suffix }}{% endif %}" placeholder="Type to filter tools..." class="{{ search_class }}">
+                        <div class="border border-neutral-300 dark:border-neutral-700 p-4 max-h-64 overflow-y-auto bg-neutral-50 dark:bg-neutral-950/50" id="toolList{% if id_suffix %}-{{ id_suffix }}{% endif %}">
+                            {% for tool in tools %}
+                            <div class="flex items-center mb-3 tool-item p-2 hover:bg-white dark:hover:bg-neutral-800 transition-colors border border-transparent hover:border-neutral-200 dark:hover:border-neutral-700 relative group">
+                                <input id="tool_{{ tool.name }}{% if id_suffix %}_{{ id_suffix }}{% endif %}" name="allowed_tools" value="{{ tool.name }}" type="checkbox" class="{% if modal %}modal-tool-checkbox {% endif %}h-4 w-4 text-accent border-neutral-300 dark:border-neutral-600 bg-white dark:bg-neutral-900 rounded-none focus:ring-accent focus:ring-offset-0 dark:focus:ring-offset-neutral-900" {% if tool.name in selected %}checked{% endif %}>
+                                <label for="tool_{{ tool.name }}{% if id_suffix %}_{{ id_suffix }}{% endif %}" class="ml-3 flex flex-col justify-center text-sm font-mono text-neutral-900 dark:text-neutral-100 tool-name-label cursor-pointer w-full overflow-hidden">
+                                    <div class="flex items-center justify-between w-full">
+                                        <div class="flex items-center">
+                                            <span>{{ tool.name }}</span>
+                                            {% if tool.version %}
+                                                <span class="text-xs text-neutral-500 ml-2">v{{ tool.version }}</span>
+                                            {% endif %}
+                                        </div>
+                                        {% if tool.type == 'mcp' %}
+                                        <span class="text-[10px] bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200 px-2 py-0.5 ml-2 border border-blue-200 dark:border-blue-800 rounded-sm whitespace-nowrap flex-shrink-0">
+                                            MCP: {{ tool.source }}
+                                        </span>
+                                        {% else %}
+                                        <span class="text-[10px] bg-neutral-100 text-neutral-600 dark:bg-neutral-800 dark:text-neutral-400 px-2 py-0.5 ml-2 border border-neutral-200 dark:border-neutral-700 rounded-sm whitespace-nowrap flex-shrink-0">
+                                            Local Hub
+                                        </span>
+                                        {% endif %}
+                                    </div>
+                                    {% if tool.description %}
+                                    <div class="text-xs text-neutral-500 dark:text-neutral-400 mt-1 truncate w-full tool-desc">
+                                        {{ tool.description }}
+                                    </div>
+                                    <!-- Custom Tooltip -->
+                                    <div class="opacity-0 invisible group-[.is-truncated]:hover:opacity-100 group-[.is-truncated]:hover:visible transition-all duration-200 delay-500 absolute z-50 left-0 top-full mt-1 w-full bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 p-2 text-xs font-mono shadow-lg border border-neutral-800 dark:border-neutral-200 whitespace-normal break-words pointer-events-none">
+                                        {{ tool.description }}
+                                    </div>
+                                    {% endif %}
+                                </label>
+                            </div>
+                            {% else %}
+                            <div class="text-sm font-mono text-neutral-500 p-4 text-center border border-dashed border-neutral-300 dark:border-neutral-700">No tools registered in system.</div>
+                            {% endfor %}
+                        </div>
+{%- endmacro %}

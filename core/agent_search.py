@@ -18,7 +18,6 @@ Ranking uses Gemini embeddings (cached per-agent in etcd, see ``scripts/sync_to_
 If embeddings are unavailable we fall back to simple keyword matching so the framework
 still works without an API key.
 """
-import os
 import re
 import asyncio
 import logging
@@ -30,10 +29,9 @@ from core.embeddings import embed_text, cosine
 from core.health import evaluate_health_status
 from core.models import is_agent_external, is_routable_agent_type
 from core.rules_engine import evaluate_rules, filter_eligible_agents
+from core.tunables import resolve as resolve_tunable
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_LIMIT = int(os.getenv("AGENT_SEARCH_LIMIT", "8"))
 
 identity_mgr = get_identity_manager()
 
@@ -164,7 +162,7 @@ async def _resolve_rule_lock(
         return None, None
 
 
-async def search_agents(query: str, limit: int = DEFAULT_LIMIT, include_disabled: bool = False) -> List[Dict]:
+async def search_agents(query: str, limit: Optional[int] = None, include_disabled: bool = False) -> List[Dict]:
     """Return up to ``limit`` agents most relevant to ``query``.
 
     Each result is ``{"name", "description", "status"}``. Background agents/scripts and
@@ -172,6 +170,8 @@ async def search_agents(query: str, limit: int = DEFAULT_LIMIT, include_disabled
     ``include_disabled`` is True (the Supervisor passes True so it can still manage them).
     Agents with ``external: False`` (internal-only agents) are always excluded.
     Pass ``limit <= 0`` to get the full ranked list when no rule locks.
+    ``limit=None`` (the default) resolves to the admin-tunable ``agent_search_limit``
+    (env ``AGENT_SEARCH_LIMIT``, default 8).
 
     Before ranking, the Trellis Rules Engine is evaluated (see ``docs/rules_engine.md``).
     A confident rule match that is also currently available (Half-Open counts as
@@ -191,6 +191,8 @@ async def search_agents(query: str, limit: int = DEFAULT_LIMIT, include_disabled
     leave its crafted, self-contained description untouched -- it's still fully
     readable by a caller that only looks at ``description``, ignoring this flag.
     """
+    if limit is None:
+        limit = resolve_tunable("agent_search_limit")
     configs = await asyncio.to_thread(identity_mgr.get_all_agent_configs)
     disabled = set(await asyncio.to_thread(identity_mgr.get_disabled_standard_agents))
     try:
@@ -220,7 +222,7 @@ async def search_agents(query: str, limit: int = DEFAULT_LIMIT, include_disabled
         candidates = [c for c in candidates if c["name"] != unavailable_note["name"]]
 
     ranked = await _rank_candidates(query, candidates)
-    selected = ranked if limit is None or limit <= 0 else ranked[:limit]
+    selected = ranked if limit <= 0 else ranked[:limit]
     results = [
         {"name": c["name"], "description": c["description"], "status": c["status"]}
         for c in selected

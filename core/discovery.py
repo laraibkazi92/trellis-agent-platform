@@ -88,6 +88,36 @@ def flatten_secret_group_keys(secret_groups: List[Dict]) -> set:
                 keys.add(field["key"])
     return keys
 
+def _build_secret_group_view(secret_groups_raw: List[Dict], current_secrets: Dict) -> List[Dict]:
+    """Normalize raw secret_groups into the per-field ``is_set`` view used by the UI.
+
+    Shared by :func:`discover_agents` and :func:`get_tool_configuration_context`
+    (and, via :func:`flatten_secret_group_keys`, by the routers' save handlers).
+    """
+    view = []
+    for group in secret_groups_raw:
+        options = []
+        for option in group.get("options", []):
+            fields = []
+            for field in option.get("fields", []):
+                fields.append({
+                    "key": field["key"],
+                    "label": field.get("label", field["key"]),
+                    "type": field.get("type", "password"),
+                    "is_set": field["key"] in current_secrets,
+                })
+            options.append({
+                "value": option.get("value"),
+                "label": option.get("label", option.get("value")),
+                "fields": fields
+            })
+        view.append({
+            "label": group.get("label", "Credential Group"),
+            "select_label": group.get("select_label", "Option"),
+            "options": options
+        })
+    return view
+
 def _unsatisfied_secret_group_keys(secret_groups: List[Dict], available_secrets: Dict) -> List[str]:
     """Returns the keys of secret_groups where no single option has all its fields set.
 
@@ -488,28 +518,7 @@ async def discover_agents(
         user_required_secrets = evaluated["required_secrets"]
         user_required_variables = evaluated["required_variables"]
 
-        agent_secret_groups = []
-        for group in secret_groups_raw:
-            options = []
-            for option in group.get("options", []):
-                fields = []
-                for field in option.get("fields", []):
-                    fields.append({
-                        "key": field["key"],
-                        "label": field.get("label", field["key"]),
-                        "type": field.get("type", "password"),
-                        "is_set": field["key"] in current_config_secrets,
-                    })
-                options.append({
-                    "value": option.get("value"),
-                    "label": option.get("label", option.get("value")),
-                    "fields": fields
-                })
-            agent_secret_groups.append({
-                "label": group.get("label", "Credential Group"),
-                "select_label": group.get("select_label", "Option"),
-                "options": options
-            })
+        agent_secret_groups = _build_secret_group_view(secret_groups_raw, current_config_secrets)
 
         agents.append({
             "name": config.get("name", name),
@@ -606,19 +615,24 @@ async def is_tool_configured(tool_name: str, user_id: Optional[str] = None) -> D
     ident_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "secrets")
     ident_variables = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "variables")
 
-    available_secrets = {**global_secrets, **ident_secrets}
-    missing_group_keys = _unsatisfied_secret_group_keys(secret_groups, available_secrets)
-
-    missing_secrets = [s for s in user_required_secrets if s not in ident_secrets]
-    missing_secrets += [k for k in missing_group_keys if k not in missing_secrets]
-    missing_variables = [v for v in user_required_variables if v not in ident_variables]
-    optional_missing_secrets = [s for s in user_optional_secrets if s not in ident_secrets]
+    # Reuse the agent-level evaluator (same grouped-key exclusion + group-satisfaction
+    # check) instead of re-deriving the user-path result by hand.
+    evaluated = _evaluate_agent_configuration(
+        required_secrets=required_secrets,
+        required_variables=required_variables,
+        optional_secrets=optional_secrets,
+        secret_groups=secret_groups,
+        global_secrets=global_secrets,
+        global_variables=global_variables,
+        identity_secrets=ident_secrets,
+        identity_variables=ident_variables,
+    )
 
     return {
-        "configured": not missing_secrets and not missing_variables,
-        "missing_secrets": missing_secrets,
-        "missing_variables": missing_variables,
-        "optional_missing_secrets": optional_missing_secrets,
+        "configured": evaluated["configured"],
+        "missing_secrets": evaluated["missing_secrets"],
+        "missing_variables": evaluated["missing_variables"],
+        "optional_missing_secrets": evaluated["optional_missing_secrets"],
     }
 
 async def get_tool_configuration_context(tool_name: str, user_id: str) -> Optional[Dict]:
@@ -656,28 +670,7 @@ async def get_tool_configuration_context(tool_name: str, user_id: str) -> Option
     current_variables = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "variables")
     global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
 
-    secret_groups = []
-    for group in secret_groups_raw:
-        options = []
-        for option in group.get("options", []):
-            fields = []
-            for field in option.get("fields", []):
-                fields.append({
-                    "key": field["key"],
-                    "label": field.get("label", field["key"]),
-                    "type": field.get("type", "password"),
-                    "is_set": field["key"] in current_secrets,
-                })
-            options.append({
-                "value": option.get("value"),
-                "label": option.get("label", option.get("value")),
-                "fields": fields,
-            })
-        secret_groups.append({
-            "label": group.get("label", "Credential Group"),
-            "select_label": group.get("select_label", "Option"),
-            "options": options,
-        })
+    secret_groups = _build_secret_group_view(secret_groups_raw, current_secrets)
 
     return {
         "required_secrets": [s for s in required_secrets if s not in global_secrets and s not in grouped_keys],
@@ -689,6 +682,40 @@ async def get_tool_configuration_context(tool_name: str, user_id: str) -> Option
         "secret_groups": secret_groups,
         "is_configured": status["configured"],
     }
+
+async def build_all_tools_view() -> List[Dict]:
+    """Merged local + MCP tool list for configuration modals.
+
+    Shape per entry: ``{name, type, source, version, description}`` where ``type`` is
+    ``"local"`` (source ``"Hub"``) or ``"mcp"`` (source is the MCP server name).
+    Sorted by name.
+    """
+    all_tools_data: List[Dict] = []
+    local_tool_configs = await asyncio.to_thread(identity_mgr.get_all_tool_configs)
+    mcp_configs = await asyncio.to_thread(identity_mgr.get_all_mcp_configs)
+
+    for t_name, t_config in local_tool_configs.items():
+        all_tools_data.append({
+            "name": t_name,
+            "type": "local",
+            "source": "Hub",
+            "version": t_config.get("version", ""),
+            "description": t_config.get("description", "")
+        })
+
+    for mcp_name, mcp_config in mcp_configs.items():
+        if mcp_config and "tools" in mcp_config:
+            for t in mcp_config["tools"]:
+                all_tools_data.append({
+                    "name": t.get("name", ""),
+                    "type": "mcp",
+                    "source": mcp_name,
+                    "version": t.get("version", ""),
+                    "description": t.get("description", "")
+                })
+
+    all_tools_data.sort(key=lambda x: x["name"])
+    return all_tools_data
 
 async def discover_tools() -> List[Dict]:
     """Scan etcd registry for tools using optimized bulk fetching."""

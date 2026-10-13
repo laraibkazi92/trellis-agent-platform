@@ -50,6 +50,14 @@
             <a href="/editor/mcp/{{ mcp.name }}" class="text-[10px] font-bold uppercase tracking-widest font-mono text-neutral-500 hover:text-accent dark:hover:text-accent-dark transition-colors">
                 Edit Configuration
             </a>
+            <span class="text-neutral-200 dark:text-neutral-800">|</span>
+            <form action="/admin/mcps/delete" method="POST" class="inline" onsubmit="return confirm('Delete MCP {{ mcp.name }}? This removes it from the registry, its tool embeddings and its workspace source file.');">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="name" value="{{ mcp.name }}">
+                <button type="submit" class="text-[10px] font-bold uppercase tracking-widest font-mono text-red-500 hover:text-red-700 transition-colors">
+                    Delete
+                </button>
+            </form>
             {% endif %}
         </div>
     </div>

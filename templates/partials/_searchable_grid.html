@@ -1,0 +1,11 @@
+{#- Shared catalog pagination controls. Set `pagination_margin` (e.g. 'mb-12' or 'mb-20')
+    before including. The Fuse.js + PaginatedGrid bootstrap <script> that sits beside this nav
+    on each page is intentionally NOT shared: the three copies differ in fetch URL, Fuse keys,
+    card selector and itemsPerPage, and tools.html embeds a `?tool=` deep-link handler inside
+    its try block, so merging them would risk changing page behavior. -#}
+<!-- Pagination Controls -->
+<nav id="pagination-controls" class="flex justify-center items-center gap-4 {{ pagination_margin }} font-mono text-sm hidden" aria-label="Pagination">
+    <button id="prev-page" aria-label="Previous page" class="px-4 py-2 border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-neutral-600 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark disabled:opacity-50 disabled:cursor-not-allowed transition-colors uppercase font-bold tracking-wider">Prev</button>
+    <span id="page-info" aria-current="page" class="text-neutral-600 dark:text-neutral-400">Page 1 of 1</span>
+    <button id="next-page" aria-label="Next page" class="px-4 py-2 border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-neutral-600 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark disabled:opacity-50 disabled:cursor-not-allowed transition-colors uppercase font-bold tracking-wider">Next</button>
+</nav>

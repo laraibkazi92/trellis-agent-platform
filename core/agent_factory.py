@@ -32,9 +32,10 @@ from pydantic_ai_rlm import create_rlm_toolset
 from core.auth import EtcdContentionError, IdentityManager, get_identity_manager, user_id_var
 from core.llm_factory import build_model_settings, resolve_model, resolve_provider
 from core.models import AgentConfig, MCPConfig, is_agent_external, is_agent_internal
-from core.health import HealthMonitor, evaluate_health_status, DEFAULT_HEALTH_COOLDOWN_SECONDS
+from core.health import HealthMonitor, evaluate_health_status
 from core.discovery import is_agent_configured
-from core.tool_search import DEFAULT_LIMIT as TOOL_SEARCH_LIMIT, execute_whitelisted_tool
+from core.tool_search import execute_whitelisted_tool
+from core.tunables import resolve as resolve_tunable
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +63,16 @@ class SupervisorDeps:
         return SupervisorDeps()
 
 
-try:
-    REGISTRY_REFRESH_TIMEOUT = max(0.1, float(os.getenv("FRAMEWORK_REGISTRY_REFRESH_TIMEOUT", "5")))
-except (TypeError, ValueError):
-    REGISTRY_REFRESH_TIMEOUT = 5.0
+def _registry_refresh_timeout() -> float:
+    """Bounded-wait timeout for an on-demand supervisor snapshot refresh (admin-tunable
+    ``registry_refresh_timeout``, env ``FRAMEWORK_REGISTRY_REFRESH_TIMEOUT``, default 5s)."""
+    return max(0.1, resolve_tunable("registry_refresh_timeout"))
+
+
+def _registry_snapshot_ttl() -> float:
+    """Background refresh interval for the supervisor eligibility snapshot (admin-tunable
+    ``registry_snapshot_ttl``, env ``FRAMEWORK_REGISTRY_SNAPSHOT_TTL``, default 15s)."""
+    return max(1.0, resolve_tunable("registry_snapshot_ttl"))
 
 
 class _RegistryEligibilitySnapshot:
@@ -76,10 +83,6 @@ class _RegistryEligibilitySnapshot:
     Fail-open: on refresh error the previous snapshot is kept; names absent from the
     snapshot fall through to super().get_compiled() (same as today's missing-config path).
     """
-    try:
-        TTL = max(1.0, float(os.getenv("FRAMEWORK_REGISTRY_SNAPSHOT_TTL", "15")))
-    except (TypeError, ValueError):
-        TTL = 15.0
 
     def __init__(self, identity_mgr, health_monitor):
         self._identity_mgr = identity_mgr
@@ -100,7 +103,7 @@ class _RegistryEligibilitySnapshot:
             configs = self._identity_mgr.get_all_agent_configs() or {}
             healths = self._identity_mgr.get_all_health_statuses("agent") or {}
             disabled = set(self._identity_mgr.get_disabled_standard_agents() or [])
-            cooldown = getattr(self._health_monitor, "cooldown_seconds", DEFAULT_HEALTH_COOLDOWN_SECONDS)
+            cooldown = getattr(self._health_monitor, "cooldown_seconds", None)
             entries = {}
             for name, cfg in configs.items():
                 entries[name] = {
@@ -128,7 +131,7 @@ class _RegistryEligibilitySnapshot:
 
     def _run(self) -> None:
         self.refresh()
-        while not self._stop.wait(self.TTL):
+        while not self._stop.wait(_registry_snapshot_ttl()):
             self.refresh()
 
     def stop(self) -> None:
@@ -191,13 +194,13 @@ async def _refresh_registry_snapshot_bounded() -> None:
     try:
         await asyncio.wait_for(
             loop.run_in_executor(_get_registry_refresh_executor(), registry._refresh_snapshot),
-            timeout=REGISTRY_REFRESH_TIMEOUT,
+            timeout=_registry_refresh_timeout(),
         )
     except asyncio.TimeoutError:
         logger.warning(
             "Registry snapshot refresh timed out after %.1fs; routing will reflect the toggle within the TTL (%.0fs).",
-            REGISTRY_REFRESH_TIMEOUT,
-            _RegistryEligibilitySnapshot.TTL,
+            _registry_refresh_timeout(),
+            _registry_snapshot_ttl(),
         )
 
 
@@ -631,7 +634,7 @@ def _register_admin_tools(agent: Agent):
             "Does not return the full catalog — search with a focused query."
         ),
     )
-    async def search_agents(query: str, limit: int = 8) -> List[Dict]:
+    async def search_agents(query: str, limit: Optional[int] = None) -> List[Dict]:
         from core.agent_search import search_agents as _search
         from core.discovery import is_agent_configured
         # include_disabled=True so manage_agent can still locate disabled agents to re-enable.
@@ -689,7 +692,7 @@ def _register_admin_tools(agent: Agent):
             "Does not return the full catalog — search with a focused query."
         ),
     )
-    async def search_tools(query: str, limit: int = TOOL_SEARCH_LIMIT) -> List[Dict]:
+    async def search_tools(query: str, limit: Optional[int] = None) -> List[Dict]:
         from core.tool_search import search_tools as _search_tools_ranked
         user_id = user_id_var.get()
         return await _search_tools_ranked(query, limit=limit, user_id=user_id)

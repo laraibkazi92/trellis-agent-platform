@@ -7,14 +7,17 @@ import asyncio
 import logging
 import secrets as secrets_module
 import yaml
-from typing import Dict, Any, List, Optional, Literal
-from fastapi import APIRouter, Request, Form
+from typing import List, Optional, Literal
+from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, ValidationError
 from core.auth import EtcdContentionError, get_current_user, is_admin
 from core.dependencies import templates, identity_mgr, CSRFRoute
-from core.routers.admin import sanitize_name, commit_to_github
+from core.routers.admin import sanitize_name
+from core.workspace_io import write_repo_file
+from core.routers._config_shared import apply_configuration_form
 from core.discovery import (
+    build_all_tools_view,
     discover_agents,
     get_agent_required_secrets,
     get_agent_required_variables,
@@ -58,6 +61,66 @@ return 0
     except Exception as e:
         print(f"Redis dequeue failed for task {task_id}: {e}")
         return False
+
+
+async def _mass_cancel_runs(user, agent_names: List[str], reason: str = "Mass cleared by admin") -> tuple[int, int]:
+    """Cancel every pending/processing run across ``agent_names``.
+
+    Cancellation metadata is stamped once per run, the etcd writes run
+    concurrently with per-run error counting, and still-pending runs are
+    best-effort dequeued from Redis. Returns ``(cleared_count, error_count)``;
+    the caller owns the user-facing flash message.
+    """
+    cleared_count = 0
+    error_count = 0
+    pending_run_ids = []
+    etcd_tasks = []
+    for name in agent_names:
+        try:
+            runs = await asyncio.to_thread(identity_mgr.get_agent_runs, name)
+        except Exception as e:
+            logger.error(f"Error fetching runs for {name}: {e}")
+            error_count += 1
+            continue
+        for run_record in runs:
+            state = run_record.get("state")
+            if state in ("pending", "processing"):
+                run_id = run_record.get("run_id")
+                metadata = run_record.get("metadata", {})
+                metadata["cancelled_by"] = user.get("email", user.get("sub"))
+                metadata["cancelled_at"] = datetime.now().isoformat()
+                metadata["reason"] = reason
+                etcd_tasks.append((
+                    name,
+                    asyncio.to_thread(
+                        identity_mgr.record_agent_run_state,
+                        name,
+                        run_id,
+                        "cancelled",
+                        metadata
+                    )
+                ))
+                if state == "pending":
+                    pending_run_ids.append(run_id)
+
+    if etcd_tasks:
+        results = await asyncio.gather(*(t for _, t in etcd_tasks), return_exceptions=True)
+        for (name, _), r in zip(etcd_tasks, results):
+            if isinstance(r, Exception):
+                error_count += 1
+                print(f"Error cancelling run for {name}: {r}")
+            elif r:
+                cleared_count += 1
+
+    # Best-effort: remove pending tasks from Redis queue
+    if pending_run_ids:
+        await asyncio.gather(
+            *[_dequeue_pending_task_from_redis(rid) for rid in pending_run_ids],
+            return_exceptions=True
+        )
+
+    return cleared_count, error_count
+
 
 class TriggerUpdate(BaseModel):
     trigger_type: Literal["none", "cron", "webhook"] = "none"
@@ -141,31 +204,7 @@ async def workflows_view(request: Request):
     workflows_list.sort(key=lambda x: x["name"].lower())
     all_mcps = await asyncio.to_thread(identity_mgr.list_mcps)
     # Fetch all tools for configuration modal
-    all_tools_data = []
-    local_tool_configs = await asyncio.to_thread(identity_mgr.get_all_tool_configs)
-    mcp_configs = await asyncio.to_thread(identity_mgr.get_all_mcp_configs)
-    
-    for t_name, t_config in local_tool_configs.items():
-        all_tools_data.append({
-            "name": t_name, 
-            "type": "local", 
-            "source": "Hub",
-            "version": t_config.get("version", ""),
-            "description": t_config.get("description", "")
-        })
-        
-    for mcp_name, mcp_config in mcp_configs.items():
-        if mcp_config and "tools" in mcp_config:
-            for t in mcp_config["tools"]:
-                all_tools_data.append({
-                    "name": t.get("name", ""), 
-                    "type": "mcp", 
-                    "source": mcp_name,
-                    "version": t.get("version", ""),
-                    "description": t.get("description", "")
-                })
-                
-    all_tools_data.sort(key=lambda x: x["name"])
+    all_tools_data = await build_all_tools_view()
 
     # Taskiq queue observability
     queue = {
@@ -225,8 +264,6 @@ async def configure_background_agent_secrets(request: Request, agent_name: str):
     agent_identity = Identity(id=agent_name, type=IdentityType.WORKFLOW)
     system_identity = Identity(id="system", type=IdentityType.SYSTEM)
 
-    current_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, agent_identity, "secrets")
-    current_variables = await asyncio.to_thread(identity_mgr.get_identity_config, agent_identity, "variables")
     global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
     global_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
     
@@ -235,28 +272,16 @@ async def configure_background_agent_secrets(request: Request, agent_name: str):
     secret_groups = await get_agent_secret_groups(config, strict=True)
     grouped_secret_keys = flatten_secret_group_keys(secret_groups)
 
-    secrets_updated = False
-    variables_updated = False
+    await apply_configuration_form(
+        form,
+        agent_identity,
+        known_secrets=set(required_secrets) | grouped_secret_keys,
+        known_variables=set(required_variables),
+        global_secrets=global_secrets,
+        global_variables=global_variables,
+        identity_mgr=identity_mgr,
+    )
 
-    for key, value in form.items():
-        if key in ("csrf_token",):
-            continue
-
-        val_str = str(value).strip()
-
-        if (key in required_secrets or key in grouped_secret_keys) and key not in global_secrets:
-            if val_str: # only update secret if not empty
-                current_secrets[key] = val_str
-                secrets_updated = True
-        elif key in required_variables and key not in global_variables:
-            current_variables[key] = val_str
-            variables_updated = True
-                
-    if secrets_updated:
-        await asyncio.to_thread(identity_mgr.save_identity_config, agent_identity, "secrets", current_secrets)
-    if variables_updated:
-        await asyncio.to_thread(identity_mgr.save_identity_config, agent_identity, "variables", current_variables)
-    
     request.session["flash_msg"] = f"Configuration for {agent_name} saved successfully."
     return RedirectResponse(url='/workflows', status_code=303)
 
@@ -331,47 +356,8 @@ async def clear_agent_active_runs(request: Request, agent_name: str):
         request.session["flash_msg"] = "Invalid agent name parameter."
         return RedirectResponse(url='/workflows', status_code=303)
         
-    cleared_count = 0
-    error_count = 0
     try:
-        runs = await asyncio.to_thread(identity_mgr.get_agent_runs, safe_name)
-        pending_run_ids = []
-        etcd_tasks = []
-        for run_record in runs:
-            state = run_record.get("state")
-            if state in ("pending", "processing"):
-                run_id = run_record.get("run_id")
-                metadata = run_record.get("metadata", {})
-                metadata["cancelled_by"] = user.get("email", user.get("sub"))
-                metadata["cancelled_at"] = datetime.now().isoformat()
-                metadata["reason"] = "Mass cleared by admin"
-                etcd_tasks.append(
-                    asyncio.to_thread(
-                        identity_mgr.record_agent_run_state,
-                        safe_name,
-                        run_id,
-                        "cancelled",
-                        metadata
-                    )
-                )
-                if state == "pending":
-                    pending_run_ids.append(run_id)
-
-        if etcd_tasks:
-            results = await asyncio.gather(*etcd_tasks, return_exceptions=True)
-            for r in results:
-                if isinstance(r, Exception):
-                    error_count += 1
-                    print(f"Error cancelling run for {safe_name}: {r}")
-                elif r:
-                    cleared_count += 1
-
-        # Best-effort: remove pending tasks from Redis queue
-        if pending_run_ids:
-            await asyncio.gather(
-                *[_dequeue_pending_task_from_redis(rid) for rid in pending_run_ids],
-                return_exceptions=True
-            )
+        cleared_count, error_count = await _mass_cancel_runs(user, [safe_name])
 
         if error_count:
             request.session["flash_msg"] = f"Cleared {cleared_count} run(s) for '{safe_name}' ({error_count} failed)."
@@ -393,56 +379,17 @@ async def clear_all_active_runs(request: Request):
         request.session["flash_msg"] = "Admin access required."
         return RedirectResponse(url='/workflows', status_code=303)
 
-    cleared_count = 0
-    error_count = 0
     try:
         agent_names = await asyncio.to_thread(identity_mgr.list_agents)
-        pending_run_ids = []
-        etcd_tasks = []
+        background_names = []
         for name in agent_names:
             config_data = await asyncio.to_thread(identity_mgr.get_agent_config, name)
             if config_data and config_data.get("type") in ("background_agent", "background_script"):
-                try:
-                    runs = await asyncio.to_thread(identity_mgr.get_agent_runs, name)
-                except Exception as e:
-                    logger.error(f"Error fetching runs for {name} during clear-all: {e}")
-                    error_count += 1
-                    continue
-                for run_record in runs:
-                    state = run_record.get("state")
-                    if state in ("pending", "processing"):
-                        run_id = run_record.get("run_id")
-                        metadata = run_record.get("metadata", {})
-                        metadata["cancelled_by"] = user.get("email", user.get("sub"))
-                        metadata["cancelled_at"] = datetime.now().isoformat()
-                        metadata["reason"] = "Global mass cleared by admin"
-                        etcd_tasks.append(
-                            asyncio.to_thread(
-                                identity_mgr.record_agent_run_state,
-                                name,
-                                run_id,
-                                "cancelled",
-                                metadata
-                            )
-                        )
-                        if state == "pending":
-                            pending_run_ids.append(run_id)
+                background_names.append(name)
 
-        if etcd_tasks:
-            results = await asyncio.gather(*etcd_tasks, return_exceptions=True)
-            for r in results:
-                if isinstance(r, Exception):
-                    error_count += 1
-                    print(f"Error cancelling run (global clear): {r}")
-                elif r:
-                    cleared_count += 1
-
-        # Best-effort: remove pending tasks from Redis queue
-        if pending_run_ids:
-            await asyncio.gather(
-                *[_dequeue_pending_task_from_redis(rid) for rid in pending_run_ids],
-                return_exceptions=True
-            )
+        cleared_count, error_count = await _mass_cancel_runs(
+            user, background_names, reason="Global mass cleared by admin"
+        )
 
         if error_count:
             request.session["flash_msg"] = f"Cleared {cleared_count} run(s) across all workflows ({error_count} failed)."
@@ -476,37 +423,13 @@ async def run_background_agent_manual(request: Request, agent_name: str):
         return RedirectResponse(url='/workflows', status_code=303)
         
     # Deferred import to prevent potential circular dependency during startup
-    from core.tasks import run_background_agent, run_background_script
-    
+    from core.tasks import enqueue_workflow_run
+
     now = datetime.now()
     xml_payload = f"<event_payload><![CDATA[\nManual execution triggered at {now.isoformat()}\n]]></event_payload>"
-    
-    agent_identity = Identity(id=safe_name, type=IdentityType.WORKFLOW)
-    
-    if config.get("type") == "background_script":
-        task = await run_background_script.kiq(
-            agent_name=safe_name,
-            prompt=xml_payload,
-            user_id=agent_identity.to_legacy_string()
-        )
-    else:
-        task = await run_background_agent.kiq(
-            agent_name=safe_name,
-            prompt=xml_payload,
-            user_id=agent_identity.to_legacy_string()
-        )
-    
-    try:
-        await asyncio.to_thread(
-            identity_mgr.record_agent_run_state,
-            safe_name,
-            task.task_id,
-            "pending",
-            {"prompt": xml_payload, "user_id": agent_identity.to_legacy_string()}
-        )
-    except Exception as e:
-        print(f"Failed to record pending state for {safe_name}: {e}")
-    
+
+    await enqueue_workflow_run(safe_name, config, xml_payload)
+
     request.session["flash_msg"] = f"Task for '{safe_name}' has been successfully enqueued for execution."
     return RedirectResponse(url='/workflows', status_code=303)
 
@@ -606,12 +529,18 @@ async def update_background_trigger(request: Request):
     
     await asyncio.to_thread(identity_mgr.save_agent_config, safe_name, config_data)
     
-    # Sync to GitHub
-    agent_dir = f"workspace/workflows/{safe_name}"
+    # Dual-write to the workspace files so the registry sync re-applies this edit on the
+    # next rebuild instead of reverting it to the previous on-disk version.
     yaml_content = yaml.dump(config_data, sort_keys=False)
-    
-    success_config = await commit_to_github(f"{agent_dir}/config.yaml", yaml_content, f"Update config for {safe_name}")
+    wrote_config = write_repo_file(f"workspace/workflows/{safe_name}/config.yaml", yaml_content)
+    wrote_skills = True
     if workflow_type == "background_agent":
-        success_skills = await commit_to_github(f"{agent_dir}/skills.md", skills_content, f"Update skills for {safe_name}")
-        
+        wrote_skills = write_repo_file(f"workspace/workflows/{safe_name}/skills.md", skills_content)
+
+    if not (wrote_config and wrote_skills):
+        request.session["flash_msg"] = (
+            f"Workflow {safe_name} updated in the registry, but its workspace file could not be "
+            f"written — the change may not survive a rebuild (check volume permissions)."
+        )
+
     return RedirectResponse(url="/workflows", status_code=303)

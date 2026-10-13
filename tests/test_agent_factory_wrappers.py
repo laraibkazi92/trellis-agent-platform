@@ -461,7 +461,7 @@ def test_manage_agent_snapshot_refresh_timeout_is_bounded(monkeypatch, caplog):
 
     monkeypatch.setattr(agent_factory, "get_identity_manager", lambda: FakeTimeoutIdentity())
     monkeypatch.setattr(agent_factory, "get_supervisor_registry", lambda: FakeRegistry())
-    monkeypatch.setattr(agent_factory, "REGISTRY_REFRESH_TIMEOUT", 0.05)
+    monkeypatch.setattr(agent_factory, "_registry_refresh_timeout", lambda: 0.05)
 
     fake_agent = _build_fake_agent()
 
@@ -514,7 +514,7 @@ def test_registry_refresh_hang_is_isolated_from_default_executor(monkeypatch, ca
     isolated_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="registry-refresh")
     monkeypatch.setattr(agent_factory, "_registry_refresh_executor", isolated_executor)
     monkeypatch.setattr(agent_factory, "get_supervisor_registry", lambda: FakeRegistry())
-    monkeypatch.setattr(agent_factory, "REGISTRY_REFRESH_TIMEOUT", 0.2)
+    monkeypatch.setattr(agent_factory, "_registry_refresh_timeout", lambda: 0.2)
 
     async def scenario():
         refresh_task = asyncio.ensure_future(agent_factory._refresh_registry_snapshot_bounded())

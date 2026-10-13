@@ -16,6 +16,12 @@ from fastmcp import FastMCP
 from core.models import ToolConfig
 from core.auth import get_identity_manager
 from core.devmode import enforce_dev_mode_safety
+from core.tunables import resolve as resolve_tunable
+from core.background.tasks import (
+    background_tasks as _background_tasks,
+    drain_background_tasks as _drain_background_tasks,
+    spawn_background as _spawn_background,
+)
 
 from core.health import HealthMonitor
 
@@ -28,28 +34,6 @@ identity_mgr = get_identity_manager()
 health_monitor = HealthMonitor(identity_mgr)
 
 logger = logging.getLogger(__name__)
-
-_background_tasks: set[asyncio.Task] = set()
-
-def _spawn_background(coro, name: str) -> asyncio.Task:
-    task = asyncio.create_task(coro, name=name)
-    _background_tasks.add(task)
-    def _done(t: asyncio.Task):
-        _background_tasks.discard(t)
-        if not t.cancelled() and t.exception() is not None:
-            logger.error("Background task %s failed: %s", name, t.exception())
-    task.add_done_callback(_done)
-    return task
-
-async def _drain_background_tasks(timeout: float = 5.0) -> None:
-    pending = {t for t in _background_tasks if not t.done()}
-    if not pending:
-        return
-    _, still_pending = await asyncio.wait(pending, timeout=timeout)
-    for task in still_pending:
-        task.cancel()
-    if still_pending:
-        logger.warning("Cancelled %d background task(s) that did not finish within %.1fs", len(still_pending), timeout)
 
 class _LifespanDrainWrapper:
     """Delegates ASGI calls to the wrapped app, draining background tasks on shutdown.
@@ -192,11 +176,8 @@ async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[
                     env["TRELLIS_USER_EMAIL"] = user_profile["email"]
 
         input_json = json.dumps(arguments).encode()
-        try:
-            env_timeout = float(os.getenv("TOOL_EXECUTION_TIMEOUT", "300"))
-        except (TypeError, ValueError):
-            env_timeout = 300.0
-        timeout = config.timeout_seconds if getattr(config, "timeout_seconds", None) else env_timeout
+        default_timeout = resolve_tunable("tool_execution_timeout")
+        timeout = config.timeout_seconds if getattr(config, "timeout_seconds", None) else default_timeout
 
         process = await asyncio.create_subprocess_exec(
             *cmd,

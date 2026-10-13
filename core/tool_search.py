@@ -9,7 +9,6 @@ matching when embeddings are unavailable. Only tools/MCP tools explicitly marked
 ``public`` are ever considered candidates — internal tools are never returned
 regardless of query, per the secure-by-default whitelisting model.
 """
-import os
 import re
 import asyncio
 import logging
@@ -18,10 +17,9 @@ from typing import List, Dict, Any, Optional
 from core.auth import get_identity_manager
 from core.embeddings import embed_text, cosine
 from core.discovery import is_tool_configured
+from core.tunables import resolve as resolve_tunable
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_LIMIT = int(os.getenv("TOOL_SEARCH_LIMIT", "8"))
 
 identity_mgr = get_identity_manager()
 
@@ -88,7 +86,7 @@ def _missing_configuration_labels(status: Dict[str, Any]) -> List[str]:
     return labels
 
 
-async def search_tools(query: str, limit: int = DEFAULT_LIMIT, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+async def search_tools(query: str, limit: Optional[int] = None, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """Return up to ``limit`` publicly-whitelisted tools most relevant to ``query``.
 
     Each result is a Tool Card: ``{"name", "description", "parameters", "configured",
@@ -104,7 +102,11 @@ async def search_tools(query: str, limit: int = DEFAULT_LIMIT, user_id: Optional
     description gains a trailing note naming the missing secrets/variables.
 
     Pass ``limit <= 0`` to get the full ranked list (mirrors ``search_agents``).
+    ``limit=None`` (the default) resolves to the admin-tunable ``tool_search_limit``
+    (env ``TOOL_SEARCH_LIMIT``, default 8).
     """
+    if limit is None:
+        limit = resolve_tunable("tool_search_limit")
     tool_configs = await asyncio.to_thread(identity_mgr.get_all_tool_configs)
     mcp_configs = await asyncio.to_thread(identity_mgr.get_all_mcp_configs)
     embeddings = await asyncio.to_thread(identity_mgr.get_all_tool_embeddings)
@@ -163,7 +165,7 @@ async def search_tools(query: str, limit: int = DEFAULT_LIMIT, user_id: Optional
         logger.warning("Embeddings unavailable; using keyword fallback for tool search.")
         ranked = _keyword_rank_tools(query, candidates)
 
-    selected = ranked if limit is None or limit <= 0 else ranked[:limit]
+    selected = ranked if limit <= 0 else ranked[:limit]
 
     statuses = [None] * len(selected)
     if user_id is not None:

@@ -3,9 +3,11 @@
 
 import asyncio
 from typing import Dict, List
-from fastapi import APIRouter, Request, Form
+from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import templates, identity_mgr, CSRFRoute
+from core.discovery import _build_secret_group_view
+from core.routers._config_shared import apply_configuration_form
 from core.models import Identity, IdentityType
 
 router = APIRouter(route_class=CSRFRoute)
@@ -132,33 +134,19 @@ async def configuration_page(request: Request):
     # Process secret groups (e.g. netctl's per-environment credentials) — one
     # card per group, with every option's fields present so switching the
     # selector never discards values already entered for other options.
-    for group in secret_groups:
-        options = []
-        for option in group.get("options", []):
-            fields = []
-            for field in option.get("fields", []):
+    for group, group_view in zip(secret_groups, _build_secret_group_view(secret_groups, current_secrets)):
+        for option in group_view["options"]:
+            for field in option["fields"]:
                 key = field["key"]
-                field_type = field.get("type", "password")
-                fields.append({
-                    "key": key,
-                    "label": field.get("label", key),
-                    "type": field_type,
-                    "is_set": key in current_secrets,
-                    "value": "",
-                    "placeholder": "******** (leave blank to keep current)" if key in current_secrets else f"Enter {field.get('label', key)}"
-                })
-            options.append({
-                "value": option.get("value"),
-                "label": option.get("label", option.get("value")),
-                "fields": fields
-            })
+                field["value"] = ""
+                field["placeholder"] = "******** (leave blank to keep current)" if key in current_secrets else f"Enter {field.get('label', key)}"
         items.append({
-            "key": group.get("label", "Credential Group"),
+            "key": group_view.get("label", "Credential Group"),
             "type": "secret_group",
             "label": "Credential Group",
             "tools": group.get("tools", []),
-            "select_label": group.get("select_label", "Option"),
-            "options": options
+            "select_label": group_view.get("select_label", "Option"),
+            "options": group_view["options"]
         })
 
     # Sort items alphabetically by key name
@@ -225,34 +213,18 @@ async def save_configuration(request: Request):
     user_identity = Identity.from_string(user_id)
     system_identity = Identity(id="system", type=IdentityType.SYSTEM)
 
-    current_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, user_identity, "secrets")
     global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
-    current_variables = await asyncio.to_thread(identity_mgr.get_identity_config, user_identity, "variables")
     global_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
-    
-    secrets_updated = False
-    variables_updated = False
-    
-    for key, value in form.items():
-        if key in ("csrf_token",):
-            continue
-            
-        val_str = str(value).strip()
-        
-        if key in known_secrets and key not in global_secrets:
-            if val_str: # only update secret if not empty
-                current_secrets[key] = val_str
-                secrets_updated = True
-                
-        elif key in known_variables and key not in global_variables:
-            # For variables, we can save empty value if they clear it
-            current_variables[key] = val_str
-            variables_updated = True
-            
-    if secrets_updated:
-        await asyncio.to_thread(identity_mgr.save_identity_config, user_identity, "secrets", current_secrets)
-    if variables_updated:
-        await asyncio.to_thread(identity_mgr.save_identity_config, user_identity, "variables", current_variables)
-    
+
+    await apply_configuration_form(
+        form,
+        user_identity,
+        known_secrets=known_secrets,
+        known_variables=known_variables,
+        global_secrets=global_secrets,
+        global_variables=global_variables,
+        identity_mgr=identity_mgr,
+    )
+
     request.session["flash_msg"] = "Settings and configuration saved successfully."
     return RedirectResponse(url='/configuration', status_code=303)

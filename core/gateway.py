@@ -7,19 +7,18 @@ import logging
 import httpx
 import yaml
 import asyncio
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 import uvicorn
-import aiofiles
 from contextlib import asynccontextmanager
+from asyncache import cached
+from cachetools import TTLCache
 from fastmcp import FastMCP, Context
 from mcp.types import ToolAnnotations
 from core.auth import AuthMiddleware, get_identity_manager, auth_token_var, user_id_var
-from core.devmode import enforce_dev_mode_safety
-from fastapi.middleware.cors import CORSMiddleware
+from core.devmode import configure_cors, enforce_dev_mode_safety
 from core.discovery import discover_agents, is_agent_configured, is_tool_configured
-from core.agent_search import search_agents as _search_agents_ranked, DEFAULT_LIMIT as AGENT_SEARCH_LIMIT
-from core.tool_search import search_tools as _search_tools_ranked, DEFAULT_LIMIT as TOOL_SEARCH_LIMIT, execute_whitelisted_tool
+from core.agent_search import search_agents as _search_agents_ranked
+from core.tool_search import search_tools as _search_tools_ranked, execute_whitelisted_tool
 from core.agent_factory import get_hub_client, get_external_mcp_client
 from core.models import is_agent_external, is_routable_agent_type
 from core.health import compute_agent_operational_status
@@ -40,49 +39,39 @@ mcp = FastMCP("Agent Gateway")
 if hasattr(mcp, "_app"):
     app = mcp._app
     app.router.lifespan_context = lifespan
-    
-    DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
-    cors_origins_str = os.getenv("CORS_ALLOWED_ORIGINS", "")
-    if DEV_MODE:
-        allow_origins = ["*"]
-    else:
-        allow_origins = [origin.strip() for origin in cors_origins_str.split(",")] if cors_origins_str else []
-        
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=allow_origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
 
-HOST_URL = os.getenv("HOST_URL", "http://localhost:8000")
+    configure_cors(app)
 
 identity_mgr = get_identity_manager()
 
-async def get_agent_description(config: dict, skills_path: Path) -> str:
-    """Extracts description from config.yaml or the first paragraph of the skills.md file."""
-    if config.get("description"):
-        return config["description"]
-        
+# HOST_URL is resolved from etcd at call time (never frozen at import), but a
+# short TTL keeps every liveness ping / outbound call from re-reading etcd.
+_host_url_cache = TTLCache(maxsize=1, ttl=60)
+
+
+@cached(cache=_host_url_cache)
+async def _resolve_host_url() -> str:
+    """Resolve HOST_URL etcd-first at call time, falling back to the env default.
+
+    Mirrors the call-time resolution already used by core/hub.py and
+    core/tasks.py, so a runtime HOST_URL change no longer requires a restart.
+    """
+    default = os.getenv("HOST_URL", "http://localhost:8000")
     try:
-        async with aiofiles.open(skills_path, "r") as f:
-            content = await f.read()
-            # Split by newlines and find the first non-empty paragraph that isn't a header
-            paragraphs = [p.strip() for p in content.split("\n\n") if p.strip() and not p.strip().startswith("#")]
-            if paragraphs:
-                return paragraphs[0]
-    except Exception:
-        pass
-    return "No description available."
+        return await asyncio.to_thread(identity_mgr.get_config, "HOST_URL", default)
+    except Exception as e:
+        logger.warning(f"Failed to resolve HOST_URL from etcd, using {default}: {e}")
+        return default
+
 
 async def _check_host_liveness_error() -> Optional[Dict]:
+    host_url = await _resolve_host_url()
     try:
         if hasattr(app, "state") and hasattr(app.state, "http_client"):
-            resp = await app.state.http_client.get(f"{HOST_URL}/health", timeout=5.0)
+            resp = await app.state.http_client.get(f"{host_url}/health", timeout=5.0)
         else:
             async with httpx.AsyncClient() as client:
-                resp = await client.get(f"{HOST_URL}/health", timeout=5.0)
+                resp = await client.get(f"{host_url}/health", timeout=5.0)
         if resp.status_code != 200:
             return {"name": "Error", "description": f"Host API unreachable (HTTP {resp.status_code})"}
     except Exception as e:
@@ -309,7 +298,7 @@ async def _get_visible_agents(names: Optional[List[str]] = None) -> List[Dict]:
     title="Search Agents",
     annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True),
 )
-async def search_agents(ctx: Context, query: str, limit: int = AGENT_SEARCH_LIMIT) -> List[Dict]:
+async def search_agents(ctx: Context, query: str, limit: Optional[int] = None) -> List[Dict]:
     """Find the agents most relevant to a request.
 
     Use this to discover which specialized agent(s) can handle a task, then call the
@@ -324,7 +313,7 @@ async def search_agents(ctx: Context, query: str, limit: int = AGENT_SEARCH_LIMI
 
     Args:
         query: Natural-language description of the task or topic to find agents for.
-        limit: Maximum number of agents to return (default: AGENT_SEARCH_LIMIT env var, 8 if unset).
+        limit: Maximum number of agents to return (default: agent_search_limit tunable; env AGENT_SEARCH_LIMIT, 8 if unset).
     """
     await ctx.report_progress(0, 2, message=f"Searching agents for: '{query}'")
 
@@ -445,7 +434,8 @@ async def use_agent(ctx: Context, agent_name: str, prompt: str) -> str:
         }
 
         async def _consume_stream(client_obj):
-            async with client_obj.stream("POST", f"{HOST_URL}/v1/chat/completions", **req_kwargs) as response:
+            host_url = await _resolve_host_url()
+            async with client_obj.stream("POST", f"{host_url}/v1/chat/completions", **req_kwargs) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     if not line.strip(): continue
@@ -489,7 +479,7 @@ async def use_agent(ctx: Context, agent_name: str, prompt: str) -> str:
     title="Search Tools",
     annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True),
 )
-async def search_tools(ctx: Context, query: str, limit: int = TOOL_SEARCH_LIMIT) -> List[Dict]:
+async def search_tools(ctx: Context, query: str, limit: Optional[int] = None) -> List[Dict]:
     """Find deterministic tools available for direct execution.
 
     Use this to discover which whitelisted tool can handle a request — a CLI lookup,
@@ -503,7 +493,7 @@ async def search_tools(ctx: Context, query: str, limit: int = TOOL_SEARCH_LIMIT)
 
     Args:
         query: Natural-language description of the command or lookup to find a tool for.
-        limit: Maximum number of tools to return (default: 8).
+        limit: Maximum number of tools to return (default: tool_search_limit tunable; env TOOL_SEARCH_LIMIT, 8 if unset).
     """
     user_id = user_id_var.get()
     await ctx.report_progress(0, 1, message=f"Searching tools for: '{query}'")

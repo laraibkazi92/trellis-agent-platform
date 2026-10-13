@@ -3,14 +3,19 @@
 
 import os
 import json
+import re
 import asyncio
+import yaml
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import templates, identity_mgr, CSRFRoute
 from core.discovery import discover_agents, discover_tools, get_agent_required_secrets, get_agent_required_variables, get_agent_secret_groups, get_tool_configuration_context, flatten_secret_group_keys
+from core.routers._config_shared import apply_configuration_form
 from core.auth import EtcdContentionError, is_admin
 from core.health import compute_agent_operational_status
 from core.models import Identity, IdentityType
+from core.tunables import resolve as resolve_tunable
+from core.workspace_io import write_repo_file
 
 router = APIRouter(route_class=CSRFRoute)
 
@@ -24,8 +29,8 @@ async def index(request: Request):
     tools = await discover_tools()
     
     dev_mode = os.getenv("DEV_MODE", "false").lower() == "true"
-    public_host_url = os.getenv("PUBLIC_HOST_URL", "http://localhost:8000")
-    public_mcp_url = os.getenv("PUBLIC_MCP_URL", "http://localhost:8002/mcp")
+    public_host_url = resolve_tunable("public_host_url")
+    public_mcp_url = resolve_tunable("public_mcp_url")
 
     return templates.TemplateResponse(
         request=request,
@@ -70,8 +75,8 @@ async def agents(request: Request):
 
     flash_msg = request.session.pop("flash_msg", None)
     
-    public_host_url = os.getenv("PUBLIC_HOST_URL", "http://localhost:8000")
-    public_mcp_url = os.getenv("PUBLIC_MCP_URL", "http://localhost:8002/mcp")
+    public_host_url = resolve_tunable("public_host_url")
+    public_mcp_url = resolve_tunable("public_mcp_url")
     
     return templates.TemplateResponse(
         request=request,
@@ -112,8 +117,6 @@ async def configure_agent_secrets(request: Request, agent_name: str):
         
     system_identity = Identity(id="system", type=IdentityType.SYSTEM)
 
-    current_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "secrets")
-    current_variables = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "variables")
     global_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
     global_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
     
@@ -122,28 +125,16 @@ async def configure_agent_secrets(request: Request, agent_name: str):
     secret_groups = await get_agent_secret_groups(config, strict=True)
     grouped_secret_keys = flatten_secret_group_keys(secret_groups)
 
-    secrets_updated = False
-    variables_updated = False
+    await apply_configuration_form(
+        form,
+        identity,
+        known_secrets=set(required_secrets) | grouped_secret_keys,
+        known_variables=set(required_variables),
+        global_secrets=global_secrets,
+        global_variables=global_variables,
+        identity_mgr=identity_mgr,
+    )
 
-    for key, value in form.items():
-        if key in ("csrf_token",):
-            continue
-
-        val_str = str(value).strip()
-
-        if (key in required_secrets or key in grouped_secret_keys) and key not in global_secrets:
-            if val_str:
-                current_secrets[key] = val_str
-                secrets_updated = True
-        elif key in required_variables and key not in global_variables:
-            current_variables[key] = val_str
-            variables_updated = True
-            
-    if secrets_updated:
-        await asyncio.to_thread(identity_mgr.save_identity_config, identity, "secrets", current_secrets)
-    if variables_updated:
-        await asyncio.to_thread(identity_mgr.save_identity_config, identity, "variables", current_variables)
-    
     request.session["flash_msg"] = f"Configuration and secrets saved for {agent_name} successfully."
     return RedirectResponse(url='/agents', status_code=303)
 
@@ -216,9 +207,6 @@ async def configure_tool_secrets(request: Request, tool_name: str):
     form = await request.form()
     identity = Identity.from_string(user_id)
 
-    current_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "secrets")
-    current_variables = await asyncio.to_thread(identity_mgr.get_identity_config, identity, "variables")
-
     known_secrets = (
         set(context["required_secrets"])
         | set(context["optional_secrets"])
@@ -226,27 +214,13 @@ async def configure_tool_secrets(request: Request, tool_name: str):
     )
     known_variables = set(context["required_variables"])
 
-    secrets_updated = False
-    variables_updated = False
-
-    for key, value in form.items():
-        if key == "csrf_token":
-            continue
-
-        val_str = str(value).strip()
-
-        if key in known_secrets:
-            if val_str:  # only update secret if not empty
-                current_secrets[key] = val_str
-                secrets_updated = True
-        elif key in known_variables:
-            current_variables[key] = val_str
-            variables_updated = True
-
-    if secrets_updated:
-        await asyncio.to_thread(identity_mgr.save_identity_config, identity, "secrets", current_secrets)
-    if variables_updated:
-        await asyncio.to_thread(identity_mgr.save_identity_config, identity, "variables", current_variables)
+    await apply_configuration_form(
+        form,
+        identity,
+        known_secrets=known_secrets,
+        known_variables=known_variables,
+        identity_mgr=identity_mgr,
+    )
 
     request.session["flash_msg"] = f"Configuration and secrets saved for {tool_name} successfully."
     return RedirectResponse(url='/tools', status_code=303)
@@ -316,6 +290,10 @@ async def add_mcp(request: Request):
         }
         
         await asyncio.to_thread(identity_mgr.save_mcp_config, name, config)
+        # Dual-write so the registry sync does not prune a marketplace-added MCP on the next
+        # rebuild (the sync only keeps MCPs that have a workspace mcp.yaml).
+        safe_mcp_name = re.sub(r'[^a-zA-Z0-9_-]', '', name)
+        write_repo_file(f"workspace/mcps/{safe_mcp_name}/mcp.yaml", yaml.dump(config, sort_keys=False))
         request.session["flash_msg"] = f"MCP '{name}' added successfully."
     except Exception as e:
         request.session["flash_msg"] = f"Error adding MCP: {str(e)}"

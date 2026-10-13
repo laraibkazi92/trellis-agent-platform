@@ -2,58 +2,30 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
-import os
-import yaml
 import asyncio
 import logging
-from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 from pathlib import Path
-from typing import Dict, List, Any, Optional
-from asyncache import cached
-from cachetools import TTLCache
-import copy
+from typing import List, Any, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 from contextlib import asynccontextmanager
-from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart, TextPart
 
-from fastmcp import Client as FastMCPClient
-from fastmcp.client import StdioTransport, SSETransport, StreamableHttpTransport
-
-from core.auth import AuthMiddleware, IdentityManager, user_id_var
-from core.devmode import enforce_dev_mode_safety
-from core.models import AgentConfig, MCPConfig, is_agent_external, is_routable_agent_type
-from core.health import HealthMonitor, compute_agent_operational_status
+from core.auth import AuthMiddleware, user_id_var
+from core.devmode import configure_cors, enforce_dev_mode_safety
+from core.models import is_agent_external, is_routable_agent_type
+from core.health import compute_agent_operational_status
+from core.background.tasks import (
+    background_tasks as _background_tasks,
+    drain_background_tasks as _drain_background_tasks,
+    spawn_background as _spawn_background,
+)
 from core.background.webhooks import router as webhooks_router
-
-_background_tasks: set[asyncio.Task] = set()
-
-def _spawn_background(coro, name: str) -> asyncio.Task:
-    task = asyncio.create_task(coro, name=name)
-    _background_tasks.add(task)
-    def _done(t: asyncio.Task):
-        _background_tasks.discard(t)
-        if not t.cancelled() and t.exception() is not None:
-            logger.error("Background task %s failed: %s", name, t.exception())
-    task.add_done_callback(_done)
-    return task
-
-async def _drain_background_tasks(timeout: float = 5.0) -> None:
-    pending = {t for t in _background_tasks if not t.done()}
-    if not pending:
-        return
-    _, still_pending = await asyncio.wait(pending, timeout=timeout)
-    for task in still_pending:
-        task.cancel()
-    if still_pending:
-        logger.warning("Cancelled %d background task(s) that did not finish within %.1fs", len(still_pending), timeout)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -90,20 +62,7 @@ app = FastAPI(title="Universal Agent Host (Stateless)", lifespan=lifespan)
 app.include_router(webhooks_router)
 
 # CORS Setup
-DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
-cors_origins_str = os.getenv("CORS_ALLOWED_ORIGINS", "")
-if DEV_MODE:
-    allow_origins = ["*"]
-else:
-    allow_origins = [origin.strip() for origin in cors_origins_str.split(",")] if cors_origins_str else []
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allow_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+configure_cors(app)
 
 from core.agent_factory import (
     get_agent,
@@ -124,7 +83,6 @@ app.add_middleware(AuthMiddleware, identity_mgr=identity_mgr)
 health_monitor = get_health_monitor()
 
 BASE_DIR = Path(__file__).parent.parent
-INTERNAL_ASSETS_DIR = BASE_DIR / "core" / "assets"
 
 class ChatMessage(BaseModel):
     role: str

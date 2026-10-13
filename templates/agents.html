@@ -7,7 +7,7 @@
 
 {% block title %}Agents{% endblock %}
 
-{% block content %}
+{% block content %}{% import "macros/credentials_form.html" as creds %}
 <!-- Global Connection Modal -->
 <div id="global-connection" class="hidden fixed inset-0 bg-neutral-950/80 z-50 flex items-center justify-center p-4">
     <div class="bg-neutral-100 dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 p-6 max-w-3xl w-full max-h-[90vh] overflow-y-auto shadow-2xl relative flex flex-col">
@@ -253,100 +253,7 @@
                     </div>
                 </div>
                 
-                <div class="space-y-4">
-                    {% if agent.required_variables %}
-                    <div class="space-y-4">
-                        <h4 class="text-xs font-bold uppercase tracking-wider text-neutral-500 font-mono border-b border-neutral-200 dark:border-neutral-800 pb-1">Configuration Variables</h4>
-                        {% for var in agent.required_variables %}
-                        <div>
-                            <div class="flex justify-between items-center mb-1">
-                                <label for="{{ var }}_{{ agent.name }}" class="block font-mono text-sm font-bold uppercase tracking-wide">
-                                    {{ var }}
-                                </label>
-                                {% if var in agent.missing_variables %}
-                                <span class="text-[10px] text-orange-500 font-mono uppercase tracking-widest font-bold">Required</span>
-                                {% else %}
-                                <span class="text-[10px] text-emerald-500 font-mono uppercase tracking-widest">Configured</span>
-                                {% endif %}
-                            </div>
-                            <input type="text" 
-                                   name="{{ var }}" 
-                                   id="{{ var }}_{{ agent.name }}"
-                                   value="{{ agent.current_variables.get(var, '') }}"
-                                   placeholder="Enter {{ var }}"
-                                   class="w-full bg-white dark:bg-[#0a0a0a] border border-neutral-300 dark:border-neutral-700 px-4 py-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 placeholder-neutral-400 dark:placeholder-neutral-600">
-                        </div>
-                        {% endfor %}
-                    </div>
-                    {% endif %}
-
-                    {% if agent.required_secrets %}
-                    <div class="space-y-4 pt-2">
-                        <h4 class="text-xs font-bold uppercase tracking-wider text-neutral-500 font-mono border-b border-neutral-200 dark:border-neutral-800 pb-1">Sensitive Secrets</h4>
-                        {% for secret in agent.required_secrets %}
-                        <div>
-                            <div class="flex justify-between items-center mb-1">
-                                <label for="{{ secret }}_{{ agent.name }}" class="block font-mono text-sm font-bold uppercase tracking-wide">
-                                    {{ secret }}
-                                </label>
-                                {% if secret in agent.missing_secrets %}
-                                <span class="text-[10px] text-orange-500 font-mono uppercase tracking-widest font-bold">Required</span>
-                                {% else %}
-                                <span class="text-[10px] text-emerald-500 font-mono uppercase tracking-widest">Configured</span>
-                                {% endif %}
-                            </div>
-                            <input type="password" 
-                                   name="{{ secret }}" 
-                                   id="{{ secret }}_{{ agent.name }}"
-                                   placeholder="{% if secret not in agent.missing_secrets %}******** (Leave blank to keep current){% else %}Enter {{ secret }}{% endif %}"
-                                   class="w-full bg-white dark:bg-[#0a0a0a] border border-neutral-300 dark:border-neutral-700 px-4 py-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 placeholder-neutral-400 dark:placeholder-neutral-600">
-                        </div>
-                        {% endfor %}
-                    </div>
-                    {% endif %}
-
-                    {% if agent.secret_groups %}
-                    <div class="space-y-4 pt-2">
-                        <h4 class="text-xs font-bold uppercase tracking-wider text-neutral-500 font-mono border-b border-neutral-200 dark:border-neutral-800 pb-1">Credential Groups</h4>
-                        {% for group in agent.secret_groups %}
-                        {% set group_key = agent.name ~ '__' ~ loop.index %}
-                        <div class="space-y-3">
-                            <div class="flex items-center gap-3">
-                                <label class="font-mono text-xs uppercase tracking-wider text-neutral-500 dark:text-neutral-400">{{ group.select_label }}</label>
-                                <select class="secret-group-select bg-white dark:bg-[#0a0a0a] border border-neutral-300 dark:border-neutral-700 p-2 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark text-neutral-900 dark:text-neutral-100"
-                                        data-group-key="{{ group_key }}">
-                                    {% for option in group.options %}
-                                    <option value="{{ option.value }}">{{ option.label }}</option>
-                                    {% endfor %}
-                                </select>
-                            </div>
-                            {% for option in group.options %}
-                            <div class="secret-group-option space-y-4 {{ '' if loop.first else 'hidden' }}"
-                                 data-group-key="{{ group_key }}" data-option-value="{{ option.value }}">
-                                {% for field in option.fields %}
-                                <div>
-                                    <div class="flex justify-between items-center mb-1">
-                                        <label for="{{ field.key }}_{{ agent.name }}" class="block font-mono text-[11px] uppercase tracking-wider text-neutral-400 dark:text-neutral-500">
-                                            {{ option.label }} {{ field.label }}
-                                        </label>
-                                        {% if field.is_set %}
-                                        <span class="text-[10px] text-emerald-500 font-mono uppercase tracking-widest">Configured</span>
-                                        {% endif %}
-                                    </div>
-                                    <input type="{{ field.type }}"
-                                           name="{{ field.key }}"
-                                           id="{{ field.key }}_{{ agent.name }}"
-                                           placeholder="{% if field.is_set %}******** (Leave blank to keep current){% else %}Enter {{ field.label }}{% endif %}"
-                                           class="w-full bg-white dark:bg-[#0a0a0a] border border-neutral-300 dark:border-neutral-700 px-4 py-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 placeholder-neutral-400 dark:placeholder-neutral-600">
-                                </div>
-                                {% endfor %}
-                            </div>
-                            {% endfor %}
-                        </div>
-                        {% endfor %}
-                    </div>
-                    {% endif %}
-                </div>
+                {{ creds.credential_fields(agent, agent.name) }}
 
                 <button type="submit" class="bg-accent hover:bg-accent-dark text-white font-mono font-bold text-sm uppercase py-3 px-8 transition-colors mt-2">
                     Save Configuration
@@ -435,12 +342,7 @@ a2a_access:
     {% endfor %}
 </div>
 
-<!-- Pagination Controls -->
-<nav id="pagination-controls" class="flex justify-center items-center gap-4 mb-12 font-mono text-sm hidden" aria-label="Pagination">
-    <button id="prev-page" aria-label="Previous page" class="px-4 py-2 border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-neutral-600 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark disabled:opacity-50 disabled:cursor-not-allowed transition-colors uppercase font-bold tracking-wider">Prev</button>
-    <span id="page-info" aria-current="page" class="text-neutral-600 dark:text-neutral-400">Page 1 of 1</span>
-    <button id="next-page" aria-label="Next page" class="px-4 py-2 border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-neutral-600 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark disabled:opacity-50 disabled:cursor-not-allowed transition-colors uppercase font-bold tracking-wider">Next</button>
-</nav>
+{% set pagination_margin = 'mb-12' %}{% include "partials/_searchable_grid.html" %}
 
 <script>
     document.addEventListener('DOMContentLoaded', async () => {

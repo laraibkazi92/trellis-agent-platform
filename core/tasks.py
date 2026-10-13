@@ -11,6 +11,7 @@ from pydantic_ai import Agent
 
 from core.auth import user_id_var
 from core.models import Identity, IdentityType
+from core.tunables import resolve as resolve_tunable
 from core.agent_factory import (
     build_agent,
     get_identity_manager,
@@ -20,10 +21,10 @@ from core.agent_factory import (
 
 RESTRICTED_ENV_VARS = {"PATH", "PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "BASH_ENV", "ENV", "HOSTALIASES"}
 
-MAX_RUN_OUTPUT_CHARS = int(os.getenv("MAX_RUN_OUTPUT_CHARS", "32768")) # 32 KB limit
-MAX_RUN_ERROR_CHARS = int(os.getenv("MAX_RUN_ERROR_CHARS", "4096"))   # 4 KB limit
 
-def _truncate_output(text: Optional[str], max_chars: int = MAX_RUN_OUTPUT_CHARS) -> str:
+def _truncate_output(text: Optional[str], max_chars: Optional[int] = None) -> str:
+    if max_chars is None:
+        max_chars = resolve_tunable("max_run_output_chars")
     if not text:
         return ""
     if len(text) <= max_chars:
@@ -31,6 +32,59 @@ def _truncate_output(text: Optional[str], max_chars: int = MAX_RUN_OUTPUT_CHARS)
     half = max(1, (max_chars - 100) // 2)
     omitted = max(0, len(text) - (half * 2))
     return f"{text[:half]}\n\n[... Truncated {omitted} characters ...]\n\n{text[-half:]}"
+
+
+async def _record_run_state(identity_mgr, agent_name: str, task_id: str, state: str, metadata: Dict[str, Any]) -> None:
+    """Persist a workflow run's state, logging (never raising) on failure."""
+    try:
+        await asyncio.to_thread(
+            identity_mgr.record_agent_run_state,
+            agent_name,
+            task_id,
+            state,
+            metadata,
+        )
+    except Exception as err:
+        print(f"Failed to record {state} state for {agent_name} run {task_id}: {err}")
+
+
+async def _abort_if_cancelled(identity_mgr, agent_name: str, task_id: str) -> bool:
+    """True if the run was cancelled before processing began."""
+    run_record = await asyncio.to_thread(identity_mgr.get_agent_run, agent_name, task_id)
+    if run_record and run_record.get("state") == "cancelled":
+        print(f"Task {task_id} for {agent_name} was cancelled before processing. Aborting.")
+        return True
+    return False
+
+
+async def enqueue_workflow_run(name: str, config: Dict, xml_payload: str) -> None:
+    """Dispatch a workflow (script or agent) and record its initial pending state."""
+    identity_mgr = get_identity_manager()
+    agent_identity = Identity(id=name, type=IdentityType.WORKFLOW)
+
+    if config.get("type") == "background_script":
+        task = await run_background_script.kiq(
+            agent_name=name,
+            prompt=xml_payload,
+            user_id=agent_identity.to_legacy_string(),
+        )
+    else:
+        task = await run_background_agent.kiq(
+            agent_name=name,
+            prompt=xml_payload,
+            user_id=agent_identity.to_legacy_string(),
+        )
+
+    try:
+        await asyncio.to_thread(
+            identity_mgr.record_agent_run_state,
+            name,
+            task.task_id,
+            "pending",
+            {"prompt": xml_payload, "user_id": agent_identity.to_legacy_string()},
+        )
+    except Exception as e:
+        print(f"Failed to record pending state for {name}: {e}")
 
 # Redis broker configuration
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -84,31 +138,8 @@ async def dynamic_cron_heartbeat():
                     print(f"Triggering background workflow {name} via cron: {expr}")
                     # System prompt for cron runs
                     xml_payload = f"<event_payload><![CDATA[\nScheduled execution triggered at {now.isoformat()}\n]]></event_payload>"
-                    
-                    agent_identity = Identity(id=name, type=IdentityType.WORKFLOW)
-                    
-                    if config_data.get("type") == "background_script":
-                        task = await run_background_script.kiq(
-                            agent_name=name,
-                            prompt=xml_payload,
-                            user_id=agent_identity.to_legacy_string()
-                        )
-                    else:
-                        task = await run_background_agent.kiq(
-                            agent_name=name,
-                            prompt=xml_payload,
-                            user_id=agent_identity.to_legacy_string()
-                        )
-                    try:
-                        await asyncio.to_thread(
-                            identity_mgr.record_agent_run_state,
-                            name,
-                            task.task_id,
-                            "pending",
-                            {"prompt": xml_payload, "user_id": agent_identity.to_legacy_string()}
-                        )
-                    except Exception as e:
-                        print(f"Failed to record pending state for {name}: {e}")
+
+                    await enqueue_workflow_run(name, config_data, xml_payload)
                     break
 
 @broker.task
@@ -126,14 +157,11 @@ async def run_background_script(
         
         try:
             # Check for cancellation before processing
-            run_record = await asyncio.to_thread(identity_mgr.get_agent_run, agent_name, task_id)
-            
-            if run_record and run_record.get("state") == "cancelled":
-                print(f"Task {task_id} for {agent_name} was cancelled before processing. Aborting.")
+            if await _abort_if_cancelled(identity_mgr, agent_name, task_id):
                 return "Cancelled before execution."
 
-            await asyncio.to_thread(
-                identity_mgr.record_agent_run_state,
+            await _record_run_state(
+                identity_mgr,
                 agent_name,
                 task_id,
                 "processing",
@@ -252,39 +280,33 @@ async def run_background_script(
                 return "Cancelled."
             raise RuntimeError(f"Script exited with status {process.returncode}:\n{output_str}")
 
-        try:
-            await asyncio.to_thread(
-                identity_mgr.record_agent_run_state,
-                agent_name,
-                task_id,
-                "completed",
-                {
-                    "prompt": _truncate_output(prompt, max_chars=8192),
-                    "user_id": user_id,
-                    "output": _truncate_output(output_str.strip())
-                }
-            )
-        except Exception as err:
-            print(f"Failed to record completed state for {agent_name} run {task_id}: {err}")
+        await _record_run_state(
+            identity_mgr,
+            agent_name,
+            task_id,
+            "completed",
+            {
+                "prompt": _truncate_output(prompt, max_chars=8192),
+                "user_id": user_id,
+                "output": _truncate_output(output_str.strip())
+            }
+        )
 
         return output_str.strip()
 
     except Exception as e:
         print(f"Error running background script '{agent_name}': {e}")
-        try:
-            await asyncio.to_thread(
-                identity_mgr.record_agent_run_state,
-                agent_name,
-                task_id,
-                "failed",
-                {
-                    "prompt": _truncate_output(prompt, max_chars=8192),
-                    "user_id": user_id,
-                    "error": str(e)[:MAX_RUN_ERROR_CHARS]
-                }
-            )
-        except Exception as err:
-            print(f"Failed to record failed state for {agent_name} run {task_id}: {err}")
+        await _record_run_state(
+            identity_mgr,
+            agent_name,
+            task_id,
+            "failed",
+            {
+                "prompt": _truncate_output(prompt, max_chars=8192),
+                "user_id": user_id,
+                "error": str(e)[:resolve_tunable("max_run_error_chars")]
+            }
+        )
         raise
     finally:
         user_id_var.reset(token)
@@ -307,14 +329,11 @@ async def run_background_agent(
         # Record processing state
         try:
             # Check for cancellation before processing
-            run_record = await asyncio.to_thread(identity_mgr.get_agent_run, agent_name, task_id)
-            
-            if run_record and run_record.get("state") == "cancelled":
-                print(f"Task {task_id} for {agent_name} was cancelled before processing. Aborting.")
+            if await _abort_if_cancelled(identity_mgr, agent_name, task_id):
                 return "Cancelled before execution."
 
-            await asyncio.to_thread(
-                identity_mgr.record_agent_run_state,
+            await _record_run_state(
+                identity_mgr,
                 agent_name,
                 task_id,
                 "processing",
@@ -404,41 +423,35 @@ async def run_background_agent(
                     print(f"Failed to record token usage for {user_id}: {e}")
                     
         # Record completed state (auth.py state machine guards against overwriting cancelled)
-        try:
-            await asyncio.to_thread(
-                identity_mgr.record_agent_run_state,
-                agent_name,
-                task_id,
-                "completed",
-                {
-                    "prompt": _truncate_output(prompt, max_chars=8192),
-                    "user_id": user_id,
-                    "output": _truncate_output(str(result.output) if result.output else ""),
-                    "usage": usage_data
-                }
-            )
-        except Exception as err:
-            print(f"Failed to record completed state for {agent_name} run {task_id}: {err}")
+        await _record_run_state(
+            identity_mgr,
+            agent_name,
+            task_id,
+            "completed",
+            {
+                "prompt": _truncate_output(prompt, max_chars=8192),
+                "user_id": user_id,
+                "output": _truncate_output(str(result.output) if result.output else ""),
+                "usage": usage_data
+            }
+        )
 
         return result.output
 
     except Exception as e:
         print(f"Error running background agent '{agent_name}': {e}")
         # Record failed state (auth.py state machine guards against overwriting cancelled)
-        try:
-            await asyncio.to_thread(
-                identity_mgr.record_agent_run_state,
-                agent_name,
-                task_id,
-                "failed",
-                {
-                    "prompt": _truncate_output(prompt, max_chars=8192),
-                    "user_id": user_id,
-                    "error": str(e)[:MAX_RUN_ERROR_CHARS]
-                }
-            )
-        except Exception as err:
-            print(f"Failed to record failed state for {agent_name} run {task_id}: {err}")
+        await _record_run_state(
+            identity_mgr,
+            agent_name,
+            task_id,
+            "failed",
+            {
+                "prompt": _truncate_output(prompt, max_chars=8192),
+                "user_id": user_id,
+                "error": str(e)[:resolve_tunable("max_run_error_chars")]
+            }
+        )
         raise
     finally:
         # Guarantee ContextVar state cleanup

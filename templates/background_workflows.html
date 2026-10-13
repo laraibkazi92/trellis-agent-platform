@@ -7,101 +7,14 @@
 
 {% block title %}Workflows{% endblock %}
 
-{% block content %}
+{% block content %}{% import "macros/credentials_form.html" as creds %}{% import "partials/_select2_theme.html" as select2 %}{% import "macros/tool_picker.html" as tool_picker %}
 
     <style type="text/tailwindcss">
         /* Select2 Custom Dark/Light Theme Overrides */
-        .select2-container--default .select2-selection--multiple,
-        .select2-container--default .select2-selection--single {
-            background-color: transparent !important;
-            border: 1px solid theme('colors.neutral.300') !important;
-            border-radius: 0 !important;
-            min-height: 46px !important;
-            padding-bottom: 0px !important;
-        }
-        .select2-container--default .select2-selection--single .select2-selection__rendered {
-            color: theme('colors.neutral.900') !important;
-            font-family: 'IBM Plex Mono', monospace;
-            line-height: 44px !important;
-            padding-left: 0.75rem !important;
-        }
-        .select2-container--default .select2-selection--single .select2-selection__arrow {
-            height: 44px !important;
-        }
-        .select2-container--default.select2-container--focus .select2-selection--multiple,
-        .select2-container--default.select2-container--focus .select2-selection--single {
-            border-color: theme('colors.accent.DEFAULT') !important;
-            box-shadow: 0 0 0 1px theme('colors.accent.DEFAULT');
-        }
-        .select2-container--default .select2-selection--multiple .select2-selection__choice {
-            background-color: theme('colors.neutral.100') !important;
-            border: 1px solid theme('colors.neutral.300') !important;
-            border-radius: 0 !important;
-            color: theme('colors.neutral.900') !important;
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 0.75rem;
-            padding: 4px 8px !important;
-            margin-top: 6px !important;
-            margin-left: 6px !important;
-            text-transform: uppercase;
-        }
-        .select2-container--default .select2-selection--multiple .select2-selection__choice__remove {
-            color: theme('colors.neutral.500') !important;
-            border-right: 1px solid theme('colors.neutral.300') !important;
-            padding-right: 6px !important;
-            margin-right: 6px !important;
-        }
-        .select2-dropdown {
-            border: 1px solid theme('colors.accent.DEFAULT') !important;
-            border-radius: 0 !important;
-            font-family: 'IBM Plex Mono', monospace;
-            font-size: 0.875rem;
-            z-index: 9999;
-        }
+{{ select2.select2_light() }}
         
         @media (prefers-color-scheme: dark) {
-            .select2-container--default .select2-selection--multiple,
-            .select2-container--default .select2-selection--single {
-                border-color: theme('colors.neutral.700') !important;
-            }
-            .select2-container--default .select2-selection--single .select2-selection__rendered {
-                color: theme('colors.neutral.100') !important;
-            }
-            .select2-container--default.select2-container--focus .select2-selection--multiple,
-            .select2-container--default.select2-container--focus .select2-selection--single {
-                border-color: theme('colors.accent.dark') !important;
-                box-shadow: 0 0 0 1px theme('colors.accent.dark');
-            }
-            .select2-container--default .select2-selection--multiple .select2-selection__choice {
-                background-color: theme('colors.neutral.800') !important;
-                border-color: theme('colors.neutral.600') !important;
-                color: theme('colors.neutral.100') !important;
-            }
-            .select2-container--default .select2-selection--multiple .select2-selection__choice__remove {
-                color: theme('colors.neutral.400') !important;
-                border-right-color: theme('colors.neutral.600') !important;
-            }
-            .select2-container--default .select2-selection--multiple .select2-selection__choice__remove:hover {
-                background-color: theme('colors.red.900') !important;
-                color: theme('colors.red.100') !important;
-            }
-            .select2-dropdown {
-                background-color: theme('colors.neutral.900') !important;
-                border-color: theme('colors.neutral.700') !important;
-            }
-            .select2-container--default .select2-results__option[aria-selected=true] {
-                background-color: theme('colors.neutral.800') !important;
-            }
-            .select2-container--default .select2-results__option--highlighted[aria-selected] {
-                background-color: theme('colors.accent.dark') !important;
-                color: white !important;
-            }
-            .select2-search--dropdown .select2-search__field {
-                background-color: theme('colors.neutral.950') !important;
-                border: 1px solid theme('colors.neutral.700') !important;
-                color: theme('colors.neutral.100') !important;
-                font-family: 'IBM Plex Mono', monospace;
-            }
+{{ select2.select2_dark() }}
         }
     </style>
 
@@ -322,12 +235,7 @@
     </table>
 </div>
 
-<!-- Pagination Controls -->
-<nav id="pagination-controls" class="flex justify-center items-center gap-4 mb-12 font-mono text-sm hidden" aria-label="Pagination">
-    <button id="prev-page" aria-label="Previous page" class="px-4 py-2 border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-neutral-600 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark disabled:opacity-50 disabled:cursor-not-allowed transition-colors uppercase font-bold tracking-wider">Prev</button>
-    <span id="page-info" aria-current="page" class="text-neutral-600 dark:text-neutral-400">Page 1 of 1</span>
-    <button id="next-page" aria-label="Next page" class="px-4 py-2 border border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 text-neutral-600 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark disabled:opacity-50 disabled:cursor-not-allowed transition-colors uppercase font-bold tracking-wider">Next</button>
-</nav>
+{% set pagination_margin = 'mb-12' %}{% include "partials/_searchable_grid.html" %}
 
 {% for agent in workflows_list %}
     {% if agent.required_secrets or agent.required_variables or agent.secret_groups %}
@@ -347,100 +255,7 @@
                     Provide the required configuration variables and secrets for this workflow. These are stored securely in its isolated service account.
                 </p>
                 
-                <div class="space-y-4">
-                    {% if agent.required_variables %}
-                    <div class="space-y-4">
-                        <h4 class="text-xs font-bold uppercase tracking-wider text-neutral-500 font-mono border-b border-neutral-200 dark:border-neutral-800 pb-1">Configuration Variables</h4>
-                        {% for var in agent.required_variables %}
-                        <div>
-                            <div class="flex justify-between items-center mb-1">
-                                <label for="{{ var }}_{{ agent.name }}" class="block font-mono text-sm font-bold uppercase tracking-wide">
-                                    {{ var }}
-                                </label>
-                                {% if var in agent.missing_variables %}
-                                <span class="text-[10px] text-orange-500 font-mono uppercase tracking-widest font-bold">Required</span>
-                                {% else %}
-                                <span class="text-[10px] text-emerald-500 font-mono uppercase tracking-widest">Configured</span>
-                                {% endif %}
-                            </div>
-                            <input type="text" 
-                                   name="{{ var }}" 
-                                   id="{{ var }}_{{ agent.name }}"
-                                   value="{{ agent.current_variables.get(var, '') }}"
-                                   placeholder="Enter {{ var }}"
-                                   class="w-full bg-white dark:bg-[#0a0a0a] border border-neutral-300 dark:border-neutral-700 px-4 py-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 placeholder-neutral-400 dark:placeholder-neutral-600">
-                        </div>
-                        {% endfor %}
-                    </div>
-                    {% endif %}
-
-                    {% if agent.required_secrets %}
-                    <div class="space-y-4 pt-2">
-                        <h4 class="text-xs font-bold uppercase tracking-wider text-neutral-500 font-mono border-b border-neutral-200 dark:border-neutral-800 pb-1">Sensitive Secrets</h4>
-                        {% for secret in agent.required_secrets %}
-                        <div>
-                            <div class="flex justify-between items-center mb-1">
-                                <label for="{{ secret }}_{{ agent.name }}" class="block font-mono text-sm font-bold uppercase tracking-wide">
-                                    {{ secret }}
-                                </label>
-                                {% if secret in agent.missing_secrets %}
-                                <span class="text-[10px] text-orange-500 font-mono uppercase tracking-widest font-bold">Required</span>
-                                {% else %}
-                                <span class="text-[10px] text-emerald-500 font-mono uppercase tracking-widest">Configured</span>
-                                {% endif %}
-                            </div>
-                            <input type="password" 
-                                   name="{{ secret }}" 
-                                   id="{{ secret }}_{{ agent.name }}"
-                                   placeholder="{% if secret not in agent.missing_secrets %}******** (Leave blank to keep current){% else %}Enter {{ secret }}{% endif %}"
-                                   class="w-full bg-white dark:bg-[#0a0a0a] border border-neutral-300 dark:border-neutral-700 px-4 py-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 placeholder-neutral-400 dark:placeholder-neutral-600">
-                        </div>
-                        {% endfor %}
-                    </div>
-                    {% endif %}
-
-                    {% if agent.secret_groups %}
-                    <div class="space-y-4 pt-2">
-                        <h4 class="text-xs font-bold uppercase tracking-wider text-neutral-500 font-mono border-b border-neutral-200 dark:border-neutral-800 pb-1">Credential Groups</h4>
-                        {% for group in agent.secret_groups %}
-                        {% set group_key = agent.name ~ '__' ~ loop.index %}
-                        <div class="space-y-3">
-                            <div class="flex items-center gap-3">
-                                <label class="font-mono text-xs uppercase tracking-wider text-neutral-500 dark:text-neutral-400">{{ group.select_label }}</label>
-                                <select class="secret-group-select bg-white dark:bg-[#0a0a0a] border border-neutral-300 dark:border-neutral-700 p-2 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark text-neutral-900 dark:text-neutral-100"
-                                        data-group-key="{{ group_key }}">
-                                    {% for option in group.options %}
-                                    <option value="{{ option.value }}">{{ option.label }}</option>
-                                    {% endfor %}
-                                </select>
-                            </div>
-                            {% for option in group.options %}
-                            <div class="secret-group-option space-y-4 {{ '' if loop.first else 'hidden' }}"
-                                 data-group-key="{{ group_key }}" data-option-value="{{ option.value }}">
-                                {% for field in option.fields %}
-                                <div>
-                                    <div class="flex justify-between items-center mb-1">
-                                        <label for="{{ field.key }}_{{ agent.name }}" class="block font-mono text-[11px] uppercase tracking-wider text-neutral-400 dark:text-neutral-500">
-                                            {{ option.label }} {{ field.label }}
-                                        </label>
-                                        {% if field.is_set %}
-                                        <span class="text-[10px] text-emerald-500 font-mono uppercase tracking-widest">Configured</span>
-                                        {% endif %}
-                                    </div>
-                                    <input type="{{ field.type }}"
-                                           name="{{ field.key }}"
-                                           id="{{ field.key }}_{{ agent.name }}"
-                                           placeholder="{% if field.is_set %}******** (Leave blank to keep current){% else %}Enter {{ field.label }}{% endif %}"
-                                           class="w-full bg-white dark:bg-[#0a0a0a] border border-neutral-300 dark:border-neutral-700 px-4 py-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 placeholder-neutral-400 dark:placeholder-neutral-600">
-                                </div>
-                                {% endfor %}
-                            </div>
-                            {% endfor %}
-                        </div>
-                        {% endfor %}
-                    </div>
-                    {% endif %}
-                </div>
+                {{ creds.credential_fields(agent, agent.name) }}
 
                 <button type="submit" class="bg-accent hover:bg-accent-dark text-white font-mono font-bold text-sm uppercase py-3 px-8 transition-colors mt-2">
                     Save Configuration
@@ -568,44 +383,7 @@
                             Allowed MCP Tools
                             <span class="font-normal text-[10px] bg-neutral-100 dark:bg-neutral-800 px-2 py-1 border border-neutral-200 dark:border-neutral-700 text-neutral-500">FILTER</span>
                         </label>
-                        <input type="text" id="toolSearch-{{ agent.name }}" placeholder="Type to filter tools..." class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono mb-4 !border-b-0">
-                        <div class="border border-neutral-300 dark:border-neutral-700 p-4 max-h-64 overflow-y-auto bg-neutral-50 dark:bg-neutral-950/50" id="toolList-{{ agent.name }}">
-                            {% for tool in all_tools %}
-                            <div class="flex items-center mb-3 tool-item p-2 hover:bg-white dark:hover:bg-neutral-800 transition-colors border border-transparent hover:border-neutral-200 dark:hover:border-neutral-700 relative group">
-                                <input id="tool_{{ tool.name }}_{{ agent.name }}" name="allowed_tools" value="{{ tool.name }}" type="checkbox" {% if tool.name in agent.config.get("allowed_tools", []) %}checked{% endif %} class="modal-tool-checkbox h-4 w-4 text-accent border-neutral-300 dark:border-neutral-600 bg-white dark:bg-neutral-900 rounded-none focus:ring-accent focus:ring-offset-0 dark:focus:ring-offset-neutral-900">
-                                <label for="tool_{{ tool.name }}_{{ agent.name }}" class="ml-3 flex flex-col justify-center text-sm font-mono text-neutral-900 dark:text-neutral-100 tool-name-label cursor-pointer w-full overflow-hidden">
-                                    <div class="flex items-center justify-between w-full">
-                                        <div class="flex items-center">
-                                            <span>{{ tool.name }}</span>
-                                            {% if tool.version %}
-                                                <span class="text-xs text-neutral-500 ml-2">v{{ tool.version }}</span>
-                                            {% endif %}
-                                        </div>
-                                        {% if tool.type == 'mcp' %}
-                                        <span class="text-[10px] bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200 px-2 py-0.5 ml-2 border border-blue-200 dark:border-blue-800 rounded-sm whitespace-nowrap flex-shrink-0">
-                                            MCP: {{ tool.source }}
-                                        </span>
-                                        {% else %}
-                                        <span class="text-[10px] bg-neutral-100 text-neutral-600 dark:bg-neutral-800 dark:text-neutral-400 px-2 py-0.5 ml-2 border border-neutral-200 dark:border-neutral-700 rounded-sm whitespace-nowrap flex-shrink-0">
-                                            Local Hub
-                                        </span>
-                                        {% endif %}
-                                    </div>
-                                    {% if tool.description %}
-                                    <div class="text-xs text-neutral-500 dark:text-neutral-400 mt-1 truncate w-full tool-desc">
-                                        {{ tool.description }}
-                                    </div>
-                                    <!-- Custom Tooltip -->
-                                    <div class="opacity-0 invisible group-[.is-truncated]:hover:opacity-100 group-[.is-truncated]:hover:visible transition-all duration-200 delay-500 absolute z-50 left-0 top-full mt-1 w-full bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 p-2 text-xs font-mono shadow-lg border border-neutral-800 dark:border-neutral-200 whitespace-normal break-words pointer-events-none">
-                                        {{ tool.description }}
-                                    </div>
-                                    {% endif %}
-                                </label>
-                            </div>
-                            {% else %}
-                            <div class="text-sm font-mono text-neutral-500 p-4 text-center border border-dashed border-neutral-300 dark:border-neutral-700">No tools registered in system.</div>
-                            {% endfor %}
-                        </div>
+{{ tool_picker.tool_picker(all_tools, agent.config.get("allowed_tools", []), id_suffix=agent.name, modal=true, search_class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono mb-4 !border-b-0") }}
                     </div>
                     
                     <div class="pt-4">

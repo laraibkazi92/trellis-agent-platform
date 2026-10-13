@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from starlette.middleware.sessions import SessionMiddleware
 from dotenv import load_dotenv
 
-from core.devmode import enforce_dev_mode_safety
+from core.devmode import configure_cors, enforce_dev_mode_safety
 
 load_dotenv()
 
@@ -39,24 +39,11 @@ if not DEV_MODE:
 enforce_dev_mode_safety("ui")
 
 from core.routers import auth, marketplace, profile, admin, configuration, docs, status, workflows, api, reports, mcp_oauth
-from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Marketplace UI", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
 
-cors_origins_str = os.getenv("CORS_ALLOWED_ORIGINS", "")
-if DEV_MODE:
-    allow_origins = ["*"]
-else:
-    allow_origins = [origin.strip() for origin in cors_origins_str.split(",")] if cors_origins_str else []
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allow_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+configure_cors(app)
 
 app.include_router(auth.router)
 app.include_router(marketplace.router)

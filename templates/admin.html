@@ -178,6 +178,110 @@
         {% endif %}
       </div>
     </div>
+
+    <div class="flex items-start justify-between flex-wrap gap-4 mt-4 pt-4 border-t border-gray-200">
+      <div class="pr-6 max-w-xl">
+        <p class="text-sm font-semibold text-gray-900">Decider Model &amp; Confidence</p>
+        <p class="text-sm text-gray-500 mt-1">
+          Model, provider and base_url for the single-pass decider, plus the minimum confidence
+          required to accept a match. Blank fields fall back to the env-var defaults
+          (<code class="text-xs bg-gray-100 px-1 py-0.5 rounded">RULES_EVALUATION_MODEL</code> etc.).
+        </p>
+      </div>
+      <form action="/admin/rules-engine/model" method="POST" class="grid grid-cols-2 gap-2 w-full max-w-md shrink-0">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <select name="provider" class="rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-neutral-900">
+          <option value="">Provider: default ({{ rules_engine.provider_default or 'inferred' }})</option>
+          {% for p in allowed_providers %}
+          <option value="{{ p }}" {% if rules_engine.provider_override == p %}selected{% endif %}>{{ p }}</option>
+          {% endfor %}
+        </select>
+        <input type="text" name="model" value="{{ rules_engine.model_override or '' }}" placeholder="Model (default: {{ rules_engine.model_default }})" class="rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-neutral-900">
+        <input type="text" name="base_url" value="{{ rules_engine.base_url_override or '' }}" placeholder="Base URL (optional)" class="rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-neutral-900">
+        <div class="flex items-center gap-2">
+          <input type="number" step="0.05" min="0" max="1" name="confidence_threshold" value="{{ rules_engine.confidence_override if rules_engine.confidence_override is not none else '' }}" placeholder="Threshold: {{ rules_engine.confidence_default }}" class="flex-1 rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-neutral-900">
+          <button type="submit" class="inline-flex items-center px-4 py-2 bg-neutral-800 text-white text-sm font-medium rounded-md hover:bg-neutral-900 shadow-sm transition-colors uppercase font-mono tracking-wide">
+            Save
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- Branding -->
+<div class="bg-white shadow-sm rounded-xl border border-gray-200 mb-8 overflow-hidden">
+  <div class="px-6 py-4 border-b border-gray-200 bg-gray-50">
+    <h2 class="text-lg font-semibold text-gray-900">Branding</h2>
+  </div>
+  <div class="px-6 py-4">
+    <p class="text-sm text-gray-500 mb-4">
+      Whitelabel the UI (app name, logos, login copy, accent colors). Stored in the framework config
+      store; leave a field blank to fall back to its
+      <code class="text-xs bg-gray-100 px-1 py-0.5 rounded">APP_*</code> env default. Changes take
+      effect within ~30 seconds and apply to every page.
+    </p>
+    {% set branding_labels = {
+      'name': 'App Name',
+      'favicon_url': 'Favicon URL',
+      'logo_url': 'Logo URL',
+      'login_logo_url': 'Login Logo URL',
+      'login_title': 'Login Title',
+      'login_subtitle': 'Login Subtitle',
+      'login_disclaimer': 'Login Disclaimer',
+      'accent_color': 'Accent Color (hex)',
+      'accent_color_dark': 'Accent Color Dark (hex)',
+    } %}
+    <form action="/admin/branding" method="POST" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      {% for key in branding_keys %}
+      <div>
+        <label class="block text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">{{ branding_labels.get(key, key) }}</label>
+        <input type="text" name="{{ key }}" value="{{ branding.get(key) or '' }}" placeholder="Using env default" class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-neutral-900">
+      </div>
+      {% endfor %}
+      <div class="md:col-span-2 flex justify-end">
+        <button type="submit" class="inline-flex items-center px-4 py-2 bg-neutral-800 text-white text-sm font-medium rounded-md hover:bg-neutral-900 shadow-sm transition-colors uppercase font-mono tracking-wide">
+          Save Branding
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Limits & Tuning -->
+<div class="bg-white shadow-sm rounded-xl border border-gray-200 mb-8 overflow-hidden">
+  <div class="px-6 py-4 border-b border-gray-200 bg-gray-50">
+    <h2 class="text-lg font-semibold text-gray-900">Limits &amp; Tuning</h2>
+  </div>
+  <div class="px-6 py-4">
+    <p class="text-sm text-gray-500 mb-4">
+      Operational limits and timeouts. Stored in the framework config store; leave a field blank
+      to fall back to its env-var default. Changes take effect within ~30 seconds.
+    </p>
+    <form action="/admin/tunables" method="POST" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      {% for t in tunables %}
+      <div>
+        <label class="block text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">
+          {{ t.label }}
+          <code class="ml-1 normal-case text-[10px] bg-gray-100 px-1 py-0.5 rounded text-gray-400">{{ t.env_var }}</code>
+        </label>
+        <input type="text" name="{{ t.name }}" value="{{ t.override if t.override is not none else '' }}" placeholder="{{ t.default }}" class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-neutral-900">
+        <p class="text-xs text-gray-400 mt-1">
+          Effective: <strong>{{ t.effective }}</strong> &middot; default {{ t.default }} &middot; {{ t.help }}
+        </p>
+        {% if t.warning %}
+        <p class="text-xs text-amber-600 mt-1">&#9888; {{ t.warning }}</p>
+        {% endif %}
+      </div>
+      {% endfor %}
+      <div class="md:col-span-2 flex justify-end">
+        <button type="submit" class="inline-flex items-center px-4 py-2 bg-neutral-800 text-white text-sm font-medium rounded-md hover:bg-neutral-900 shadow-sm transition-colors uppercase font-mono tracking-wide">
+          Save Limits &amp; Tuning
+        </button>
+      </div>
+    </form>
   </div>
 </div>
 
