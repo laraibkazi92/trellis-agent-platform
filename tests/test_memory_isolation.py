@@ -401,11 +401,24 @@ def test_sync_retain_degrades_to_shared_bank_without_user(monkeypatch):
 class FakeAdminIdentity:
     """In-memory stand-in for the flag reads/writes the admin router uses."""
 
+    BRANDING_KEYS = (
+        "name",
+        "favicon_url",
+        "logo_url",
+        "login_logo_url",
+        "login_title",
+        "login_subtitle",
+        "login_disclaimer",
+        "accent_color",
+        "accent_color_dark",
+    )
+
     def __init__(self, agent_memory_enabled=False, isolated=False):
         self.flags = {
             "agent_memory_enabled": agent_memory_enabled,
             "agent_memory_isolated_per_user": isolated,
         }
+        self.tunables = {}
 
     def list_all_users(self):
         return []
@@ -427,6 +440,30 @@ class FakeAdminIdentity:
 
     def get_rules_evaluation_timeout(self):
         return None
+
+    def get_rules_evaluation_model(self):
+        return None
+
+    def get_rules_evaluation_provider(self):
+        return None
+
+    def get_rules_evaluation_base_url(self):
+        return None
+
+    def get_rules_confidence_threshold(self):
+        return None
+
+    def get_branding(self, key):
+        return None
+
+    def get_tunable(self, name):
+        return self.tunables.get(name)
+
+    def set_tunable(self, name, value):
+        self.tunables[name] = value
+
+    def clear_tunable(self, name):
+        self.tunables.pop(name, None)
 
 
 class FakeAdminRequest:

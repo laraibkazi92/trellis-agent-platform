@@ -16,6 +16,7 @@ Covers:
 import asyncio
 from types import SimpleNamespace
 
+import yaml
 from starlette.datastructures import FormData
 
 from core.routers import admin
@@ -269,8 +270,6 @@ def test_save_agent_persists_external_false_and_internal_false(monkeypatch):
     the checkbox fields themselves are absent, that represents a deliberate uncheck in
     the browser, and False should still be persisted."""
     monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
-    monkeypatch.setattr(admin, "GITHUB_REPO", "")
-    monkeypatch.setattr(admin, "GITHUB_TOKEN", "")
 
     agent_configs = {
         "data-parser": {"name": "data-parser", "description": "worker"},
@@ -304,8 +303,6 @@ def test_save_agent_raw_post_without_sentinels_preserves_existing_values(monkeyp
     be treated as a deliberate uncheck -- it should preserve whatever external/internal
     value the agent already had persisted, rather than silently flipping to False."""
     monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
-    monkeypatch.setattr(admin, "GITHUB_REPO", "")
-    monkeypatch.setattr(admin, "GITHUB_TOKEN", "")
 
     agent_configs = {
         "data-parser": {
@@ -341,8 +338,6 @@ def test_save_agent_raw_post_without_sentinels_preserves_default_true(monkeypatc
     (legacy config predating the flags) -- the default of True must be preserved, not
     flipped to False."""
     monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
-    monkeypatch.setattr(admin, "GITHUB_REPO", "")
-    monkeypatch.setattr(admin, "GITHUB_TOKEN", "")
 
     agent_configs = {
         "legacy-agent": {"name": "legacy-agent", "description": "worker"},
@@ -372,8 +367,6 @@ def test_save_agent_raw_post_without_sentinels_coerces_legacy_string_values(monk
     of a real bool false) must be normalized to a genuine bool when preserved through the
     sentinel-absent branch, so downstream `is not False` identity checks work correctly."""
     monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
-    monkeypatch.setattr(admin, "GITHUB_REPO", "")
-    monkeypatch.setattr(admin, "GITHUB_TOKEN", "")
 
     agent_configs = {
         "legacy-string-agent": {
@@ -405,8 +398,6 @@ def test_save_agent_raw_post_without_sentinels_coerces_legacy_string_values(monk
 
 def test_save_agent_persists_external_true_and_internal_true_when_checked(monkeypatch):
     monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
-    monkeypatch.setattr(admin, "GITHUB_REPO", "")
-    monkeypatch.setattr(admin, "GITHUB_TOKEN", "")
 
     agent_configs = {
         "general-agent": {"name": "general-agent", "description": "general"},
@@ -436,8 +427,6 @@ def test_save_agent_persists_external_true_and_internal_true_when_checked(monkey
 
 def test_save_agent_drops_a2a_targets_with_internal_false(monkeypatch):
     monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
-    monkeypatch.setattr(admin, "GITHUB_REPO", "")
-    monkeypatch.setattr(admin, "GITHUB_TOKEN", "")
 
     agent_configs = {
         "triage-lead": {"name": "triage-lead", "description": "d"},
@@ -471,8 +460,6 @@ def test_save_agent_keeps_a2a_target_missing_from_registry_fail_open(monkeypatch
     fail closed on — matches the fail-open-on-missing-config pattern used elsewhere in this
     spec (Phase 2/3), as opposed to fail-closed only on an explicit internal: False."""
     monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
-    monkeypatch.setattr(admin, "GITHUB_REPO", "")
-    monkeypatch.setattr(admin, "GITHUB_TOKEN", "")
 
     agent_configs = {
         "triage-lead": {"name": "triage-lead", "description": "d"},
@@ -496,3 +483,31 @@ def test_save_agent_keeps_a2a_target_missing_from_registry_fail_open(monkeypatch
 
     saved = fake_identity.saved_configs["triage-lead"]
     assert saved["a2a_access"] == ["unknown-agent"]
+
+
+def test_save_agent_dual_writes_workspace_files(monkeypatch):
+    """UI edits must persist to the workspace, not just etcd: scripts/sync_to_db.py
+    re-applies the on-disk config on every rebuild, so an etcd-only save would be
+    reverted. This is the local-file replacement for the old GitHub write-back."""
+    monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
+
+    fake_identity = FakeIdentityManagerAdmin({"data-parser": {"name": "data-parser"}})
+    monkeypatch.setattr(admin, "identity_mgr", fake_identity)
+
+    form_data = _form([
+        ("model", "gemini-3-flash-preview"),
+        ("thinking_level", "none"),
+        ("version", "0.1.0"),
+        ("description", "worker"),
+        ("skills_content", "do work"),
+    ])
+    request = FakeRequest(session=_admin_session(), form_data=form_data)
+
+    asyncio.run(admin.save_agent(request, "data-parser"))
+
+    # conftest redirects workspace_io at a per-test tmp dir, so this never touches the repo.
+    from core import workspace_io
+
+    agent_dir = workspace_io.WORKSPACE_DIR / "agents" / "data-parser"
+    assert yaml.safe_load((agent_dir / "config.yaml").read_text())["name"] == "data-parser"
+    assert (agent_dir / "skills.md").read_text() == "do work"

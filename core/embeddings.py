@@ -14,10 +14,9 @@ import math
 import logging
 from typing import List, Optional
 
-logger = logging.getLogger(__name__)
+from core.tunables import resolve as resolve_tunable
 
-# 768-dim by default; configurable so deployments can swap models without code changes.
-EMBEDDING_MODEL = os.getenv("AGENT_EMBEDDING_MODEL", "gemini-embedding-001")
+logger = logging.getLogger(__name__)
 
 _client = None
 
@@ -54,7 +53,7 @@ def embed_text(text: str, task_type: str = "retrieval_document") -> Optional[Lis
     try:
         from google.genai import types
         response = client.models.embed_content(
-            model=EMBEDDING_MODEL,
+            model=resolve_tunable("agent_embedding_model"),
             contents=text,
             config=types.EmbedContentConfig(task_type=task_type),
         )

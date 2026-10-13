@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
-import os
 import copy
 import logging
 from datetime import datetime, timezone
@@ -13,15 +12,14 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from core.auth import IdentityManager
 import core.health_db as health_db
-
-DEFAULT_HEALTH_COOLDOWN_SECONDS = int(os.getenv("HEALTH_COOLDOWN_SECONDS", "60"))
+from core.tunables import resolve as resolve_tunable
 
 
 def compute_agent_operational_status(
     cfg: Dict[str, Any],
     agent_health: Optional[Dict[str, Any]],
     tool_healths: Dict[str, Dict[str, Any]],
-    cooldown_seconds: int = DEFAULT_HEALTH_COOLDOWN_SECONDS,
+    cooldown_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Cross-reference an agent's own evaluated health against its ``allowed_tools``'
     health to derive the combined Online/Offline/Degraded status.
@@ -34,6 +32,8 @@ def compute_agent_operational_status(
 
     Returns ``{"status", "offline_tools", "agent_error"}``.
     """
+    if cooldown_seconds is None:
+        cooldown_seconds = resolve_tunable("health_cooldown_seconds")
     offline_tools = [
         t for t in cfg.get("allowed_tools", [])
         if evaluate_health_status(tool_healths.get(t) or {}, cooldown_seconds).get("status") == "Offline"
@@ -49,18 +49,22 @@ def compute_agent_operational_status(
 
 
 def evaluate_health_status(
-    status: Dict[str, Any], cooldown_seconds: int = DEFAULT_HEALTH_COOLDOWN_SECONDS
+    status: Dict[str, Any], cooldown_seconds: Optional[int] = None
 ) -> Dict[str, Any]:
     """Evaluate if an Offline status has exceeded its cooldown period and should
     transition to Half-Open for probe requests.
 
-    Pure function (no I/O, only reads ``status`` and the system clock) so every
-    caller that needs to know whether an agent is *actually* usable right now --
-    ``core.agent_search._resolve_rule_lock``'s post-match availability check (rules
-    engine, Phase E), the ``/agents`` marketplace page, and the ``/health`` endpoint --
-    derives the same evaluated status from the same raw stored record, instead of
-    independently reimplementing (and silently disagreeing on) the cooldown transform.
+    No I/O of its own (only reads ``status``, the system clock, and the cached
+    ``health_cooldown_seconds`` tunable) so every caller that needs to know whether an
+    agent is *actually* usable right now -- ``core.agent_search._resolve_rule_lock``'s
+    post-match availability check (rules engine, Phase E), the ``/agents`` marketplace
+    page, and the ``/health`` endpoint -- derives the same evaluated status from the same
+    raw stored record, instead of independently reimplementing (and silently disagreeing
+    on) the cooldown transform. ``cooldown_seconds=None`` resolves to the admin-tunable
+    ``health_cooldown_seconds`` (env ``HEALTH_COOLDOWN_SECONDS``, default 60).
     """
+    if cooldown_seconds is None:
+        cooldown_seconds = resolve_tunable("health_cooldown_seconds")
     if not status or status.get("status") != "Offline":
         return status
 
@@ -84,8 +88,8 @@ def evaluate_health_status(
 class HealthMonitor:
     def __init__(self, identity_mgr: "IdentityManager"):
         self.identity_mgr = identity_mgr
-        self.failure_threshold = int(os.getenv("HEALTH_FAILURE_THRESHOLD", "10"))
-        self.cooldown_seconds = int(os.getenv("HEALTH_COOLDOWN_SECONDS", "60"))
+        self.failure_threshold = resolve_tunable("health_failure_threshold")
+        self.cooldown_seconds = resolve_tunable("health_cooldown_seconds")
         # Initialize the health events database
         health_db.init_db()
 

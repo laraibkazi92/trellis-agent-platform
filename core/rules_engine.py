@@ -254,15 +254,20 @@ _model_overrides_checked_at: float = 0.0
 _model_overrides_refresh_in_flight: bool = False
 _cached_provider_override: Optional[str] = None
 _cached_base_url_override: Optional[str] = None
+_cached_model_override: Optional[str] = None
+_cached_confidence_override: Optional[float] = None
 
 
 def _refresh_model_overrides_sync() -> None:
     """Runs in a thread-pool worker via loop.run_in_executor -- never awaited directly."""
     global _cached_provider_override, _cached_base_url_override
+    global _cached_model_override, _cached_confidence_override
     global _model_overrides_checked_at, _model_overrides_refresh_in_flight
     try:
         _cached_provider_override = identity_mgr.get_rules_evaluation_provider()
         _cached_base_url_override = identity_mgr.get_rules_evaluation_base_url()
+        _cached_model_override = identity_mgr.get_rules_evaluation_model()
+        _cached_confidence_override = identity_mgr.get_rules_confidence_threshold()
     except Exception as e:
         logger.warning(f"[RulesEngine] Failed to refresh model provider/base_url overrides from etcd: {e}; retaining previous cache")
     finally:
@@ -303,6 +308,18 @@ def _resolve_evaluation_base_url() -> Optional[str]:
     """Admin etcd override > RULES_EVALUATION_BASE_URL env var > None."""
     _kick_model_overrides_refresh()
     return _cached_base_url_override or RULES_EVALUATION_BASE_URL or None
+
+
+def _resolve_evaluation_model() -> str:
+    """Admin etcd override > RULES_EVALUATION_MODEL env var default."""
+    _kick_model_overrides_refresh()
+    return _cached_model_override or RULES_EVALUATION_MODEL
+
+
+def _resolve_confidence_threshold() -> float:
+    """Admin etcd override (set via /admin) > RULES_CONFIDENCE_THRESHOLD env var default."""
+    _kick_model_overrides_refresh()
+    return _cached_confidence_override if _cached_confidence_override is not None else RULES_CONFIDENCE_THRESHOLD
 
 # Exact-match query result cache: avoids re-invoking the LLM for a repeated
 # identical query. Keyed on (query, catalog_hash) rather than query alone so a
@@ -350,7 +367,8 @@ def _build_evaluation_agent() -> Agent:
     """
     provider = _resolve_evaluation_provider()
     base_url = _resolve_evaluation_base_url()
-    model = resolve_model(provider, RULES_EVALUATION_MODEL, base_url)
+    model_name = _resolve_evaluation_model()
+    model = resolve_model(provider, model_name, base_url)
     if provider == "google":
         # Gemini thinking is explicitly zeroed out to keep the decider deterministic
         # and cheap (preserved from the pre-multi-provider implementation).
@@ -360,7 +378,7 @@ def _build_evaluation_agent() -> Agent:
     elif provider in ("openai", "anthropic"):
         # Their reasoning models default to medium effort, which blows the
         # sub-3s evaluation timeout; pin the cheapest effort instead.
-        model_settings = build_model_settings(provider, RULES_EVALUATION_MODEL, "low")
+        model_settings = build_model_settings(provider, model_name, "low")
     else:
         model_settings = None
     return Agent(
@@ -411,6 +429,7 @@ async def evaluate_rules(
 
         agent = _build_evaluation_agent()
         timeout = _resolve_evaluation_timeout()
+        threshold = _resolve_confidence_threshold()
         run_result = await asyncio.wait_for(agent.run(user_prompt), timeout=timeout)
         result = run_result.output
 
@@ -421,9 +440,9 @@ async def evaluate_rules(
             logger.warning(
                 f"[RulesEngine] Matched agent '{result.matched_agent}' is not an eligible agent; failing open to semantic search"
             )
-        elif result.confidence < RULES_CONFIDENCE_THRESHOLD:
+        elif result.confidence < threshold:
             logger.debug(
-                f"[RulesEngine] Match confidence {result.confidence} below threshold {RULES_CONFIDENCE_THRESHOLD}; falling open to semantic search"
+                f"[RulesEngine] Match confidence {result.confidence} below threshold {threshold}; falling open to semantic search"
             )
         else:
             logger.info(

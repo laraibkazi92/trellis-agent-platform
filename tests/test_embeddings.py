@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 import core.embeddings as embeddings
+from core import tunables
 
 _VECTOR = [0.1, 0.2, 0.3]
 
@@ -58,7 +59,7 @@ def test_embed_text_passes_model_contents_and_default_task_type(monkeypatch):
     embeddings.embed_text("hello")
 
     (call,) = models.calls
-    assert call["model"] == embeddings.EMBEDDING_MODEL
+    assert call["model"] == tunables.resolve("agent_embedding_model")
     assert call["contents"] == "hello"
     assert call["config"].task_type == "retrieval_document"
 

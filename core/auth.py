@@ -19,7 +19,6 @@ from core.models import Identity, IdentityType
 
 import pyetcd
 from fastapi import Request, HTTPException
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
@@ -272,22 +271,6 @@ class IdentityManager:
         """Set a framework configuration value."""
         self.client.put(f"/config/framework/{key}", json.dumps(value))
 
-    def get_disabled_agents(self) -> List[str]:
-        """Retrieve the list of disabled agents (Legacy: maps to standard agents).
-
-        Not itself @retry_etcd()-decorated: relies on get_disabled_standard_agents()'s
-        own retry, which itself relies on get_config()'s retry. This method used to be
-        a third @retry_etcd() layer on top of both -- three nested retry layers multiply
-        worst-case retry time (10x10x10 attempts, ~2000+s) instead of adding to it -- see
-        get_agent_memory_enabled above for the same (now-normalized) pattern."""
-        return self.get_disabled_standard_agents()
-
-    def set_disabled_agents(self, agents: List[str]) -> None:
-        """Set the list of disabled agents (Legacy: maps to standard agents).
-
-        Not itself @retry_etcd()-decorated -- see get_disabled_agents above."""
-        self.set_disabled_standard_agents(agents)
-
     def get_disabled_standard_agents(self) -> List[str]:
         """Retrieve the list of disabled standard agents.
 
@@ -311,12 +294,6 @@ class IdentityManager:
         ~200+s) instead of adding to it -- see get_agent_memory_enabled above for the
         same pattern."""
         return self.get_config("disabled_workflows", [])
-
-    def set_disabled_workflows(self, workflows: List[str]) -> None:
-        """Set the list of disabled workflows.
-
-        Not itself @retry_etcd()-decorated -- see get_disabled_workflows above."""
-        self.set_config("disabled_workflows", workflows)
 
     def _atomic_update_config_list(self, key: str, update_fn) -> List[str]:
         """Atomically update a JSON list in /config/framework/{key} using Compare-And-Swap (CAS).
@@ -445,6 +422,11 @@ class IdentityManager:
         self.set_config("rules_evaluation_timeout", float(timeout_seconds))
 
     @retry_etcd()
+    def clear_config(self, key: str) -> None:
+        """Delete a framework configuration value from etcd, reverting it to its default."""
+        self.client.delete(f"/config/framework/{key}")
+
+    @retry_etcd()
     def clear_rules_evaluation_timeout(self) -> None:
         """Remove the admin override, reverting to the RULES_EVALUATION_TIMEOUT env var default."""
         self.client.delete("/config/framework/rules_evaluation_timeout")
@@ -481,30 +463,113 @@ class IdentityManager:
         Not itself @retry_etcd()-decorated -- see get_rules_evaluation_base_url above."""
         self.set_config("rules_evaluation_base_url", str(base_url))
 
-    def get_app_config(self) -> Dict[str, Any]:
-        """Retrieve the application configuration for whitelabeling.
+    def get_rules_evaluation_model(self) -> Optional[str]:
+        """Retrieve the admin-configured model for the Rules Engine LLM decider, or None
+        if never set -- callers fall back to the RULES_EVALUATION_MODEL env var default.
 
-        Not itself @retry_etcd()-decorated: get_config() already retries, and this
-        method calls it once per whitelabel key (5 keys). Stacking a second retry layer
-        on top would multiply worst-case retry time per key (10x10 attempts per key,
-        ~200+s each, ~1000+s total) instead of adding to it -- see get_agent_memory_enabled
-        above for the same pattern."""
-        # Start with environment variables as defaults
-        config = {
-            "APP_NAME": os.getenv("APP_NAME", "Trellis"),
-            "APP_LOGO_URL": os.getenv("APP_LOGO_URL", ""),
-            "APP_FAVICON_URL": os.getenv("APP_FAVICON_URL", ""),
-            "APP_ACCENT_COLOR": os.getenv("APP_ACCENT_COLOR", "#0055FF"),
-            "APP_ACCENT_COLOR_DARK": os.getenv("APP_ACCENT_COLOR_DARK", "#3377FF"),
-        }
-        
-        # Try to override with etcd values if they exist
-        for key in config.keys():
-            etcd_val = self.get_config(f"app_{key.lower()}")
-            if etcd_val:
-                config[key] = etcd_val
-                
-        return config
+        Not itself @retry_etcd()-decorated -- see get_rules_evaluation_provider above."""
+        value = self.get_config("rules_evaluation_model", None)
+        return str(value) if value is not None else None
+
+    def set_rules_evaluation_model(self, model: str) -> None:
+        """Set the admin-configured model for the Rules Engine LLM decider.
+
+        Not itself @retry_etcd()-decorated -- see get_rules_evaluation_model above."""
+        self.set_config("rules_evaluation_model", str(model))
+
+    def get_rules_confidence_threshold(self) -> Optional[float]:
+        """Retrieve the admin-configured confidence threshold for the Rules Engine decider,
+        or None if never set -- callers fall back to the RULES_CONFIDENCE_THRESHOLD env var
+        default.
+
+        Not itself @retry_etcd()-decorated -- see get_rules_evaluation_provider above."""
+        value = self.get_config("rules_confidence_threshold", None)
+        return float(value) if value is not None else None
+
+    def set_rules_confidence_threshold(self, threshold: float) -> None:
+        """Set the admin-configured confidence threshold for the Rules Engine decider.
+
+        Not itself @retry_etcd()-decorated -- see get_rules_confidence_threshold above."""
+        self.set_config("rules_confidence_threshold", float(threshold))
+
+    # --- Whitelabel / Branding ---
+    # One override per key, stored at /config/framework/app_<key>. The admin UI
+    # (Admin Dashboard -> Branding) is the primary editing surface; the APP_* env vars
+    # only seed the defaults defined in core/dependencies.py.
+    BRANDING_KEYS = (
+        "name",
+        "favicon_url",
+        "logo_url",
+        "login_logo_url",
+        "login_title",
+        "login_subtitle",
+        "login_disclaimer",
+        "accent_color",
+        "accent_color_dark",
+    )
+
+    def get_branding(self, key: str) -> Optional[str]:
+        """Read one branding override from etcd, or None when never set via the UI -- the
+        caller then falls back to that key's APP_* env default.
+
+        Deliberately NOT @retry_etcd()-decorated, and not routed through get_config():
+        this feeds the per-render Jinja context processor, where a fast failure that falls
+        back to defaults beats a multi-second retry storm against a blipping etcd."""
+        if key not in self.BRANDING_KEYS:
+            raise ValueError(f"Unknown branding key '{key}'")
+        value, _ = self.client.get(f"/config/framework/app_{key}")
+        if value:
+            return value.decode("utf-8")
+        return None
+
+    def set_branding(self, key: str, value: str) -> None:
+        """Persist one branding override to etcd.
+
+        Not itself @retry_etcd()-decorated -- see get_branding above."""
+        if key not in self.BRANDING_KEYS:
+            raise ValueError(f"Unknown branding key '{key}'")
+        self.set_config(f"app_{key}", str(value))
+
+    @retry_etcd()
+    def clear_branding(self, key: str) -> None:
+        """Remove a branding override, reverting that key to its env-seeded default."""
+        if key not in self.BRANDING_KEYS:
+            raise ValueError(f"Unknown branding key '{key}'")
+        self.client.delete(f"/config/framework/app_{key}")
+
+    # --- Runtime Tunables (Admin Dashboard -> Limits & Tuning) ---
+    # One override per tunable, stored at /config/framework/tunable_<name>. The registry of
+    # valid names/defaults/types lives in core/tunables.py (not imported here to avoid a
+    # cycle); these accessors are the etcd seam it resolves through.
+
+    def get_tunable(self, name: str) -> Optional[Any]:
+        """Read one runtime tunable override from etcd, or None when never set -- the
+        caller then falls back to that tunable's env var / built-in default.
+
+        Deliberately NOT @retry_etcd()-decorated, and not routed through get_config():
+        this feeds the background refresh behind hot request paths, where a fast failure
+        that keeps the last-known cache beats a multi-second retry storm against a blipping
+        etcd. Values are stored as JSON so typed tunables round-trip."""
+        value, _ = self.client.get(f"/config/framework/tunable_{name}")
+        if not value:
+            return None
+        try:
+            return json.loads(value.decode("utf-8"))
+        except Exception as e:
+            logger.warning(f"Failed to parse tunable override at tunable_{name}: {e}")
+            return None
+
+    def set_tunable(self, name: str, value: Any) -> None:
+        """Set a runtime tunable override.
+
+        Not itself @retry_etcd()-decorated: set_config() already retries."""
+        self.set_config(f"tunable_{name}", value)
+
+    def clear_tunable(self, name: str) -> None:
+        """Remove a runtime tunable override, reverting it to its env/default.
+
+        Not itself @retry_etcd()-decorated: clear_config() already retries."""
+        self.clear_config(f"tunable_{name}")
 
     # --- Registry Methods for Agents and Tools ---
 
@@ -535,11 +600,9 @@ class IdentityManager:
         """Persist an agent's description embedding for semantic search."""
         self.client.put(f"/registry/agents/{name}/embedding", json.dumps(vector))
 
-    @retry_etcd()
-    def get_all_agent_embeddings(self) -> Dict[str, List[float]]:
-        """Bulk-fetch every agent's cached embedding vector, keyed by agent name."""
+    def _get_all_embeddings_by_prefix(self, prefix: str) -> Dict[str, List[float]]:
+        """Helper to bulk-fetch every cached embedding vector under a registry prefix."""
         embeddings: Dict[str, List[float]] = {}
-        prefix = "/registry/agents/"
         suffix = "/embedding"
         for value, metadata in self.client.get_prefix(prefix):
             key_str = metadata.key.decode('utf-8')
@@ -552,20 +615,27 @@ class IdentityManager:
                         pass
         return embeddings
 
-    @retry_etcd()
-    def list_agents(self) -> List[str]:
-        """List all agent names in the registry."""
+    def _list_names_by_prefix(self, prefix: str) -> List[str]:
+        """Helper to list the first path segment of every key under a registry prefix."""
         names = set()
-        prefix = "/registry/agents/"
         for value, metadata in self.client.get_prefix(prefix):
             key_str = metadata.key.decode('utf-8')
             if key_str.startswith(prefix):
-                # Extract the name part after the prefix
                 rest = key_str[len(prefix):]
                 name = rest.split('/')[0]
                 if name:
                     names.add(name)
         return list(names)
+
+    @retry_etcd()
+    def get_all_agent_embeddings(self) -> Dict[str, List[float]]:
+        """Bulk-fetch every agent's cached embedding vector, keyed by agent name."""
+        return self._get_all_embeddings_by_prefix("/registry/agents/")
+
+    @retry_etcd()
+    def list_agents(self) -> List[str]:
+        """List all agent names in the registry."""
+        return self._list_names_by_prefix("/registry/agents/")
 
     @retry_etcd()
     def save_tool_config(self, name: str, config: Dict) -> None:
@@ -581,17 +651,7 @@ class IdentityManager:
     @retry_etcd()
     def list_tools(self) -> List[str]:
         """List all tool names in the registry."""
-        names = set()
-        prefix = "/registry/tools/"
-        for value, metadata in self.client.get_prefix(prefix):
-            key_str = metadata.key.decode('utf-8')
-            if key_str.startswith(prefix):
-                # Extract the name part after the prefix
-                rest = key_str[len(prefix):]
-                name = rest.split('/')[0]
-                if name:
-                    names.add(name)
-        return list(names)
+        return self._list_names_by_prefix("/registry/tools/")
 
     def _get_all_configs_by_prefix(self, prefix: str) -> Dict[str, Dict]:
         """Helper to fetch all configs under a given registry prefix."""
@@ -621,19 +681,7 @@ class IdentityManager:
     @retry_etcd()
     def get_all_tool_embeddings(self) -> Dict[str, List[float]]:
         """Bulk-fetch every tool's cached embedding vector, keyed by tool name."""
-        embeddings: Dict[str, List[float]] = {}
-        prefix = "/registry/tools/"
-        suffix = "/embedding"
-        for value, metadata in self.client.get_prefix(prefix):
-            key_str = metadata.key.decode('utf-8')
-            if key_str.startswith(prefix) and key_str.endswith(suffix) and value:
-                name = key_str[len(prefix):-len(suffix)]
-                if name:
-                    try:
-                        embeddings[name] = json.loads(value.decode('utf-8'))
-                    except json.JSONDecodeError:
-                        pass
-        return embeddings
+        return self._get_all_embeddings_by_prefix("/registry/tools/")
 
     @retry_etcd()
     def save_mcp_config(self, name: str, config: Dict) -> None:
@@ -649,16 +697,7 @@ class IdentityManager:
     @retry_etcd()
     def list_mcps(self) -> List[str]:
         """List all MCP names in the registry."""
-        names = set()
-        prefix = "/registry/mcps/"
-        for value, metadata in self.client.get_prefix(prefix):
-            key_str = metadata.key.decode('utf-8')
-            if key_str.startswith(prefix):
-                rest = key_str[len(prefix):]
-                name = rest.split('/')[0]
-                if name:
-                    names.add(name)
-        return list(names)
+        return self._list_names_by_prefix("/registry/mcps/")
 
     @retry_etcd()
     def get_all_mcp_configs(self) -> Dict[str, Dict]:

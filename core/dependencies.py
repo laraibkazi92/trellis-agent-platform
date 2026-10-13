@@ -3,6 +3,8 @@
 
 import os
 import re
+import time
+import asyncio
 from fastapi.templating import Jinja2Templates
 from authlib.integrations.starlette_client import OAuth
 from core.auth import get_identity_manager
@@ -24,17 +26,88 @@ def _validate_hex_color(color: str, default: str) -> str:
         return color
     return default
 
-def whitelabel_context(request):
+# Branding is edited primarily in the Admin UI (Admin Dashboard -> Branding) and stored in
+# etcd; the APP_* env vars below are only the shipped defaults. The context processor runs on
+# every render, so values are served from a short-lived cache and refreshed out of band --
+# a page render must never block on etcd (same rationale as core/rules_engine.py's overrides).
+_BRANDING_ENV_DEFAULTS = {
+    "name": ("APP_NAME", "Trellis"),
+    "favicon_url": ("APP_FAVICON_URL", ""),
+    "logo_url": ("APP_LOGO_URL", ""),
+    "login_logo_url": ("APP_LOGIN_LOGO_URL", ""),
+    "login_title": ("APP_LOGIN_TITLE", "Welcome Back"),
+    "login_subtitle": ("APP_LOGIN_SUBTITLE", "Sign in to your workspace"),
+    "login_disclaimer": (
+        "APP_LOGIN_DISCLAIMER",
+        "This system is for authorized use only. All activities are monitored and logged for security and compliance purposes.",
+    ),
+    "accent_color": ("APP_ACCENT_COLOR", "#0055FF"),
+    "accent_color_dark": ("APP_ACCENT_COLOR_DARK", "#3377FF"),
+}
+_BRANDING_CACHE_TTL_SECONDS = 30.0
+_branding_cache: dict = {}
+_branding_cached_at: float = 0.0
+_branding_refresh_in_flight: bool = False
+
+
+def _env_branding_defaults() -> dict:
     return {
-        "app_name": os.getenv("APP_NAME", "Trellis").strip(),
-        "app_favicon_url": os.getenv("APP_FAVICON_URL", "").strip(),
-        "app_logo_url": os.getenv("APP_LOGO_URL", "").strip(),
-        "app_login_logo_url": os.getenv("APP_LOGIN_LOGO_URL", "").strip(),
-        "app_login_title": os.getenv("APP_LOGIN_TITLE", "Welcome Back").strip(),
-        "app_login_subtitle": os.getenv("APP_LOGIN_SUBTITLE", "Sign in to your workspace").strip(),
-        "app_login_disclaimer": os.getenv("APP_LOGIN_DISCLAIMER", "This system is for authorized use only. All activities are monitored and logged for security and compliance purposes.").strip(),
-        "app_accent_color": _validate_hex_color(os.getenv("APP_ACCENT_COLOR", "#0055FF"), "#0055FF"),
-        "app_accent_color_dark": _validate_hex_color(os.getenv("APP_ACCENT_COLOR_DARK", "#3377FF"), "#3377FF"),
+        key: os.getenv(env_var, default).strip()
+        for key, (env_var, default) in _BRANDING_ENV_DEFAULTS.items()
+    }
+
+
+def _refresh_branding_sync() -> None:
+    """Runs in a thread-pool worker via loop.run_in_executor -- never awaited directly."""
+    global _branding_cache, _branding_cached_at, _branding_refresh_in_flight
+    values = _env_branding_defaults()
+    try:
+        for key in values:
+            override = identity_mgr.get_branding(key)
+            if override:
+                values[key] = override
+    except Exception:
+        # etcd unavailable or not seeded yet -- ship the env defaults.
+        values = _env_branding_defaults()
+    _branding_cache = values
+    _branding_cached_at = time.monotonic()
+    _branding_refresh_in_flight = False
+
+
+def _branding_values() -> dict:
+    """Resolve branding as: etcd override (Admin UI) > APP_* env default. Serves the
+    last-known cache immediately and, if it is stale, schedules a background refresh for
+    the next render instead of waiting on etcd here."""
+    global _branding_refresh_in_flight
+
+    now = time.monotonic()
+    if _branding_cache and (now - _branding_cached_at) < _BRANDING_CACHE_TTL_SECONDS:
+        return _branding_cache
+
+    if not _branding_refresh_in_flight:
+        _branding_refresh_in_flight = True
+        try:
+            asyncio.get_running_loop().run_in_executor(None, _refresh_branding_sync)
+        except RuntimeError:
+            # No running loop (e.g. sync render/test) -- skip this refresh cycle rather
+            # than block; the next render from an async context will pick it up.
+            _branding_refresh_in_flight = False
+
+    return _branding_cache or _env_branding_defaults()
+
+
+def whitelabel_context(request):
+    values = _branding_values()
+    return {
+        "app_name": values["name"],
+        "app_favicon_url": values["favicon_url"],
+        "app_logo_url": values["logo_url"],
+        "app_login_logo_url": values["login_logo_url"],
+        "app_login_title": values["login_title"],
+        "app_login_subtitle": values["login_subtitle"],
+        "app_login_disclaimer": values["login_disclaimer"],
+        "app_accent_color": _validate_hex_color(values["accent_color"], "#0055FF"),
+        "app_accent_color_dark": _validate_hex_color(values["accent_color_dark"], "#3377FF"),
     }
 
 import secrets

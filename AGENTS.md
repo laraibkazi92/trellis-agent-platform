@@ -25,6 +25,7 @@
 ## 💻 Development Workflow
 - **Start/Rebuild**: `docker compose up -d --build`
 - **Registry Sync**: The registry is synchronized automatically when you rebuild and start the containers via `docker compose up -d --build`. You do not need to run manual sync scripts.
+- **Config persistence (UI edits)**: Agent/tool/workflow/MCP edits made in the UI are dual-written to **both** etcd and the matching `workspace/` file (via `core/workspace_io.py`), so the next rebuild's registry sync re-applies them instead of reverting. There is no Git write-back — commit workspace changes yourself if you want version history.
 - **DB/Config access**: Use `IdentityManager` in `core/auth.py` for all etcd operations.
 
 ## 📚 Developer Docs

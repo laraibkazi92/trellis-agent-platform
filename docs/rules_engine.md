@@ -239,7 +239,8 @@ proceeds through the existing vector/keyword fallback, unchanged:
 | LLM API error, rate limit, missing API key | Falls open — logged as a **warning**. |
 | Error resolving agent eligibility (etcd/discovery failure) | Falls open — logged as a **warning**. |
 
-Environment variables (`core/rules_engine.py`):
+Environment variables (`core/rules_engine.py`) — optional defaults; set/override them in the
+Admin Dashboard -> Trellis Rules Engine:
 
 | Variable | Default | Purpose |
 | :--- | :--- | :--- |
@@ -249,14 +250,15 @@ Environment variables (`core/rules_engine.py`):
 | `RULES_EVALUATION_PROVIDER` | *(inferred)* | Provider for the decider. Omitted/empty infers from the model-name prefix (`gemini*` → google, `claude*` → anthropic, `gpt-*`/`o1*`/`o3*`/`o4*`/`chatgpt*` → openai). |
 | `RULES_EVALUATION_BASE_URL` | *(none)* | Custom endpoint for the decider (used by `openai-compatible`/`ollama` providers). |
 
-An admin-configured timeout (set via `/admin`, persisted in etcd) takes precedence over the
-`RULES_EVALUATION_TIMEOUT` env var default when present. The request path never blocks on etcd to
-read it — it uses the last-known cached value (starting at the env var default) and refreshes it
-in the background every 30 seconds, so a change made in `/admin` can take up to that long to apply.
-Admin etcd overrides for the decider's provider/base_url (`rules_evaluation_provider`,
-`rules_evaluation_base_url` via `IdentityManager`) follow the same cached background-refresh
-pattern and take precedence over the env var defaults. There is no dashboard field for
-these yet — set the etcd keys directly to use them.
+The **Admin Dashboard -> Trellis Rules Engine** is the primary editing surface for the decider:
+timeout (existing field) plus model, provider, base_url and confidence threshold. All four are
+persisted in etcd (`rules_evaluation_timeout`, `rules_evaluation_model`,
+`rules_evaluation_provider`, `rules_evaluation_base_url`, `rules_confidence_threshold` via
+`IdentityManager`) and override the env var defaults in the table above when set. The request
+path never blocks on etcd to read them — it uses the last-known cached value (starting at the env
+var default) and refreshes in the background every 30 seconds, so a change made in `/admin` can
+take up to that long to apply. Clearing a field in the UI removes the override, reverting that
+setting to its env var default.
 
 Identical queries are memoized in-process for 60 seconds (keyed on the query text **and** a hash of
 the current rule catalog, so an edited rule invalidates the cache immediately even within the TTL

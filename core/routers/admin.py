@@ -5,8 +5,6 @@ import os
 import re
 import json
 import yaml
-import base64
-import httpx
 import asyncio
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -14,60 +12,43 @@ from core.dependencies import templates, CSRFRoute
 from core.auth import get_identity_manager
 from core.health import HealthMonitor
 from core.models import Identity, IdentityType, is_agent_internal, coerce_bool_flag, ALLOWED_PROVIDERS
-from core.rules_engine import RULES_EVALUATION_TIMEOUT as RULES_EVALUATION_TIMEOUT_DEFAULT
+from core.rules_engine import (
+    RULES_EVALUATION_TIMEOUT as RULES_EVALUATION_TIMEOUT_DEFAULT,
+    RULES_EVALUATION_MODEL as RULES_EVALUATION_MODEL_DEFAULT,
+    RULES_EVALUATION_PROVIDER as RULES_EVALUATION_PROVIDER_DEFAULT,
+    RULES_EVALUATION_BASE_URL as RULES_EVALUATION_BASE_URL_DEFAULT,
+    RULES_CONFIDENCE_THRESHOLD as RULES_CONFIDENCE_THRESHOLD_DEFAULT,
+)
+from core import tunables
+from core.workspace_io import delete_repo_path, write_repo_file
 
 router = APIRouter(route_class=CSRFRoute)
 
 identity_mgr = get_identity_manager()
 health_monitor = HealthMonitor(identity_mgr)
 
-GITHUB_REPO = os.getenv("GITHUB_REPO", "") # e.g. user/repo
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+# Display metadata for the "Limits & Tuning" card (name -> (label, help text)); the
+# authoritative registry (env var, default, type) lives in core/tunables.py.
+_TUNABLE_LABELS = {
+    "max_run_output_chars": ("Max Run Output Chars", "Stdout/stderr stored per workflow run (characters)."),
+    "max_run_error_chars": ("Max Run Error Chars", "Error trace stored per workflow run (characters)."),
+    "tool_execution_timeout": ("Tool Execution Timeout", "Seconds before a hub tool subprocess is killed."),
+    "tool_search_limit": ("Tool Search Limit", "Max tools returned by search_tools."),
+    "agent_search_limit": ("Agent Search Limit", "Max agents returned by search_agents."),
+    "health_failure_threshold": ("Health Failure Threshold", "Consecutive failures before an entity trips to Offline."),
+    "health_cooldown_seconds": ("Health Cooldown", "Seconds before an Offline entity is probed (Half-Open)."),
+    "registry_refresh_timeout": ("Registry Refresh Timeout", "Bounded wait (seconds) for an on-demand supervisor snapshot refresh."),
+    "registry_snapshot_ttl": ("Registry Snapshot TTL", "Seconds between background supervisor eligibility snapshot refreshes."),
+    "agent_embedding_model": ("Agent Embedding Model", "Model used to embed agents for semantic search."),
+    "public_host_url": ("Public Host URL", "Base URL shown for the REST/host API."),
+    "public_mcp_url": ("Public MCP URL", "MCP endpoint URL shown for the gateway."),
+}
 
-async def commit_to_github(path: str, content: str, message: str, client: httpx.AsyncClient = None) -> bool:
-    """Commits a file change to GitHub. Returns True on success, False on failure."""
-    if not GITHUB_REPO or not GITHUB_TOKEN:
-        print("GitHub integration not configured. Skipping commit.")
-        return False
-        
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
-    
-    try:
-        if client:
-            get_resp = await client.get(url, headers=headers)
-        else:
-            async with httpx.AsyncClient(timeout=10.0) as local_client:
-                get_resp = await local_client.get(url, headers=headers)
+_EMBEDDING_MODEL_WARNING = (
+    "Changing this invalidates previously stored embeddings — agents must be "
+    "re-embedded (rebuild / registry sync) before semantic search works again."
+)
 
-        sha = None
-        if get_resp.status_code == 200:
-            sha = get_resp.json().get("sha")
-            
-        data = {
-            "message": f"{message} [skip ci]",
-            "content": base64.b64encode(content.encode()).decode()
-        }
-        if sha:
-            data["sha"] = sha
-            
-        if client:
-            put_resp = await client.put(url, headers=headers, json=data)
-        else:
-            async with httpx.AsyncClient(timeout=10.0) as local_client:
-                put_resp = await local_client.put(url, headers=headers, json=data)
-                
-        if put_resp.status_code not in (200, 201):
-            print(f"Failed to commit to GitHub: {put_resp.text}")
-            return False
-        return True
-    except Exception as e:
-        print(f"Error during GitHub commit: {e}")
-        return False
 
 def sanitize_name(name: str) -> str:
     """Sanitize name parameter to prevent path traversal and registry injection."""
@@ -125,6 +106,29 @@ async def admin_dashboard(request: Request):
     agent_memory_enabled = await asyncio.to_thread(identity_mgr.get_agent_memory_enabled)
     agent_memory_isolated = await asyncio.to_thread(identity_mgr.get_agent_memory_isolated_per_user)
     rules_evaluation_timeout_override = await asyncio.to_thread(identity_mgr.get_rules_evaluation_timeout)
+    rules_engine_model_override = await asyncio.to_thread(identity_mgr.get_rules_evaluation_model)
+    rules_engine_provider_override = await asyncio.to_thread(identity_mgr.get_rules_evaluation_provider)
+    rules_engine_base_url_override = await asyncio.to_thread(identity_mgr.get_rules_evaluation_base_url)
+    rules_confidence_override = await asyncio.to_thread(identity_mgr.get_rules_confidence_threshold)
+    branding = {
+        key: await asyncio.to_thread(identity_mgr.get_branding, key)
+        for key in identity_mgr.BRANDING_KEYS
+    }
+    tunables_ctx = []
+    for name, spec in tunables.TUNABLES.items():
+        override = await asyncio.to_thread(identity_mgr.get_tunable, name)
+        label, help_text = _TUNABLE_LABELS.get(name, (name, ""))
+        tunables_ctx.append({
+            "name": name,
+            "env_var": spec.env_var,
+            "type": spec.type.__name__,
+            "default": tunables.env_default(name),
+            "override": override,
+            "effective": tunables.effective(name, override),
+            "label": label,
+            "help": help_text,
+            "warning": _EMBEDDING_MODEL_WARNING if name == "agent_embedding_model" else None,
+        })
 
     return templates.TemplateResponse(
         request=request,
@@ -150,7 +154,19 @@ async def admin_dashboard(request: Request):
                     if rules_evaluation_timeout_override is not None
                     else RULES_EVALUATION_TIMEOUT_DEFAULT
                 ),
+                "model_override": rules_engine_model_override,
+                "model_default": RULES_EVALUATION_MODEL_DEFAULT,
+                "provider_override": rules_engine_provider_override,
+                "provider_default": RULES_EVALUATION_PROVIDER_DEFAULT,
+                "base_url_override": rules_engine_base_url_override,
+                "base_url_default": RULES_EVALUATION_BASE_URL_DEFAULT,
+                "confidence_override": rules_confidence_override,
+                "confidence_default": RULES_CONFIDENCE_THRESHOLD_DEFAULT,
             },
+            "branding": branding,
+            "branding_keys": identity_mgr.BRANDING_KEYS,
+            "tunables": tunables_ctx,
+            "allowed_providers": sorted(ALLOWED_PROVIDERS),
             "flash_msg": flash_msg
         }
     )
@@ -210,6 +226,125 @@ async def set_rules_evaluation_timeout(request: Request, timeout_seconds: str = 
 
     await asyncio.to_thread(identity_mgr.set_rules_evaluation_timeout, value)
     request.session["flash_msg"] = f"Rules Engine timeout set to {value}s. Changes take effect within ~30 seconds."
+    return RedirectResponse(url='/admin', status_code=303)
+
+@router.post("/admin/rules-engine/model")
+async def set_rules_engine_model(
+    request: Request,
+    model: str = Form(""),
+    provider: str = Form(""),
+    base_url: str = Form(""),
+    confidence_threshold: str = Form(""),
+):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    provider = provider.strip()
+    if provider and provider.lower() not in ALLOWED_PROVIDERS:
+        request.session["flash_msg"] = (
+            f"Unknown provider '{provider}'. Valid providers: {', '.join(sorted(ALLOWED_PROVIDERS))}."
+        )
+        return RedirectResponse(url='/admin', status_code=303)
+
+    raw_threshold = confidence_threshold.strip()
+    threshold: Optional[float] = None
+    if raw_threshold:
+        try:
+            threshold = float(raw_threshold)
+        except ValueError:
+            request.session["flash_msg"] = f"Invalid confidence threshold '{raw_threshold}' — must be a number."
+            return RedirectResponse(url='/admin', status_code=303)
+        if not (0.0 <= threshold <= 1.0):
+            request.session["flash_msg"] = "Confidence threshold must be between 0.0 and 1.0."
+            return RedirectResponse(url='/admin', status_code=303)
+
+    # Empty submission for a field means "clear the override", reverting to its env default.
+    if provider:
+        await asyncio.to_thread(identity_mgr.set_rules_evaluation_provider, provider)
+    else:
+        await asyncio.to_thread(identity_mgr.clear_config, "rules_evaluation_provider")
+
+    if base_url.strip():
+        await asyncio.to_thread(identity_mgr.set_rules_evaluation_base_url, base_url.strip())
+    else:
+        await asyncio.to_thread(identity_mgr.clear_config, "rules_evaluation_base_url")
+
+    if model.strip():
+        await asyncio.to_thread(identity_mgr.set_rules_evaluation_model, model.strip())
+    else:
+        await asyncio.to_thread(identity_mgr.clear_config, "rules_evaluation_model")
+
+    if threshold is not None:
+        await asyncio.to_thread(identity_mgr.set_rules_confidence_threshold, threshold)
+    else:
+        await asyncio.to_thread(identity_mgr.clear_config, "rules_confidence_threshold")
+
+    request.session["flash_msg"] = "Rules Engine model settings updated. Changes take effect within ~30 seconds."
+    return RedirectResponse(url='/admin', status_code=303)
+
+@router.post("/admin/branding")
+async def set_branding(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    form = await request.form()
+    for key in identity_mgr.BRANDING_KEYS:
+        value = str(form.get(key, "")).strip()
+        if value and key in ("accent_color", "accent_color_dark"):
+            if not re.match(r"^#(?:[0-9a-fA-F]{3}){1,2}$", value):
+                request.session["flash_msg"] = f"Invalid hex color for {key}: '{value}'."
+                return RedirectResponse(url='/admin', status_code=303)
+        if value:
+            await asyncio.to_thread(identity_mgr.set_branding, key, value)
+        else:
+            # Empty field = clear the override, reverting to the APP_* env default.
+            await asyncio.to_thread(identity_mgr.clear_branding, key)
+
+    request.session["flash_msg"] = "Branding updated. Changes take effect within ~30 seconds."
+    return RedirectResponse(url='/admin', status_code=303)
+
+@router.post("/admin/tunables")
+async def set_tunables(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    form = await request.form()
+    updates = []  # (name, value); a None value clears the override
+    errors = []
+    for name, spec in tunables.TUNABLES.items():
+        raw_value = form.get(name)
+        if raw_value is None:
+            # Field absent from this submission -- leave the override untouched.
+            continue
+        raw = str(raw_value).strip()
+        if raw == "":
+            # Empty field = clear the override, reverting to the env/default value.
+            updates.append((name, None))
+            continue
+        try:
+            value = tunables.coerce(name, raw)
+        except (TypeError, ValueError):
+            errors.append(f"{spec.env_var} must be a valid {spec.type.__name__}")
+            continue
+        if spec.type is int and value < 1:
+            errors.append(f"{spec.env_var} must be >= 1")
+            continue
+        if spec.type is float and value <= 0:
+            errors.append(f"{spec.env_var} must be > 0")
+            continue
+        updates.append((name, value))
+
+    if errors:
+        request.session["flash_msg"] = "Limits & Tuning not saved: " + "; ".join(errors) + "."
+        return RedirectResponse(url='/admin', status_code=303)
+
+    for name, value in updates:
+        if value is None:
+            await asyncio.to_thread(tunables.clear_tunable, name, identity_mgr)
+        else:
+            await asyncio.to_thread(tunables.set_tunable, name, value, identity_mgr)
+
+    request.session["flash_msg"] = "Limits & Tuning updated. Changes take effect within ~30 seconds."
     return RedirectResponse(url='/admin', status_code=303)
 
 @router.post("/admin/users/toggle_ban")
@@ -649,21 +784,58 @@ async def save_agent(request: Request, name: str):
     await asyncio.to_thread(identity_mgr.save_agent_config, safe_name, config)
     await asyncio.to_thread(identity_mgr.save_agent_skills, safe_name, skills_content)
     
-    # 2. Sync to GitHub
-    agent_dir = f"agents/{safe_name}" if safe_name != "supervisor" else "core/assets/supervisor"
+    # 2. Persist to the workspace files so the registry sync re-applies this edit on the
+    #    next rebuild instead of overwriting it with the previous on-disk version. The
+    #    supervisor's files live in the image (core/assets/supervisor), not the bind-mounted
+    #    workspace, so it stays registry-only and resets to the bundled defaults on rebuild.
+    if safe_name == "supervisor":
+        request.session["flash_msg"] = (
+            "Supervisor updated in the registry (bundled files are not writable; changes "
+            "will not survive a rebuild)."
+        )
+        return RedirectResponse(url='/agents', status_code=303)
+
     yaml_content = yaml.dump(config, sort_keys=False)
-    
-    client = getattr(request.app.state, "http_client", None)
-    
-    success_config = await commit_to_github(f"{agent_dir}/config.yaml", yaml_content, f"Update config for {safe_name}", client=client)
-    success_skills = await commit_to_github(f"{agent_dir}/skills.md", skills_content, f"Update skills for {safe_name}", client=client)
-    
-    if GITHUB_REPO and GITHUB_TOKEN and (not success_config or not success_skills):
-        request.session["flash_msg"] = f"Agent {safe_name} updated locally, but GitHub sync failed."
-    else:
+    wrote_config = write_repo_file(f"workspace/agents/{safe_name}/config.yaml", yaml_content)
+    wrote_skills = write_repo_file(f"workspace/agents/{safe_name}/skills.md", skills_content)
+
+    if wrote_config and wrote_skills:
         request.session["flash_msg"] = f"Agent {safe_name} updated successfully."
+    else:
+        request.session["flash_msg"] = (
+            f"Agent {safe_name} updated in the registry, but its workspace file could not be "
+            f"written — the change may not survive a rebuild (check volume permissions)."
+        )
         
     return RedirectResponse(url='/agents', status_code=303)
+
+@router.post("/admin/mcps/delete")
+async def delete_mcp(request: Request, name: str = Form(...)):
+    if redirect := require_admin(request, '/mcps'):
+        return redirect
+
+    safe_name = sanitize_name(name)
+    if not safe_name:
+        request.session["flash_msg"] = "Invalid name parameter."
+        return RedirectResponse(url='/mcps', status_code=303)
+
+    await asyncio.to_thread(identity_mgr.delete_mcp, safe_name)
+    await asyncio.to_thread(identity_mgr.delete_mcp_tool_embeddings, safe_name)
+
+    # Remove the workspace source file too: sync_to_db re-adds any
+    # workspace/mcps/<name>/mcp.yaml on the next rebuild, so deleting only the registry
+    # entry would silently resurrect it.
+    removed = delete_repo_path(f"workspace/mcps/{safe_name}/mcp.yaml")
+
+    if removed:
+        request.session["flash_msg"] = f"MCP {safe_name} deleted (registry, embeddings and workspace source)."
+    else:
+        request.session["flash_msg"] = (
+            f"MCP {safe_name} removed from the registry, but its workspace file could not be "
+            f"deleted — it may be re-added on the next rebuild (check volume permissions)."
+        )
+
+    return RedirectResponse(url='/mcps', status_code=303)
 
 @router.post("/editor/mcp/{name}")
 async def save_mcp(request: Request, name: str):
@@ -698,15 +870,16 @@ async def save_mcp(request: Request, name: str):
     
     await asyncio.to_thread(identity_mgr.save_mcp_config, safe_name, config)
     
-    # Sync to GitHub
+    # Dual-write to the workspace file so the registry sync re-applies this edit on the
+    # next rebuild instead of reverting it to the previous on-disk version.
     yaml_content = yaml.dump(config, sort_keys=False)
-    client = getattr(request.app.state, "http_client", None)
-    success = await commit_to_github(f"mcps/{safe_name}/mcp.yaml", yaml_content, f"Update config for MCP {safe_name}", client=client)
-    
-    if GITHUB_REPO and GITHUB_TOKEN and not success:
-        request.session["flash_msg"] = f"MCP {safe_name} updated locally, but GitHub sync failed."
-    else:
+    if write_repo_file(f"workspace/mcps/{safe_name}/mcp.yaml", yaml_content):
         request.session["flash_msg"] = f"MCP {safe_name} updated successfully."
+    else:
+        request.session["flash_msg"] = (
+            f"MCP {safe_name} updated in the registry, but its workspace file could not be "
+            f"written — the change may not survive a rebuild (check volume permissions)."
+        )
         
     return RedirectResponse(url='/mcps', status_code=303)
 
@@ -732,16 +905,17 @@ async def save_tool(request: Request, name: str):
     
     await asyncio.to_thread(identity_mgr.save_tool_config, safe_name, config)
     
-    # 2. Sync to GitHub
+    # 2. Persist to the workspace file so the registry sync re-applies this edit on the
+    #    next rebuild instead of reverting it to the previous on-disk version.
     if config.get("rel_path"):
         yaml_content = yaml.dump({k:v for k,v in config.items() if k != "rel_path"}, sort_keys=False)
-        client = getattr(request.app.state, "http_client", None)
-        success = await commit_to_github(f"{config['rel_path']}/tool.yaml", yaml_content, f"Update config for {safe_name}", client=client)
-        
-        if GITHUB_REPO and GITHUB_TOKEN and not success:
-            request.session["flash_msg"] = f"Tool {safe_name} updated locally, but GitHub sync failed."
-        else:
+        if write_repo_file(f"{config['rel_path']}/tool.yaml", yaml_content):
             request.session["flash_msg"] = f"Tool {safe_name} updated successfully."
+        else:
+            request.session["flash_msg"] = (
+                f"Tool {safe_name} updated in the registry, but its workspace file could not be "
+                f"written — the change may not survive a rebuild (check volume permissions)."
+            )
     else:
         request.session["flash_msg"] = f"Tool {safe_name} updated successfully."
         
