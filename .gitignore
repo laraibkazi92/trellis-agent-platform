@@ -1,5 +1,3 @@
-test_*.py
-
 *pycache*
 .env
 
@@ -33,3 +31,6 @@ workspace/tools/opsctl/*.whl
 .DS_Store
 .venv/
 .codegraph
+
+# Cleanup audit artifacts (scratch reports, safe to regenerate)
+__cleanup_reports/

@@ -57,7 +57,6 @@ def prune_agent(identity_mgr: IdentityManager, agent_name: str, keep: int, dry_r
 
     # Sort newest first
     records.sort(key=lambda x: x[1], reverse=True)
-    to_keep = records[:keep]
     to_delete = records[keep:]
 
     delete_bytes = sum(r[2] for r in to_delete)
