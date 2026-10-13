@@ -10,13 +10,25 @@ x-common-env: &common-env
   HOST_BIND: ${HOST_BIND:-0.0.0.0}
   TZ: UTC
 
+# Host uid:gid the app containers run as, so files written into the bind-mounted
+# workspace/ are owned by the operator instead of root. Match your host user:
+#   TRELLIS_UID=$(id -u) TRELLIS_GID=$(id -g)
+# The /app/data health volume inherits the image's build-time ownership on FIRST
+# creation; if it already exists root-owned, run `docker compose down -v` once.
+x-app-build: &app-build
+  context: .
+  args:
+    PUID: ${TRELLIS_UID:-1000}
+    PGID: ${TRELLIS_GID:-1000}
+
 services:
   # DB Sync Init Container
   # Runs once at startup to sync agents/tools to etcd
   db-sync:
-    build: .
+    build: *app-build
     image: trellis-agent-platform:v2
     container_name: db-sync
+    user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     environment:
       <<: *common-env
       GEMINI_API_KEY: ${GEMINI_API_KEY}
@@ -31,9 +43,10 @@ services:
   # Universal Agent Host (FastAPI + PydanticAI)
   # This is the main entry point for the agent fleet.
   host:
-    build: .
+    build: *app-build
     image: trellis-agent-platform:v2
     container_name: agent-host
+    user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     env_file:
       - .env
     environment:
@@ -66,9 +79,10 @@ services:
   # Polyglot Tool Hub (Internal MCP Server)
   # Executes local polyglot tools and exposes them to the Host via SSE
   hub:
-    build: .
+    build: *app-build
     image: trellis-agent-platform:v2
     container_name: tool-hub
+    # Runs as ROOT on purpose (bubblewrap). Do NOT add a user: here.
     command: python core/hub.py
     restart: unless-stopped
     # Least-privilege sandbox: the hub wraps every tool execution in bubblewrap
@@ -114,9 +128,10 @@ services:
   # External Gateway MCP Server
   # Bridges external MCP clients to the internal agent fleet via the Host's HTTP API.
   gateway:
-    build: .
+    build: *app-build
     image: trellis-agent-platform:v2
     container_name: agent-gateway
+    user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     environment:
       <<: *common-env
       HOST_URL: http://host:8000
@@ -159,9 +174,10 @@ services:
       retries: 5
 
   taskiq-worker:
-    build: .
+    build: *app-build
     image: trellis-agent-platform:v2
     container_name: taskiq-worker
+    user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     env_file:
       - .env
     environment:
@@ -184,9 +200,10 @@ services:
     restart: unless-stopped
 
   taskiq-scheduler:
-    build: .
+    build: *app-build
     image: trellis-agent-platform:v2
     container_name: taskiq-scheduler
+    user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     env_file:
       - .env
     environment:
@@ -250,9 +267,10 @@ services:
     restart: unless-stopped
 
   ui:
-    build: .
+    build: *app-build
     image: trellis-agent-platform:v2
     container_name: agent-ui
+    user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     env_file:
       - .env
     environment:

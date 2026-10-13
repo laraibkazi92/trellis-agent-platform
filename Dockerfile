@@ -47,6 +47,19 @@ COPY templates/ templates/
 COPY scripts/ scripts/
 COPY docs/ docs/
 
+# Non-root runtime user. docker-compose passes the host uid:gid (TRELLIS_UID/TRELLIS_GID)
+# as PUID/PGID so files written into the bind-mounted workspace/ are owned by the operator
+# instead of root. /app/data is created here and owned by that user: the `health-data`
+# named volume inherits this ownership when Docker first populates it (first `up`).
+# NOTE: the hub service deliberately runs as root (bubblewrap needs CAP_SETFCAP + a root
+# uid_map) and overrides this with its own `user:` in docker-compose.yml.
+ARG PUID=1000
+ARG PGID=1000
+RUN groupadd -g ${PGID} trellis \
+    && useradd -u ${PUID} -g ${PGID} -m -s /usr/sbin/nologin trellis \
+    && mkdir -p /app/data \
+    && chown -R ${PUID}:${PGID} /app
+
 # Set PYTHONPATH to the root so core imports work
 ENV PYTHONPATH=/app
 
