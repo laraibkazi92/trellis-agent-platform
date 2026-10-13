@@ -82,13 +82,15 @@ source works as long as the addresses resolve from the Trellis pods.
 
 See `values.yaml` for the full list with comments.
 
-- `secrets.*` — rendered into a Secret (`SESSION_SECRET`, `ENCRYPTION_KEY`,
-  `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`). **Set
-  `sessionSecret` explicitly — it ships empty, and outside DEV_MODE the app
-  refuses to start without `SESSION_SECRET` (or `ENCRYPTION_KEY`) set.** Empty
-  values are omitted; if you blank all of them the Secret is not rendered and
-  pods referencing it via `envFrom` will not start — keep at least one set or
-  manage the Secret yourself.
+- `secrets.*` — rendered into a Secret (`SESSION_SECRET`, `ENCRYPTION_KEY`).
+  Agent LLM provider keys are **not** set here: configure them in the Admin UI ->
+  Global Tool Configuration, where they are stored encrypted in etcd. (This chart
+  deploys no Hindsight; an externally-managed Hindsight reads its own LLM key from
+  the environment.) **Set `sessionSecret` explicitly — it ships empty, and outside
+  DEV_MODE the app refuses to start without `SESSION_SECRET` (or `ENCRYPTION_KEY`)
+  set.** Empty values are omitted; if you blank all of them the Secret is not
+  rendered and pods referencing it via `envFrom` will not start — keep at least one
+  set or manage the Secret yourself.
 - `config.*` — non-secret env (DEV_MODE, TZ, CORS, ADMIN_USERS, public URLs).
 - `ingress.enabled` — routes `<host>/` to the nginx edge gateway.
 - `resources` — applied to every deployment (single block for simplicity).

@@ -23,6 +23,7 @@ from pydantic_ai import Agent
 from pydantic_ai.models.google import GoogleModelSettings
 from pydantic_ai.settings import ModelSettings
 
+from core import llm_factory
 from core.auth import get_identity_manager
 from core.llm_factory import (
     ProviderConfigError,
@@ -359,16 +360,29 @@ def _build_user_prompt(catalog: str, query: str) -> str:
     )
 
 
-def _build_evaluation_agent() -> Agent:
+def _build_evaluation_agent(
+    api_key: Optional[str] = None,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> Agent:
     """Construct a fresh single-pass structured-decider Agent for one evaluation call.
 
     Not module-cached: construction is cheap (no network I/O), and a fresh instance
     keeps this function trivially mockable in tests via ``monkeypatch.setattr(Agent)``.
+    ``api_key`` (prefetched off the event loop by ``evaluate_rules``) is threaded into
+    the model build; when None the key is read here as before.
+
+    ``provider``/``base_url`` may be pre-resolved by the caller. ``evaluate_rules``
+    always threads them so the provider cannot flip (via the async background override
+    refresh) between fetching the key and building the model -- which would pair a key
+    for one vendor with another vendor's model. When omitted (direct callers/tests),
+    they are resolved here as before.
     """
-    provider = _resolve_evaluation_provider()
-    base_url = _resolve_evaluation_base_url()
+    if provider is None:
+        provider = _resolve_evaluation_provider()
+        base_url = _resolve_evaluation_base_url()
     model_name = _resolve_evaluation_model()
-    model = resolve_model(provider, model_name, base_url)
+    model = resolve_model(provider, model_name, base_url, api_key=api_key)
     if provider == "google":
         # Gemini thinking is explicitly zeroed out to keep the decider deterministic
         # and cheap (preserved from the pre-multi-provider implementation).
@@ -427,7 +441,15 @@ async def evaluate_rules(
         catalog = compile_rules_prompt(global_rules, eligible_agents)
         user_prompt = _build_user_prompt(catalog, normalized_query)
 
-        agent = _build_evaluation_agent()
+        # Prefetch the provider key off the event loop: get_provider_api_key is sync and
+        # can block ~20s under etcd degradation, which must not stall this request path.
+        # Resolve provider/base_url once and thread them into model construction so a
+        # concurrent background override refresh cannot flip the provider between the
+        # key fetch and the model build (misrouting a key to the wrong vendor).
+        provider = _resolve_evaluation_provider()
+        base_url = _resolve_evaluation_base_url()
+        api_key = await asyncio.to_thread(llm_factory.get_provider_api_key, provider)
+        agent = _build_evaluation_agent(provider=provider, base_url=base_url, api_key=api_key)
         timeout = _resolve_evaluation_timeout()
         threshold = _resolve_confidence_threshold()
         run_result = await asyncio.wait_for(agent.run(user_prompt), timeout=timeout)

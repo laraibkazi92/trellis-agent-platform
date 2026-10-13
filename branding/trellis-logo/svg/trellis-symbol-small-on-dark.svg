@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="t">
+  <title id="t">Trellis symbol — small-size cut</title>
+  <g fill="#FFFFFF">
+    <rect x="44" y="34" width="17" height="172" rx="8.5"/>
+    <rect x="195" y="34" width="17" height="196" rx="8.5"/>
+  </g>
+  <g fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="27"/>
+    <rect x="113" y="58" width="30" height="184"/>
+  </g>
+</svg>

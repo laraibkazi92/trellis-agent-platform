@@ -20,6 +20,8 @@ from core import agent_factory
 from subagents_pydantic_ai import SubAgentConfig
 from subagents_pydantic_ai.types import CompiledSubAgent
 
+from _llm_key_seam import install_provider_keys
+
 
 # --- FrameworkAgentRegistry.get_compiled -------------------------------------
 
@@ -201,7 +203,7 @@ class FakeSubAgentCapability:
 
 
 def _setup_build_agent_common(monkeypatch):
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+    install_provider_keys(monkeypatch)
     monkeypatch.setattr(agent_factory, "_hub_tools_cache", [], raising=False)
     monkeypatch.setattr(agent_factory, "_external_mcp_tools", {}, raising=False)
     monkeypatch.setattr(agent_factory, "Agent", FakeBuiltAgent)

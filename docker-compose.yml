@@ -31,7 +31,6 @@ services:
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     environment:
       <<: *common-env
-      GEMINI_API_KEY: ${GEMINI_API_KEY}
     volumes:
       - ./workspace:/app/workspace
     command: python scripts/sync_to_db.py
@@ -53,7 +52,8 @@ services:
       <<: *common-env
       HOST_URL: http://host:8000
       HUB_URL: http://hub:8001/mcp
-      GOOGLE_API_KEY: ${GEMINI_API_KEY}
+      # Framework LLM provider keys (google/openai/anthropic) are NOT set here: configure
+      # them in the Admin UI -> Global Tool Configuration, stored Fernet-encrypted in etcd.
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
       REDIS_URL: redis://redis:6379/0
       HINDSIGHT_URL: http://hindsight:8888
@@ -111,16 +111,28 @@ services:
     cap_drop: [ALL]
     cap_add: [SYS_ADMIN, SETFCAP]
     security_opt: ["no-new-privileges:true", "systempaths=unconfined", "seccomp=unconfined"]
-    env_file:
-      - .env
+    # NOTE: no `env_file: .env` here on purpose. The hub copies os.environ into every
+    # tool subprocess it spawns (core/hub.py), so loading the whole .env would hand
+    # tools every framework secret it holds (e.g. GEMINI_API_KEY, SESSION_SECRET).
+    # Only the variables the hub actually needs are passed explicitly below.
+    environment:
+      <<: *common-env
+      HOST_URL: http://host:8000
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      DEV_USER_EMAIL: ${DEV_USER_EMAIL:-dev-user@local.host}
+      # Decrypts identity-scoped tool secrets for injection into the tool subprocess.
+      # ENCRYPTION_KEY falls back to SESSION_SECRET when unset.
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      # Env-var defaults the hub reads; Admin UI (etcd) overrides still win.
+      TOOL_EXECUTION_TIMEOUT: ${TOOL_EXECUTION_TIMEOUT:-}
+      HEALTH_FAILURE_THRESHOLD: ${HEALTH_FAILURE_THRESHOLD:-}
+      HEALTH_COOLDOWN_SECONDS: ${HEALTH_COOLDOWN_SECONDS:-}
     depends_on:
       etcd:
         condition: service_healthy
       db-sync:
         condition: service_completed_successfully
-    environment:
-      <<: *common-env
-      HOST_URL: http://host:8000
     volumes:
       - health-data:/app/data
       - ./workspace:/app/workspace
@@ -178,15 +190,21 @@ services:
     image: trellis-agent-platform:v2
     container_name: taskiq-worker
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
-    env_file:
-      - .env
+    # NOTE: no `env_file: .env` here on purpose. The worker copies os.environ into
+    # every background-script subprocess it spawns (core/tasks.py), so loading the
+    # whole .env would hand those scripts every framework secret it holds. Only the
+    # variables the worker actually needs are passed explicitly below.
     environment:
       <<: *common-env
       HOST_URL: http://host:8000
       HUB_URL: http://hub:8001/mcp
-      GOOGLE_API_KEY: ${GEMINI_API_KEY}
+      # Framework LLM provider keys (google/openai/anthropic) are NOT set here: configure
+      # them in the Admin UI -> Global Tool Configuration, stored Fernet-encrypted in etcd.
       REDIS_URL: redis://redis:6379/0
       HINDSIGHT_URL: http://hindsight:8888
+      # Decrypts identity-scoped secrets for background agents/scripts.
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
     volumes:
       - ./workspace:/app/workspace
     command: taskiq worker core.tasks:broker --workers 2
@@ -204,8 +222,9 @@ services:
     image: trellis-agent-platform:v2
     container_name: taskiq-scheduler
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
-    env_file:
-      - .env
+    # NOTE: no `env_file: .env`. The scheduler only enqueues jobs (the worker runs
+    # them); it never decrypts secrets and spawns no subprocesses. Its one real
+    # requirement, REDIS_URL, is set explicitly below.
     environment:
       <<: *common-env
       REDIS_URL: redis://redis:6379/0

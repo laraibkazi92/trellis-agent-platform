@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="t">
+  <title id="t">Trellis app icon</title>
+  <rect width="256" height="256" rx="56" fill="#123B2E"/>
+  <g transform="translate(128 128) scale(0.70) translate(-128 -128)">
+<g id="lattice" fill="#FFFFFF">
+    <path d="M46 30 A5 5 0 0 1 56 30 L60 200 H42 Z"/>
+    <path d="M198 30 A5 5 0 0 1 208 30 L212 232 H194 Z"/>
+    <rect x="14" y="144" width="228" height="12" rx="6"/>
+    <rect x="24" y="210" width="206" height="12" rx="6"/>
+  </g>
+  <g id="t" fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="24"/>
+    <path d="M116 58 H140 L144 238 H112 Z"/>
+  </g>
+  </g>
+</svg>

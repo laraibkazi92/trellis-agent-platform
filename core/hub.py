@@ -15,6 +15,7 @@ from typing import Dict, Any, Optional
 from fastmcp import FastMCP
 from core.models import ToolConfig
 from core.auth import get_identity_manager
+from core.env_sanitize import sanitized_env
 from core.devmode import enforce_dev_mode_safety
 from core.tunables import resolve as resolve_tunable
 from core.background.tasks import (
@@ -127,7 +128,7 @@ async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[
     cmd = bwrap_cmd + cmd
 
     try:
-        env = os.environ.copy()
+        env = sanitized_env()
 
         # A CLI binary dropped into this tool's own bin/ on the host becomes
         # available to it automatically — workspace/ is already bind-mounted
@@ -295,7 +296,7 @@ def register_tools():
             bin_dir.mkdir(exist_ok=True)
             bin_path = bin_dir / config.name
             try:
-                subprocess.run(["go", "build", "-o", str(bin_path), config.entrypoint], cwd=str(tool_dir), check=True)
+                subprocess.run(["go", "build", "-o", str(bin_path), config.entrypoint], cwd=str(tool_dir), check=True, env=sanitized_env())
             except subprocess.CalledProcessError as e:
                 logger.error(f"Failed to compile Go tool {name}: {e}")
                 continue

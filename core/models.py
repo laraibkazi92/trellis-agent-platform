@@ -7,7 +7,7 @@ from enum import Enum
 
 # LLM providers core/llm_factory.py can resolve. `openai-compatible` targets any
 # OpenAI-compatible endpoint via `base_url`.
-ALLOWED_PROVIDERS = ("google", "openai", "anthropic", "ollama", "openai-compatible")
+ALLOWED_PROVIDERS = ("google", "openai", "anthropic", "openai-compatible")
 
 
 class IdentityType(str, Enum):
@@ -122,7 +122,7 @@ class AgentConfig(BaseModel):
     model: Optional[str] = None
     thinking_level: Optional[Literal['none', 'low', 'medium', 'high', 'n/a']] = None
     provider: Optional[str] = Field(default=None, description="LLM provider. None infers from the model name prefix (gemini*/claude*/gpt-*/o1*/o3*/o4*/chatgpt*).")
-    base_url: Optional[str] = Field(default=None, description="Custom API endpoint. Required for 'openai-compatible', optional for 'ollama'.")
+    base_url: Optional[str] = Field(default=None, description="Custom API endpoint. Required for 'openai-compatible'.")
     a2a_access: List[str] = Field(default_factory=list, description="List of other agents this agent can call.")
     allowed_tools: List[str] = Field(default_factory=list, description="List of MCP tools this agent is allowed to use.")
     allowed_mcps: List[str] = Field(default_factory=list, description="List of MCP servers this agent is allowed to connect to.")

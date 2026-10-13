@@ -23,6 +23,7 @@ from types import SimpleNamespace
 import core.memory as memory_mod
 from core import agent_factory, host
 from core.auth import user_id_var
+from _llm_key_seam import install_provider_keys
 from core.memory import (
     MEMORY_FLAG_KEY,
     MEMORY_ISOLATION_FLAG_KEY,
@@ -202,7 +203,7 @@ class FakeBuiltAgent:
 def _setup_build_agent(monkeypatch, flag_identity):
     """Hermetic build_agent() harness (mirrors _setup_build_agent_common in
     tests/test_agent_delegation_access.py) that wires a REAL MemoryManager over fakes."""
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+    install_provider_keys(monkeypatch)
     monkeypatch.setattr(agent_factory, "_hub_tools_cache", [], raising=False)
     monkeypatch.setattr(agent_factory, "_external_mcp_tools", {}, raising=False)
     monkeypatch.setattr(agent_factory, "Agent", FakeBuiltAgent)

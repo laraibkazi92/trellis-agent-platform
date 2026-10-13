@@ -6,19 +6,26 @@
 Used to power semantic agent discovery (see ``core.agent_search``). Embeddings are
 computed at sync time for each agent and at query time for search requests.
 
-Degrades gracefully: if the Gemini SDK or ``GEMINI_API_KEY`` is unavailable,
-``embed_text`` returns ``None`` so callers can fall back to keyword matching.
+Degrades gracefully: if the Gemini SDK or the etcd-stored Google key is
+unavailable, ``embed_text`` returns ``None`` so callers can fall back to keyword
+matching.
 """
-import os
 import math
 import logging
 from typing import List, Optional
 
+from core.llm_factory import get_provider_api_key
 from core.tunables import resolve as resolve_tunable
 
 logger = logging.getLogger(__name__)
 
 _client = None
+
+
+def reset_client_cache() -> None:
+    """Drop the cached genai client so a rotated Google key is picked up on next use."""
+    global _client
+    _client = None
 
 
 def _get_client():
@@ -32,9 +39,15 @@ def _get_client():
         logger.warning("google-genai not installed; embeddings disabled.")
         return None
 
-    api_key = os.getenv("GEMINI_API_KEY")
+    try:
+        api_key = get_provider_api_key("google")
+    except Exception as e:
+        # Fail open: an etcd read failure must degrade to keyword search, not raise
+        # through the caller's asyncio.to_thread.
+        logger.warning(f"Failed to read Google API key from etcd; embeddings disabled: {e}")
+        return None
     if not api_key:
-        logger.warning("GEMINI_API_KEY not set; embeddings disabled.")
+        logger.warning("No Google API key configured in etcd; embeddings disabled.")
         return None
 
     _client = genai.Client(api_key=api_key)

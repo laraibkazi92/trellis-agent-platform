@@ -51,9 +51,6 @@ config:
 secrets:
   sessionSecret: ""
   encryptionKey: ""
-  geminiApiKey: ""
-  openaiApiKey: ""
-  anthropicApiKey: ""
 
 # External stateful dependencies, provided outside this chart (existing
 # services in the namespace, or subcharts you add yourself — see README.md).

@@ -87,14 +87,15 @@ class FakeAgent:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_rules_engine(monkeypatch):
+def _isolate_rules_engine(monkeypatch, llm_provider_keys):
     """Reset the query-result cache and stub out the real LLM client for every test.
 
     Also pre-seeds the admin-timeout-override cache as "just refreshed, no override" so
     tests never trigger a background etcd refresh (there is none in this environment;
     the refresh is fire-and-forget and would otherwise leak a lingering thread per test).
+    ``llm_provider_keys`` supplies the Google key offline so the decider's model builds
+    without env vars or etcd.
     """
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
     monkeypatch.setattr(rules_engine, "Agent", FakeAgent)
     monkeypatch.setattr(rules_engine, "_cached_timeout_override", None)
     monkeypatch.setattr(rules_engine, "_timeout_override_checked_at", rules_engine.time.monotonic())

@@ -13,6 +13,8 @@ import pytest
 
 from core import workspace_io
 
+from _llm_key_seam import install_provider_keys
+
 
 @pytest.fixture(autouse=True)
 def _isolated_workspace_io(tmp_path, monkeypatch):
@@ -21,3 +23,13 @@ def _isolated_workspace_io(tmp_path, monkeypatch):
     monkeypatch.setattr(workspace_io, "BASE_DIR", tmp_path)
     monkeypatch.setattr(workspace_io, "WORKSPACE_DIR", ws)
     yield
+
+
+@pytest.fixture
+def llm_provider_keys(monkeypatch):
+    """Seam for the etcd-backed framework LLM provider keys (see tests/_llm_key_seam.py).
+
+    Returns a mutable ``ProviderKeySeam`` that callers may clear/override; it
+    records each provider consulted in ``.consulted``. Never touches etcd.
+    """
+    return install_provider_keys(monkeypatch)

@@ -67,15 +67,8 @@ spec:
                 name: {{ include "trellis.fullname" . }}-env
             - secretRef:
                 name: {{ include "trellis.fullname" . }}
-          {{- if .Values.secrets.geminiApiKey }}
-          env:
-            # compose maps GOOGLE_API_KEY from GEMINI_API_KEY for pydantic-ai.
-            - name: GOOGLE_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "trellis.fullname" . }}
-                  key: GEMINI_API_KEY
-          {{- end }}
+          # Framework LLM provider keys are configured in the Admin UI -> Global Tool
+          # Configuration (stored Fernet-encrypted in etcd), not injected via env here.
           # Mirrors the compose healthcheck (curl -sf http://127.0.0.1:8000/health).
           readinessProbe:
             httpGet:

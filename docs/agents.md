@@ -32,7 +32,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 **Auth**: Bearer token required. Generate API keys in the Dashboard UI under **API Keys**. Disable auth with `DEV_MODE=true` for local development only.
 
-**Streaming**: Add `"stream": true` to the request body to receive SSE-streamed tokens.
+**Streaming**: Add `"stream": true` to the request body to receive newline-delimited JSON (NDJSON) progress events: `{"status": "processing"}` heartbeat lines (at least one every 5 s), `{"status": "tool_call", "tool": "<name>"}` whenever the agent calls a tool, and a final line with either the full response (`{"choices": [{"message": {"role": "assistant", "content": "..."}}]}`) or `{"error": "..."}`. The response text arrives in one piece at the end — individual tokens are not streamed.
 
 ### Via MCP Gateway
 
@@ -44,21 +44,23 @@ claude mcp add --transport http trellis http://localhost:8002/mcp \
   --header "Authorization: Bearer YOUR_API_KEY"
 ```
 
-The gateway exposes two tools (it does **not** create one tool per agent, so it scales to large fleets):
+The gateway exposes four tools (it does **not** create one tool per agent, so it scales to large fleets):
 
-- **`search_agents(query, limit)`** — semantic search over the fleet; returns a ranked shortlist of relevant agents (`name`, `description`). Use this to discover who can handle a task.
+- **`search_agents(query, limit)`** — semantic search over the fleet; returns a ranked shortlist of relevant agents (`name`, `description`, `configured`). Use this to discover who can handle a task.
 - **`use_agent(agent_name, prompt)`** — run a specific agent.
+- **`search_tools(query, limit)`** — ranked search over deterministic tools exposed for direct execution; returns Tool Cards (`name`, `description`, `parameters`, `configured`, `status`, `source`).
+- **`use_tool(tool_name, arguments)`** — execute one of those tools directly and return its raw structured output, bypassing any agent hop.
 
-Typical flow: call `search_agents` to find the right agent, then `use_agent` to run it. To let the framework decide, call `use_agent("supervisor", prompt)` — the supervisor searches the fleet and delegates to the best-matching agent(s).
+Typical flow: call `search_agents` to find the right agent, then `use_agent` to run it. To let the framework decide, call `use_agent("supervisor", prompt)` — the supervisor searches the fleet and delegates to the best-matching agent(s). For a single deterministic operation (a CLI lookup, a status check), `search_tools` + `use_tool` skips the agent entirely; tools opt in via `public: true` in their `tool.yaml` (see the [Tools guide](tools.md)).
 
 ### Listing Available Agents
 
-```bash
-curl http://localhost:8000/agents \
-  -H "Authorization: Bearer YOUR_API_KEY"
-```
+There is no agent-listing REST endpoint on the host. Use either:
 
-Or view all agents in the Dashboard UI at **http://localhost:8080**.
+- The **Dashboard UI** at http://localhost:8080 (**Agents** page), or
+- The Gateway MCP's `search_agents` tool, which returns each agent's `name`, `description`, and `configured` flag.
+
+The host's `GET /health` endpoint also reports the operational status of every routable agent.
 
 ---
 
@@ -86,15 +88,24 @@ name: my-agent                    # Required. Unique snake-case identifier. Used
 version: 0.1.0                    # Required. Semantic version string.
 author: user@example.com          # Required. Creator email or name.
 description: "Does X and Y."      # Required. Shown in the UI. LLM uses this for routing decisions.
+type: user_agent                  # Optional. Defaults to user_agent here; background_agent /
+                                  #   background_script configs belong in workspace/workflows/.
 model: gemini-3-flash-preview     # Required. LLM model identifier.
-thinking_level: medium            # Required. One of: none, low, medium, high.
-provider: google                  # Optional. One of: google, openai, anthropic, ollama,
+thinking_level: medium            # Required. One of: none, low, medium, high, n/a (n/a behaves
+                                  #   like none; the dashboard editors apply it automatically for
+                                  #   models without thinking support).
+provider: google                  # Optional. One of: google, openai, anthropic,
                                   #   openai-compatible. Omitted/empty infers from the model
                                   #   name prefix (gemini* → google, claude* → anthropic,
                                   #   gpt-*/o1*/o3*/o4*/chatgpt* → openai); anything else
                                   #   fails at build time with a config error.
 base_url: http://localhost:11434/v1  # Optional. Custom API endpoint. Required for
-                                  #   openai-compatible, optional for ollama.
+                                  #   openai-compatible.
+external: true                    # Optional (default true). Set false to hide this agent from
+                                  #   the gateway, semantic search, and auto-routing (internal-only
+                                  #   worker subagent).
+internal: true                    # Optional (default true). Set false to bar other agents from
+                                  #   delegating to it via a2a_access.
 allowed_tools:                    # Required. Tool names this agent may call. Use [] for no tools.
   - get_system_time
   - fetch_issues
@@ -106,6 +117,11 @@ tags:                             # Optional. Labels for UI filtering and discov
   - support
   - tickets
 agent_memory: false               # Optional. Opt into per-agent persistent memory (Hindsight).
+rules:                            # Optional. Deterministic routing rules — see rules_engine.md.
+  - use_when:
+      - "User asks about X"
+    do_not_use_when:
+      - "User asks about Y"
 ```
 
 **`agent_memory`**: When `true`, the framework automatically recalls relevant context from
@@ -127,13 +143,15 @@ independent of the agent's own `model`.
 
 **`thinking_level`**: Controls reasoning depth and token cost. `none` is fastest; `high` enables deep chain-of-thought. Match to task complexity.
 
-**`provider` / `base_url`**: Which LLM vendor serves `model`. API keys come from the standard environment variables (`GEMINI_API_KEY`/`GOOGLE_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` — see `.env.example`); Ollama needs none. `thinking_level` maps per provider: Gemini uses token budgets/levels, Anthropic maps to `anthropic_effort`, OpenAI to `openai_reasoning_effort`; Ollama and `openai-compatible` run with their own defaults. `openai-compatible` points `base_url` at any OpenAI-compatible endpoint (vLLM, LiteLLM, Ollama's `/v1`, …). Both fields can also be set in the admin agent editor.
+**`provider` / `base_url`**: Which LLM vendor serves `model`. Provider API keys are configured in the Admin UI → **Global Tool Configuration** and stored Fernet-encrypted in etcd — not in environment variables. `thinking_level` maps per provider: Gemini uses token budgets/levels, Anthropic maps to `anthropic_effort`, OpenAI to `openai_reasoning_effort`; `openai-compatible` runs with its own defaults. `openai-compatible` points `base_url` at any OpenAI-compatible endpoint (vLLM, LiteLLM, Ollama's `/v1`, …). Both fields can also be set in the admin agent editor.
 
-**`allowed_tools`**: Must exactly match the `name` field in each tool's `tool.yaml`. The hub exposes only listed tools to this agent.
+**`allowed_tools`**: Must exactly match the `name` field in each tool's `tool.yaml`. The hub exposes only listed tools to this agent. Built-in console tools (`ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `execute`) can also be listed. Long-lived background shells (`run_in_background`, `read_output`, `kill_shell`, `list_shells`) are **not** available: their spawn path cannot be env-sanitized, so they are disabled to keep the host's bootstrap secrets out of agent-run commands.
 
 **`allowed_mcps`**: Must exactly match the `name` in each `mcp.yaml`. All tools from that MCP server become available to the agent. Tool names are prefixed `mcp__{mcp_name}__{tool_name}` internally.
 
-**`a2a_access`**: Enables Agent-to-Agent delegation. The agent can call listed agents as sub-tasks (as if calling a tool). Keep this list small and intentional — the supervisor does not use `a2a_access`; it discovers and delegates dynamically via `search_agents` + `delegate`.
+**`a2a_access`**: Enables Agent-to-Agent delegation. The agent can call listed agents as sub-tasks (as if calling a tool). Targets must be `internal: true` (the default) — delegation to agents marked `internal: false` is skipped at build time with a warning. Keep this list small and intentional — the supervisor does not use `a2a_access`; it discovers and delegates dynamically via `search_agents` + `delegate`.
+
+**`rules`**: Optional declarative routing rules evaluated before semantic search — lock matching queries onto this agent deterministically. See the [Rules Engine guide](rules_engine.md) for the full field reference and authoring guidance.
 
 ---
 
@@ -182,7 +200,7 @@ docker compose up -d --build
 
 Confirm the output shows your agent:
 ```
-Saved config for agent: my-agent
+Saved config for agent: my-agent (Type: user_agent)
 Saved skills for agent: my-agent
 ```
 

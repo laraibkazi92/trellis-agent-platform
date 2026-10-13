@@ -6,10 +6,10 @@ This guide explains how to register external MCP servers so they are natively av
 
 ## Directory Structure
 
-All MCP servers are configured in the `mcps/` directory at the root of the project. Each server should have its own directory containing an `mcp.yaml` file.
+All MCP servers are configured in the `workspace/mcps/` directory of the project. Each server should have its own directory containing an `mcp.yaml` file.
 
 ```text
-Trellis/
+workspace/
 └── mcps/
     └── logs/
         └── mcp.yaml
@@ -17,16 +17,20 @@ Trellis/
 
 ## Configuration Schema (`mcp.yaml`)
 
-The `mcp.yaml` defines how the Universal Agent Host (`core/host.py`) connects to the external MCP server. The framework supports two transports: `stdio` (for local executables) and `sse` (for HTTP-based servers).
+The `mcp.yaml` defines how the Universal Agent Host (`core/host.py`) connects to the external MCP server. The framework supports four transports: `stdio` (for local executables), `sse` (for HTTP SSE servers), and `http` / `streamable-http` (for Streamable HTTP servers — two aliases for the same transport).
 
 ### Fields
 
 - `name`: The unique identifier for the MCP server.
-- `transport`: The communication protocol. Either `stdio` or `sse`.
-- `command`: The command to execute (for `stdio`) or the connection URL (for `sse`).
+- `transport`: The communication protocol. One of `stdio`, `sse`, `http`, `streamable-http`.
+- `command`: The command to execute (for `stdio`) or the connection URL (for `sse`/`http`/`streamable-http`).
 - `args` (Optional): A list of arguments to pass to the command (only applicable for `stdio`).
-- `env` (Optional): A dictionary of environment variables (for `stdio`) or HTTP headers (for `sse`).
+- `env` (Optional): A dictionary of environment variables (for `stdio`) or HTTP headers (for `sse`/`http`/`streamable-http`).
 - `secrets` (Optional): A list of required user secrets. These will automatically appear in the UI's Secret Manager.
+- `optional_secrets` (Optional): Secrets injected when present but not required for the server to start.
+- `variables` (Optional): Non-sensitive configuration variables. Same structure as `secrets` (including contextual scoping); resolved and injected exactly like secrets, just stored as plain variables.
+- `public` (Optional): Expose **all** tools from this MCP server directly to external MCP clients via the Gateway's `search_tools`/`use_tool` tools (no agent hop required).
+- `public_tools` (Optional): A whitelist of specific tool names to expose publicly when `public` is not set server-wide.
 - `tools` (Optional): A static list of tool definitions (`name`, `description`, `inputSchema`) exposed by the server. You normally don't write this by hand: when it's absent, the registry sync live-connects to the server (spawning the `stdio` command or opening the HTTP URL, with a ~20s budget), discovers its tools, and persists the discovered list into the registry config automatically. That list then feeds the runtime's discovery fast-path and the semantic tool-search index (`mcp__{server}__{tool}` embeddings). Hand-listing `tools` in `mcp.yaml` skips discovery entirely — useful when the server can't be reached from the sync environment; if discovery fails, the config is still saved and the runtime falls back to live discovery.
 
 ## Secure Secret Management

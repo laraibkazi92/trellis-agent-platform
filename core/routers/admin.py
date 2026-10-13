@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import templates, CSRFRoute
 from core.auth import get_identity_manager
 from core.health import HealthMonitor
+from core.llm_factory import LLM_PROVIDER_KEY_NAMES
 from core.models import Identity, IdentityType, is_agent_internal, coerce_bool_flag, ALLOWED_PROVIDERS
 from core.rules_engine import (
     RULES_EVALUATION_TIMEOUT as RULES_EVALUATION_TIMEOUT_DEFAULT,
@@ -48,6 +49,14 @@ _EMBEDDING_MODEL_WARNING = (
     "Changing this invalidates previously stored embeddings — agents must be "
     "re-embedded (rebuild / registry sync) before semantic search works again."
 )
+
+# Framework-level LLM provider API keys, managed under Admin -> Global Tool
+# Configuration. They are stored encrypted in etcd via IdentityManager (never in
+# environment variables). Derived from core.llm_factory's LLM_PROVIDER_KEY_NAMES
+# (first/canonical name per provider, deduped), so adding a provider there surfaces
+# here automatically. OPENAI_API_KEY also serves openai-compatible providers.
+_LLM_PROVIDER_KEY_NAMES = tuple(dict.fromkeys(names[0] for names in LLM_PROVIDER_KEY_NAMES.values()))
+_LLM_PROVIDER_TOOL_LABEL = "Framework (LLM Providers)"
 
 
 def sanitize_name(name: str) -> str:
@@ -481,7 +490,28 @@ async def admin_configuration_page(request: Request):
         })
         
     items.sort(key=lambda x: x["key"].lower())
-    
+
+    # Framework LLM provider keys form a distinct leading group. Skip any key a
+    # tool/MCP already declares so it renders exactly once (keep the tool entry).
+    llm_provider_keys = await asyncio.to_thread(identity_mgr.get_llm_provider_keys)
+    already_declared = set(required_secrets) | set(required_variables)
+    llm_items = []
+    for llm_key in _LLM_PROVIDER_KEY_NAMES:
+        if llm_key in already_declared:
+            continue
+        configured = llm_key in llm_provider_keys
+        llm_items.append({
+            "key": llm_key,
+            "type": "secret",
+            "label": "LLM",
+            "tools": [_LLM_PROVIDER_TOOL_LABEL],
+            "is_global": configured,
+            "value": "",
+            "placeholder": "******** (leave blank to keep current)" if configured
+                           else "Set provider key (stored encrypted in etcd)",
+        })
+    items = llm_items + items
+
     flash_msg = request.session.pop("flash_msg", None)
 
     return templates.TemplateResponse(
@@ -543,6 +573,8 @@ async def save_admin_configuration(request: Request):
     system_identity = Identity(id="system", type=IdentityType.SYSTEM)
     current_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
     current_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
+    current_llm_keys = await asyncio.to_thread(identity_mgr.get_llm_provider_keys)
+    llm_keys = dict(current_llm_keys)
     
     secrets_updated = False
     variables_updated = False
@@ -564,11 +596,22 @@ async def save_admin_configuration(request: Request):
             elif key in current_variables:
                 del current_variables[key]
                 variables_updated = True
-            
+
+    # Framework LLM provider keys live in their own encrypted store; a non-empty
+    # value sets the key, an empty value leaves the stored key unchanged.
+    for llm_key in _LLM_PROVIDER_KEY_NAMES:
+        if llm_key not in form:
+            continue
+        val_str = str(form.get(llm_key)).strip()
+        if val_str:
+            llm_keys[llm_key] = val_str
+
     if secrets_updated:
         await asyncio.to_thread(identity_mgr.save_identity_config, system_identity, "secrets", current_secrets)
     if variables_updated:
         await asyncio.to_thread(identity_mgr.save_identity_config, system_identity, "variables", current_variables)
+    if llm_keys != current_llm_keys:
+        await asyncio.to_thread(identity_mgr.save_llm_provider_keys, llm_keys)
     
     request.session["flash_msg"] = "Global configurations and secrets saved successfully."
     return RedirectResponse(url='/admin/configuration', status_code=303)
@@ -581,7 +624,14 @@ async def delete_admin_configuration_key(request: Request, secret_key: str = For
     system_identity = Identity(id="system", type=IdentityType.SYSTEM)
     current_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
     current_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
-    
+
+    if secret_key in _LLM_PROVIDER_KEY_NAMES:
+        llm_keys = dict(await asyncio.to_thread(identity_mgr.get_llm_provider_keys))
+        if secret_key in llm_keys:
+            del llm_keys[secret_key]
+            await asyncio.to_thread(identity_mgr.save_llm_provider_keys, llm_keys)
+            request.session["flash_msg"] = f"Global secret '{secret_key}' removed."
+
     if secret_key in current_secrets:
         del current_secrets[secret_key]
         await asyncio.to_thread(identity_mgr.save_identity_config, system_identity, "secrets", current_secrets)

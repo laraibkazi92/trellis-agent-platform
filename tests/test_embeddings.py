@@ -99,15 +99,16 @@ def test_embed_text_fails_open_on_request_error(monkeypatch, caplog):
 
 # --- _get_client ---------------------------------------------------------------
 
-def test_get_client_none_without_api_key(monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.setattr(embeddings, "_client", None)
+def test_get_client_none_without_api_key(monkeypatch, llm_provider_keys):
+    llm_provider_keys.clear()
+    embeddings.reset_client_cache()
     assert embeddings._get_client() is None
+    assert llm_provider_keys.consulted == ["google"]
 
 
-def test_get_client_constructs_and_caches(monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr(embeddings, "_client", None)
+def test_get_client_constructs_and_caches(monkeypatch, llm_provider_keys):
+    llm_provider_keys["google"] = "test-key"
+    embeddings.reset_client_cache()
     created = []
 
     class _FakeGenaiClient:

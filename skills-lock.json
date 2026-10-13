@@ -1,10 +1,22 @@
 {
   "version": 1,
   "skills": {
+    "claude-security": {
+      "source": "anthropics/claude-plugins-official",
+      "sourceType": "github",
+      "skillPath": "plugins/claude-security/skills/claude-security/SKILL.md",
+      "computedHash": "5e4b6f34f21865d3f6e957ea43b26bcbba28f1f3c05a271641139204e6757926"
+    },
     "playwright-cli": {
       "source": "microsoft/playwright-cli",
       "sourceType": "github",
       "computedHash": "a1243fa79a233960647c4cc4b7f3b743cb4893b63fb2d5b04f118c368d9e432b"
+    },
+    "security-review": {
+      "source": "getsentry/skills",
+      "sourceType": "github",
+      "skillPath": "skills/security-review/SKILL.md",
+      "computedHash": "6b3e784d5589c67a11bbcc881b479fc8c2fdc1661a28d3f9d0213772b38fbd80"
     }
   }
 }

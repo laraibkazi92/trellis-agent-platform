@@ -1,0 +1,489 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 2478" width="1400" height="2478">
+  <title>Trellis brand sheet</title>
+<rect x="0" y="0" width="1400" height="2900" rx="0" fill="#FFFFFF" opacity="1"/>
+<rect x="0" y="0" width="1400" height="200" rx="0" fill="#123B2E" opacity="1"/>
+<g transform="translate(72.00 26.00) scale(0.46544)" opacity="1">
+<g transform="translate(0 1.33) scale(0.945312)">
+<g id="lattice" fill="#FFFFFF">
+    <path d="M46 30 A5 5 0 0 1 56 30 L60 200 H42 Z"/>
+    <path d="M198 30 A5 5 0 0 1 208 30 L212 232 H194 Z"/>
+    <rect x="14" y="144" width="228" height="12" rx="6"/>
+    <rect x="24" y="210" width="206" height="12" rx="6"/>
+  </g>
+  <g id="t" fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="24"/>
+    <path d="M116 58 H140 L144 238 H112 Z"/>
+  </g>
+  </g>
+  <g>
+<path fill="#E8A33D" transform="translate(286.604 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M525 691H12V586H198V0H331V586H511Z"/>
+<path fill="#FFFFFF" transform="translate(393.720 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M336 543C274 543 223 501 198 425L186 529H75V0H203V282C223 371 256 418 320 418C339 418 351 416 367 412L389 536C372 541 355 543 336 543Z"/>
+<path fill="#FFFFFF" transform="translate(472.518 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M511 277C511 444 426 544 278 544C128 544 43 422 43 261C43 94 131 -15 295 -15C375 -15 439 14 491 56L438 129C392 97 353 82 306 82C236 82 186 117 176 225H508C509 239 511 260 511 277ZM384 308H176C183 413 221 453 281 453C353 453 384 401 384 314Z"/>
+<path fill="#FFFFFF" transform="translate(583.532 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M198 -15C231 -15 262 -7 284 3L256 93C248 90 238 88 227 88C205 88 197 100 197 125V755L69 741V121C69 34 117 -15 198 -15Z"/>
+<path fill="#FFFFFF" transform="translate(642.835 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M198 -15C231 -15 262 -7 284 3L256 93C248 90 238 88 227 88C205 88 197 100 197 125V755L69 741V121C69 34 117 -15 198 -15Z"/>
+<path fill="#FFFFFF" transform="translate(702.139 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M138 797C91 797 58 763 58 719C58 676 91 642 138 642C186 642 219 676 219 719C219 763 186 797 138 797ZM203 529H75V0H203Z"/>
+<path fill="#FFFFFF" transform="translate(757.544 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M244 544C121 544 40 478 40 390C40 312 88 260 197 230C296 202 317 188 317 144C317 104 280 80 223 80C169 80 120 101 79 132L15 60C64 16 135 -15 226 -15C347 -15 449 43 449 153C449 247 388 291 280 320C190 345 169 361 169 396C169 428 198 449 249 449C296 449 338 434 382 406L432 481C382 520 320 544 244 544Z"/>
+  </g>
+</g>
+<text x="72" y="178" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="16" font-weight="400" fill="#B9CEC5" text-anchor="start" letter-spacing="0" opacity="1">Self-hosted, polyglot LLM agent framework</text>
+<text x="1328" y="74" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13" font-weight="700" fill="#E8A33D" text-anchor="end" letter-spacing="2" opacity="1">LOGO KIT</text>
+<text x="1328" y="100" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13" font-weight="400" fill="#B9CEC5" text-anchor="end" letter-spacing="0" opacity="1">Round 3 · final direction</text>
+<text x="1328" y="122" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13" font-weight="400" fill="#B9CEC5" text-anchor="end" letter-spacing="0" opacity="1">Grown T · fence lattice</text>
+<text x="72" y="256" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13" font-weight="700" fill="#123B2E" text-anchor="start" letter-spacing="1.6" opacity="1">THE MARK</text>
+<text x="160" y="256" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13.5" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">A fence lattice with a grown T — the two members that carry the T are bolder than the frame.</text>
+<line x1="72" y1="270" x2="1328" y2="270" stroke="#E3E7E6" stroke-width="1"/>
+<g transform="translate(72.00 294.00) scale(1.17188)" opacity="1">
+<g id="lattice" fill="#123B2E">
+    <path d="M46 30 A5 5 0 0 1 56 30 L60 200 H42 Z"/>
+    <path d="M198 30 A5 5 0 0 1 208 30 L212 232 H194 Z"/>
+    <rect x="14" y="144" width="228" height="12" rx="6"/>
+    <rect x="24" y="210" width="206" height="12" rx="6"/>
+  </g>
+  <g id="t" fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="24"/>
+    <path d="M116 58 H140 L144 238 H112 Z"/>
+  </g>
+</g>
+<text x="410" y="328" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="15.5" font-weight="400" fill="#14212B" text-anchor="start" letter-spacing="0" opacity="1">The trellis is drawn as a fence lattice: canes that thicken toward the base,</text>
+<text x="410" y="352" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="15.5" font-weight="400" fill="#14212B" text-anchor="start" letter-spacing="0" opacity="1">rails that bow, uneven member lengths — organic, not machined. The middle</text>
+<text x="410" y="376" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="15.5" font-weight="400" fill="#14212B" text-anchor="start" letter-spacing="0" opacity="1">post and top rail are the heaviest lines and read as a T; the T sits forward</text>
+<text x="410" y="400" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="15.5" font-weight="400" fill="#14212B" text-anchor="start" letter-spacing="0" opacity="1">and, in colour, is the only amber element.</text>
+<text x="410" y="434" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13" font-weight="700" fill="#5B6B73" text-anchor="start" letter-spacing="1.2" opacity="1">Sizes</text>
+<g transform="translate(410.00 564.00) scale(0.06250)" opacity="1">
+<g id="lattice" fill="#123B2E">
+    <path d="M46 30 A5 5 0 0 1 56 30 L60 200 H42 Z"/>
+    <path d="M198 30 A5 5 0 0 1 208 30 L212 232 H194 Z"/>
+    <rect x="14" y="144" width="228" height="12" rx="6"/>
+    <rect x="24" y="210" width="206" height="12" rx="6"/>
+  </g>
+  <g id="t" fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="24"/>
+    <path d="M116 58 H140 L144 238 H112 Z"/>
+  </g>
+</g>
+<text x="418.0" y="602" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="11.5" font-weight="400" fill="#5B6B73" text-anchor="middle" letter-spacing="0" opacity="1">16px</text>
+<g transform="translate(468.00 548.00) scale(0.12500)" opacity="1">
+<g id="lattice" fill="#123B2E">
+    <path d="M46 30 A5 5 0 0 1 56 30 L60 200 H42 Z"/>
+    <path d="M198 30 A5 5 0 0 1 208 30 L212 232 H194 Z"/>
+    <rect x="14" y="144" width="228" height="12" rx="6"/>
+    <rect x="24" y="210" width="206" height="12" rx="6"/>
+  </g>
+  <g id="t" fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="24"/>
+    <path d="M116 58 H140 L144 238 H112 Z"/>
+  </g>
+</g>
+<text x="484.0" y="602" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="11.5" font-weight="400" fill="#5B6B73" text-anchor="middle" letter-spacing="0" opacity="1">32px</text>
+<g transform="translate(542.00 516.00) scale(0.25000)" opacity="1">
+<g id="lattice" fill="#123B2E">
+    <path d="M46 30 A5 5 0 0 1 56 30 L60 200 H42 Z"/>
+    <path d="M198 30 A5 5 0 0 1 208 30 L212 232 H194 Z"/>
+    <rect x="14" y="144" width="228" height="12" rx="6"/>
+    <rect x="24" y="210" width="206" height="12" rx="6"/>
+  </g>
+  <g id="t" fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="24"/>
+    <path d="M116 58 H140 L144 238 H112 Z"/>
+  </g>
+</g>
+<text x="574.0" y="602" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="11.5" font-weight="400" fill="#5B6B73" text-anchor="middle" letter-spacing="0" opacity="1">64px</text>
+<g transform="translate(648.00 452.00) scale(0.50000)" opacity="1">
+<g id="lattice" fill="#123B2E">
+    <path d="M46 30 A5 5 0 0 1 56 30 L60 200 H42 Z"/>
+    <path d="M198 30 A5 5 0 0 1 208 30 L212 232 H194 Z"/>
+    <rect x="14" y="144" width="228" height="12" rx="6"/>
+    <rect x="24" y="210" width="206" height="12" rx="6"/>
+  </g>
+  <g id="t" fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="24"/>
+    <path d="M116 58 H140 L144 238 H112 Z"/>
+  </g>
+</g>
+<text x="712.0" y="602" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="11.5" font-weight="400" fill="#5B6B73" text-anchor="middle" letter-spacing="0" opacity="1">128px</text>
+<text x="72" y="642" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13" font-weight="700" fill="#123B2E" text-anchor="start" letter-spacing="1.6" opacity="1">COLOUR</text>
+<text x="144" y="642" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13.5" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Two colours, with a clear job each. The palette avoids the default blue of developer tools.</text>
+<line x1="72" y1="656" x2="1328" y2="656" stroke="#E3E7E6" stroke-width="1"/>
+<rect x="72" y="688" width="58" height="58" rx="10" fill="#123B2E" opacity="1"/>
+<text x="146" y="708" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="15" font-weight="600" fill="#14212B" text-anchor="start" letter-spacing="0" opacity="1">Pine</text>
+<text x="146" y="727" font-family="Fira Code, DejaVu Sans Mono, monospace" font-size="13" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">#123B2E</text>
+<text x="146" y="744" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="12.5" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Lattice, headings, key UI</text>
+<rect x="386" y="688" width="58" height="58" rx="10" fill="#E8A33D" opacity="1"/>
+<text x="460" y="708" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="15" font-weight="600" fill="#14212B" text-anchor="start" letter-spacing="0" opacity="1">Amber</text>
+<text x="460" y="727" font-family="Fira Code, DejaVu Sans Mono, monospace" font-size="13" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">#E8A33D</text>
+<text x="460" y="744" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="12.5" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">The T, accents, focus</text>
+<rect x="700" y="688" width="58" height="58" rx="10" fill="#14212B" opacity="1"/>
+<text x="774" y="708" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="15" font-weight="600" fill="#14212B" text-anchor="start" letter-spacing="0" opacity="1">Ink</text>
+<text x="774" y="727" font-family="Fira Code, DejaVu Sans Mono, monospace" font-size="13" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">#14212B</text>
+<text x="774" y="744" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="12.5" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Body text, one-colour mark</text>
+<rect x="1014" y="688" width="58" height="58" rx="10" fill="#FFFFFF" stroke="#E3E7E6" stroke-width="1" opacity="1"/>
+<text x="1088" y="708" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="15" font-weight="600" fill="#14212B" text-anchor="start" letter-spacing="0" opacity="1">Paper</text>
+<text x="1088" y="727" font-family="Fira Code, DejaVu Sans Mono, monospace" font-size="13" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">#FFFFFF</text>
+<text x="1088" y="744" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="12.5" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Backgrounds</text>
+<text x="72" y="784" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Pine 5535 C (approx.) · Amber 143 C (approx.) — verify against a Pantone guide before print.</text>
+<text x="72" y="808" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">The T keeps its own colour on light and dark; in one-colour use it still reads because it is the heaviest element.</text>
+<text x="72" y="850" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13" font-weight="700" fill="#123B2E" text-anchor="start" letter-spacing="1.6" opacity="1">VARIANTS</text>
+<text x="160" y="850" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13.5" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Every mark ships in full colour, one colour, and reversed.</text>
+<line x1="72" y1="864" x2="1328" y2="864" stroke="#E3E7E6" stroke-width="1"/>
+<rect x="72" y="896" width="200" height="200" rx="14" fill="#FFFFFF" stroke="#E3E7E6" stroke-width="1" opacity="1"/>
+<g transform="translate(102.00 926.00) scale(0.54688)" opacity="1">
+<g id="lattice" fill="#123B2E">
+    <path d="M46 30 A5 5 0 0 1 56 30 L60 200 H42 Z"/>
+    <path d="M198 30 A5 5 0 0 1 208 30 L212 232 H194 Z"/>
+    <rect x="14" y="144" width="228" height="12" rx="6"/>
+    <rect x="24" y="210" width="206" height="12" rx="6"/>
+  </g>
+  <g id="t" fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="24"/>
+    <path d="M116 58 H140 L144 238 H112 Z"/>
+  </g>
+</g>
+<text x="172.0" y="1120" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13.5" font-weight="400" fill="#5B6B73" text-anchor="middle" letter-spacing="0" opacity="1">Full colour</text>
+<rect x="306" y="896" width="200" height="200" rx="14" fill="#FFFFFF" stroke="#E3E7E6" stroke-width="1" opacity="1"/>
+<g transform="translate(336.00 926.00) scale(0.54688)" opacity="1">
+<g id="lattice" fill="#123B2E">
+    <path d="M46 30 A5 5 0 0 1 56 30 L60 200 H42 Z"/>
+    <path d="M198 30 A5 5 0 0 1 208 30 L212 232 H194 Z"/>
+    <rect x="14" y="144" width="228" height="12" rx="6"/>
+    <rect x="24" y="210" width="206" height="12" rx="6"/>
+  </g>
+  <g id="t" fill="#123B2E">
+    <rect x="14" y="58" width="228" height="24"/>
+    <path d="M116 58 H140 L144 238 H112 Z"/>
+  </g>
+</g>
+<text x="406.0" y="1120" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13.5" font-weight="400" fill="#5B6B73" text-anchor="middle" letter-spacing="0" opacity="1">One colour</text>
+<rect x="540" y="896" width="200" height="200" rx="14" fill="#123B2E" stroke="#E3E7E6" stroke-width="1" opacity="1"/>
+<g transform="translate(570.00 926.00) scale(0.54688)" opacity="1">
+<g id="lattice" fill="#FFFFFF">
+    <path d="M46 30 A5 5 0 0 1 56 30 L60 200 H42 Z"/>
+    <path d="M198 30 A5 5 0 0 1 208 30 L212 232 H194 Z"/>
+    <rect x="14" y="144" width="228" height="12" rx="6"/>
+    <rect x="24" y="210" width="206" height="12" rx="6"/>
+  </g>
+  <g id="t" fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="24"/>
+    <path d="M116 58 H140 L144 238 H112 Z"/>
+  </g>
+</g>
+<text x="640.0" y="1120" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13.5" font-weight="400" fill="#5B6B73" text-anchor="middle" letter-spacing="0" opacity="1">On dark</text>
+<rect x="774" y="896" width="200" height="200" rx="14" fill="#123B2E" stroke="#E3E7E6" stroke-width="1" opacity="1"/>
+<g transform="translate(804.00 926.00) scale(0.54688)" opacity="1">
+<g id="lattice" fill="#FFFFFF">
+    <path d="M46 30 A5 5 0 0 1 56 30 L60 200 H42 Z"/>
+    <path d="M198 30 A5 5 0 0 1 208 30 L212 232 H194 Z"/>
+    <rect x="14" y="144" width="228" height="12" rx="6"/>
+    <rect x="24" y="210" width="206" height="12" rx="6"/>
+  </g>
+  <g id="t" fill="#FFFFFF">
+    <rect x="14" y="58" width="228" height="24"/>
+    <path d="M116 58 H140 L144 238 H112 Z"/>
+  </g>
+</g>
+<text x="874.0" y="1120" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13.5" font-weight="400" fill="#5B6B73" text-anchor="middle" letter-spacing="0" opacity="1">Reversed</text>
+<text x="72" y="1170" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13" font-weight="700" fill="#123B2E" text-anchor="start" letter-spacing="1.6" opacity="1">LOCKUPS</text>
+<text x="152" y="1170" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13.5" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Horizontal is primary. One unit = the width of a lattice cane.</text>
+<line x1="72" y1="1184" x2="1328" y2="1184" stroke="#E3E7E6" stroke-width="1"/>
+<g transform="translate(72.00 1236.00) scale(0.59908)" opacity="1">
+<g transform="translate(0 1.33) scale(0.945312)">
+<g id="lattice" fill="#123B2E">
+    <path d="M46 30 A5 5 0 0 1 56 30 L60 200 H42 Z"/>
+    <path d="M198 30 A5 5 0 0 1 208 30 L212 232 H194 Z"/>
+    <rect x="14" y="144" width="228" height="12" rx="6"/>
+    <rect x="24" y="210" width="206" height="12" rx="6"/>
+  </g>
+  <g id="t" fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="24"/>
+    <path d="M116 58 H140 L144 238 H112 Z"/>
+  </g>
+  </g>
+  <g>
+<path fill="#E8A33D" transform="translate(286.604 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M525 691H12V586H198V0H331V586H511Z"/>
+<path fill="#123B2E" transform="translate(393.720 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M336 543C274 543 223 501 198 425L186 529H75V0H203V282C223 371 256 418 320 418C339 418 351 416 367 412L389 536C372 541 355 543 336 543Z"/>
+<path fill="#123B2E" transform="translate(472.518 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M511 277C511 444 426 544 278 544C128 544 43 422 43 261C43 94 131 -15 295 -15C375 -15 439 14 491 56L438 129C392 97 353 82 306 82C236 82 186 117 176 225H508C509 239 511 260 511 277ZM384 308H176C183 413 221 453 281 453C353 453 384 401 384 314Z"/>
+<path fill="#123B2E" transform="translate(583.532 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M198 -15C231 -15 262 -7 284 3L256 93C248 90 238 88 227 88C205 88 197 100 197 125V755L69 741V121C69 34 117 -15 198 -15Z"/>
+<path fill="#123B2E" transform="translate(642.835 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M198 -15C231 -15 262 -7 284 3L256 93C248 90 238 88 227 88C205 88 197 100 197 125V755L69 741V121C69 34 117 -15 198 -15Z"/>
+<path fill="#123B2E" transform="translate(702.139 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M138 797C91 797 58 763 58 719C58 676 91 642 138 642C186 642 219 676 219 719C219 763 186 797 138 797ZM203 529H75V0H203Z"/>
+<path fill="#123B2E" transform="translate(757.544 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M244 544C121 544 40 478 40 390C40 312 88 260 197 230C296 202 317 188 317 144C317 104 280 80 223 80C169 80 120 101 79 132L15 60C64 16 135 -15 226 -15C347 -15 449 43 449 153C449 247 388 291 280 320C190 345 169 361 169 396C169 428 198 449 249 449C296 449 338 434 382 406L432 481C382 520 320 544 244 544Z"/>
+  </g>
+</g>
+<text x="72" y="1460" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13.5" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Horizontal — primary</text>
+<g transform="translate(700.00 1217.00) scale(0.51282)" opacity="1">
+<g transform="translate(98.82 0) scale(1.046875)">
+<g id="lattice" fill="#123B2E">
+    <path d="M46 30 A5 5 0 0 1 56 30 L60 200 H42 Z"/>
+    <path d="M198 30 A5 5 0 0 1 208 30 L212 232 H194 Z"/>
+    <rect x="14" y="144" width="228" height="12" rx="6"/>
+    <rect x="24" y="210" width="206" height="12" rx="6"/>
+  </g>
+  <g id="t" fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="24"/>
+    <path d="M116 58 H140 L144 238 H112 Z"/>
+  </g>
+  </g>
+  <g>
+<path fill="#E8A33D" transform="translate(-1.705 416.08399566473986) scale(0.17052023121387283 -0.17052023121387283)" d="M525 691H12V586H198V0H331V586H511Z"/>
+<path fill="#123B2E" transform="translate(87.306 416.08399566473986) scale(0.17052023121387283 -0.17052023121387283)" d="M336 543C274 543 223 501 198 425L186 529H75V0H203V282C223 371 256 418 320 418C339 418 351 416 367 412L389 536C372 541 355 543 336 543Z"/>
+<path fill="#123B2E" transform="translate(152.786 416.08399566473986) scale(0.17052023121387283 -0.17052023121387283)" d="M511 277C511 444 426 544 278 544C128 544 43 422 43 261C43 94 131 -15 295 -15C375 -15 439 14 491 56L438 129C392 97 353 82 306 82C236 82 186 117 176 225H508C509 239 511 260 511 277ZM384 308H176C183 413 221 453 281 453C353 453 384 401 384 314Z"/>
+<path fill="#123B2E" transform="translate(245.038 416.08399566473986) scale(0.17052023121387283 -0.17052023121387283)" d="M198 -15C231 -15 262 -7 284 3L256 93C248 90 238 88 227 88C205 88 197 100 197 125V755L69 741V121C69 34 117 -15 198 -15Z"/>
+<path fill="#123B2E" transform="translate(294.318 416.08399566473986) scale(0.17052023121387283 -0.17052023121387283)" d="M198 -15C231 -15 262 -7 284 3L256 93C248 90 238 88 227 88C205 88 197 100 197 125V755L69 741V121C69 34 117 -15 198 -15Z"/>
+<path fill="#123B2E" transform="translate(343.598 416.08399566473986) scale(0.17052023121387283 -0.17052023121387283)" d="M138 797C91 797 58 763 58 719C58 676 91 642 138 642C186 642 219 676 219 719C219 763 186 797 138 797ZM203 529H75V0H203Z"/>
+<path fill="#123B2E" transform="translate(389.639 416.08399566473986) scale(0.17052023121387283 -0.17052023121387283)" d="M244 544C121 544 40 478 40 390C40 312 88 260 197 230C296 202 317 188 317 144C317 104 280 80 223 80C169 80 120 101 79 132L15 60C64 16 135 -15 226 -15C347 -15 449 43 449 153C449 247 388 291 280 320C190 345 169 361 169 396C169 428 198 449 249 449C296 449 338 434 382 406L432 481C382 520 320 544 244 544Z"/>
+  </g>
+</g>
+<text x="700" y="1460" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13.5" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Stacked — square formats, social</text>
+<g transform="translate(1030.00 1271.00) scale(0.10749)" opacity="1">
+<g transform="translate(14.0 827.0)">
+<path fill="#E8A33D" transform="translate(0.000 0) scale(1.0 -1.0)" d="M525 691H12V586H198V0H331V586H511Z"/>
+<path fill="#123B2E" transform="translate(522.000 0) scale(1.0 -1.0)" d="M336 543C274 543 223 501 198 425L186 529H75V0H203V282C223 371 256 418 320 418C339 418 351 416 367 412L389 536C372 541 355 543 336 543Z"/>
+<path fill="#123B2E" transform="translate(906.000 0) scale(1.0 -1.0)" d="M511 277C511 444 426 544 278 544C128 544 43 422 43 261C43 94 131 -15 295 -15C375 -15 439 14 491 56L438 129C392 97 353 82 306 82C236 82 186 117 176 225H508C509 239 511 260 511 277ZM384 308H176C183 413 221 453 281 453C353 453 384 401 384 314Z"/>
+<path fill="#123B2E" transform="translate(1447.000 0) scale(1.0 -1.0)" d="M198 -15C231 -15 262 -7 284 3L256 93C248 90 238 88 227 88C205 88 197 100 197 125V755L69 741V121C69 34 117 -15 198 -15Z"/>
+<path fill="#123B2E" transform="translate(1736.000 0) scale(1.0 -1.0)" d="M198 -15C231 -15 262 -7 284 3L256 93C248 90 238 88 227 88C205 88 197 100 197 125V755L69 741V121C69 34 117 -15 198 -15Z"/>
+<path fill="#123B2E" transform="translate(2025.000 0) scale(1.0 -1.0)" d="M138 797C91 797 58 763 58 719C58 676 91 642 138 642C186 642 219 676 219 719C219 763 186 797 138 797ZM203 529H75V0H203Z"/>
+<path fill="#123B2E" transform="translate(2295.000 0) scale(1.0 -1.0)" d="M244 544C121 544 40 478 40 390C40 312 88 260 197 230C296 202 317 188 317 144C317 104 280 80 223 80C169 80 120 101 79 132L15 60C64 16 135 -15 226 -15C347 -15 449 43 449 153C449 247 388 291 280 320C190 345 169 361 169 396C169 428 198 449 249 449C296 449 338 434 382 406L432 481C382 520 320 544 244 544Z"/>
+  </g>
+</g>
+<text x="1030" y="1460" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13.5" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Wordmark — where the symbol is already known</text>
+<text x="72" y="1516" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13" font-weight="700" fill="#123B2E" text-anchor="start" letter-spacing="1.6" opacity="1">ICONS &amp; SMALL SIZES</text>
+<text x="248" y="1516" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13.5" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">At 16 px the thin frame becomes texture — a simplified cut keeps the T sharp.</text>
+<line x1="72" y1="1530" x2="1328" y2="1530" stroke="#E3E7E6" stroke-width="1"/>
+<g transform="translate(72.00 1562.00) scale(0.58594)" opacity="1">
+<rect width="256" height="256" rx="52" fill="#123B2E"/>
+  <g transform="translate(128 128) scale(0.74) translate(-128 -128)">
+<g fill="#FFFFFF">
+    <rect x="44" y="34" width="17" height="172" rx="8.5"/>
+    <rect x="195" y="34" width="17" height="196" rx="8.5"/>
+  </g>
+  <g fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="27"/>
+    <rect x="113" y="58" width="30" height="184"/>
+  </g>
+  </g>
+</g>
+<text x="72" y="1738" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13.5" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">App / favicon tile</text>
+<rect x="250" y="1562" width="150" height="150" rx="14" fill="#FFFFFF" stroke="#E3E7E6" stroke-width="1" opacity="1"/>
+<g transform="translate(265.00 1574.00) scale(0.46875)" opacity="1">
+<g fill="#123B2E">
+    <rect x="44" y="34" width="17" height="172" rx="8.5"/>
+    <rect x="195" y="34" width="17" height="196" rx="8.5"/>
+  </g>
+  <g fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="27"/>
+    <rect x="113" y="58" width="30" height="184"/>
+  </g>
+</g>
+<text x="250" y="1738" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13.5" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Small cut (≥16 px)</text>
+<g transform="translate(435.00 1650.00) scale(0.06250)" opacity="1">
+<rect width="256" height="256" rx="52" fill="#123B2E"/>
+  <g transform="translate(128 128) scale(0.74) translate(-128 -128)">
+<g fill="#FFFFFF">
+    <rect x="44" y="34" width="17" height="172" rx="8.5"/>
+    <rect x="195" y="34" width="17" height="196" rx="8.5"/>
+  </g>
+  <g fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="27"/>
+    <rect x="113" y="58" width="30" height="184"/>
+  </g>
+  </g>
+</g>
+<text x="443.0" y="1682" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="11" font-weight="400" fill="#5B6B73" text-anchor="middle" letter-spacing="0" opacity="1">16</text>
+<g transform="translate(497.00 1646.00) scale(0.09375)" opacity="1">
+<rect width="256" height="256" rx="52" fill="#123B2E"/>
+  <g transform="translate(128 128) scale(0.74) translate(-128 -128)">
+<g fill="#FFFFFF">
+    <rect x="44" y="34" width="17" height="172" rx="8.5"/>
+    <rect x="195" y="34" width="17" height="196" rx="8.5"/>
+  </g>
+  <g fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="27"/>
+    <rect x="113" y="58" width="30" height="184"/>
+  </g>
+  </g>
+</g>
+<text x="509.0" y="1682" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="11" font-weight="400" fill="#5B6B73" text-anchor="middle" letter-spacing="0" opacity="1">24</text>
+<g transform="translate(567.00 1642.00) scale(0.12500)" opacity="1">
+<rect width="256" height="256" rx="52" fill="#123B2E"/>
+  <g transform="translate(128 128) scale(0.74) translate(-128 -128)">
+<g fill="#FFFFFF">
+    <rect x="44" y="34" width="17" height="172" rx="8.5"/>
+    <rect x="195" y="34" width="17" height="196" rx="8.5"/>
+  </g>
+  <g fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="27"/>
+    <rect x="113" y="58" width="30" height="184"/>
+  </g>
+  </g>
+</g>
+<text x="583.0" y="1682" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="11" font-weight="400" fill="#5B6B73" text-anchor="middle" letter-spacing="0" opacity="1">32</text>
+<g transform="translate(645.00 1634.00) scale(0.18750)" opacity="1">
+<rect width="256" height="256" rx="52" fill="#123B2E"/>
+  <g transform="translate(128 128) scale(0.74) translate(-128 -128)">
+<g fill="#FFFFFF">
+    <rect x="44" y="34" width="17" height="172" rx="8.5"/>
+    <rect x="195" y="34" width="17" height="196" rx="8.5"/>
+  </g>
+  <g fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="27"/>
+    <rect x="113" y="58" width="30" height="184"/>
+  </g>
+  </g>
+</g>
+<text x="669.0" y="1682" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="11" font-weight="400" fill="#5B6B73" text-anchor="middle" letter-spacing="0" opacity="1">48</text>
+<text x="435" y="1738" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13.5" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Tile at real size</text>
+<g transform="translate(720.00 1650.00) scale(0.06250)" opacity="1">
+<g fill="#123B2E">
+    <rect x="44" y="34" width="17" height="172" rx="8.5"/>
+    <rect x="195" y="34" width="17" height="196" rx="8.5"/>
+  </g>
+  <g fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="27"/>
+    <rect x="113" y="58" width="30" height="184"/>
+  </g>
+</g>
+<text x="728.0" y="1682" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="11" font-weight="400" fill="#5B6B73" text-anchor="middle" letter-spacing="0" opacity="1">16</text>
+<g transform="translate(782.00 1646.00) scale(0.09375)" opacity="1">
+<g fill="#123B2E">
+    <rect x="44" y="34" width="17" height="172" rx="8.5"/>
+    <rect x="195" y="34" width="17" height="196" rx="8.5"/>
+  </g>
+  <g fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="27"/>
+    <rect x="113" y="58" width="30" height="184"/>
+  </g>
+</g>
+<text x="794.0" y="1682" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="11" font-weight="400" fill="#5B6B73" text-anchor="middle" letter-spacing="0" opacity="1">24</text>
+<g transform="translate(852.00 1642.00) scale(0.12500)" opacity="1">
+<g fill="#123B2E">
+    <rect x="44" y="34" width="17" height="172" rx="8.5"/>
+    <rect x="195" y="34" width="17" height="196" rx="8.5"/>
+  </g>
+  <g fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="27"/>
+    <rect x="113" y="58" width="30" height="184"/>
+  </g>
+</g>
+<text x="868.0" y="1682" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="11" font-weight="400" fill="#5B6B73" text-anchor="middle" letter-spacing="0" opacity="1">32</text>
+<g transform="translate(930.00 1634.00) scale(0.18750)" opacity="1">
+<g fill="#123B2E">
+    <rect x="44" y="34" width="17" height="172" rx="8.5"/>
+    <rect x="195" y="34" width="17" height="196" rx="8.5"/>
+  </g>
+  <g fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="27"/>
+    <rect x="113" y="58" width="30" height="184"/>
+  </g>
+</g>
+<text x="954.0" y="1682" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="11" font-weight="400" fill="#5B6B73" text-anchor="middle" letter-spacing="0" opacity="1">48</text>
+<text x="720" y="1738" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13.5" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Small cut at real size</text>
+<g transform="translate(1010.00 1578.00) scale(0.46094)" opacity="1">
+<g id="lattice" fill="#000000">
+    <path d="M46 30 A5 5 0 0 1 56 30 L60 200 H42 Z"/>
+    <path d="M198 30 A5 5 0 0 1 208 30 L212 232 H194 Z"/>
+    <rect x="14" y="144" width="228" height="12" rx="6"/>
+    <rect x="24" y="210" width="206" height="12" rx="6"/>
+  </g>
+  <g id="t" fill="#000000">
+    <rect x="14" y="58" width="228" height="24"/>
+    <path d="M116 58 H140 L144 238 H112 Z"/>
+  </g>
+</g>
+<text x="1010" y="1738" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13.5" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Black, one colour</text>
+<text x="72" y="1794" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13" font-weight="700" fill="#123B2E" text-anchor="start" letter-spacing="1.6" opacity="1">IN CONTEXT</text>
+<line x1="72" y1="1808" x2="1328" y2="1808" stroke="#E3E7E6" stroke-width="1"/>
+<rect x="72" y="1840" width="360" height="150" rx="12" fill="#F4F6F4" opacity="1"/>
+<rect x="88" y="1856" width="200" height="40" rx="9" fill="#FFFFFF" stroke="#E3E7E6" stroke-width="1" opacity="1"/>
+<g transform="translate(102.00 1862.00) scale(0.10938)" opacity="1">
+<rect width="256" height="256" rx="52" fill="#123B2E"/>
+  <g transform="translate(128 128) scale(0.74) translate(-128 -128)">
+<g fill="#FFFFFF">
+    <rect x="44" y="34" width="17" height="172" rx="8.5"/>
+    <rect x="195" y="34" width="17" height="196" rx="8.5"/>
+  </g>
+  <g fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="27"/>
+    <rect x="113" y="58" width="30" height="184"/>
+  </g>
+  </g>
+</g>
+<text x="140" y="1882" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="15" font-weight="600" fill="#14212B" text-anchor="start" letter-spacing="0" opacity="1">Trellis</text>
+<rect x="296" y="1856" width="120" height="40" rx="9" fill="#FFFFFF" stroke="#E3E7E6" stroke-width="1" opacity="1"/>
+<text x="356" y="1882" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="15" font-weight="400" fill="#5B6B73" text-anchor="middle" letter-spacing="0" opacity="1">Agents</text>
+<text x="88" y="1932" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13.5" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Browser tab</text>
+<text x="88" y="1956" font-family="Fira Code, DejaVu Sans Mono, monospace" font-size="12" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">favicon.svg + favicon.ico</text>
+<rect x="470" y="1840" width="400" height="150" rx="12" fill="#0B1512" opacity="1"/>
+<rect x="470" y="1840" width="400" height="30" rx="12" fill="#152621" opacity="1"/>
+<circle cx="490" cy="1855" r="5" fill="#F2685E"/>
+<circle cx="510" cy="1855" r="5" fill="#E8A33D"/>
+<circle cx="530" cy="1855" r="5" fill="#7ECB6A"/>
+<text x="486" y="1898" font-family="Fira Code, DejaVu Sans Mono, monospace" font-size="13" font-weight="400" fill="#9FD3BC" text-anchor="start" letter-spacing="0" opacity="1">$ trellis agent run --tool search</text>
+<text x="486" y="1920" font-family="Fira Code, DejaVu Sans Mono, monospace" font-size="13" font-weight="400" fill="#6F8C82" text-anchor="start" letter-spacing="0" opacity="1">&gt; routed via rules engine</text>
+<text x="486" y="1942" font-family="Fira Code, DejaVu Sans Mono, monospace" font-size="13" font-weight="400" fill="#6F8C82" text-anchor="start" letter-spacing="0" opacity="1">&gt; 3 agents online</text>
+<g transform="translate(800.00 1900.00) scale(0.21094)" opacity="1">
+<g id="lattice" fill="#FFFFFF">
+    <path d="M46 30 A5 5 0 0 1 56 30 L60 200 H42 Z"/>
+    <path d="M198 30 A5 5 0 0 1 208 30 L212 232 H194 Z"/>
+    <rect x="14" y="144" width="228" height="12" rx="6"/>
+    <rect x="24" y="210" width="206" height="12" rx="6"/>
+  </g>
+  <g id="t" fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="24"/>
+    <path d="M116 58 H140 L144 238 H112 Z"/>
+  </g>
+</g>
+<text x="470" y="2016" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13.5" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Terminal / dark UI</text>
+<text x="470" y="2040" font-family="Fira Code, DejaVu Sans Mono, monospace" font-size="12" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">use the *-on-dark variant</text>
+<rect x="930" y="1840" width="398" height="160" rx="12" fill="#FFFFFF" stroke="#E3E7E6" stroke-width="1" opacity="1"/>
+<g transform="translate(952.00 1858.00) scale(0.27650)" opacity="1">
+<g transform="translate(0 1.33) scale(0.945312)">
+<g id="lattice" fill="#123B2E">
+    <path d="M46 30 A5 5 0 0 1 56 30 L60 200 H42 Z"/>
+    <path d="M198 30 A5 5 0 0 1 208 30 L212 232 H194 Z"/>
+    <rect x="14" y="144" width="228" height="12" rx="6"/>
+    <rect x="24" y="210" width="206" height="12" rx="6"/>
+  </g>
+  <g id="t" fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="24"/>
+    <path d="M116 58 H140 L144 238 H112 Z"/>
+  </g>
+  </g>
+  <g>
+<path fill="#E8A33D" transform="translate(286.604 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M525 691H12V586H198V0H331V586H511Z"/>
+<path fill="#123B2E" transform="translate(393.720 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M336 543C274 543 223 501 198 425L186 529H75V0H203V282C223 371 256 418 320 418C339 418 351 416 367 412L389 536C372 541 355 543 336 543Z"/>
+<path fill="#123B2E" transform="translate(472.518 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M511 277C511 444 426 544 278 544C128 544 43 422 43 261C43 94 131 -15 295 -15C375 -15 439 14 491 56L438 129C392 97 353 82 306 82C236 82 186 117 176 225H508C509 239 511 260 511 277ZM384 308H176C183 413 221 453 281 453C353 453 384 401 384 314Z"/>
+<path fill="#123B2E" transform="translate(583.532 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M198 -15C231 -15 262 -7 284 3L256 93C248 90 238 88 227 88C205 88 197 100 197 125V755L69 741V121C69 34 117 -15 198 -15Z"/>
+<path fill="#123B2E" transform="translate(642.835 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M198 -15C231 -15 262 -7 284 3L256 93C248 90 238 88 227 88C205 88 197 100 197 125V755L69 741V121C69 34 117 -15 198 -15Z"/>
+<path fill="#123B2E" transform="translate(702.139 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M138 797C91 797 58 763 58 719C58 676 91 642 138 642C186 642 219 676 219 719C219 763 186 797 138 797ZM203 529H75V0H203Z"/>
+<path fill="#123B2E" transform="translate(757.544 199.0) scale(0.20520231213872833 -0.20520231213872833)" d="M244 544C121 544 40 478 40 390C40 312 88 260 197 230C296 202 317 188 317 144C317 104 280 80 223 80C169 80 120 101 79 132L15 60C64 16 135 -15 226 -15C347 -15 449 43 449 153C449 247 388 291 280 320C190 345 169 361 169 396C169 428 198 449 249 449C296 449 338 434 382 406L432 481C382 520 320 544 244 544Z"/>
+  </g>
+</g>
+<rect x="952" y="1940" width="250" height="9" rx="4.5" fill="#E3E7E6" opacity="1"/>
+<rect x="952" y="1958" width="340" height="9" rx="4.5" fill="#EDF0EF" opacity="1"/>
+<text x="930" y="2026" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13.5" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">README header</text>
+<text x="930" y="2050" font-family="Fira Code, DejaVu Sans Mono, monospace" font-size="12" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">horizontal lockup</text>
+<text x="72" y="2090" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13" font-weight="700" fill="#123B2E" text-anchor="start" letter-spacing="1.6" opacity="1">CLEAR SPACE &amp; MINIMUM SIZE</text>
+<line x1="72" y1="2104" x2="1328" y2="2104" stroke="#E3E7E6" stroke-width="1"/>
+<rect x="72" y="2136" width="190" height="190" rx="10" fill="#FFFFFF" stroke="#E3E7E6" stroke-width="1" opacity="1"/>
+<g transform="translate(92.00 2156.00) scale(0.58594)" opacity="1">
+<g id="lattice" fill="#123B2E">
+    <path d="M46 30 A5 5 0 0 1 56 30 L60 200 H42 Z"/>
+    <path d="M198 30 A5 5 0 0 1 208 30 L212 232 H194 Z"/>
+    <rect x="14" y="144" width="228" height="12" rx="6"/>
+    <rect x="24" y="210" width="206" height="12" rx="6"/>
+  </g>
+  <g id="t" fill="#E8A33D">
+    <rect x="14" y="58" width="228" height="24"/>
+    <path d="M116 58 H140 L144 238 H112 Z"/>
+  </g>
+</g>
+<rect x="72" y="2136" width="190" height="190" rx="10" fill="none" stroke="#E8A33D" stroke-width="1.5" opacity="1"/>
+<text x="300" y="2166" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="14" font-weight="600" fill="#14212B" text-anchor="start" letter-spacing="0" opacity="1">Clear space</text>
+<text x="300" y="2190" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="14" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Keep a margin of 1 × cane width (≈ 7 % of the mark) on all sides.</text>
+<text x="300" y="2214" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="14" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Nothing enters that zone — no type, no rules, no edges.</text>
+<text x="300" y="2254" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="14" font-weight="600" fill="#14212B" text-anchor="start" letter-spacing="0" opacity="1">Minimum size</text>
+<text x="300" y="2278" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="14" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Symbol: 16 px screen / 6 mm print (use the small cut).</text>
+<text x="300" y="2302" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="14" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Horizontal lockup: 130 px wide screen / 34 mm print.</text>
+<text x="72" y="2388" font-family="Fira Code, DejaVu Sans Mono, monospace" font-size="13" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Files: /svg (masters + variants) · /png (rasters 16–1600 px) · /web (favicon.ico, PWA icons, manifest)</text>
+<text x="72" y="2412" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Trademark: this is original artwork, but a professional clearance search is still recommended before registration.</text>
+<text x="72" y="2436" font-family="Fira Sans, DejaVu Sans, sans-serif" font-size="13" font-weight="400" fill="#5B6B73" text-anchor="start" letter-spacing="0" opacity="1">Wordmark: Fira Sans (SIL Open Font License) delivered as outlined paths — no font dependency.</text>
+</svg>

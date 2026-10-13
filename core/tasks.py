@@ -11,13 +11,16 @@ from pydantic_ai import Agent
 
 from core.auth import user_id_var
 from core.models import Identity, IdentityType
+from core.env_sanitize import sanitized_env
 from core.tunables import resolve as resolve_tunable
 from core.agent_factory import (
     build_agent,
     get_identity_manager,
     get_health_monitor,
     get_hub_client,
+    install_llm_key_watch,
 )
+from core.llm_factory import warm_key_cache
 
 RESTRICTED_ENV_VARS = {"PATH", "PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "BASH_ENV", "ENV", "HOSTALIASES"}
 
@@ -90,8 +93,21 @@ async def enqueue_workflow_run(name: str, config: Dict, xml_payload: str) -> Non
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 broker = ListQueueBroker(redis_url, socket_timeout=None)
 
-from taskiq import TaskiqScheduler, Context, TaskiqDepends
+from taskiq import TaskiqEvents, TaskiqScheduler, Context, TaskiqDepends
 from taskiq.schedule_sources import LabelScheduleSource
+
+
+@broker.on_event(TaskiqEvents.WORKER_STARTUP)
+def _install_llm_key_watch_on_startup(state) -> None:
+    """Register the LLM-key etcd watch in the worker process (idempotent).
+
+    The taskiq worker is a separate process from the Host with its own agent
+    cache, so it needs its own watch registered at startup. This hook is sync and
+    runs during startup (no event loop to hand off to), so the cache warm is called
+    directly rather than via asyncio.to_thread.
+    """
+    install_llm_key_watch()
+    warm_key_cache()
 
 scheduler = TaskiqScheduler(
     broker=broker,
@@ -207,7 +223,7 @@ async def run_background_script(
         else:
             cmd = [str(entrypoint_path)]
 
-        env = os.environ.copy()
+        env = sanitized_env()
         from core.discovery import get_agent_required_secrets, get_agent_required_variables
         
         # Scoped Secret Injection (Aggregated from config + allowed tools/mcps)

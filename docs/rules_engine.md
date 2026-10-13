@@ -65,9 +65,10 @@ scenario; each entry is evaluated independently against the query.
 | `examples` | No (default `[]`) | Representative real user queries. Helps the LLM decider generalize beyond the literal wording of `use_when`. |
 
 > ⚠️ These models do not set `extra="forbid"` (consistent with the rest of `core/models.py`'s config
-> loading). A typo'd key — e.g. `when_to_use` instead of `use_when` — is **silently dropped**, not
-> rejected. It will not raise a validation error; it will just produce a rule with an empty condition
-> list that never matches anything. Stick to the exact field names above.
+> loading). A typo'd key — e.g. `when_to_use` instead of `use_when` — is dropped rather than rejected
+> with a validation error: the registry sync prints a warning naming the unrecognized field, but the
+> rule still syncs with an empty condition list that never matches anything. Stick to the exact field
+> names above.
 
 A rule block with all fields empty (`use_when: []`, `do_not_use_when: []`, `examples: []`) is still
 schema-valid but functionally inert — it will never influence the LLM decider's output.
@@ -106,10 +107,10 @@ global_rules:
 | `description` | No | Operational justification, shown to the LLM decider. |
 | `use_when` / `do_not_use_when` / `examples` | No | Same semantics as `AgentRule` above. |
 
-> ⚠️ There is no cross-validation today that `target_agent` names a real agent. A typo'd
-> `target_agent` (e.g. `troubleshoting-agent`) will sync to etcd successfully and simply never match
+> ⚠️ The registry sync warns when `target_agent` doesn't name a known agent (and prints the
+> offending `rule_id`), but it is not a hard error: the rule still syncs and simply never matches
 > anything at evaluation time — the LLM is instructed to only choose from the eligible agent pool, so
-> a global rule targeting a nonexistent or currently-ineligible agent is silently inert, not an error.
+> a global rule targeting a nonexistent or currently-ineligible agent is inert, not an error.
 > Double-check `target_agent` spelling against the agent's `name:` field in its `config.yaml`.
 
 If `workspace/routing_rules.yaml` does not exist, the sync script logs
@@ -248,7 +249,7 @@ Admin Dashboard -> Trellis Rules Engine:
 | `RULES_EVALUATION_TIMEOUT` | `2.5` (seconds) | Hard timeout on the LLM call before failing open. |
 | `RULES_EVALUATION_MODEL` | `gemini-2.5-flash` | Model used for the structured decider. |
 | `RULES_EVALUATION_PROVIDER` | *(inferred)* | Provider for the decider. Omitted/empty infers from the model-name prefix (`gemini*` → google, `claude*` → anthropic, `gpt-*`/`o1*`/`o3*`/`o4*`/`chatgpt*` → openai). |
-| `RULES_EVALUATION_BASE_URL` | *(none)* | Custom endpoint for the decider (used by `openai-compatible`/`ollama` providers). |
+| `RULES_EVALUATION_BASE_URL` | *(none)* | Custom endpoint for the decider (used by `openai-compatible` providers). |
 
 The **Admin Dashboard -> Trellis Rules Engine** is the primary editing surface for the decider:
 timeout (existing field) plus model, provider, base_url and confidence threshold. All four are

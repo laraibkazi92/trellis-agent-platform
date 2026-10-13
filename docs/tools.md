@@ -119,11 +119,12 @@ except Exception as e:
 ```yaml
 - name: my_tool                   # Required. Unique identifier. Must match agent's allowed_tools entry.
   version: 0.1.0                  # Required. Semantic version.
-  author: user@example.com        # Required.
+  author: user@example.com        # Optional. Author metadata; not validated or used at runtime.
   description: "Fetches X from Y." # Required. LLM reads this to decide when and how to call the tool.
-  runtime: python                 # Required. One of: python, node, go.
+  runtime: python                 # Required. One of: python, ts, go, bash.
   entrypoint: my_script.py        # Required. File to execute relative to the tool directory.
-  rel_path: tools/my-tool         # Required. Directory path relative to repo root.
+  rel_path: tools/my-tool         # Managed automatically — the registry sync computes it from the
+                                  #   tool directory and overwrites any value; no need to set it.
   inputs:                         # Required. Schema of the stdin JSON object.
     my_arg:
       type: string                # One of: string, boolean, array, object, number.
@@ -153,6 +154,10 @@ except Exception as e:
       - MY_EMAIL
     background:
       - BG_SERVICE_URL
+  public: false                   # Optional. Expose this tool for direct execution by external MCP
+                                  #   clients via the Gateway's search_tools/use_tool (no agent hop).
+  optional_secrets:               # Optional. Injected when present; never required for the tool to run.
+    - MY_OPTIONAL_TOKEN
 ```
 
 **Secrets vs Variables**: Both are stored in etcd and injected as environment variables. `secrets` is for sensitive credentials; `variables` is for non-sensitive config like base URLs or email addresses.
@@ -167,6 +172,10 @@ variables:
 ```
 
 **Contextual scoping** (`general` / `user` / `background`): Lets one tool authenticate differently depending on whether it's called by a user agent (personal token) or a background workflow (service account). Required fields differ by context.
+
+**`public` tools**: Setting `public: true` exposes the tool through the Gateway MCP's `search_tools`/`use_tool`, so external MCP clients can execute it directly with no intermediate agent hop. Only public tools are embedded for tool search at registry-sync time. MCP servers can do the same per server (`public`) or per tool (`public_tools`) — see the [MCP guide](mcp.md).
+
+**`optional_secrets` / `secret_groups`**: `optional_secrets` are injected when the caller has stored them but never count against configuration readiness. `secret_groups` is a UI hint that renders a set of optional secrets as a single card with a selector (e.g. an environment dropdown) on the configuration page; each group is `{label, select_label, options: [{value, label, fields: [{key, label, type}]}]}`.
 
 ---
 
@@ -196,9 +205,10 @@ variables:
 
 | Runtime | `entrypoint` | Notes |
 |---------|-------------|-------|
-| `python` | `.py` file | Python 3.12 container environment |
-| `node` | `.js` file | Node.js; install deps in the tool directory |
-| `go` | compiled binary | Build and commit the binary to the directory |
+| `python` | `.py` file | Runs with the hub's Python 3.12 interpreter |
+| `ts` | `.ts` file | Executed with `npx tsx`; install deps in the tool directory |
+| `go` | compiled binary | Build and commit the binary to `<tool-dir>/.bin/<tool-name>` — the hub executes it from there |
+| `bash` | `.sh` file | Runs with `bash` |
 
 ---
 
@@ -244,9 +254,9 @@ from shared.slack.client import SlackClient
 
 After creating or modifying `tool.yaml`, push to etcd:
 
-   ```bash
-   docker compose up -d --build
-   ```
+```bash
+docker compose up -d --build
+```
 
 Confirm the output shows your tool:
 ```
@@ -260,7 +270,7 @@ The hub reloads tool configs dynamically, so no restart is needed for most chang
 ### Local Development Checklist
 
 - [ ] `tool.yaml` has a unique `name` not already in use
-- [ ] `rel_path` matches the actual directory path from repo root
+- [ ] Tool directory lives under `workspace/tools/` (the sync derives `rel_path` automatically)
 - [ ] Script reads all inputs from `sys.stdin` (JSON), writes only JSON to `sys.stdout`
 - [ ] Secrets/variables declared in `tool.yaml` and accessible via `os.getenv()`
 - [ ] Tool tested locally with `echo '{...}' | ENV_VAR=val python script.py`

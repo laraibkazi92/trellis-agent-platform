@@ -1,95 +1,82 @@
-# Trellis: Agent Platform
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="branding/trellis-logo/svg/trellis-horizontal-on-dark.svg">
+    <img src="branding/trellis-logo/masters/trellis-horizontal.svg" alt="Trellis" width="460">
+  </picture>
+</p>
 
-A scalable, multi-agent orchestration framework built with FastAPI, PydanticAI, FastMCP, and etcd. It provides an OpenAI-compatible gateway, dynamic tool execution, and an external MCP gateway for seamless integration with clients like Claude Desktop.
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-123B2E" alt="License: Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/python-3.12-123B2E?logo=python&logoColor=white" alt="Python 3.12">
+  <img src="https://img.shields.io/badge/docker--compose-123B2E?logo=docker&logoColor=white" alt="Docker Compose">
+</p>
 
-## Architecture Overview
+Trellis runs a fleet of LLM agents behind one OpenAI-compatible API. Each agent is a config file plus a skills prompt; tools are standalone scripts in Python, TypeScript, Go, or Bash, executed in a sandbox. Call agents over REST or from MCP clients like Claude Desktop. A dashboard manages users, API keys, and credentials; etcd holds all framework state.
 
-The framework relies on a microservice architecture with `etcd` acting as the central state and configuration registry:
+## Architecture
 
-- **Universal Agent Host (`core/host.py` - Port 8000)**: FastAPI application that orchestrates LLM agents via PydanticAI.
-- **Polyglot Tool Hub (`core/hub.py` - Port 8001)**: FastMCP server that dynamically discovers and executes tools written in Python, TypeScript, or Go. Communicates with the Host over HTTP (SSE Transport).
-- **Gateway MCP (`core/gateway.py` - Port 8002)**: External bridge allowing MCP clients to interact with the entire agent fleet via the `/mcp` endpoint.
-- **Dashboard UI (`core/ui.py` - Port 8080)**: Web interface for managing Agents, Tools, API Keys, and Tool Secrets.
-- **State Registry (`etcd` - Port 2379)**: Central database for users, authentication keys, agent configs, and tool secrets.
+| Service | Port | What it does |
+| --- | --- | --- |
+| Agent host (`core/host.py`) | 8000 | FastAPI + PydanticAI. Serves `/v1/chat/completions`, routes to agents, runs them. |
+| Tool hub (`core/hub.py`) | 8001 | FastMCP server. Discovers tools in `workspace/tools/` and runs each in a bubblewrap sandbox. |
+| MCP gateway (`core/gateway.py`) | 8002 | Exposes the agent fleet to external MCP clients at `/mcp`. |
+| Dashboard UI (`core/ui.py`) | 8080 | Manage agents, tools, workflows, API keys, and tool secrets. |
+| nginx gateway | 80/443 | Single front door for the stack, with optional TLS. |
+| Infrastructure | internal | etcd (state registry), Redis with Taskiq (background jobs), Hindsight (agent memory). |
 
-## Core Concepts & Terminology
+## Quick start
 
-- **Agents**: Defined in `workspace/agents/` with a `config.yaml` and specialized `skills.md`.
-- **Tools**: Polyglot standalone scripts defined in `workspace/tools/` using `tool.yaml` configurations.
-- **API Keys**: Inbound authentication tokens used to access the framework via API or MCP endpoints.
-- **Tool Secrets**: Outbound, third-party credentials (e.g., ticketing systems, support systems, OpenAI) securely stored for use by Agents and Tools.
+Docker and one LLM API key. Gemini is the default provider; OpenAI and Anthropic work too.
 
-## Quick Start
-
-### 1. Prerequisites
-- Docker and Docker Compose
-- LLM API Keys (e.g., `GEMINI_API_KEY`, `OPENAI_API_KEY`) set in your environment.
-
-### 2. Run the Stack
-Start the framework services (Host, Hub, Gateway, UI, and etcd) using Docker Compose:
 ```bash
+cp .env.example .env    # set SESSION_SECRET
 docker compose up -d --build
 ```
 
-### 3. Sync Filesystem to Registry
-The framework uses etcd for state. When you modify or add new agents/tools on the filesystem, sync them to the database:
-```bash
-docker compose up -d --build
-```
+LLM provider keys are **not** set in `.env` — configure them in the Dashboard (**Admin →
+Global Tool Configuration**), where they are stored encrypted in etcd. An agent can't run
+until at least one provider key is configured there.
 
-### 4. Dashboard UI
-Navigate to **http://localhost:8080** to access the Dashboard UI. Here you can review active agents, tools, and configure your API Keys and Tool Secrets.
+Every rebuild syncs `workspace/` into etcd, so new agents and tools go live on the next one. Open http://localhost:8080 and create an API key, or set `DEV_MODE=true` in `.env` to run without authentication.
 
-### 5. API Usage
-All `/v1/` endpoints, `/mcp`, and `/sse` require `Bearer` token authentication (unless `DEV_MODE=true` is set).
+## Call an agent
 
 ```bash
-# Target a specific agent
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -d '{
-    "model": "troubleshooting-agent",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
-
-# Auto-route — omit model or pass "auto" to let the supervisor pick
-curl -X POST http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_API_KEY" \
-  -d '{
-    "model": "auto",
+    "model": "demo-assistant",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
 ```
 
-### 6. Connecting via MCP
-To expose the agent fleet to an external MCP client (like Claude Desktop), use:
+Use `"model": "auto"` and a supervisor picks the agent that fits the request.
+
+## Connect an MCP client
+
 ```bash
-# Example for Claude Desktop configuration
-claude mcp add --transport http trellis http://localhost:8002/mcp --header "Authorization: Bearer YOUR_API_KEY"
+claude mcp add --transport http trellis http://localhost:8002/mcp \
+  --header "Authorization: Bearer YOUR_API_KEY"
 ```
 
-## Directory Structure
+## Workspace layout
 
-- `core/`: Framework logic, auth, routers, and host/hub/gateway/ui services.
-- `data/`: Persistent runtime data.
-- `docs/`: Developer guides for agents, tools, workflows, and MCP.
-- `gateway/`: Nginx gateway configuration.
-- `scripts/`: Operational scripts like `sync_to_db.py`.
-- `templates/`: HTML templates for the Dashboard UI.
-- `tests/`: Test suite.
-- `workspace/`: Agent, tool, and workflow content — `agents/`, `tools/`, `mcps/`, `workflows/`, and `shared/`.
+- `workspace/agents/` - one directory per agent: `config.yaml` plus a `skills.md` prompt.
+- `workspace/tools/` - standalone scripts in any language with a `tool.yaml` manifest. JSON in on stdin, JSON out on stdout.
+- `workspace/workflows/` - background agents and scripts triggered by schedules or webhooks.
+- `workspace/mcps/` - registrations for external MCP servers.
 
-## Development Workflow
+## Docs
 
-1. Scaffold new agents/tools inside their respective directories. See [Building Agents](docs/agents.md) and [Building Tools](docs/tools.md).
-2. Tools should use `stdin` for JSON arguments and `stdout` for JSON results. See [Building Tools](docs/tools.md).
-3. Agents are defined with configurations and skills. See [Building Agents](docs/agents.md).
-4. Run `docker compose up -d --build` to push changes to etcd.
-5. Manage third-party credentials via the **Tool Secrets** UI.
-6. Operate the stack from the terminal with the `trellis` CLI (`scripts/trellis init|sync|logs`). See [CLI Guide](docs/cli.md).
+- [Agents](docs/agents.md) - building agent configs and skills prompts
+- [Tools](docs/tools.md) - the stdin/stdout tool protocol
+- [Workflows](docs/workflows.md) - background agents and scripts
+- [MCP](docs/mcp.md) - registering external MCP servers
+- [CLI](docs/cli.md) - scaffold workspaces, sync the registry, inspect runs
+- [Rules Engine](docs/rules_engine.md) - lock queries onto agents with plain-language rules, ahead of semantic search
+- [Branding](branding/trellis-logo/GUIDELINES.md) - logo kit usage guide
 
 ## License
 
-This project is licensed under the [Apache-2.0](LICENSE).
+[Apache-2.0](LICENSE)

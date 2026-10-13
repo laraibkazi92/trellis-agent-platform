@@ -25,11 +25,14 @@ from subagents_pydantic_ai import SubAgentCapability, SubAgentConfig
 from subagents_pydantic_ai.registry import DynamicAgentRegistry
 from subagents_pydantic_ai.toolset import create_subagent_toolset
 from subagents_pydantic_ai.types import CompiledSubAgent
-from pydantic_ai_backends import ConsoleCapability, LocalBackend
+from pydantic_ai_backends import ConsoleCapability
 from pydantic_ai_shields import CostTracking, ToolGuard
 from pydantic_ai_rlm import create_rlm_toolset
 
 from core.auth import EtcdContentionError, IdentityManager, get_identity_manager, user_id_var
+from core import llm_factory
+from core.console_backend import SanitizedLocalBackend
+from core.env_sanitize import sanitized_env
 from core.llm_factory import build_model_settings, resolve_model, resolve_provider
 from core.models import AgentConfig, MCPConfig, is_agent_external, is_agent_internal
 from core.health import HealthMonitor, evaluate_health_status
@@ -278,7 +281,7 @@ async def get_external_mcp_client(mcp_name: str, user_id: str) -> FastMCPClient:
     env = _inject_config(env, config.variables, identity_mgr, user_id, "variables", is_background)
 
     if config.transport == "stdio":
-        full_env = os.environ.copy()
+        full_env = sanitized_env()
         full_env.update(env)
         transport = StdioTransport(command=config.command, args=config.args or [], env=full_env, keep_alive=True)
     elif config.transport in ["http", "streamable-http"]:
@@ -424,7 +427,10 @@ async def build_agent(agent_name: str) -> Agent:
             
     config = AgentConfig(**config_data)
     provider = resolve_provider(config.provider, config.model)
-    model = resolve_model(provider, config.model, config.base_url)
+    # Prefetch the etcd-stored key off the event loop (build_agent already does its
+    # other etcd I/O via asyncio.to_thread); resolve_model uses it directly.
+    api_key = await asyncio.to_thread(llm_factory.get_provider_api_key, provider)
+    model = resolve_model(provider, config.model, config.base_url, api_key=api_key)
     model_settings = build_model_settings(provider, config.model, config.thinking_level)
     
     capabilities = []
@@ -443,7 +449,14 @@ async def build_agent(agent_name: str) -> Agent:
     allowed_console_tools = [t for t in console_tool_names if t in allowed_tools]
     
     if allowed_console_tools:
-        capabilities.append(ConsoleCapability(backend=LocalBackend(root_dir="/workspace", enable_execute=("execute" in allowed_console_tools))))
+        # The background-shell tools (run_in_background/read_output/kill_shell/
+        # list_shells) aren't part of the console tool allowlist and their spawn path
+        # (BackgroundProcesses.start) has no env hook, so they can't be env-sanitized
+        # -- disabled here.
+        capabilities.append(ConsoleCapability(
+            backend=SanitizedLocalBackend(root_dir="/workspace", enable_execute=("execute" in allowed_console_tools)),
+            include_background=False,
+        ))
         blocked_console_tools = [t for t in console_tool_names if t not in allowed_tools]
         if blocked_console_tools:
             capabilities.append(ToolGuard(blocked=blocked_console_tools))
@@ -560,7 +573,7 @@ async def get_agent(agent_name: str) -> Agent:
         return agent
 
 
-def evict_agent(agent_name: str, _visited: Optional[set] = None) -> None:
+def evict_agent(agent_name: str, _visited: Optional[set] = None, _all_configs: Optional[Dict[str, Any]] = None) -> None:
     """Remove an agent from the cache (called from etcd watch thread — must be sync).
 
     Also cascades the eviction to every OTHER cached agent whose `a2a_access` lists
@@ -576,6 +589,10 @@ def evict_agent(agent_name: str, _visited: Optional[set] = None) -> None:
     `_visited` guards against infinite recursion on a2a_access cycles/diamonds; it's an
     internal recursion detail and defaults to None so existing callers (e.g. `on_agent_change`)
     are unaffected.
+
+    `_all_configs` lets a bulk caller (``evict_all_agents``) fetch the config map once
+    and reuse it across every eviction, instead of issuing one etcd read per cached
+    agent on the shared watch thread. When None it is fetched here as before.
     """
     if _visited is None:
         _visited = set()
@@ -587,18 +604,76 @@ def evict_agent(agent_name: str, _visited: Optional[set] = None) -> None:
     if agent_name != "supervisor" and _supervisor_registry is not None:
         _supervisor_registry.remove(agent_name)
 
-    try:
-        identity_mgr = get_identity_manager()
-        all_configs = identity_mgr.get_all_agent_configs()
-    except Exception as e:
-        logger.error(f"evict_agent: failed to fetch agent configs for reverse-dependency propagation: {e}")
-        return
+    if _all_configs is None:
+        try:
+            all_configs = get_identity_manager().get_all_agent_configs()
+        except Exception as e:
+            logger.error(f"evict_agent: failed to fetch agent configs for reverse-dependency propagation: {e}")
+            return
+    else:
+        all_configs = _all_configs
 
     for other_name, cfg in (all_configs or {}).items():
         if other_name == agent_name or other_name in _visited:
             continue
         if agent_name in ((cfg or {}).get("a2a_access") or []):
-            evict_agent(other_name, _visited)
+            evict_agent(other_name, _visited, all_configs)
+
+
+def evict_all_agents() -> None:
+    """Evict every cached agent (sync: called from the etcd watch thread).
+
+    Fetches the agent configs once up front so the reverse-dependency walk in
+    ``evict_agent`` doesn't issue one etcd read per cached agent.
+    """
+    try:
+        all_configs = get_identity_manager().get_all_agent_configs() or {}
+    except Exception as e:
+        logger.error(f"evict_all_agents: failed to fetch agent configs: {e}")
+        all_configs = {}
+    for name in list(_agent_cache.keys()):
+        evict_agent(name, _all_configs=all_configs)
+
+
+_llm_key_watch_id: Any = None
+
+
+def _on_llm_keys_change(event) -> None:
+    """Sync etcd watch callback: flush every cache derived from the LLM keys.
+
+    A key rotation/deletion must drop both the resolved-key TTL cache and every
+    already-built agent (which baked a model bound to the old key), plus the
+    cached embeddings client. Runs on the watch thread, so it must not await.
+    """
+    from core import embeddings, llm_factory
+    llm_factory.reset_key_cache()
+    embeddings.reset_client_cache()
+    evict_all_agents()
+
+
+def install_llm_key_watch() -> None:
+    """Register the single etcd watch that invalidates LLM-key-derived caches.
+
+    Idempotent: guarded by a module-level watch-id sentinel, so repeat calls are
+    no-ops. The host process and the taskiq worker are separate processes with
+    separate in-memory caches, so each calls this once at startup.
+    """
+    global _llm_key_watch_id
+    if _llm_key_watch_id is not None:
+        return
+    identity_mgr = get_identity_manager()
+    _llm_key_watch_id = identity_mgr.client.add_watch_prefix_callback(
+        "/identities/system/system/llm_keys", _on_llm_keys_change
+    )
+
+
+def cancel_llm_key_watch() -> None:
+    """Cancel the LLM-key etcd watch and clear the sentinel (idempotent)."""
+    global _llm_key_watch_id
+    watch_id = _llm_key_watch_id
+    _llm_key_watch_id = None
+    if watch_id is not None:
+        get_identity_manager().client.cancel_watch(watch_id)
 
 
 async def prewarm_agents() -> None:

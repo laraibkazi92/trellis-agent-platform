@@ -3,12 +3,17 @@
 
 """Tests for core/llm_factory.py — multi-provider LLM resolution.
 
-All model constructions are offline-safe: pydantic-ai providers validate API keys
-eagerly (from env) but make no network calls, so each test seeds dummy keys via
-monkeypatch and asserts on the constructed Model/ModelSettings shapes.
+Provider keys now live in the encrypted etcd store, so every test drives them
+through the ``llm_provider_keys`` seam (tests/_llm_key_seam.py) instead of env
+vars — no test touches etcd. Model construction is offline-safe: pydantic-ai
+providers validate keys eagerly but make no network calls, so tests assert on the
+constructed Model/ModelSettings shapes and on which provider was asked for a key.
 """
+from types import SimpleNamespace
+
 import pytest
 
+from core import llm_factory
 from core import rules_engine
 from core.llm_factory import (
     EFFORT_LEVELS,
@@ -22,14 +27,15 @@ from core.llm_factory import (
 )
 from core.models import AgentConfig, ALLOWED_PROVIDERS
 
+# Captured pre-fixture so the precedence test can exercise the real resolver
+# (which reads IdentityManager) while the autouse seam is active.
+_REAL_GET_PROVIDER_API_KEY = llm_factory.get_provider_api_key
+
 
 @pytest.fixture(autouse=True)
-def _dummy_provider_keys(monkeypatch):
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
+def _dummy_provider_keys(llm_provider_keys):
+    """Seed dummy keys for every test; individual tests may clear/override them."""
+    return llm_provider_keys
 
 
 # --- infer_provider ----------------------------------------------------------
@@ -118,15 +124,6 @@ def test_resolve_model_anthropic():
     assert isinstance(resolve_model("anthropic", "claude-sonnet-4-5"), AnthropicModel)
 
 
-def test_resolve_model_ollama_defaults_and_custom_base_url():
-    from pydantic_ai.models.ollama import OllamaModel
-    m = resolve_model("ollama", "llama3.1")
-    assert isinstance(m, OllamaModel)
-    assert str(m.client.base_url) == "http://localhost:11434/v1/"
-    custom = resolve_model("ollama", "llama3.1", "http://myhost:11434/v1")
-    assert str(custom.client.base_url) == "http://myhost:11434/v1/"
-
-
 def test_resolve_model_openai_compatible_base_url_reaches_provider():
     from pydantic_ai.models.openai import OpenAIChatModel
     m = resolve_model("openai-compatible", "my-local-model", "http://localhost:1234/v1")
@@ -139,9 +136,127 @@ def test_resolve_model_openai_compatible_requires_base_url():
         resolve_model("openai-compatible", "my-local-model")
 
 
+def test_resolve_model_openai_compatible_needs_no_key(llm_provider_keys):
+    """A keyless compatible endpoint still resolves even when no key is stored."""
+    from pydantic_ai.models.openai import OpenAIChatModel
+    llm_provider_keys.clear()
+    m = resolve_model("openai-compatible", "my-local-model", "http://localhost:1234/v1")
+    assert isinstance(m, OpenAIChatModel)
+    # It consulted only the compatible provider, which has no required key.
+    assert llm_provider_keys.consulted == ["openai-compatible"]
+    assert llm_provider_keys.get("openai-compatible") is None
+
+
 def test_resolve_model_infers_provider_when_none():
     from pydantic_ai.models.anthropic import AnthropicModel
     assert isinstance(resolve_model(None, "claude-sonnet-4-5"), AnthropicModel)
+
+
+# --- stored-key plumbing -------------------------------------------------------
+
+@pytest.mark.parametrize("provider,model", [
+    ("google", "gemini-2.5-flash"),
+    ("openai", "gpt-4o"),
+    ("anthropic", "claude-sonnet-4-5"),
+])
+def test_resolve_model_missing_key_raises_pointing_at_admin_ui(provider, model, llm_provider_keys):
+    llm_provider_keys.clear()
+    with pytest.raises(ProviderConfigError, match="Admin Dashboard -> Global Tool Configuration"):
+        resolve_model(provider, model)
+
+
+# Decoy credentials for every env var pydantic-ai/SDKs would otherwise fall back to.
+# If any resolve_model path silently read the environment, these would satisfy it.
+_DECOY_ENV_KEYS = {
+    "GEMINI_API_KEY": "decoy-gemini-env",
+    "GOOGLE_API_KEY": "decoy-google-env",
+    "OPENAI_API_KEY": "decoy-openai-env",
+    "ANTHROPIC_API_KEY": "decoy-anthropic-env",
+}
+
+
+@pytest.mark.parametrize("provider,model", [
+    ("google", "gemini-2.5-flash"),
+    ("openai", "gpt-4o"),
+    ("anthropic", "claude-sonnet-4-5"),
+])
+def test_resolve_model_ignores_decoy_env_keys(provider, model, llm_provider_keys, monkeypatch):
+    """With a decoy in *every* provider env var and an empty store, the remote
+    providers must still refuse to build: the env fallback is unreachable."""
+    for name, value in _DECOY_ENV_KEYS.items():
+        monkeypatch.setenv(name, value)
+    llm_provider_keys.clear()  # the etcd store reports no key for this provider
+
+    with pytest.raises(ProviderConfigError, match=f"No API key configured for provider '{provider}'"):
+        resolve_model(provider, model)
+
+
+def test_resolve_model_openai_compatible_ignores_decoy_env_key(llm_provider_keys, monkeypatch):
+    """A keyless compatible endpoint is handed a non-empty placeholder, so the
+    OpenAI SDK cannot pick OPENAI_API_KEY up from the environment."""
+    monkeypatch.setenv("OPENAI_API_KEY", _DECOY_ENV_KEYS["OPENAI_API_KEY"])
+    llm_provider_keys.clear()
+
+    m = resolve_model("openai-compatible", "some-model", "http://localhost:9999/v1")
+    # pydantic-ai's OpenAIChatModel.client is the AsyncOpenAI SDK instance itself.
+    assert m.client.api_key == "api-key-not-set"
+    assert m.client.api_key != _DECOY_ENV_KEYS["OPENAI_API_KEY"]
+
+
+def test_resolve_model_explicit_api_key_is_used_without_store_lookup(llm_provider_keys):
+    """The prefetch ``api_key=`` param is passed straight to the provider and must
+    not trigger another store read."""
+    llm_provider_keys.clear()
+    assert resolve_model("openai", "gpt-4o", api_key="explicit-openai").client.api_key == "explicit-openai"
+    assert resolve_model(
+        "anthropic", "claude-sonnet-4-5", api_key="explicit-anthropic"
+    ).client.api_key == "explicit-anthropic"
+    assert resolve_model(
+        "google", "gemini-2.5-flash", api_key="explicit-google"
+    ).client._api_client.api_key == "explicit-google"
+    assert llm_provider_keys.consulted == []
+
+
+def test_resolve_model_passes_stored_key_to_openai_provider(llm_provider_keys):
+    llm_provider_keys["openai"] = "sk-from-etcd"
+    m = resolve_model("openai", "gpt-4o")
+    assert m.client.api_key == "sk-from-etcd"
+    assert llm_provider_keys.consulted == ["openai"]
+
+
+def test_resolve_model_passes_stored_key_to_google_provider(llm_provider_keys):
+    llm_provider_keys["google"] = "goog-from-etcd"
+    m = resolve_model("google", "gemini-2.5-flash")
+    assert m.client._api_client.api_key == "goog-from-etcd"
+    assert llm_provider_keys.consulted == ["google"]
+
+
+def test_resolve_model_passes_stored_key_to_anthropic_provider(llm_provider_keys):
+    llm_provider_keys["anthropic"] = "anth-from-etcd"
+    m = resolve_model("anthropic", "claude-sonnet-4-5")
+    assert m.client.api_key == "anth-from-etcd"
+    assert llm_provider_keys.consulted == ["anthropic"]
+
+
+def test_resolve_model_consults_store_for_inferred_provider(llm_provider_keys):
+    """Provider inference (not just explicit providers) must hit the key store."""
+    resolve_model(None, "gemini-2.5-flash")
+    assert llm_provider_keys.consulted == ["google"]
+
+
+def test_gemini_api_key_precedence_over_google_api_key(monkeypatch):
+    """The real resolver (not the seam) must prefer GEMINI_API_KEY over GOOGLE_API_KEY."""
+    from core import auth
+
+    fake_mgr = SimpleNamespace(
+        get_llm_provider_keys=lambda: {"GEMINI_API_KEY": "gemini-wins", "GOOGLE_API_KEY": "google-loses"},
+    )
+    monkeypatch.setattr(auth, "get_identity_manager", lambda: fake_mgr)
+    llm_factory.reset_key_cache()
+    try:
+        assert _REAL_GET_PROVIDER_API_KEY("google") == "gemini-wins"
+    finally:
+        llm_factory.reset_key_cache()
 
 
 # --- build_model_settings ------------------------------------------------------
@@ -201,8 +316,7 @@ def test_settings_anthropic_and_openai_reject_non_effort_levels():
     assert build_model_settings("openai", "gpt-4o", "bogus") is None
 
 
-def test_settings_ollama_and_openai_compatible_have_no_thinking_mapping():
-    assert build_model_settings("ollama", "llama3.1", "high") is None
+def test_settings_openai_compatible_has_no_thinking_mapping():
     assert build_model_settings("openai-compatible", "m", "high") is None
 
 

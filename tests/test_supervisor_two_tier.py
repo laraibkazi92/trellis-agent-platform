@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional
 from core import agent_factory
 from core.auth import user_id_var
 
+from _llm_key_seam import install_provider_keys
+
 
 class FakeAgent:
     """Stand-in for pydantic_ai.Agent — only `tool_plain` is exercised by
@@ -445,7 +447,7 @@ def test_build_agent_supervisor_registers_two_tier_toolset(monkeypatch):
     """Builds a real supervisor Agent (etcd/hub/model calls mocked) and verifies
     search_tools and use_tool land in its toolset alongside the pre-existing
     search_agents and the subagent toolset's task tool."""
-    monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+    install_provider_keys(monkeypatch)
 
     fake_identity = FakeIdentityManager(dict(SUPERVISOR_CONFIG), "You are the supervisor.")
     monkeypatch.setattr(agent_factory, "get_identity_manager", lambda: fake_identity)

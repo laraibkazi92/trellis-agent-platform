@@ -166,6 +166,26 @@ class IdentityManager:
             return {k: v for k, v in resolved.items() if k in keys}
         return resolved
 
+    # --- Framework LLM provider keys (Admin Dashboard -> Global Tool Configuration) ---
+    # Stored encrypted at /identities/system/system/llm_keys. Deliberately NOT in the
+    # "secrets" category: tool/workflow subprocesses receive the system "secrets" merge
+    # via get_resolved_config, and the framework's private LLM keys must never be
+    # injected into tool code. This store is read only by core.llm_factory.
+
+    def get_llm_provider_keys(self) -> Dict[str, str]:
+        """Return the decrypted framework LLM provider keys, or {} when unset.
+
+        Keys live in their own encrypted store (see the comment above) so they are
+        never merged into the tool/workflow secrets namespace.
+        """
+        path = Identity(id="system", type=IdentityType.SYSTEM).get_etcd_path("llm_keys")
+        return self._get_kv(path, decrypt=True) or {}
+
+    def save_llm_provider_keys(self, keys: Dict[str, str]) -> None:
+        """Persist the framework LLM provider keys, encrypting them at rest."""
+        path = Identity(id="system", type=IdentityType.SYSTEM).get_etcd_path("llm_keys")
+        self._set_kv(path, keys, encrypt=True)
+
     @retry_etcd()
     def upsert_user(self, user_id: str, profile: Dict) -> None:
         """Create or update a user profile."""
@@ -449,7 +469,7 @@ class IdentityManager:
 
     def get_rules_evaluation_base_url(self) -> Optional[str]:
         """Retrieve the admin-configured base_url for the Rules Engine LLM decider
-        (used by 'openai-compatible'/'ollama' providers), or None if never set --
+        (used by the 'openai-compatible' provider), or None if never set --
         callers fall back to the RULES_EVALUATION_BASE_URL env var in that case.
 
         Not itself @retry_etcd()-decorated: get_config() already retries -- see

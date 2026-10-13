@@ -4,9 +4,8 @@
 # Example background-script workflow. It runs as an ordinary Python process on
 # a cron schedule — no LLM, no secrets. See docs/workflows.md.
 #
-# Trigger manually without waiting for the schedule:
-#   curl -X POST http://localhost:8000/admin/workflows/demo-inventory/trigger \
-#     -H "Authorization: Bearer YOUR_API_KEY"
+# Trigger manually without waiting for the schedule: Workflows → Run in the
+# Dashboard UI (admin only).
 
 name: demo-inventory
 version: 0.1.0
