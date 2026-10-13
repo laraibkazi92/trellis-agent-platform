@@ -26,23 +26,19 @@ Trellis runs a fleet of LLM agents behind one OpenAI-compatible API. Each agent 
 
 ## Quick start
 
-Docker and one LLM API key. Gemini is the default provider; OpenAI and Anthropic work too.
+Docker is the only prerequisite.
 
 ```bash
 cp .env.example .env    # set SESSION_SECRET
 docker compose up -d --build
 ```
 
-LLM provider keys are **not** set in `.env` — configure them in the Dashboard (**Admin →
-Global Tool Configuration**), where they are stored encrypted in etcd. An agent can't run
-until at least one provider key is configured there.
-
-Every rebuild syncs `workspace/` into etcd, so new agents and tools go live on the next one. Open http://localhost:8080 and create an API key, or set `DEV_MODE=true` in `.env` to run without authentication.
+Every rebuild syncs `workspace/` into etcd, so new agents and tools go live on the next one. Configure your LLM provider keys in the Dashboard (**Admin → Global Tool Configuration**) — stored encrypted in etcd, they serve Google (Gemini), OpenAI, Anthropic, or any OpenAI-compatible endpoint. Then browse to http://localhost and create an API key, or set `DEV_MODE=true` in `.env` to run without authentication.
 
 ## Call an agent
 
 ```bash
-curl -X POST http://localhost:8000/v1/chat/completions \
+curl -X POST http://localhost/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -d '{
@@ -56,7 +52,7 @@ Use `"model": "auto"` and a supervisor picks the agent that fits the request.
 ## Connect an MCP client
 
 ```bash
-claude mcp add --transport http trellis http://localhost:8002/mcp \
+claude mcp add --transport http trellis http://localhost/mcp \
   --header "Authorization: Bearer YOUR_API_KEY"
 ```
 
