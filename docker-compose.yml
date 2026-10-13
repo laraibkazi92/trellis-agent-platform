@@ -2,9 +2,11 @@ x-common-env: &common-env
   ETCD_HOST: etcd
   ETCD_PORT: 2379
   DEV_MODE: ${DEV_MODE:-false}
-  # Shared bind-host for the DEV_MODE safety guard (core/devmode.py) and the
-  # published-port mappings below. Set HOST_BIND=127.0.0.1 in .env when running
-  # DEV_MODE=true so unauthenticated services stay loopback-only.
+  # Host address the published ports bind to (nginx 80/443, hindsight 8888/9999).
+  # etcd and redis are intentionally NOT published to the host -- they are only
+  # reachable inside the compose network. DEV_MODE does not restrict this bind
+  # (core/devmode.py only logs a warning), so set HOST_BIND=127.0.0.1 yourself if
+  # you want unauthenticated services kept loopback-only.
   HOST_BIND: ${HOST_BIND:-0.0.0.0}
   TZ: UTC
 
@@ -20,8 +22,6 @@ services:
       GEMINI_API_KEY: ${GEMINI_API_KEY}
     volumes:
       - ./workspace:/app/workspace
-      - ./core:/app/core
-      - ./scripts:/app/scripts
     command: python scripts/sync_to_db.py
     depends_on:
       etcd:
@@ -47,9 +47,6 @@ services:
     volumes:
       - health-data:/app/data
       - ./workspace:/app/workspace
-      - ./core:/app/core
-      - ./scripts:/app/scripts
-      - ./templates:/app/templates
     command: granian --interface asgi core.host:app --host 0.0.0.0 --port 8000 --workers 2 --runtime-threads 1 --workers-max-rss 256 --workers-lifetime 3600
     depends_on:
       hub:
@@ -113,9 +110,6 @@ services:
     volumes:
       - health-data:/app/data
       - ./workspace:/app/workspace
-      - ./core:/app/core
-      - ./scripts:/app/scripts
-      - ./templates:/app/templates
 
   # External Gateway MCP Server
   # Bridges external MCP clients to the internal agent fleet via the Host's HTTP API.
@@ -130,9 +124,6 @@ services:
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
     volumes:
       - ./workspace:/app/workspace
-      - ./core:/app/core
-      - ./scripts:/app/scripts
-      - ./templates:/app/templates
     command: python core/gateway.py
     depends_on:
       - host
@@ -140,11 +131,14 @@ services:
     restart: unless-stopped
 
   etcd:
-    image: quay.io/coreos/etcd:v3.5.0
+    # gcr.io is etcd's primary registry (quay.io/coreos/etcd is the secondary).
+    # 3.6 keeps the v3 gRPC API used by pyetcd/etcd-sdk-python, so the client is
+    # unchanged. In-place upgrade of an existing 3.5 data dir is supported, but
+    # it is one-way: once migrated to the 3.6 storage version, rolling back to a
+    # 3.5 image requires a snapshot/restore.
+    image: gcr.io/etcd-development/etcd:v3.6.15
     container_name: etcd-server
     command: etcd --advertise-client-urls http://etcd:2379 --listen-client-urls http://0.0.0.0:2379 --data-dir /etcd-data
-    ports:
-      - "${HOST_BIND:-0.0.0.0}:2379:2379"
     volumes:
       - etcd-data:/etcd-data
     restart: unless-stopped
@@ -157,8 +151,6 @@ services:
   redis:
     image: redis:alpine
     container_name: redis-server
-    ports:
-      - "${HOST_BIND:-0.0.0.0}:6379:6379"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -181,9 +173,6 @@ services:
       HINDSIGHT_URL: http://hindsight:8888
     volumes:
       - ./workspace:/app/workspace
-      - ./core:/app/core
-      - ./scripts:/app/scripts
-      - ./templates:/app/templates
     command: taskiq worker core.tasks:broker --workers 2
     depends_on:
       etcd:
@@ -205,9 +194,6 @@ services:
       REDIS_URL: redis://redis:6379/0
     volumes:
       - ./workspace:/app/workspace
-      - ./core:/app/core
-      - ./scripts:/app/scripts
-      - ./templates:/app/templates
     command: taskiq scheduler core.tasks:scheduler
     depends_on:
       etcd:
@@ -277,9 +263,6 @@ services:
     volumes:
       - health-data:/app/data
       - ./workspace:/app/workspace
-      - ./core:/app/core
-      - ./scripts:/app/scripts
-      - ./templates:/app/templates
     command: uvicorn core.ui:app --host 0.0.0.0 --port 8080
     depends_on:
       etcd:

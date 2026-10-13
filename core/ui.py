@@ -35,8 +35,7 @@ if not DEV_MODE:
     if missing:
         raise ValueError(f"Missing required environment variables for UI: {', '.join(missing)}")
 
-# Startup gate: refuse to serve an unauthenticated DEV_MODE instance on a
-# remotely reachable bind host (see core/devmode.py).
+# Warn if this is an unauthenticated DEV_MODE instance (see core/devmode.py).
 enforce_dev_mode_safety("ui")
 
 from core.routers import auth, marketplace, profile, admin, configuration, docs, status, workflows, api, reports, mcp_oauth

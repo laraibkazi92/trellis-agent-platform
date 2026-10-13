@@ -38,6 +38,15 @@ Delegates to `scripts/sync_to_db.py`'s `main()` (identical behavior to `python s
 
 In normal operation the compose `db-sync` init container does this for you on `docker compose up -d --build`; the CLI form is for running it on demand against an already-running etcd.
 
+> **etcd and redis are not published to the host.** The compose stack exposes them only on the internal `trellis-network`, so run framework tooling from inside a container rather than directly on the host:
+>
+> ```bash
+> docker compose exec host python scripts/trellis sync
+> docker compose exec host python scripts/trellis logs [AGENT] --limit N
+> ```
+>
+> Containers already have `ETCD_HOST=etcd` / `ETCD_PORT=2379` (and `REDIS_URL`) set, so no extra configuration is needed. Any host-side script that relied on the old `127.0.0.1:2379` / `localhost:6379` defaults — including `scripts/migrate_users_schema.py`, `scripts/prune_etcd_runs.py`, and the other `scripts/` migrations that read `ETCD_HOST`/`ETCD_PORT` — will no longer connect; use the container form above.
+
 ## `logs` — inspect recent agent runs
 
 ```bash
