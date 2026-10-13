@@ -8,25 +8,10 @@ data/
 workspace/reports/
 *.playwright*
 
-# example-cli MCP bundle (generated artifacts — rebuild with `npm run build`)
-workspace/mcps/example-cli/bundle/devops.js
-workspace/mcps/example-cli/bundle/devops.js.map
-workspace/mcps/example-cli/node_modules/
-
-# Host-installed CLI binaries (netctl, etc.) — placed directly on the host
-# into each tool's own bin/ (e.g. workspace/tools/netctl-cli/bin/netctl),
-# never committed. See core/hub.py's per-tool PATH injection.
+# Host-installed CLI binaries — placed directly on the host into each tool's own
+# bin/ (e.g. workspace/tools/<tool>/bin/<binary>), never committed. See
+# core/hub.py's per-tool PATH injection.
 workspace/tools/*/bin/
-
-# netctl binary + its source archive — placed directly on the host into
-# workspace/tools/netctl-cli/, never committed (see wrapper.py's NETCTL_BIN).
-workspace/tools/netctl-cli/netctl
-workspace/tools/netctl-cli/*.tar.gz
-
-# opsctl venv — built directly on the host via `uv venv` + `uv pip install
-# <wheel>`, never committed (see workspace/tools/opsctl/wrapper.py).
-workspace/tools/opsctl/.venv/
-workspace/tools/opsctl/*.whl
 
 .DS_Store
 .venv/

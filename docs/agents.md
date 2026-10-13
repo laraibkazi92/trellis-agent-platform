@@ -97,7 +97,7 @@ base_url: http://localhost:11434/v1  # Optional. Custom API endpoint. Required f
                                   #   openai-compatible, optional for ollama.
 allowed_tools:                    # Required. Tool names this agent may call. Use [] for no tools.
   - get_system_time
-  - tl_issues_fetch
+  - fetch_issues
 allowed_mcps:                     # Optional. External MCP server names to connect.
   - logs
 a2a_access:                       # Optional. Other agent names this agent may delegate to.
@@ -167,7 +167,7 @@ Use this tool when [condition]. Always pass [required fields].
 **Best practices:**
 1. **Be specific about tool usage** — explain *when* to call each tool, not just that it exists.
 2. **Provide output templates** — LLMs follow formatting examples more reliably than prose descriptions.
-3. **Set hard constraints** — prevents hallucination of data (e.g., "Do not invent Issues ticket IDs").
+3. **Set hard constraints** — prevents hallucination of data (e.g., "Do not invent issue IDs").
 4. **Keep it focused** — one agent, one responsibility. Narrow scope = better accuracy.
 
 ---

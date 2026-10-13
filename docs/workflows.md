@@ -99,8 +99,8 @@ type: background
 model: gemini-3-flash-preview
 thinking_level: low
 allowed_tools:
-  - tl_issues_fetch
-  - tl_fetch_support
+  - fetch_issues
+  - fetch_support
   - slack_post_message
 trigger:
   type: cron

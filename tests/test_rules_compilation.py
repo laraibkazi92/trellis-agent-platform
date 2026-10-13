@@ -109,7 +109,7 @@ def test_gating_multiple_agents_mixed_eligibility():
         "troubleshooting-agent": _agent_cfg(),
         "ticket-summary-agent": _agent_cfg(
             name="ticket-summary-agent",
-            description="Generates structured executive summaries and ticket reports from Issues and Support.",
+            description="Generates structured executive summaries and ticket reports from ticketing and support systems.",
             rules=[
                 {
                     "description": "Executive summaries and case recaps",

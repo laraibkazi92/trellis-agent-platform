@@ -33,7 +33,7 @@ def _case_summary_cfg(**overrides):
         name="ticket-summary-agent",
         type="user_agent",
         external=True,
-        description="Generates structured executive summaries and ticket reports from Issues and Support.",
+        description="Generates structured executive summaries and ticket reports from ticketing and support systems.",
         rules=[
             {
                 "description": "Executive summaries and case recaps",

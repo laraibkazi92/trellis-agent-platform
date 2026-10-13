@@ -49,7 +49,7 @@ Full guides for consuming and building each framework component:
 ## 🎨 UI/UX & Frontend Design Patterns
 - **Terminology**: 
   - `API Keys`: Inbound authentication tokens (accessing the framework).
-  - `Tool Secrets`: Outbound credentials for 3rd-party integrations (e.g., Issues, Support).
+  - `Tool Secrets`: Outbound credentials for 3rd-party integrations (e.g., ticketing systems, support systems).
 - **Notifications**: Use auto-dismissible toasts for success/error flashes (see `templates/base.html` for the `setTimeout` pattern).
 - **Navigation & Modals**: For deep-linking to specific items (like a tool details modal), use query parameters (e.g., `?tool=name`). Parse this on `DOMContentLoaded`, trigger the modal/filter, and use `window.history.replaceState` to strip the parameter to prevent loop issues on refresh.
 - **Tooltips**: Avoid native browser `title` attributes. Use Tailwind CSS utility classes (e.g., `group`, `group-hover:block`, `absolute`) for clean, floating tooltips.
@@ -59,6 +59,6 @@ Trellis intentionally uses **Personal Access Tokens (PATs)** and manually provid
 
 **Reasoning:**
 1. **SDK Compatibility:** External gateways (like `open-connector`) often enforce routing all tool traffic through a local proxy to hide credentials. This breaks standard Python/TS SDKs (e.g., `octokit`, `slack-sdk`) used by Trellis standalone tools. Trellis injects raw tokens directly so developers can write standard, idiomatic code.
-2. **Maintenance Overhead:** Implementing user-level OAuth natively requires registering and maintaining global Developer Applications (Client IDs & Secrets) for *every single SaaS provider* (GitHub, Slack, Issues, etc.). This introduces an unsustainable configuration burden.
+2. **Maintenance Overhead:** Implementing user-level OAuth natively requires registering and maintaining global Developer Applications (Client IDs & Secrets) for *every single SaaS provider* (GitHub, Slack, ticketing systems, etc.). This introduces an unsustainable configuration burden.
 3. **SSO Limitations:** While Trellis uses OIDC for user authentication (SSO), OIDC cannot broker API access tokens for 3rd-party APIs. 
 4. **Simplicity:** The PAT model keeps the framework infrastructure lean. While it requires users to manually generate and provide their tokens initially, it guarantees that tools remain simple, stateless, and fully compatible with existing libraries. For organization-wide access without user friction, Trellis supports injecting global Service Account (Bot) tokens into the environment instead.

@@ -315,9 +315,8 @@
                                 <select name="webhook_provider" id="modal-webhook-provider-{{ agent.name }}" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
                                     <option value="generic" {% if agent.config.get("trigger", {}).get("provider") == "generic" %}selected{% endif %}>Generic HMAC (SHA-256)</option>
                                     <option value="github" {% if agent.config.get("trigger", {}).get("provider") == "github" %}selected{% endif %}>GitHub</option>
-                                    <option value="issues" {% if agent.config.get("trigger", {}).get("provider") == "issues" %}selected{% endif %}>Issues</option>
                                     <option value="slack" {% if agent.config.get("trigger", {}).get("provider") == "slack" %}selected{% endif %}>Slack</option>
-                                    <option value="support" {% if agent.config.get("trigger", {}).get("provider") == "support" %}selected{% endif %}>Support</option>
+                                    <option value="notion" {% if agent.config.get("trigger", {}).get("provider") == "notion" %}selected{% endif %}>Notion</option>
                                 </select>
                             </div>
                             <div>

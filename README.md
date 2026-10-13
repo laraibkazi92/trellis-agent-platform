@@ -17,7 +17,7 @@ The framework relies on a microservice architecture with `etcd` acting as the ce
 - **Agents**: Defined in `workspace/agents/` with a `config.yaml` and specialized `skills.md`.
 - **Tools**: Polyglot standalone scripts defined in `workspace/tools/` using `tool.yaml` configurations.
 - **API Keys**: Inbound authentication tokens used to access the framework via API or MCP endpoints.
-- **Tool Secrets**: Outbound, third-party credentials (e.g., Issues, Support, OpenAI) securely stored for use by Agents and Tools.
+- **Tool Secrets**: Outbound, third-party credentials (e.g., ticketing systems, support systems, OpenAI) securely stored for use by Agents and Tools.
 
 ## Quick Start
 

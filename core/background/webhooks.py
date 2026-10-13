@@ -27,20 +27,6 @@ def validate_github(payload_body: bytes, secret: str, request: Request) -> bool:
     expected_signature = "sha256=" + hash_object.hexdigest()
     return hmac.compare_digest(expected_signature, signature_header)
 
-def validate_issues(payload_body: bytes, secret: str, request: Request) -> bool:
-    signature_header = request.headers.get("X-Hub-Signature")
-    if not signature_header:
-        return False
-    
-    hash_object = hmac.new(secret.encode('utf-8'), msg=payload_body, digestmod=hashlib.sha256)
-    expected_signature = hash_object.hexdigest()
-    
-    # Issues sometimes includes the sha256= prefix and sometimes doesn't depending on the integration type
-    if signature_header.startswith("sha256="):
-        expected_signature = "sha256=" + expected_signature
-        
-    return hmac.compare_digest(expected_signature, signature_header)
-
 def validate_notion(payload_body: bytes, secret: str, request: Request) -> bool:
     # Notion signature validation (commonly uses Notion-Signature header)
     signature = request.headers.get("Notion-Signature")
@@ -51,21 +37,6 @@ def validate_notion(payload_body: bytes, secret: str, request: Request) -> bool:
     hash_object = hmac.new(secret.encode('utf-8'), msg=payload_body, digestmod=hashlib.sha256)
     expected_signature = hash_object.hexdigest()
     return hmac.compare_digest(expected_signature, signature)
-
-def validate_support(payload_body: bytes, secret: str, request: Request) -> bool:
-    # Support does not natively support dynamic HMAC signing of webhook payloads.
-    # Instead, we validate via static token validation using the "Authorization: Bearer <token>"
-    # header (as configured in Support automation headers) or custom "X-Support-Signature".
-    token_header = request.headers.get("Authorization") or request.headers.get("X-Support-Signature")
-    if not token_header:
-        return False
-        
-    # Strip prefix if it exists in Authorization header (e.g. "Bearer ")
-    provided_token = token_header[7:] if token_header.startswith("Bearer ") else token_header
-    expected_token = secret[7:] if secret.startswith("Bearer ") else secret
-    
-    # Use compare_digest for secure constant-time comparison
-    return hmac.compare_digest(provided_token, expected_token)
 
 def validate_generic(payload_body: bytes, secret: str, request: Request) -> bool:
     # Generic SHA-256 signature or static token in Authorization or X-Signature header
@@ -86,7 +57,7 @@ def validate_generic(payload_body: bytes, secret: str, request: Request) -> bool
     if hmac.compare_digest(cmp_token, expected_hmac):
         return True
         
-    # 2. Fall back to simple static token comparison for non-HMAC providers like Support
+    # 2. Fall back to simple static token comparison for non-HMAC providers
     expected_token = secret[7:] if secret.startswith("Bearer ") else secret
     return hmac.compare_digest(provided_token, expected_token)
 
@@ -111,10 +82,8 @@ def validate_slack(payload_body: bytes, secret: str, request: Request) -> bool:
 
 VALIDATORS: Dict[str, Callable] = {
     "github": validate_github,
-    "issues": validate_issues,
     "slack": validate_slack,
     "notion": validate_notion,
-    "support": validate_support,
     "generic": validate_generic
 }
 
