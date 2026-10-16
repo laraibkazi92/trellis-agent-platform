@@ -46,4 +46,6 @@ jobs:
           pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Run the test suite
-        run: python -m pytest tests/ -q
+        # pytest-timeout guard: a stuck test fails in 2 min with a thread dump instead of
+        # burning the job timeout and reporting "cancelled" at 15 min (which hides the cause).
+        run: python -m pytest tests/ -q --timeout=120 --timeout-method=thread
