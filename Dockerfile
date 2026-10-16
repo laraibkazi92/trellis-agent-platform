@@ -2,7 +2,16 @@
 FROM python:3.12-slim
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-# Install system dependencies for Node.js and Go
+# Install system dependencies for Node.js and Go.
+# TARGETARCH is provided by BuildKit's predefined platform args (amd64/arm64/...); it
+# must be re-declared inside the stage to be visible. Defaulting to amd64 keeps the
+# legacy builder (no BuildKit target args) working. Using it for the Go tarball makes
+# the image buildable for arm64 (Apple Silicon, arm servers) -- the previous hardcoded
+# linux-amd64 tarball produced a broken Go toolchain on arm64 hosts. Note: Go publishes
+# its 32-bit ARM tarball as linux-armv6l, so TARGETARCH=arm would 404 -- only amd64/arm64
+# are published by CI; add an explicit case mapping if linux/arm/v7 is ever needed. A bad
+# arch fails loudly (curl -f and tar both error), never silently.
+ARG TARGETARCH
 RUN apt-get update && apt-get install -y \
     curl \
     git \
@@ -11,7 +20,7 @@ RUN apt-get update && apt-get install -y \
     && update-ca-certificates \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
-    && curl -fsSL https://golang.org/dl/go1.22.2.linux-amd64.tar.gz | tar -C /usr/local -xzf - \
+    && curl -fsSL "https://golang.org/dl/go1.22.2.linux-${TARGETARCH:-amd64}.tar.gz" | tar -C /usr/local -xzf - \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

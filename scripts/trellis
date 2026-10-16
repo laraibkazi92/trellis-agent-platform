@@ -112,10 +112,11 @@ def cmd_sync(args) -> int:
     except ImportError as exc:
         return _fail(f"cannot import scripts/sync_to_db.py: {exc}")
     try:
-        sync_to_db.main()
+        # main() returns non-zero when the registry prune guard refuses to wipe the
+        # registry (see scripts/sync_to_db.py) -- propagate it so the CLI fails too.
+        return sync_to_db.main(["--force-prune"] if args.force_prune else []) or 0
     except Exception as exc:
         return _fail(f"sync failed: {exc.__class__.__name__}: {exc}")
-    return 0
 
 
 def _run_with_timeout(label: str, func, *args, timeout: float = ETCD_TIMEOUT_SECONDS):
@@ -268,6 +269,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_sync = sub.add_parser(
         "sync", help="sync workspace/ contents into the etcd registry"
+    )
+    p_sync.add_argument(
+        "--force-prune",
+        action="store_true",
+        help=(
+            "allow pruning the whole registry when the workspace syncs nothing at all "
+            "(it looks unmounted; equivalent to SYNC_FORCE_PRUNE=true)"
+        ),
     )
     p_sync.set_defaults(func=cmd_sync)
 

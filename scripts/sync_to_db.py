@@ -1,6 +1,7 @@
 # Copyright (C) 2026 Laraib Kazi
 # SPDX-License-Identifier: Apache-2.0
 
+import argparse
 import asyncio
 import os
 import sys
@@ -250,7 +251,48 @@ def prune_obsolete_mcps(identity_mgr, existing_mcps, seen_mcps):
         identity_mgr.client.delete(f"/registry/mcps/{mcp}/config")
         identity_mgr.delete_mcp_tool_embeddings(mcp)
 
-def main():
+def _registry_would_be_wiped(existing_by_category, seen_by_category) -> bool:
+    """True when sync saw NOTHING anywhere in the workspace, yet etcd still has entries.
+
+    That shape almost always means the workspace was not mounted (a mis-pointed
+    TRELLIS_WORKSPACE_DIR, a missing bind mount) rather than that every author deleted
+    their work in one commit. Used to gate the prune pass in main().
+
+    Deliberately *global*, not per-category: a single empty category alongside a
+    populated one is indistinguishable from ordinary pruning (an org with agents but no
+    tools of its own yet), so blocking it would break the documented first-run flow of
+    deleting the demo content. Only a total blank counts as an unmounted workspace.
+    """
+    return any(existing_by_category) and not any(seen_by_category)
+
+
+def _force_prune_requested(argv=None) -> bool:
+    """True when the prune guard should be bypassed: ``--force-prune`` or SYNC_FORCE_PRUNE.
+
+    The env form exists because the compose ``db-sync`` init container runs this
+    script with no arguments -- an operator sets SYNC_FORCE_PRUNE=true in .env rather
+    than editing the container command.
+    """
+    parser = argparse.ArgumentParser(
+        prog="sync_to_db.py",
+        description="Sync workspace/ (agents, workflows, tools, mcps) into the etcd registry.",
+    )
+    parser.add_argument(
+        "--force-prune",
+        action="store_true",
+        help=(
+            "Allow pruning the whole registry when the workspace syncs nothing at all "
+            "(it looks unmounted). Equivalent to SYNC_FORCE_PRUNE=true."
+        ),
+    )
+    args = parser.parse_args(argv)
+    if args.force_prune:
+        return True
+    return os.getenv("SYNC_FORCE_PRUNE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def main(argv=None):
+    force_prune = _force_prune_requested(argv)
     identity_mgr = IdentityManager(
         host=os.getenv("ETCD_HOST", "127.0.0.1"),
         port=int(os.getenv("ETCD_PORT", 2379))
@@ -367,6 +409,39 @@ def main():
                 seen_mcps.add(config["name"])
 
     # 2. Prune obsolete items
+    #
+    # Guard first: refuse when sync saw NOTHING anywhere in the workspace while the
+    # registry still has entries. That is the signature of an unmounted or mis-pointed
+    # workspace, and silently wiping a registry on a typo is the worst failure mode
+    # this script has. The check is deliberately global (all three categories blank),
+    # not per-category, so a legitimately empty category -- an org with agents but no
+    # tools of its own yet -- prunes normally instead of blocking the stack.
+    # supervisor is excluded because it is synced from the image
+    # (core/assets/supervisor), not the workspace, so it would always be "seen" and
+    # mask an otherwise empty workspace/agents/.
+    #
+    # (Aborting skips the WHOLE prune pass, not just one category, so nothing is
+    # half-pruned before the operator fixes the mount.)
+    categories = ("agents", "tools", "mcps")
+    seen_user_agents = seen_agents - {"supervisor"}
+    existing_user_agents = existing_agents - {"supervisor"}
+    existing_by_category = (existing_user_agents, existing_tools, existing_mcps)
+    seen_by_category = (seen_user_agents, seen_tools, seen_mcps)
+
+    if not force_prune and _registry_would_be_wiped(existing_by_category, seen_by_category):
+        print(f"\nREFUSING TO PRUNE: sync found no agents, no tools, and no MCPs under {WORKSPACE_DIR} --")
+        print("the workspace looks unmounted (wrong TRELLIS_WORKSPACE_DIR, or a missing bind mount),")
+        print("or all of its content was removed at once.")
+        for category, existing in zip(categories, existing_by_category):
+            if existing:
+                count = len(existing)
+                print(f"  - {category}: {count} entr{'y' if count == 1 else 'ies'} still in etcd")
+        print("Nothing was deleted. To resolve:")
+        print("  - fix TRELLIS_WORKSPACE_DIR / the bind mount and re-run, or")
+        print("  - if you really did remove all workspace content (e.g. every demo directory),")
+        print("    re-run once with --force-prune (or SYNC_FORCE_PRUNE=true).")
+        return 1
+
     print("\nPruning obsolete entries from etcd...")
     
     for agent in existing_agents - seen_agents:
@@ -383,6 +458,7 @@ def main():
     prune_obsolete_mcps(identity_mgr, existing_mcps, seen_mcps)
 
     print("\nSync complete.")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,5 +1,7 @@
 # Trellis: LLM Agent Context & Dev Guide
 
+> Audience: this is the developer guide for working **on** the framework repo. To run Trellis for an org, see [docs/deploy.md](docs/deploy.md) (operator guide); to contribute to the engine, see [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## 🏗 Architecture & Stack
 - **Stack**: Python 3.12, FastAPI, PydanticAI (LLM routing), FastMCP (Tooling), etcd-sdk-python (State/Registry).
 - **`core/host.py`** (Port 8000): Universal Agent Host. FastAPI + PydanticAI. Orchestrates LLM agents.

@@ -14,25 +14,42 @@ x-common-env: &common-env
 # workspace/ are owned by the operator instead of root. Match your host user:
 #   TRELLIS_UID=$(id -u) TRELLIS_GID=$(id -g)
 # The /app/data health volume inherits the image's build-time ownership on FIRST
-# creation; if it already exists root-owned, run `docker compose down -v` once.
+# creation. If it already exists root-owned, remove ONLY that volume and recreate:
+#   docker compose down && docker volume rm "$(basename "$PWD")_health-data"
+# Do NOT use `docker compose down -v` -- that also deletes the etcd-data volume
+# (users, API keys, run history). See docs/upgrading.md.
 x-app-build: &app-build
   context: .
   args:
     PUID: ${TRELLIS_UID:-1000}
     PGID: ${TRELLIS_GID:-1000}
 
+# Workspace bind mounts: every app service mounts the workspace at the SAME
+# container path (/app/workspace), from ${TRELLIS_WORKSPACE_DIR:-./workspace}. Point
+# TRELLIS_WORKSPACE_DIR at your org's own content checkout (another repo) to keep the
+# engine and content separate -- see docs/deploy.md. Relative paths resolve from this
+# file's directory. The compose merge rule that makes this work: volumes are merged by
+# container path, so a docker-compose.override.yml replacing /app/workspace keeps the
+# other mounts (e.g. health-data:/app/data) intact.
 services:
   # DB Sync Init Container
-  # Runs once at startup to sync agents/tools to etcd
+  # Runs once at startup to sync agents/tools/workflows/mcps to etcd. Refuses to prune
+  # when the workspace syncs nothing at all while the registry still has entries -- see
+  # the guard in scripts/sync_to_db.py. A refusal exits non-zero, which blocks the stack
+  # from starting onto a wiped registry; fix TRELLIS_WORKSPACE_DIR, or set
+  # SYNC_FORCE_PRUNE=true in .env if the wipe is intended.
   db-sync:
     build: *app-build
-    image: trellis-agent-platform:v2
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.2.0}
     container_name: db-sync
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     environment:
       <<: *common-env
+      # Escape hatch for the prune guard: set SYNC_FORCE_PRUNE=true in .env to allow a
+      # sync that prunes with an empty workspace (e.g. you really did delete them all).
+      SYNC_FORCE_PRUNE: ${SYNC_FORCE_PRUNE:-}
     volumes:
-      - ./workspace:/app/workspace
+      - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace
     command: python scripts/sync_to_db.py
     depends_on:
       etcd:
@@ -43,7 +60,7 @@ services:
   # This is the main entry point for the agent fleet.
   host:
     build: *app-build
-    image: trellis-agent-platform:v2
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.2.0}
     container_name: agent-host
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     env_file:
@@ -59,7 +76,7 @@ services:
       HINDSIGHT_URL: http://hindsight:8888
     volumes:
       - health-data:/app/data
-      - ./workspace:/app/workspace
+      - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace
     command: granian --interface asgi core.host:app --host 0.0.0.0 --port 8000 --workers 2 --runtime-threads 1 --workers-max-rss 256 --workers-lifetime 3600
     depends_on:
       hub:
@@ -80,7 +97,7 @@ services:
   # Executes local polyglot tools and exposes them to the Host via SSE
   hub:
     build: *app-build
-    image: trellis-agent-platform:v2
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.2.0}
     container_name: tool-hub
     # Runs as ROOT on purpose (bubblewrap). Do NOT add a user: here.
     command: python core/hub.py
@@ -135,13 +152,13 @@ services:
         condition: service_completed_successfully
     volumes:
       - health-data:/app/data
-      - ./workspace:/app/workspace
+      - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace
 
   # External Gateway MCP Server
   # Bridges external MCP clients to the internal agent fleet via the Host's HTTP API.
   gateway:
     build: *app-build
-    image: trellis-agent-platform:v2
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.2.0}
     container_name: agent-gateway
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     environment:
@@ -150,7 +167,7 @@ services:
       HUB_URL: http://hub:8001/mcp
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
     volumes:
-      - ./workspace:/app/workspace
+      - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace
     command: python core/gateway.py
     depends_on:
       - host
@@ -187,7 +204,7 @@ services:
 
   taskiq-worker:
     build: *app-build
-    image: trellis-agent-platform:v2
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.2.0}
     container_name: taskiq-worker
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     # NOTE: no `env_file: .env` here on purpose. The worker copies os.environ into
@@ -206,7 +223,7 @@ services:
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
       SESSION_SECRET: ${SESSION_SECRET:-}
     volumes:
-      - ./workspace:/app/workspace
+      - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace
     command: taskiq worker core.tasks:broker --workers 2
     depends_on:
       etcd:
@@ -219,7 +236,7 @@ services:
 
   taskiq-scheduler:
     build: *app-build
-    image: trellis-agent-platform:v2
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.2.0}
     container_name: taskiq-scheduler
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     # NOTE: no `env_file: .env`. The scheduler only enqueues jobs (the worker runs
@@ -229,7 +246,7 @@ services:
       <<: *common-env
       REDIS_URL: redis://redis:6379/0
     volumes:
-      - ./workspace:/app/workspace
+      - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace
     command: taskiq scheduler core.tasks:scheduler
     depends_on:
       etcd:
@@ -287,7 +304,7 @@ services:
 
   ui:
     build: *app-build
-    image: trellis-agent-platform:v2
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.2.0}
     container_name: agent-ui
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     env_file:
@@ -299,7 +316,7 @@ services:
       REDIS_URL: redis://redis:6379/0
     volumes:
       - health-data:/app/data
-      - ./workspace:/app/workspace
+      - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace
     command: uvicorn core.ui:app --host 0.0.0.0 --port 8080
     depends_on:
       etcd:

@@ -31,12 +31,22 @@ Each subdirectory gets a `.gitkeep` placeholder. If no `.env` exists in `PATH`, 
 ## `sync` — push the filesystem into the registry
 
 ```bash
-python scripts/trellis sync
+python scripts/trellis sync [--force-prune]
 ```
 
 Delegates to `scripts/sync_to_db.py`'s `main()` (identical behavior to `python scripts/sync_to_db.py`): it walks `workspace/agents`, `workspace/workflows`, `workspace/tools`, and `workspace/mcps`, writes configs to etcd, and deletes registry entries whose source directories are gone. It connects using `ETCD_HOST`/`ETCD_PORT` (defaults `127.0.0.1:2379`).
 
 In normal operation the compose `db-sync` init container does this for you on `docker compose up -d --build`; the CLI form is for running it on demand against an already-running etcd.
+
+### Prune guard
+
+Sync is authoritative: it deletes registry entries whose source is gone. So a mis-pointed `TRELLIS_WORKSPACE_DIR` (or a missing bind mount) would otherwise silently wipe the whole registry. To prevent that, sync **refuses to prune when it found nothing at all** — no agents, no tools, and no MCPs in the workspace — while etcd still has entries, and exits non-zero. Fix the workspace path, or bypass it deliberately:
+
+```bash
+python scripts/trellis sync --force-prune     # or SYNC_FORCE_PRUNE=true
+```
+
+The check is global, not per-category: one empty category alongside a populated one (an org with agents but no tools of its own yet) prunes as usual. A refusal skips the **whole** prune pass for that run (nothing is half-pruned). The compose `db-sync` container runs the same guard — a refusal exits non-zero, which blocks `host`/`ui` from starting on the bad mount. To override the container, set `SYNC_FORCE_PRUNE=true` in `.env`.
 
 > **etcd and redis are not published to the host.** The compose stack exposes them only on the internal `trellis-network`, so run framework tooling from inside a container rather than directly on the host:
 >

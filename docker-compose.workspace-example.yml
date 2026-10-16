@@ -1,0 +1,54 @@
+# ==============================================================================
+# Example override: mount an external workspace (content) checkout
+# ==============================================================================
+# Copy this file to `docker-compose.override.yml` (compose auto-loads it) when you
+# want to keep the framework (engine) and your agents/tools (content) in separate
+# repos. Everything else stays as-is.
+#
+#   cp docker-compose.workspace-example.yml docker-compose.override.yml
+#   # then edit the path below
+#   docker compose up -d
+#
+# NOTE: this is OPTIONAL. The base compose already parameterizes the mount via
+# TRELLIS_WORKSPACE_DIR in .env -- setting that is the simplest way to point at an
+# external checkout. Use this override instead when you want per-instance divergence
+# (e.g. a dev override that differs from prod) or prefer an explicit file.
+#
+# How the merge works: compose merges `volumes` by CONTAINER PATH, not by list, so
+# re-declaring only `/app/workspace` here replaces that one mount and leaves every
+# other mount (e.g. `health-data:/app/data`) untouched.
+#
+# Paths in an override file resolve relative to the BASE compose file's directory
+# (this repo), so a relative path is relative to the clone.
+#
+# The path below assumes the content repo was scaffolded with `trellis init`, which
+# nests the workspace under a `workspace/` directory. If your content repo IS the
+# workspace (agents/ and tools/ at its root), drop the trailing `/workspace`.
+services:
+  db-sync:
+    volumes:
+      - ../acme-trellis-workspace/workspace:/app/workspace
+
+  host:
+    volumes:
+      - ../acme-trellis-workspace/workspace:/app/workspace
+
+  hub:
+    volumes:
+      - ../acme-trellis-workspace/workspace:/app/workspace
+
+  gateway:
+    volumes:
+      - ../acme-trellis-workspace/workspace:/app/workspace
+
+  taskiq-worker:
+    volumes:
+      - ../acme-trellis-workspace/workspace:/app/workspace
+
+  taskiq-scheduler:
+    volumes:
+      - ../acme-trellis-workspace/workspace:/app/workspace
+
+  ui:
+    volumes:
+      - ../acme-trellis-workspace/workspace:/app/workspace

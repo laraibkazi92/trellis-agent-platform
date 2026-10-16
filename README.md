@@ -13,6 +13,12 @@
 
 Trellis runs a fleet of LLM agents behind one OpenAI-compatible API. Each agent is a config file plus a skills prompt; tools are standalone scripts in Python, TypeScript, Go, or Bash, executed in a sandbox. Call agents over REST or from MCP clients like Claude Desktop. A dashboard manages users, API keys, and credentials; etcd holds all framework state.
 
+## Who is this for?
+
+- **Org operators** (deploy and host the framework) - start with [docs/deploy.md](docs/deploy.md).
+- **Content authors** (build agents, tools, workflows, and MCP servers) - see [docs/agents.md](docs/agents.md), [docs/tools.md](docs/tools.md), [docs/workflows.md](docs/workflows.md), and [docs/mcp.md](docs/mcp.md).
+- **Framework contributors** (work on the engine itself) - see [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Architecture
 
 | Service | Port | What it does |
@@ -26,12 +32,17 @@ Trellis runs a fleet of LLM agents behind one OpenAI-compatible API. Each agent 
 
 ## Quick start
 
-Docker is the only prerequisite.
+Docker is the only prerequisite. If you are deploying Trellis for an organization, follow [docs/deploy.md](docs/deploy.md) first — it covers pointing Trellis at your own content repo.
+
+The fastest path is the prebuilt multi-arch image, published publicly on GHCR as `ghcr.io/laraibkazi92/trellis-agent-platform` (anonymous pulls — no login — once its GHCR package visibility is public):
 
 ```bash
 cp .env.example .env    # set SESSION_SECRET
-docker compose up -d --build
+docker compose pull && docker compose up -d      # prebuilt image
+# or: docker compose up -d --build               # build from source
 ```
+
+Orgs pin the engine to a release tag — the first release is `v0.2.0` (set `TRELLIS_IMAGE` in `.env`) — while `main` tracks upstream development.
 
 Every rebuild syncs `workspace/` into etcd, so new agents and tools go live on the next one. Configure your LLM provider keys in the Dashboard (**Admin → Global Tool Configuration**) — stored encrypted in etcd, they serve Google (Gemini), OpenAI, Anthropic, or any OpenAI-compatible endpoint. Then browse to http://localhost and create an API key, or set `DEV_MODE=true` in `.env` to run without authentication.
 
@@ -63,14 +74,18 @@ claude mcp add --transport http trellis http://localhost/mcp \
 - `workspace/workflows/` - background agents and scripts triggered by schedules or webhooks.
 - `workspace/mcps/` - registrations for external MCP servers.
 
+To run Trellis for an organization with your own content repo, point `TRELLIS_WORKSPACE_DIR` at that checkout instead of `./workspace` — see [docs/deploy.md](docs/deploy.md).
+
 ## Docs
 
+- [Deploy](docs/deploy.md) - running Trellis for your org: content repos, image pinning, and TLS
 - [Agents](docs/agents.md) - building agent configs and skills prompts
 - [Tools](docs/tools.md) - the stdin/stdout tool protocol
 - [Workflows](docs/workflows.md) - background agents and scripts
 - [MCP](docs/mcp.md) - registering external MCP servers
 - [CLI](docs/cli.md) - scaffold workspaces, sync the registry, inspect runs
 - [Rules Engine](docs/rules_engine.md) - lock queries onto agents with plain-language rules, ahead of semantic search
+- [Upgrading](docs/upgrading.md) - versioning, release tags, and breaking-change notes
 - [Branding](branding/trellis-logo/GUIDELINES.md) - logo kit usage guide
 
 ## License
