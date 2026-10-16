@@ -25,6 +25,10 @@ So good work never compounds. A great agent helps one person once instead of bec
 
 Trellis is a self-hosted control plane for a fleet of LLM agents. Teams author each agent as a config file plus a skills prompt, share one set of sandboxed tools, and reach the whole fleet through a single OpenAI-compatible endpoint or a single MCP connection. Users, credentials, routing, memory, and background jobs all run on infrastructure you own.
 
+https://github.com/user-attachments/assets/1181afeb-793f-45fa-a1f3-3babfc3e8052
+
+*The Trellis dashboard and agent fleet in 45 seconds.*
+
 <p align="center">
   <img src="docs/assets/portal-home.png" alt="The Trellis dashboard: fleet telemetry, the agent registry, the tool library, and MCP connection details" width="880">
 </p>
