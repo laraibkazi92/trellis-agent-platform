@@ -4,8 +4,13 @@
 # CI v1: run the test suite on every push/PR to main.
 # The suite is fully self-contained (mocked; no etcd/redis/LLM needed) — the
 # TestLiveRegistry probes self-skip when no etcd is reachable, which is the
-# normal case on a clean runner. Image publishing stays manual for now
-# (scripts/publish_images.sh); automate it here only after that's revisited.
+# normal case on a clean runner.
+#
+# Image publishing is automated in .github/workflows/publish-images.yml (triggered
+# by a v* tag push): it publishes the multi-arch engine image to GHCR, which is the
+# compose / `docker compose pull` install path. scripts/publish_images.sh stays the
+# manual path for pushing both the app AND gateway images to your own registry, which
+# is what the Helm chart under charts/trellis consumes.
 
 name: CI
 

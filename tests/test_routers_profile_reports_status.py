@@ -55,6 +55,15 @@ async def _collect_asgi_body(response):
     messages = []
 
     async def receive():
+        # Model a real ASGI client: yield to the loop, then report the disconnect once the
+        # body has been fully sent. FileResponse.__call__ (Starlette >= 1.8, legacy ASGI
+        # path) loops on receive() watching for http.disconnect; a receive() that never
+        # suspends spins that loop without ever letting the file-streaming task run, which
+        # hangs the suite.
+        await asyncio.sleep(0)
+        last = messages[-1] if messages else None
+        if last and last["type"] == "http.response.body" and not last.get("more_body"):
+            return {"type": "http.disconnect"}
         return {"type": "http.request", "body": b"", "more_body": False}
 
     async def send(message):
