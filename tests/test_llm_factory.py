@@ -204,6 +204,13 @@ def test_resolve_model_per_provider(provider, llm_provider_keys):
         assert str(model.client.base_url).rstrip("/") == base_url
 
 
+def test_resolve_model_wraps_sdk_model_name_validation(llm_provider_keys):
+    """SDK-level model-id validation must surface as ProviderConfigError, not a bare
+    crash: openrouter rejects unprefixed ids and the host maps that to a 400."""
+    with pytest.raises(ProviderConfigError, match="prefixed with the upstream provider"):
+        resolve_model("openrouter", "gpt-4o")
+
+
 def test_resolve_model_openai_stays_on_chat_completions(llm_provider_keys):
     """openai must keep dispatching to OpenAIChatModel, never OpenAIResponsesModel."""
     from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel

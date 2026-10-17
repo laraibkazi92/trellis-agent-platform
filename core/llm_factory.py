@@ -281,12 +281,22 @@ def resolve_model(
         )
 
     url = stripped_url or get_provider_base_url(spec) or spec.default_base_url
-    if spec.build == "openai-compatible":
-        return OpenAIChatModel(model_name, provider=build_provider(spec, key, url))
-    return infer_model(
-        f"{spec.pydantic_name}:{model_name}",
-        provider_factory=lambda _name: build_provider(spec, key, url),
-    )
+    try:
+        if spec.build == "openai-compatible":
+            return OpenAIChatModel(model_name, provider=build_provider(spec, key, url))
+        return infer_model(
+            f"{spec.pydantic_name}:{model_name}",
+            provider_factory=lambda _name: build_provider(spec, key, url),
+        )
+    except ProviderConfigError:
+        raise
+    except Exception as e:
+        # The SDK's own validation (e.g. "OpenRouter model names must be prefixed
+        # with the upstream provider") is a configuration mistake, not a crash:
+        # re-raise as ProviderConfigError so the caller gets an actionable message.
+        raise ProviderConfigError(
+            f"Cannot build model '{model_name}' for provider '{spec.id}': {e}"
+        ) from e
 
 
 def build_model_settings(
