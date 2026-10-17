@@ -131,7 +131,7 @@ class TriggerUpdate(BaseModel):
     webhook_secret: Optional[str] = None
 
 class AgentUpdateModel(TriggerUpdate):
-    model: str
+    model: Optional[str] = None
     thinking_level: str
     provider: Optional[str] = None
     base_url: Optional[str] = None
@@ -546,7 +546,9 @@ async def update_background_trigger(request: Request):
             )
             return RedirectResponse(url='/workflows', status_code=303)
 
-        config_data["model"] = validated_data.model
+        # A blank model means "inherit the framework default": normalize to None.
+        model_value = (validated_data.model or "").strip() or None
+        config_data["model"] = model_value
         config_data["thinking_level"] = validated_data.thinking_level
         config_data["provider"] = provider or None
         config_data["base_url"] = base_url
