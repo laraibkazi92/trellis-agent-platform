@@ -22,6 +22,7 @@ from core.llm_providers import (
     provider_ui_specs,
 )
 from core.llm_defaults import (
+    FrameworkDefaults,
     get_framework_defaults,
     reset_defaults_cache,
     resolve_effective_llm_config,
@@ -90,7 +91,13 @@ def _provider_label(provider_id: str) -> str:
     except ProviderConfigError:
         return provider_id
 
-def _inherit_hint(provider, model, base_url, defaults, default_provider_label) -> str | None:
+def _inherit_hint(
+    provider: str | None,
+    model: str | None,
+    base_url: str | None,
+    defaults: FrameworkDefaults | None,
+    default_provider_label: str | None,
+) -> str | None:
     """Read-only editor hint for the inherit paths (plan §9).
 
     Two states inherit a model and get a hint: both provider and model blank (the
@@ -104,8 +111,11 @@ def _inherit_hint(provider, model, base_url, defaults, default_provider_label) -
         effective = resolve_effective_llm_config(provider, model, base_url, defaults)
     except ProviderConfigError:
         return None
-    if (effective.source in ("framework", "provider-default")
-            and defaults and defaults.provider == effective.provider):
+    matched = bool(
+        defaults and defaults.provider and defaults.model
+        and defaults.provider == effective.provider
+    )
+    if matched and effective.source in ("framework", "provider-default"):
         return f"Inherits framework default: {default_provider_label or defaults.provider} / {effective.model}"
     if effective.source == "provider-default":
         return f"Uses {_provider_label(effective.provider)} default: {effective.model}"

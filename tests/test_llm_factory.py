@@ -435,6 +435,20 @@ def test_resolve_model_ollama_uses_etcd_base_url_over_default(llm_provider_keys,
     assert str(m.client.base_url).rstrip("/") == "http://etcd-ollama:11434"
 
 
+def test_resolve_model_litellm_falls_back_to_its_local_endpoint(llm_provider_keys):
+    """A litellm model with no endpoint used to fall through to the OpenAI SDK's
+    default (https://api.openai.com/v1), carrying the gateway key with it."""
+    m = resolve_model("litellm", "openai/gpt-4o")
+
+    assert str(m.client.base_url).rstrip("/") == "http://localhost:4000"
+
+
+def test_resolve_model_litellm_honours_an_explicit_endpoint(llm_provider_keys):
+    m = resolve_model("litellm", "openai/gpt-4o", "http://litellm.internal:4000")
+
+    assert str(m.client.base_url).rstrip("/") == "http://litellm.internal:4000"
+
+
 def test_seam_install_accepts_base_urls(monkeypatch):
     """The seam's ``base_urls`` hook is how a global etcd endpoint is simulated."""
     from pydantic_ai.models.ollama import OllamaModel

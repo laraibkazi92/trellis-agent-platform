@@ -322,9 +322,6 @@
             var providers = window.LLM_PROVIDERS || [];
             var CUSTOM_MODEL = '__custom__';
             var initialModel = {{ (config.model or '') | tojson }};
-            // Last value we auto-filled into the Base URL field; only that value is
-            // cleared/swapped on a provider change, never a user-typed endpoint.
-            var lastAutoBaseUrl = null;
 
             function providerById(providerId) {
                 for (var i = 0; i < providers.length; i++) {
@@ -415,26 +412,20 @@
                     $field.show();
                     $input.prop('disabled', false).prop('required', false);
                     $input.attr('placeholder', 'Optional endpoint');
-                    if ($input.val() === lastAutoBaseUrl) $input.val('');
-                    lastAutoBaseUrl = null;
                     return;
                 }
 
                 var supports = !!spec.supports_base_url;
                 var requires = !!spec.requires_base_url;
+                // A provider's registry default is a build-time fallback, so it is shown
+                // as a placeholder and never written into the field: pre-filling it would
+                // persist the endpoint on save and pin the agent away from the org
+                // default it is supposed to inherit.
                 var placeholder = spec.base_url_placeholder || spec.default_base_url || 'Optional endpoint';
-                var autoUrl = supports ? (spec.default_base_url || '') : '';
 
                 $field.toggle(supports);
                 $input.prop('disabled', !supports).prop('required', requires);
                 $input.attr('placeholder', placeholder);
-
-                // Swap a previously auto-filled default instead of leaking it across
-                // providers; an operator-typed endpoint is never overwritten.
-                if ($input.val() === lastAutoBaseUrl || !$input.val()) {
-                    $input.val(autoUrl);
-                }
-                lastAutoBaseUrl = autoUrl;
             }
 
             // Logic for Thinking Level based on the effective provider's style
@@ -517,8 +508,8 @@
                 updateThinkingLevel();
             });
 
-            // The inherit hint describes the *unset* state only; any operator edit makes
-            // it stale (case B would then use the provider's registry default).
+            // The hint is computed server-side from the saved config and never
+            // recomputed, so the first operator edit invalidates it.
             $('#providerSelect, #modelSelect, #modelCustomInput').on('change input', function() {
                 var hint = document.getElementById('inheritDefaultHint');
                 if (hint) hint.style.display = 'none';

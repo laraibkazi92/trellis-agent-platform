@@ -127,6 +127,9 @@ def test_base_url_support_is_consistent_with_the_requirement():
     for spec in PROVIDERS.values():
         if not spec.supports_base_url:
             assert not spec.requires_base_url, f"{spec.id} requires an unsupported base_url"
+        assert not spec.default_base_url or spec.supports_base_url, (
+            f"{spec.id} has a default_base_url but does not support one"
+        )
 
 
 # --- registry default models & usability -------------------------------------

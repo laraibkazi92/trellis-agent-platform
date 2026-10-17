@@ -200,11 +200,11 @@ An admin can set **one org-wide default provider + model** (and an optional `bas
 leaves **both `provider` and `model` blank** inherits that pair instead of failing.
 
 The default is applied at build time and is **never written into your YAML**. The agent editor
-shows a read-only hint under the model field while the model is blank — `Inherits framework
-default: <Provider> / <model>` when the framework default applies, or `Uses <Provider> default:
-<model>` when a pinned provider falls back to its own registry default — and nothing is
-prefilled, so "inherit" survives every edit and the agent keeps tracking the org default as it
-changes.
+shows a read-only hint under the model field while the model is blank and a default can be
+resolved — `Inherits framework default: <Provider> / <model>` when the framework default
+applies, or `Uses <Provider> default: <model>` when a pinned provider falls back to its own
+registry default — and nothing is prefilled, so "inherit" survives every edit and the agent
+keeps tracking the org default as it changes.
 
 Resolution priority, highest first:
 
@@ -225,10 +225,10 @@ Notes:
   `openai` → `gpt-5-mini`), so `provider` set + `model` blank is a valid configuration.
 - **To opt out of inheritance, set both `provider` and `model`.** A fully-specified pair is
   used verbatim and never consults the framework default.
-- **`openai-compatible` is the exception:** it has no registry default, so it always needs an
-  explicit `model` *and* an explicit `base_url`. Its config validator rejects a pinned
-  `openai-compatible` provider with no `base_url` before resolution runs, so case B cannot apply
-  to it — to inherit an org-wide endpoint, leave `provider` blank as well (case D).
+- **`openai-compatible` is the exception:** it has no registry default, so a pinned
+  `openai-compatible` agent must always name a `model` — a blank one raises (case B cannot
+  resolve for it). To inherit an org-wide endpoint instead, leave `provider` blank as well
+  (case D).
 
 ---
 

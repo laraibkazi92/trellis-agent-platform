@@ -520,6 +520,7 @@ def test_editor_case_b_hint_does_not_prefill_the_model_field():
     config = _editor_config(provider="deepseek", model=None)
     html = _render_editor(config, default_llm=FrameworkDefaults("deepseek", "deepseek-chat", None))
 
+    assert 'id="inheritDefaultHint"' in html
     assert re.search(r'<input type="hidden" name="model" id="modelValue" value="">', html)
 
 
@@ -528,6 +529,15 @@ def test_editor_hint_absent_for_an_unknown_provider():
     html = _render_editor(config, default_llm=FrameworkDefaults("deepseek", "deepseek-chat", None))
 
     assert 'id="inheritDefaultHint"' not in html
+
+
+def test_editor_never_prefills_a_provider_default_endpoint():
+    """A provider's registry default is a placeholder, never a value: writing it into the
+    field would persist it on save and pin the agent away from the endpoint it inherits."""
+    html = _render_editor(_editor_config(provider="litellm", model=None))
+
+    assert "lastAutoBaseUrl" not in html
+    assert "$input.attr('placeholder', placeholder)" in html
 
 
 def test_editor_provider_pill_reads_infer_from_model_not_model_name():
@@ -659,10 +669,11 @@ def test_admin_rules_card_inline_script_consumes_shared_registry_payload():
     assert "data-requires-url" in _rules_provider_select(html)
 
 
-def test_admin_rules_card_does_not_leak_auto_filled_base_url_across_providers():
-    """Switching ollama -> deepseek -> google must not resubmit ollama's default URL."""
+def test_admin_rules_card_never_prefills_a_provider_default_endpoint():
+    """The rules base_url only ever *previews* the provider default as a placeholder, so
+    switching ollama -> deepseek -> google can never resubmit ollama's URL."""
     html = _render_admin()
 
-    assert "lastAutoBaseUrl" in html
-    # The swap guard has to be present on both the "no spec" and the normal branch.
-    assert html.count("lastAutoBaseUrl") >= 3
+    # No auto-fill machinery: nothing writes default_base_url into the input value.
+    assert "lastAutoBaseUrl" not in html
+    assert "baseUrlInput.placeholder = spec.base_url_placeholder || spec.default_base_url" in html
