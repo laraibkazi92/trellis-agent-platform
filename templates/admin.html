@@ -193,7 +193,7 @@
       <form action="/admin/rules-engine/model" method="POST" class="grid grid-cols-2 gap-2 w-full max-w-md shrink-0">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <select name="provider" id="rulesProviderSelect" class="rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-neutral-900">
-          <option value="">Provider: default ({{ rules_engine.provider_default or 'inferred' }})</option>
+          <option value="">Provider: default ({{ rules_engine.provider_default or 'infer from model' }})</option>
           {% for p in llm_providers %}
           <option
             value="{{ p.id }}"

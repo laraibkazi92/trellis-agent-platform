@@ -520,7 +520,7 @@ def test_admin_rules_card_first_option_is_the_inferred_default():
     markup = first_option.group(0)
     assert 'value=""' in markup
     assert "default" in markup.lower()
-    assert "inferred" in markup.lower()
+    assert "infer from model" in markup.lower()
 
 
 def test_admin_rules_card_model_datalist_covers_multiple_providers_without_duplicates():

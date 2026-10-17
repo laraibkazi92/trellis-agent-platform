@@ -500,3 +500,38 @@ def test_rules_engine_blank_provider_and_model_keeps_base_url_override(monkeypat
     assert fake_identity.rules["base_url"] == "http://gateway:4000"
     assert "provider" not in fake_identity.rules
     assert "model" not in fake_identity.rules
+
+
+def test_rules_engine_blank_model_with_provider_persists_registry_default(monkeypatch):
+    """A provider override with a blank model must persist that provider's registry
+    default, not clear the model and let the decider pair it with the env model."""
+    monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
+    fake_identity = FakeRulesIdentity()
+    monkeypatch.setattr(admin, "identity_mgr", fake_identity)
+
+    request = FakeRequest(session=_admin_session())
+    response = asyncio.run(admin.set_rules_engine_model(
+        request, model="", provider="deepseek", base_url="", confidence_threshold="",
+    ))
+
+    assert response.status_code == 303
+    assert fake_identity.rules["provider"] == "deepseek"
+    assert fake_identity.rules["model"] == "deepseek-chat"
+
+
+def test_rules_engine_provider_without_registry_default_requires_explicit_model(monkeypatch):
+    """openai-compatible has no registry default, so a blank model must be rejected
+    and nothing written (base_url supplied, so it is not the base_url guard firing)."""
+    monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
+    fake_identity = FakeRulesIdentity()
+    monkeypatch.setattr(admin, "identity_mgr", fake_identity)
+
+    request = FakeRequest(session=_admin_session())
+    response = asyncio.run(admin.set_rules_engine_model(
+        request, model="", provider="openai-compatible", base_url="http://gateway:4000/v1",
+        confidence_threshold="",
+    ))
+
+    assert response.status_code == 303
+    assert "requires an explicit model" in request.session["flash_msg"]
+    assert fake_identity.rules == {}

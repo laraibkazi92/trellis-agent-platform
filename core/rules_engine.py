@@ -31,7 +31,7 @@ from core.llm_factory import (
     infer_provider,
     resolve_model,
 )
-from core.llm_providers import get_spec, provider_accepts_base_url
+from core.llm_providers import default_model_for, get_spec, provider_accepts_base_url
 from core.models import RuleEvaluationResult, is_agent_external, is_routable_agent_type
 
 logger = logging.getLogger(__name__)
@@ -303,13 +303,19 @@ def _resolve_evaluation_settings() -> tuple[str, str, Optional[str]]:
     from the post-refresh one (``deepseek-chat``), egressing the query and rule catalog
     to the wrong vendor. Read them together so provider inference always uses the same
     model that will be sent.
+
+    A provider override with no model completes from that provider's registry default
+    (never the env ``RULES_EVALUATION_MODEL``, which may belong to another vendor); it
+    only falls through to the env model when the provider has no registry default.
     """
     _kick_model_overrides_refresh()
-    model_name = _cached_model_override or RULES_EVALUATION_MODEL
-    provider = (
-        _cached_provider_override
-        or RULES_EVALUATION_PROVIDER
-        or infer_provider(model_name)
+    provider = _cached_provider_override or RULES_EVALUATION_PROVIDER
+    if not provider:
+        provider = infer_provider(_cached_model_override or RULES_EVALUATION_MODEL)
+    model_name = (
+        _cached_model_override
+        or default_model_for(provider)
+        or RULES_EVALUATION_MODEL
     )
     base_url = _cached_base_url_override or RULES_EVALUATION_BASE_URL or None
     return provider, model_name, base_url

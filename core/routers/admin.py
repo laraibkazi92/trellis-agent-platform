@@ -14,6 +14,7 @@ from core.health import HealthMonitor
 from core.llm_factory import ProviderConfigError, infer_provider
 from core.llm_providers import (
     FRAMEWORK_PROVIDER_KEY_ENV,
+    default_model_for,
     provider_accepts_base_url,
     provider_requires_base_url,
     provider_ui_specs,
@@ -304,6 +305,18 @@ async def set_rules_engine_model(
             request.session["flash_msg"] = "Confidence threshold must be between 0.0 and 1.0."
             return RedirectResponse(url='/admin', status_code=303)
 
+    # Resolve the model to persist before any write, so a rejected save writes nothing.
+    # A provider override with a blank model must never fall through to the env
+    # RULES_EVALUATION_MODEL, which would egress one vendor's query to another.
+    model_value = model.strip()
+    if not model_value and effective_provider:
+        model_value = default_model_for(effective_provider) or ""
+        if not model_value:
+            request.session["flash_msg"] = (
+                f"Provider '{effective_provider}' requires an explicit model."
+            )
+            return RedirectResponse(url='/admin', status_code=303)
+
     # Empty submission for a field means "clear the override", reverting to its env default.
     if effective_provider:
         await asyncio.to_thread(identity_mgr.set_rules_evaluation_provider, effective_provider)
@@ -315,8 +328,8 @@ async def set_rules_engine_model(
     else:
         await asyncio.to_thread(identity_mgr.clear_config, "rules_evaluation_base_url")
 
-    if model.strip():
-        await asyncio.to_thread(identity_mgr.set_rules_evaluation_model, model.strip())
+    if model_value:
+        await asyncio.to_thread(identity_mgr.set_rules_evaluation_model, model_value)
     else:
         await asyncio.to_thread(identity_mgr.clear_config, "rules_evaluation_model")
 
