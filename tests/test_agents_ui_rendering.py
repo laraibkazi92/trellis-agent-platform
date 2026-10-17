@@ -556,3 +556,12 @@ def test_admin_rules_card_inline_script_consumes_shared_registry_payload():
     assert "updateRulesProviderFields" in html
     assert "data-supports-url" in _rules_provider_select(html)
     assert "data-requires-url" in _rules_provider_select(html)
+
+
+def test_admin_rules_card_does_not_leak_auto_filled_base_url_across_providers():
+    """Switching ollama -> deepseek -> google must not resubmit ollama's default URL."""
+    html = _render_admin()
+
+    assert "lastAutoBaseUrl" in html
+    # The swap guard has to be present on both the "no spec" and the normal branch.
+    assert html.count("lastAutoBaseUrl") >= 3

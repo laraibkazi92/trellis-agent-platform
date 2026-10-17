@@ -40,7 +40,8 @@
             <div class="llm-provider-card bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm space-y-3"
                  data-provider="{{ p.id }}"
                  data-search="{{ (p.label ~ ' ' ~ p.id ~ ' ' ~ (p.key_names|join(' ')) ~ ' ' ~ (p.base_url_key or ''))|lower }}"
-                 data-configured="{{ '1' if p.configured or p.base_url_value else '0' }}">
+                 data-configured="{{ '1' if p.configured or p.base_url_value else '0' }}"
+                 data-keyless="{{ '1' if keyless else '0' }}">
 
                 <div class="flex flex-wrap items-center gap-2">
                     <span class="font-bold text-neutral-900 dark:text-neutral-100">{{ p.label }}</span>
@@ -164,7 +165,8 @@ document.addEventListener('DOMContentLoaded', function () {
 
         cards.forEach(function (card) {
             var matches = !query || (card.getAttribute('data-search') || '').indexOf(query) !== -1;
-            var unconfigured = card.getAttribute('data-configured') === '0';
+            var unconfigured = card.getAttribute('data-configured') === '0'
+                && card.getAttribute('data-keyless') !== '1';
             var show = matches && (!unconfiguredOnly || unconfigured);
             card.classList.toggle('hidden', !show);
             if (show) visible += 1;

@@ -185,6 +185,20 @@ def test_admin_llm_providers_page_renders_all_providers(monkeypatch):
     assert "CONFIGURED" in _card_html(html, "deepseek")
 
 
+def test_admin_llm_providers_page_marks_keyless_providers_for_the_unconfigured_filter(monkeypatch):
+    """Ollama needs no credentials, so the "Only unconfigured" filter must not list it."""
+    monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
+    monkeypatch.setattr(admin, "identity_mgr", FakeLLMIdentityManager())
+    captured = _capture_templates(monkeypatch)
+
+    asyncio.run(admin.admin_llm_providers_page(FakeRequest(session=_admin_session())))
+
+    html = captured["html"]
+    assert 'data-provider="ollama"' in html
+    assert 'data-keyless="1"' in _card_html(html, "ollama")
+    assert 'data-keyless="0"' in _card_html(html, "deepseek")
+
+
 def test_admin_llm_providers_page_redirects_anonymous_to_login(monkeypatch):
     monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
     monkeypatch.setattr(admin, "identity_mgr", FakeLLMIdentityManager())
