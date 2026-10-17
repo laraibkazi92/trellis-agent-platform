@@ -185,7 +185,9 @@
         <p class="text-sm text-gray-500 mt-1">
           Model, provider and base_url for the single-pass decider, plus the minimum confidence
           required to accept a match. Blank fields fall back to the env-var defaults
-          (<code class="text-xs bg-gray-100 px-1 py-0.5 rounded">RULES_EVALUATION_MODEL</code> etc.).
+          (<code class="text-xs bg-gray-100 px-1 py-0.5 rounded">RULES_EVALUATION_MODEL</code> etc.),
+          except that a blank model next to a selected provider uses that provider's registry
+          default.
           Provider credentials are managed in
           <a href="/admin/llm-providers" class="underline hover:text-gray-900">Admin &rarr; LLM Providers</a>.
         </p>

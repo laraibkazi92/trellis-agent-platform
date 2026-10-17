@@ -403,11 +403,12 @@ def test_resolve_evaluation_settings_without_overrides_uses_env_defaults(monkeyp
     monkeypatch.setattr(rules_engine, "_cached_model_override", None)
     monkeypatch.setattr(rules_engine, "_cached_base_url_override", None)
     monkeypatch.setattr(rules_engine, "RULES_EVALUATION_PROVIDER", "google")
-    monkeypatch.setattr(rules_engine, "RULES_EVALUATION_MODEL", "gemini-2.5-flash")
+    # Deliberately NOT google's registry default, so discarding the env model fails here.
+    monkeypatch.setattr(rules_engine, "RULES_EVALUATION_MODEL", "gemini-2.0-flash")
 
     provider, model_name, base_url = rules_engine._resolve_evaluation_settings()
 
-    assert (provider, model_name) == ("google", "gemini-2.5-flash")
+    assert (provider, model_name) == ("google", "gemini-2.0-flash")
     assert base_url is None
 
 
