@@ -716,6 +716,26 @@ def test_editor_page_renders_inherit_hint_for_an_unset_agent(monkeypatch):
     assert '<option value="deepseek" selected' not in html
 
 
+def test_editor_page_renders_case_b_hint_for_a_provider_only_agent(monkeypatch):
+    """Route-level: provider set + blank model shows the registry-default hint (case B)."""
+    monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
+    fake_identity = FakeIdentityManagerAdmin(
+        {"provider-only": {
+            "name": "provider-only", "description": "d",
+            "provider": "deepseek", "model": "", "a2a_access": [],
+        }}
+    )
+    monkeypatch.setattr(admin, "identity_mgr", fake_identity)
+    monkeypatch.setattr(admin, "get_framework_defaults", lambda: FrameworkDefaults())
+
+    response = asyncio.run(admin.editor_page(FakeRequest(session=_admin_session()), "agent", "provider-only"))
+
+    assert response.status_code == 200
+    html = response.body.decode()
+    assert 'id="inheritDefaultHint"' in html
+    assert "Uses DeepSeek default: deepseek-chat" in html
+
+
 def test_save_agent_empty_provider_stays_none(monkeypatch):
     """Auto/inferred provider must still save as None without tripping validation."""
     monkeypatch.setenv("ADMIN_USERS", "admin@example.com")

@@ -22,7 +22,8 @@ import re
 
 from core.dependencies import llm_providers_context, templates
 from core.llm_defaults import FrameworkDefaults
-from core.llm_providers import get_spec, provider_ui_specs
+from core.llm_providers import provider_ui_specs
+from core.routers.admin import _inherit_hint, _provider_label
 
 
 class _FakeURL:
@@ -392,12 +393,14 @@ def _editor_config(name="deepseek-agent", **overrides):
 
 
 def _render_editor(config, default_llm=None):
-    default_llm_provider_label = None
-    if default_llm is not None and default_llm.provider:
-        try:
-            default_llm_provider_label = get_spec(default_llm.provider).label
-        except Exception:
-            default_llm_provider_label = default_llm.provider
+    default_llm_provider_label = _provider_label(default_llm.provider) if (default_llm and default_llm.provider) else None
+    inherit_hint = _inherit_hint(
+        config.get("provider"),
+        config.get("model"),
+        config.get("base_url"),
+        default_llm,
+        default_llm_provider_label,
+    )
     context = {
         "request": _FakeRequest(),
         "user": {"name": "Test User", "sub": "test-user"},
@@ -416,8 +419,7 @@ def _render_editor(config, default_llm=None):
         "app_name": "Trellis",
         "app_accent_color": "#0055FF",
         "app_accent_color_dark": "#3377FF",
-        "default_llm": default_llm,
-        "default_llm_provider_label": default_llm_provider_label,
+        "inherit_hint": inherit_hint,
     }
     context.update(llm_providers_context(None))
     return templates.env.get_template("editor.html").render(**context)
@@ -485,6 +487,47 @@ def test_editor_hides_inherit_hint_when_no_framework_default():
 
     assert 'id="inheritDefaultHint"' not in html
     assert "Inherits framework default" not in html
+
+
+# --- Editor: case B hint (provider set, blank model) --------------------------
+
+def test_editor_case_b_hint_names_the_framework_default_when_provider_matches():
+    config = _editor_config(provider="deepseek", model=None)
+    html = _render_editor(config, default_llm=FrameworkDefaults("deepseek", "deepseek-chat", None))
+
+    assert 'id="inheritDefaultHint"' in html
+    assert "Inherits framework default: DeepSeek / deepseek-chat" in html
+
+
+def test_editor_case_b_hint_names_the_registry_default_for_a_foreign_provider():
+    config = _editor_config(provider="google", model=None)
+    html = _render_editor(config, default_llm=FrameworkDefaults("deepseek", "deepseek-chat", None))
+
+    assert 'id="inheritDefaultHint"' in html
+    assert "Uses Google (Gemini) default: gemini-2.5-flash" in html
+    assert "Inherits framework default" not in html
+
+
+def test_editor_case_b_hint_names_the_registry_default_with_no_framework_default():
+    config = _editor_config(provider="deepseek", model=None)
+    html = _render_editor(config, default_llm=FrameworkDefaults())
+
+    assert 'id="inheritDefaultHint"' in html
+    assert "Uses DeepSeek default: deepseek-chat" in html
+
+
+def test_editor_case_b_hint_does_not_prefill_the_model_field():
+    config = _editor_config(provider="deepseek", model=None)
+    html = _render_editor(config, default_llm=FrameworkDefaults("deepseek", "deepseek-chat", None))
+
+    assert re.search(r'<input type="hidden" name="model" id="modelValue" value="">', html)
+
+
+def test_editor_hint_absent_for_an_unknown_provider():
+    config = _editor_config(provider="nope", model=None)
+    html = _render_editor(config, default_llm=FrameworkDefaults("deepseek", "deepseek-chat", None))
+
+    assert 'id="inheritDefaultHint"' not in html
 
 
 def test_editor_provider_pill_reads_infer_from_model_not_model_name():

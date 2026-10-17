@@ -189,6 +189,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         key_names=("LITELLM_API_KEY",),
         requires_key=False,
         supports_base_url=True,
+        default_base_url="http://localhost:4000",
         base_url_placeholder="http://localhost:4000",
         base_url_kwarg="api_base",
         key_placeholder="litellm-placeholder",

@@ -121,9 +121,9 @@
                             <p class="text-xs text-neutral-500 dark:text-neutral-400 mt-2 font-mono">JavaScript is required to change the model. Saved model: <code>{{ config.model or '(unset)' }}</code>.</p>
                         </noscript>
                         <input type="text" id="modelCustomInput" class="form-input mt-2" placeholder="Custom model id" disabled>
-                        {% if not config.provider and not config.model and default_llm and default_llm.provider %}
+                        {% if inherit_hint %}
                         <p id="inheritDefaultHint" class="text-xs text-neutral-500 dark:text-neutral-400 mt-2 font-mono">
-                            Inherits framework default: {{ default_llm_provider_label }} / {{ default_llm.model }}
+                            {{ inherit_hint }}
                         </p>
                         {% endif %}
                     </div>

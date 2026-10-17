@@ -107,6 +107,10 @@ def test_ollama_default_base_url():
     assert PROVIDERS["ollama"].default_base_url == "http://localhost:11434"
 
 
+def test_litellm_has_a_default_base_url():
+    assert PROVIDERS["litellm"].default_base_url == "http://localhost:4000"
+
+
 def test_known_models_have_no_colon_qualifier():
     # Model ids are plain: the 'provider:model' form is rejected by model hygiene.
     for spec in PROVIDERS.values():
@@ -310,6 +314,38 @@ def test_build_provider_drops_base_url_for_providers_that_reject_it():
 def test_build_provider_keyless_openai_compatible_requires_base_url():
     with pytest.raises(ProviderConfigError, match="requires a base_url"):
         build_provider(PROVIDERS["openai-compatible"], None, None)
+
+
+def test_build_provider_litellm_falls_back_to_its_default_endpoint(monkeypatch):
+    """A litellm default stored with no endpoint now resolves to a concrete URL
+    instead of leaving the SDK to fail opaquely at request time."""
+    captured = {}
+
+    class _FakeProvider:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "pydantic_ai.providers.infer_provider_class", lambda name: _FakeProvider
+    )
+    build_provider(PROVIDERS["litellm"], None, None)
+
+    assert captured["api_base"] == "http://localhost:4000"
+
+
+def test_build_provider_litellm_keeps_an_explicit_endpoint(monkeypatch):
+    captured = {}
+
+    class _FakeProvider:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "pydantic_ai.providers.infer_provider_class", lambda name: _FakeProvider
+    )
+    build_provider(PROVIDERS["litellm"], None, "http://litellm.internal:4000")
+
+    assert captured["api_base"] == "http://litellm.internal:4000"
 
 
 def test_build_provider_missing_sdk_raises_actionable_error(monkeypatch):

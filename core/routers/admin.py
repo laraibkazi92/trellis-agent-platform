@@ -24,6 +24,7 @@ from core.llm_providers import (
 from core.llm_defaults import (
     get_framework_defaults,
     reset_defaults_cache,
+    resolve_effective_llm_config,
     validate_defaults,
 )
 from core.models import Identity, IdentityType, is_agent_internal, coerce_bool_flag, ALLOWED_PROVIDERS
@@ -82,6 +83,33 @@ _LLM_PROVIDER_PAGE_KEY_NAMES = frozenset(
 def sanitize_name(name: str) -> str:
     """Sanitize name parameter to prevent path traversal and registry injection."""
     return re.sub(r'[^a-zA-Z0-9_-]', '', name)
+
+def _provider_label(provider_id: str) -> str:
+    try:
+        return get_spec(provider_id).label
+    except ProviderConfigError:
+        return provider_id
+
+def _inherit_hint(provider, model, base_url, defaults, default_provider_label) -> str | None:
+    """Read-only editor hint for the inherit paths (plan §9).
+
+    Two states inherit a model and get a hint: both provider and model blank (the
+    framework default), and provider set with a blank model (the provider's registry
+    default, or the framework default when it is that same provider). A
+    fully-specified agent, an inferred model, or an unknown provider renders nothing.
+    """
+    if (model or "").strip():
+        return None
+    try:
+        effective = resolve_effective_llm_config(provider, model, base_url, defaults)
+    except ProviderConfigError:
+        return None
+    if (effective.source in ("framework", "provider-default")
+            and defaults and defaults.provider == effective.provider):
+        return f"Inherits framework default: {default_provider_label or defaults.provider} / {effective.model}"
+    if effective.source == "provider-default":
+        return f"Uses {_provider_label(effective.provider)} default: {effective.model}"
+    return None
 
 def require_admin(request: Request, fallback_url: str):
     user = request.session.get('user')
@@ -942,12 +970,14 @@ async def editor_page(request: Request, type: str, name: str):
 
         # §9: read-only inherit hint. Display-only -- never prefill config.provider/model.
         default_llm = await asyncio.to_thread(get_framework_defaults)
-        default_llm_provider_label = None
-        if default_llm.provider:
-            try:
-                default_llm_provider_label = get_spec(default_llm.provider).label
-            except ProviderConfigError:
-                default_llm_provider_label = default_llm.provider
+        default_llm_provider_label = _provider_label(default_llm.provider) if default_llm.provider else None
+        inherit_hint = _inherit_hint(
+            config.get("provider"),
+            config.get("model"),
+            config.get("base_url"),
+            default_llm,
+            default_llm_provider_label,
+        )
 
         return templates.TemplateResponse(
             request=request,
@@ -964,8 +994,7 @@ async def editor_page(request: Request, type: str, name: str):
                 "all_tools": all_tools,
                 "all_mcps": all_mcps,
                 "error": flash_msg,
-                "default_llm": default_llm,
-                "default_llm_provider_label": default_llm_provider_label,
+                "inherit_hint": inherit_hint,
             }
         )
     elif type == "tool":
