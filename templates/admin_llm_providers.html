@@ -17,6 +17,90 @@
         <p class="text-neutral-500 dark:text-neutral-400 font-mono text-sm">Provider credentials are stored encrypted in etcd and passed explicitly to the model SDKs &mdash; Trellis never reads them from the environment.</p>
     </div>
 
+    <!-- Framework defaults: the org-wide provider/model/base_url that agents and
+         workflows with a blank provider/model inherit. Providers are limited to the
+         usable set (credential / endpoint / SDK present); models to that provider's
+         curated known_models. -->
+    {% set empty_state = not has_usable and not stored_provider %}
+    <div id="frameworkDefaultsCard" class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm space-y-4 mb-6">
+        <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+            <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Framework defaults</h2>
+            <span class="font-mono text-[11px] text-neutral-500 dark:text-neutral-400">Agents and workflows that leave provider/model blank inherit this pair.</span>
+        </div>
+
+        {% if stored_provider_unusable %}
+        <div class="flex flex-wrap items-center gap-2 border border-amber-500/30 bg-amber-50 text-amber-600 dark:bg-amber-950/20 dark:text-amber-400 rounded px-3 py-2">
+            <span class="font-mono text-xs">
+                The stored default provider is no longer configured, so inheriting agents will fail until a credential is restored or the default is cleared.
+            </span>
+            <span class="font-mono text-[11px] font-bold uppercase">{{ stored_provider_label }} &mdash; not configured</span>
+        </div>
+        {% endif %}
+
+        {% if empty_state %}
+        <p class="font-mono text-xs text-neutral-500 dark:text-neutral-400">No LLM provider is configured yet. Add a key below, then set a default.</p>
+        {% endif %}
+
+        <form action="/admin/llm-providers/defaults" method="POST" class="space-y-4">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="grid gap-4 md:grid-cols-3">
+                <div class="space-y-1">
+                    <label for="frameworkDefaultProvider" class="font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Provider</label>
+                    <select name="provider" id="frameworkDefaultProvider"
+                            class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
+                        <option value="" {% if not selected_provider %}selected{% endif %}>None &mdash; fall back to model-name inference</option>
+                        {% for p in usable_providers %}
+                        <option value="{{ p.id }}" {% if p.id == selected_provider %}selected{% endif %}>{{ p.label }}</option>
+                        {% endfor %}
+                        {% if stored_provider_unusable %}
+                        <option value="{{ stored_provider }}" selected>{{ stored_provider_label }} &mdash; not configured</option>
+                        {% endif %}
+                    </select>
+                </div>
+                <div class="space-y-1">
+                    <label for="frameworkDefaultModel" class="font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Model</label>
+                    <div id="frameworkDefaultModelWrap">
+                    {% if model_free_text %}
+                    <input type="text" name="model" id="frameworkDefaultModel" value="{{ model_free_text_value }}" required placeholder="Model id"
+                           class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
+                    {% else %}
+                    <select name="model" id="frameworkDefaultModel"
+                            class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
+                        {% for m in model_options %}
+                        <option value="{{ m }}" {% if m == selected_model %}selected{% endif %}>{{ m }}</option>
+                        {% endfor %}
+                        {% if defaults.model and defaults.model not in model_options %}
+                        <option value="{{ defaults.model }}" selected>{{ defaults.model }}</option>
+                        {% endif %}
+                    </select>
+                    {% endif %}
+                    </div>
+                </div>
+                <div id="frameworkDefaultBaseUrlWrap" class="space-y-1 {% if not selected_supports_base_url %}hidden{% endif %}">
+                    <label for="frameworkDefaultBaseUrl" class="font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Base URL</label>
+                    <input type="text" name="base_url" id="frameworkDefaultBaseUrl" value="{{ stored_base_url }}" placeholder="{{ selected_base_url_placeholder }}" {% if not selected_supports_base_url %}disabled{% endif %}
+                           class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
+                </div>
+            </div>
+            <div class="flex justify-end">
+                <button type="submit" {% if empty_state %}disabled{% endif %}
+                        class="bg-accent hover:bg-accent-dark text-white font-mono font-bold text-sm uppercase py-2.5 px-6 transition-colors rounded disabled:opacity-50 disabled:cursor-not-allowed">
+                    Save default
+                </button>
+            </div>
+        </form>
+
+        {% if defaults.provider or defaults.model or defaults.base_url %}
+        <form action="/admin/llm-providers/defaults/clear" method="POST" class="flex justify-end">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit"
+                    class="text-xs text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300 font-mono uppercase transition-colors">
+                Clear default
+            </button>
+        </form>
+        {% endif %}
+    </div>
+
     <div class="flex flex-col sm:flex-row sm:items-center gap-3 mb-6">
         <div class="relative flex-1">
             <i data-lucide="search" class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400 dark:text-neutral-500"></i>
@@ -149,7 +233,60 @@
     {% endfor %}
 </div>
 
+<script>window.LLM_PROVIDERS = {{ llm_providers_json | safe }};</script>
 <script>
+document.addEventListener('DOMContentLoaded', function () {
+    // Framework defaults: rebuild the model control (and toggle base_url) when the
+    // provider select changes, from the registry payload. The server-rendered initial
+    // control is left untouched so a stored de-listed model survives (D14).
+    var providerSelect = document.getElementById('frameworkDefaultProvider');
+    var modelWrap = document.getElementById('frameworkDefaultModelWrap');
+    var baseUrlWrap = document.getElementById('frameworkDefaultBaseUrlWrap');
+    var baseUrlInput = document.getElementById('frameworkDefaultBaseUrl');
+    var controlClass = 'w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded';
+
+    if (providerSelect && modelWrap) {
+        var providers = {};
+        (window.LLM_PROVIDERS || []).forEach(function (p) { providers[p.id] = p; });
+
+        function rebuildModel(spec) {
+            var models = (spec && spec.known_models) || [];
+            var control;
+            if (!spec || models.length === 0) {
+                control = document.createElement('input');
+                control.type = 'text';
+                control.required = true;
+                control.placeholder = 'Model id';
+                control.value = '';
+            } else {
+                control = document.createElement('select');
+                models.forEach(function (m) {
+                    var opt = document.createElement('option');
+                    opt.value = m;
+                    opt.textContent = m;
+                    if (m === spec.default_model) opt.selected = true;
+                    control.appendChild(opt);
+                });
+            }
+            control.name = 'model';
+            control.id = 'frameworkDefaultModel';
+            control.className = controlClass;
+            modelWrap.replaceChildren(control);
+        }
+
+        providerSelect.addEventListener('change', function () {
+            var spec = providers[providerSelect.value] || null;
+            rebuildModel(spec);
+            var supports = !!(spec && spec.supports_base_url);
+            if (baseUrlWrap) baseUrlWrap.classList.toggle('hidden', !supports);
+            if (baseUrlInput) {
+                baseUrlInput.disabled = !supports;
+                if (spec) baseUrlInput.placeholder = spec.base_url_placeholder || spec.default_base_url || '';
+            }
+        });
+    }
+});
+
 document.addEventListener('DOMContentLoaded', function () {
     var filter = document.getElementById('llmProviderFilter');
     var onlyUnconfigured = document.getElementById('llmOnlyUnconfigured');

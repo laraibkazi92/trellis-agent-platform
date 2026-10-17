@@ -23,19 +23,23 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from starlette.datastructures import FormData
 from starlette.responses import RedirectResponse
 
-from core.llm_providers import FRAMEWORK_PROVIDER_KEY_ENV, provider_ui_specs
+from core.llm_providers import FRAMEWORK_PROVIDER_KEY_ENV, get_spec, provider_ui_specs
 from core.routers import admin
 
 
 # --- Shared fakes --------------------------------------------------------------
 
 class FakeLLMIdentityManager:
-    def __init__(self, llm_keys=None, tools=None, mcps=None, identity_configs=None):
+    def __init__(self, llm_keys=None, tools=None, mcps=None, identity_configs=None,
+                 default_provider=None, default_model=None, default_base_url=None):
         self.llm_keys = dict(llm_keys or {})
         self.saved_llm_keys = []
         self._tools = tools or {}
         self._mcps = mcps or {}
         self._identity_configs = identity_configs or {}
+        self.default_provider = default_provider
+        self.default_model = default_model
+        self.default_base_url = default_base_url
 
     # LLM provider key store
 
@@ -45,6 +49,35 @@ class FakeLLMIdentityManager:
     def save_llm_provider_keys(self, keys):
         self.llm_keys = dict(keys)
         self.saved_llm_keys.append(dict(keys))
+
+    # Framework LLM defaults
+
+    def get_default_llm_provider(self):
+        return self.default_provider
+
+    def set_default_llm_provider(self, value):
+        self.default_provider = value
+
+    def clear_default_llm_provider(self):
+        self.default_provider = None
+
+    def get_default_llm_model(self):
+        return self.default_model
+
+    def set_default_llm_model(self, value):
+        self.default_model = value
+
+    def clear_default_llm_model(self):
+        self.default_model = None
+
+    def get_default_llm_base_url(self):
+        return self.default_base_url
+
+    def set_default_llm_base_url(self, value):
+        self.default_base_url = value
+
+    def clear_default_llm_base_url(self):
+        self.default_base_url = None
 
     # Tools / MCPs (used by /admin/configuration)
 
@@ -145,6 +178,24 @@ def _card_html(html, provider_id):
     start = html.index(marker)
     next_marker = html.find('data-provider="', start + len(marker))
     return html[start:] if next_marker == -1 else html[start:next_marker]
+
+
+def _defaults_html(html):
+    """Slice the rendered HTML for the Framework defaults card only."""
+    start = html.index('id="frameworkDefaultsCard"')
+    end = html.index("llmProviderFilter", start)
+    return html[start:end]
+
+
+def _capture_resets(monkeypatch):
+    """Record calls to admin.reset_defaults_cache()."""
+    calls = []
+
+    def fake_reset():
+        calls.append(True)
+
+    monkeypatch.setattr(admin, "reset_defaults_cache", fake_reset)
+    return calls
 
 
 # --- GET /admin/llm-providers --------------------------------------------------
@@ -535,3 +586,260 @@ def test_rules_engine_provider_without_registry_default_requires_explicit_model(
     assert response.status_code == 303
     assert "requires an explicit model" in request.session["flash_msg"]
     assert fake_identity.rules == {}
+
+
+# --- Framework defaults card (GET) ---------------------------------------------
+
+def _render_page(monkeypatch, identity):
+    monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
+    monkeypatch.setattr(admin, "identity_mgr", identity)
+    captured = _capture_templates(monkeypatch)
+    asyncio.run(admin.admin_llm_providers_page(FakeRequest(session=_admin_session())))
+    return captured["html"]
+
+
+def test_framework_defaults_card_renders(monkeypatch):
+    html = _render_page(monkeypatch, FakeLLMIdentityManager(llm_keys={"DEEPSEEK_API_KEY": "x"}))
+    assert "Framework defaults" in html
+    defaults = _defaults_html(html)
+    assert 'name="provider"' in defaults
+    assert "Save default" in defaults
+    # No stored default, so no Clear button.
+    assert "Clear default" not in defaults
+
+
+def test_framework_defaults_provider_select_lists_only_usable(monkeypatch):
+    html = _render_page(monkeypatch, FakeLLMIdentityManager(llm_keys={"DEEPSEEK_API_KEY": "x"}))
+    defaults = _defaults_html(html)
+    assert 'value="deepseek"' in defaults
+    assert 'value="fireworks"' not in defaults
+    # Keyless providers are always usable.
+    for provider_id in ("ollama", "litellm", "openai-compatible"):
+        assert f'value="{provider_id}"' in defaults
+
+
+def test_framework_defaults_empty_state(monkeypatch):
+    monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
+    monkeypatch.setattr(admin, "identity_mgr", FakeLLMIdentityManager())
+    monkeypatch.setattr(admin, "provider_is_usable", lambda spec, keys: False)
+    captured = _capture_templates(monkeypatch)
+
+    asyncio.run(admin.admin_llm_providers_page(FakeRequest(session=_admin_session())))
+    defaults = _defaults_html(captured["html"])
+    assert "No LLM provider is configured yet" in defaults
+    assert "disabled" in defaults
+    # Only the None fallback option remains.
+    provider_select = defaults.split('name="provider"')[1].split("</select>")[0]
+    assert provider_select.count("<option") == 1
+    assert '<option value=""' in provider_select
+    assert "Clear default" not in defaults
+
+
+def test_framework_defaults_stored_but_unusable_is_flagged(monkeypatch):
+    identity = FakeLLMIdentityManager(default_provider="deepseek", default_model="deepseek-chat")
+    html = _render_page(monkeypatch, identity)  # no DEEPSEEK key stored
+    defaults = _defaults_html(html)
+
+    assert 'value="deepseek" selected' in defaults
+    assert "not configured" in defaults
+    assert "no longer configured" in defaults
+    assert "Clear default" in defaults
+
+
+def test_framework_defaults_model_select_is_curated(monkeypatch):
+    identity = FakeLLMIdentityManager(
+        llm_keys={"GEMINI_API_KEY": "x"}, default_provider="google",
+    )
+    html = _render_page(monkeypatch, identity)
+    defaults = _defaults_html(html)
+
+    for model in get_spec("google").known_models:
+        assert f'value="{model}"' in defaults
+    assert 'value="gpt-5"' not in defaults
+    assert 'value="gemini-2.5-flash" selected' in defaults
+
+
+def test_framework_defaults_openai_compatible_renders_text_input(monkeypatch):
+    identity = FakeLLMIdentityManager(default_provider="openai-compatible")
+    html = _render_page(monkeypatch, identity)
+    defaults = _defaults_html(html)
+
+    assert '<input type="text" name="model" id="frameworkDefaultModel"' in defaults
+    assert "required" in defaults
+
+
+# --- Framework defaults (POST) -------------------------------------------------
+
+def _post_defaults(monkeypatch, identity, **fields):
+    monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
+    monkeypatch.setattr(admin, "identity_mgr", identity)
+    resets = _capture_resets(monkeypatch)
+    request = FakeRequest(session=_admin_session(), form_data=_form(list(fields.items())))
+    response = asyncio.run(admin.save_llm_defaults(request))
+    return response, request, resets
+
+
+def test_save_defaults_persists_all_three_and_resets_cache(monkeypatch):
+    identity = FakeLLMIdentityManager()
+    response, request, resets = _post_defaults(
+        monkeypatch, identity,
+        provider="ollama", model="llama3.2", base_url="http://box:11434",
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin/llm-providers"
+    assert identity.default_provider == "ollama"
+    assert identity.default_model == "llama3.2"
+    assert identity.default_base_url == "http://box:11434"
+    assert resets == [True]
+    assert request.session["flash_msg"] == "Framework LLM default saved."
+
+
+def test_save_defaults_provider_only_stores_registry_default(monkeypatch):
+    identity = FakeLLMIdentityManager(llm_keys={"GEMINI_API_KEY": "x"})
+    _, request, resets = _post_defaults(
+        monkeypatch, identity, provider="google", model="", base_url="",
+    )
+
+    assert identity.default_provider == "google"
+    assert identity.default_model == "gemini-2.5-flash"
+    assert resets == [True]
+    assert request.session["flash_msg"] == "Framework LLM default saved."
+
+
+def test_save_defaults_rejects_non_curated_model(monkeypatch):
+    identity = FakeLLMIdentityManager(llm_keys={"GEMINI_API_KEY": "x"})
+    _, request, resets = _post_defaults(
+        monkeypatch, identity, provider="google", model="not-a-model", base_url="",
+    )
+
+    assert "not one of the curated models" in request.session["flash_msg"]
+    assert identity.default_provider is None
+    assert identity.default_model is None
+    assert resets == []
+
+
+def test_save_defaults_accepts_stored_non_curated_model(monkeypatch):
+    """D14: a stored model that has dropped out of known_models is kept, not rejected."""
+    identity = FakeLLMIdentityManager(
+        llm_keys={"GEMINI_API_KEY": "x"},
+        default_provider="google", default_model="not-a-model",
+    )
+    _, request, resets = _post_defaults(
+        monkeypatch, identity, provider="google", model="not-a-model", base_url="",
+    )
+
+    assert identity.default_provider == "google"
+    assert identity.default_model == "not-a-model"
+    assert resets == [True]
+    assert request.session["flash_msg"] == "Framework LLM default saved."
+
+
+def test_save_defaults_rejects_unknown_provider(monkeypatch):
+    identity = FakeLLMIdentityManager()
+    _, request, resets = _post_defaults(
+        monkeypatch, identity, provider="nope", model="x", base_url="",
+    )
+
+    assert "Unknown LLM provider" in request.session["flash_msg"]
+    assert identity.default_provider is None
+    assert resets == []
+
+
+def test_save_defaults_rejects_newly_selected_unusable_provider(monkeypatch):
+    identity = FakeLLMIdentityManager()  # no FIREWORKS_API_KEY stored
+    _, request, resets = _post_defaults(
+        monkeypatch, identity, provider="fireworks",
+        model="accounts/fireworks/models/llama-v3p3-70b-instruct", base_url="",
+    )
+
+    assert "no credential/endpoint configured" in request.session["flash_msg"]
+    assert identity.default_provider is None
+    assert resets == []
+
+
+def test_save_defaults_allows_resaving_stored_unusable_provider(monkeypatch):
+    """D14: the currently stored provider may be re-saved even without its credential."""
+    identity = FakeLLMIdentityManager(default_provider="fireworks")
+    _, request, resets = _post_defaults(
+        monkeypatch, identity, provider="fireworks", model="", base_url="",
+    )
+
+    assert identity.default_provider == "fireworks"
+    assert identity.default_model == "accounts/fireworks/models/llama-v3p3-70b-instruct"
+    assert resets == [True]
+    assert request.session["flash_msg"] == "Framework LLM default saved."
+
+
+def test_save_defaults_requires_explicit_model_without_registry_default(monkeypatch):
+    identity = FakeLLMIdentityManager()
+    _, request, resets = _post_defaults(
+        monkeypatch, identity, provider="openai-compatible", model="",
+        base_url="http://gw:4000/v1",
+    )
+
+    assert "requires an explicit model" in request.session["flash_msg"]
+    assert identity.default_provider is None
+    assert resets == []
+
+
+def test_save_defaults_rejects_base_url_for_provider_that_rejects_it(monkeypatch):
+    identity = FakeLLMIdentityManager(llm_keys={"DEEPSEEK_API_KEY": "x"})
+    _, request, resets = _post_defaults(
+        monkeypatch, identity, provider="deepseek", model="deepseek-chat",
+        base_url="http://stale:1",
+    )
+
+    assert "does not accept a base_url" in request.session["flash_msg"]
+    assert identity.default_provider is None
+    assert resets == []
+
+
+def test_save_defaults_rejects_missing_required_base_url(monkeypatch):
+    identity = FakeLLMIdentityManager()
+    _, request, resets = _post_defaults(
+        monkeypatch, identity, provider="openai-compatible", model="llama3.2:3b",
+        base_url="",
+    )
+
+    assert "requires a base_url" in request.session["flash_msg"]
+    assert identity.default_provider is None
+    assert resets == []
+
+
+def test_save_defaults_blank_provider_clears_all_three(monkeypatch):
+    identity = FakeLLMIdentityManager(
+        default_provider="google", default_model="gemini-2.5-flash",
+        default_base_url="http://gw",
+    )
+    _, request, resets = _post_defaults(
+        monkeypatch, identity, provider="", model="ignored", base_url="http://ignored",
+    )
+
+    assert identity.default_provider is None
+    assert identity.default_model is None
+    assert identity.default_base_url is None
+    assert resets == [True]
+    assert request.session["flash_msg"] == "Framework LLM default cleared."
+
+
+def test_clear_llm_defaults_clears_all_three(monkeypatch):
+    monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
+    identity = FakeLLMIdentityManager(
+        default_provider="google", default_model="gemini-2.5-flash",
+        default_base_url="http://gw",
+    )
+    monkeypatch.setattr(admin, "identity_mgr", identity)
+    resets = _capture_resets(monkeypatch)
+
+    request = FakeRequest(session=_admin_session())
+    response = asyncio.run(admin.clear_llm_defaults(request))
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin/llm-providers"
+    assert identity.default_provider is None
+    assert identity.default_model is None
+    assert identity.default_base_url is None
+    assert resets == [True]
+    assert request.session["flash_msg"] == "Framework LLM default cleared."
+
