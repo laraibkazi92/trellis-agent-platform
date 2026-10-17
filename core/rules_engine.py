@@ -306,7 +306,11 @@ def _resolve_evaluation_provider() -> str:
         return _cached_provider_override
     if RULES_EVALUATION_PROVIDER:
         return RULES_EVALUATION_PROVIDER
-    return infer_provider(RULES_EVALUATION_MODEL)
+    # Infer from the *resolved* model, not the env default: the admin model override
+    # and the provider override refresh independently, so inferring from the env
+    # default can pair a cached ``deepseek-chat`` with Google's endpoint (and egress
+    # the query to the wrong vendor) during the cache refresh window.
+    return infer_provider(_resolve_evaluation_model())
 
 
 def _resolve_evaluation_base_url() -> Optional[str]:

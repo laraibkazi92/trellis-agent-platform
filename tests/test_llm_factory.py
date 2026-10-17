@@ -606,6 +606,7 @@ def test_settings_none_or_na_level_returns_none_for_every_provider(provider, mod
 
 def test_rules_engine_provider_defaults_to_inference(monkeypatch):
     monkeypatch.setattr(rules_engine, "_cached_provider_override", None, raising=False)
+    monkeypatch.setattr(rules_engine, "_cached_model_override", None, raising=False)
     monkeypatch.setattr(rules_engine, "_model_overrides_checked_at", rules_engine.time.monotonic(), raising=False)
     monkeypatch.setattr(rules_engine, "RULES_EVALUATION_PROVIDER", "")
     monkeypatch.setattr(rules_engine, "RULES_EVALUATION_MODEL", "gemini-2.5-flash")
@@ -615,8 +616,22 @@ def test_rules_engine_provider_defaults_to_inference(monkeypatch):
     assert rules_engine._resolve_evaluation_provider() == "openai"
 
 
+def test_rules_engine_provider_infers_from_the_resolved_model(monkeypatch):
+    """The provider and model overrides refresh on independent cache cycles, so the
+    inference must use the resolved model -- otherwise a cached ``deepseek-chat``
+    pairs with the env default's Google endpoint and egresses there."""
+    monkeypatch.setattr(rules_engine, "_cached_provider_override", None, raising=False)
+    monkeypatch.setattr(rules_engine, "_cached_model_override", "deepseek-chat", raising=False)
+    monkeypatch.setattr(rules_engine, "_model_overrides_checked_at", rules_engine.time.monotonic(), raising=False)
+    monkeypatch.setattr(rules_engine, "RULES_EVALUATION_PROVIDER", "")
+    monkeypatch.setattr(rules_engine, "RULES_EVALUATION_MODEL", "gemini-2.5-flash")
+
+    assert rules_engine._resolve_evaluation_provider() == "deepseek"
+
+
 def test_rules_engine_provider_env_then_etcd_precedence(monkeypatch):
     monkeypatch.setattr(rules_engine, "_cached_provider_override", None, raising=False)
+    monkeypatch.setattr(rules_engine, "_cached_model_override", None, raising=False)
     monkeypatch.setattr(rules_engine, "_cached_base_url_override", None, raising=False)
     monkeypatch.setattr(rules_engine, "_model_overrides_checked_at", rules_engine.time.monotonic(), raising=False)
 
@@ -639,6 +654,7 @@ def test_rules_engine_provider_uninferrable_model_raises(monkeypatch):
     (evaluate_rules catches it and fails open) rather than silently egressing
     the query and rule catalog to a default provider."""
     monkeypatch.setattr(rules_engine, "_cached_provider_override", None, raising=False)
+    monkeypatch.setattr(rules_engine, "_cached_model_override", None, raising=False)
     monkeypatch.setattr(rules_engine, "_model_overrides_checked_at", rules_engine.time.monotonic(), raising=False)
     monkeypatch.setattr(rules_engine, "RULES_EVALUATION_PROVIDER", "")
     monkeypatch.setattr(rules_engine, "RULES_EVALUATION_MODEL", "llama3.1")
