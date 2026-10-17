@@ -672,8 +672,15 @@ def test_admin_rules_card_inline_script_consumes_shared_registry_payload():
     # payload, not from per-option data-* attributes.
     assert 'value="deepseek"' in select
     assert "data-supports-url" not in select
-    assert "window.LLM_PROVIDERS" in html
     assert "updateRulesProviderFields" in html
+
+    # The payload is actually injected on this page, not merely referenced by the script.
+    payload_match = re.search(
+        r"window\.LLM_PROVIDERS = (\[.*?\]);", html, re.DOTALL
+    )
+    assert payload_match, "window.LLM_PROVIDERS payload not found in admin.html"
+    providers = json.loads(payload_match.group(1))
+    assert {p["id"] for p in providers} >= {"deepseek", "ollama", "openai-compatible"}
 
 
 def test_admin_rules_card_never_prefills_a_provider_default_endpoint():

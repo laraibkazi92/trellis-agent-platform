@@ -111,15 +111,16 @@ def _inherit_hint(
         effective = resolve_effective_llm_config(provider, model, base_url, defaults)
     except ProviderConfigError:
         return None
-    # `_normalize_defaults` never yields a provider without a model, but a hand-built
-    # default could; only claim the inheritance the resolver would actually perform.
-    matched_provider = None
+    # A stored default only counts when it is complete. `_normalize_defaults` never yields a
+    # provider without a model, so this only guards a hand-built default -- and it strips,
+    # deliberately stricter than the resolver's `has_defaults`.
+    defaults_provider = None
     if defaults and defaults.provider and (defaults.model or "").strip():
-        matched_provider = defaults.provider
+        defaults_provider = defaults.provider
 
-    if (matched_provider and matched_provider == effective.provider
+    if (defaults_provider and defaults_provider == effective.provider
             and effective.source in ("framework", "provider-default")):
-        return f"Inherits framework default: {default_provider_label or matched_provider} / {effective.model}"
+        return f"Inherits framework default: {default_provider_label or defaults_provider} / {effective.model}"
     if effective.source == "provider-default":
         return f"Uses {_provider_label(effective.provider)} default: {effective.model}"
     return None
