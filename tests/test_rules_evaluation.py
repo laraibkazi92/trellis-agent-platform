@@ -367,3 +367,61 @@ def test_refresh_timeout_override_preserves_previous_cache_on_error(monkeypatch)
     rules_engine._refresh_timeout_override_sync()
     # Cache must retain 4.5, not be overwritten with None
     assert rules_engine._cached_timeout_override == 4.5
+
+
+# --- provider/model pairing (_resolve_evaluation_settings) ---
+
+def test_resolve_evaluation_settings_pairs_provider_override_with_its_registry_default(monkeypatch):
+    """A provider override with a blank model must complete from that provider's own
+    registry default, never the env RULES_EVALUATION_MODEL (which may be another vendor)."""
+    monkeypatch.setattr(rules_engine, "_cached_provider_override", "deepseek")
+    monkeypatch.setattr(rules_engine, "_cached_model_override", None)
+    monkeypatch.setattr(rules_engine, "_cached_base_url_override", None)
+    monkeypatch.setattr(rules_engine, "RULES_EVALUATION_PROVIDER", "")
+    monkeypatch.setattr(rules_engine, "RULES_EVALUATION_MODEL", "gemini-2.5-flash")
+
+    provider, model_name, base_url = rules_engine._resolve_evaluation_settings()
+
+    assert (provider, model_name) == ("deepseek", "deepseek-chat")
+    assert base_url is None
+
+
+def test_resolve_evaluation_settings_prefers_explicit_model_override(monkeypatch):
+    monkeypatch.setattr(rules_engine, "_cached_provider_override", "deepseek")
+    monkeypatch.setattr(rules_engine, "_cached_model_override", "deepseek-reasoner")
+    monkeypatch.setattr(rules_engine, "_cached_base_url_override", None)
+    monkeypatch.setattr(rules_engine, "RULES_EVALUATION_MODEL", "gemini-2.5-flash")
+
+    provider, model_name, base_url = rules_engine._resolve_evaluation_settings()
+
+    assert (provider, model_name) == ("deepseek", "deepseek-reasoner")
+    assert base_url is None
+
+
+def test_resolve_evaluation_settings_without_overrides_uses_env_defaults(monkeypatch):
+    monkeypatch.setattr(rules_engine, "_cached_provider_override", None)
+    monkeypatch.setattr(rules_engine, "_cached_model_override", None)
+    monkeypatch.setattr(rules_engine, "_cached_base_url_override", None)
+    monkeypatch.setattr(rules_engine, "RULES_EVALUATION_PROVIDER", "google")
+    # Deliberately NOT google's registry default, so discarding the env model fails here.
+    monkeypatch.setattr(rules_engine, "RULES_EVALUATION_MODEL", "gemini-2.0-flash")
+
+    provider, model_name, base_url = rules_engine._resolve_evaluation_settings()
+
+    assert (provider, model_name) == ("google", "gemini-2.0-flash")
+    assert base_url is None
+
+
+def test_resolve_evaluation_settings_openai_compatible_falls_back_to_env_model(monkeypatch):
+    """openai-compatible has no registry default, so a provider-only override falls back
+    to RULES_EVALUATION_MODEL and still resolves without raising (fail-open)."""
+    monkeypatch.setattr(rules_engine, "_cached_provider_override", "openai-compatible")
+    monkeypatch.setattr(rules_engine, "_cached_model_override", None)
+    monkeypatch.setattr(rules_engine, "_cached_base_url_override", None)
+    monkeypatch.setattr(rules_engine, "RULES_EVALUATION_PROVIDER", "")
+    monkeypatch.setattr(rules_engine, "RULES_EVALUATION_MODEL", "local-llama")
+
+    provider, model_name, base_url = rules_engine._resolve_evaluation_settings()
+
+    assert (provider, model_name) == ("openai-compatible", "local-llama")
+    assert base_url is None

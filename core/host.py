@@ -39,9 +39,13 @@ async def lifespan(app: FastAPI):
     _memory_watch_id = identity_mgr.client.add_watch_prefix_callback("/config/framework/agent_memory_enabled", on_memory_flag_change)
     _memory_isolation_watch_id = identity_mgr.client.add_watch_prefix_callback("/config/framework/agent_memory_isolated_per_user", on_memory_flag_change)
     install_llm_key_watch()
+    install_llm_defaults_watch()
     # Warm the LLM provider-key cache off the event loop so the first request-path
     # lookup is a cache hit instead of a (possibly ~20s) etcd round-trip.
     await asyncio.to_thread(warm_key_cache)
+    # Warm the framework LLM default cache (etcd read) beside the key cache so the
+    # first inherit-the-default build is a cache hit.
+    await asyncio.to_thread(warm_defaults_cache)
     await get_hub_client()
     await discover_external_mcps()
     _spawn_background(prewarm_agents(), "prewarm_agents")
@@ -58,6 +62,7 @@ async def lifespan(app: FastAPI):
     if _memory_isolation_watch_id:
         identity_mgr.client.cancel_watch(_memory_isolation_watch_id)
     cancel_llm_key_watch()
+    cancel_llm_defaults_watch()
     hub_client = await get_hub_client()
     if hub_client:
         await hub_client.__aexit__(None, None, None)
@@ -74,6 +79,8 @@ from core.agent_factory import (
     evict_agent,
     install_llm_key_watch,
     cancel_llm_key_watch,
+    install_llm_defaults_watch,
+    cancel_llm_defaults_watch,
     prewarm_agents,
     discover_external_mcps,
     get_hub_client,
@@ -83,6 +90,7 @@ from core.agent_factory import (
     is_hub_connected,
     SupervisorDeps,
 )
+from core.llm_defaults import warm_defaults_cache
 from core.llm_factory import warm_key_cache
 from core.llm_providers import ProviderConfigError
 from core.memory import get_memory_manager

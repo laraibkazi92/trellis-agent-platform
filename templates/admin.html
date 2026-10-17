@@ -185,7 +185,9 @@
         <p class="text-sm text-gray-500 mt-1">
           Model, provider and base_url for the single-pass decider, plus the minimum confidence
           required to accept a match. Blank fields fall back to the env-var defaults
-          (<code class="text-xs bg-gray-100 px-1 py-0.5 rounded">RULES_EVALUATION_MODEL</code> etc.).
+          (<code class="text-xs bg-gray-100 px-1 py-0.5 rounded">RULES_EVALUATION_MODEL</code> etc.),
+          except that a blank model next to a selected provider uses that provider's registry
+          default.
           Provider credentials are managed in
           <a href="/admin/llm-providers" class="underline hover:text-gray-900">Admin &rarr; LLM Providers</a>.
         </p>
@@ -193,7 +195,7 @@
       <form action="/admin/rules-engine/model" method="POST" class="grid grid-cols-2 gap-2 w-full max-w-md shrink-0">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <select name="provider" id="rulesProviderSelect" class="rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-neutral-900">
-          <option value="">Provider: default ({{ rules_engine.provider_default or 'inferred' }})</option>
+          <option value="">Provider: default ({{ rules_engine.provider_default or 'infer from model' }})</option>
           {% for p in llm_providers %}
           <option
             value="{{ p.id }}"

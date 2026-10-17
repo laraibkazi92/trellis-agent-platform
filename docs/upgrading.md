@@ -229,6 +229,37 @@ dependencies are installed.
   Providers that cannot take an endpoint (`deepseek`, `openrouter`, …) reject one with a clear
   error instead of silently dropping it.
 
+#### Framework LLM defaults
+
+An admin can now set one org-wide default provider + model in **Admin → LLM Providers →
+Framework defaults**. Agents and background workflows that leave both `provider` and `model`
+blank inherit it; the value lives only in etcd and is never written into an agent's YAML.
+
+- **Behaviour change — call this out.** An agent or workflow with `model` blank used to build a
+  model with an **empty id** and fail on the first request. It now resolves — either to the
+  admin's framework default, or, when nothing is configured, to `google` / `gemini-2.5-flash`.
+  A config that has never served a request may therefore start running (and billing). This only
+  affects configurations that were already broken; a fully-specified agent is unchanged.
+- **A provider with a blank model now resolves** to that provider's registry default (e.g.
+  `deepseek` → `deepseek-chat`) instead of failing. `openai-compatible` still requires an
+  explicit model — it has no registry default.
+- **Workflow schema widening.** `AgentUpdateModel.model` is now optional, so background agents
+  can be saved with a blank model (inherit). This is a widening only: every existing stored
+  workflow keeps its model and is unaffected.
+- **New etcd keys, no migration.** The default lives at
+  `/config/framework/default_llm_provider`, `/config/framework/default_llm_model`, and
+  `/config/framework/default_llm_base_url`. All three are empty by default, and empty means
+  today's behaviour apart from the case-E fallback above.
+- **Rules decider pairing.** An admin provider override with a blank model now persists that
+  provider's registry default instead of pairing the override with the environment
+  `RULES_EVALUATION_MODEL` (which could egress to the wrong vendor). Deployments that set only
+  `RULES_EVALUATION_MODEL` with no provider override are unchanged.
+- **Endpoint environment residual.** Trellis always passes a configured `base_url` explicitly
+  to the provider SDK, but for a provider that supports an endpoint and has **no** configured
+  `base_url` — neither per-agent, nor the framework default, nor a global store — the SDK may
+  still read its own endpoint environment variable (for example `OPENAI_BASE_URL`). Set the
+  endpoint explicitly if you do not want that fallback.
+
 ---
 
 ## Release checklist (maintainer template)

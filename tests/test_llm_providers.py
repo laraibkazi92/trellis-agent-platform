@@ -20,7 +20,10 @@ from core.llm_providers import (
     ProviderConfigError,
     ProviderSpec,
     build_provider,
+    default_model_for,
+    provider_is_usable,
     provider_ui_specs,
+    sdk_installed,
 )
 from _llm_key_seam import DEFAULT_TEST_KEYS
 
@@ -42,6 +45,7 @@ EXPECTED_SPEC_KEYS = (
     "base_url_key",
     "thinking_style",
     "known_models",
+    "default_model",
     "model_prefixes",
     "sdk_extra",
     "sdk_installed",
@@ -119,6 +123,79 @@ def test_base_url_support_is_consistent_with_the_requirement():
     for spec in PROVIDERS.values():
         if not spec.supports_base_url:
             assert not spec.requires_base_url, f"{spec.id} requires an unsupported base_url"
+
+
+# --- registry default models & usability -------------------------------------
+
+def test_default_model_is_curated_or_none():
+    for spec in PROVIDERS.values():
+        if spec.default_model is not None:
+            assert spec.default_model in spec.known_models, (
+                f"{spec.id}: default_model {spec.default_model!r} is not in known_models"
+            )
+
+
+def test_only_openai_compatible_has_no_default_model():
+    assert PROVIDERS["openai-compatible"].default_model is None
+    without_default = {spec.id for spec in PROVIDERS.values() if spec.default_model is None}
+    assert without_default == {"openai-compatible"}
+
+
+def test_ui_specs_expose_default_model_matching_the_spec():
+    for entry, spec in zip(provider_ui_specs(), PROVIDERS.values()):
+        assert entry["default_model"] == spec.default_model, spec.id
+
+
+def test_default_model_for_known_and_unknown_providers():
+    assert default_model_for("google") == "gemini-2.5-flash"
+    assert default_model_for("unknown") is None
+    assert default_model_for("") is None
+
+
+# The normative §5 table: a curated-but-wrong default (e.g. a pricier tier) must fail.
+EXPECTED_DEFAULT_MODELS = {
+    "google": "gemini-2.5-flash",
+    "openai": "gpt-5-mini",
+    "anthropic": "claude-haiku-4-5",
+    "deepseek": "deepseek-chat",
+    "fireworks": "accounts/fireworks/models/llama-v3p3-70b-instruct",
+    "together": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    "moonshotai": "kimi-latest",
+    "vercel": "google/gemini-2.5-flash",
+    "zai": "glm-4.5-air",
+    "openrouter": "deepseek/deepseek-chat",
+    "alibaba": "qwen-plus",
+    "ollama": "llama3.2",
+    "litellm": "openai/gpt-4o",
+    "huggingface": "meta-llama/Llama-3.3-70B-Instruct",
+    "openai-compatible": None,
+}
+
+
+def test_default_models_match_the_spec_table():
+    assert {spec.id: spec.default_model for spec in PROVIDERS.values()} == EXPECTED_DEFAULT_MODELS
+
+
+def test_provider_is_usable_requires_a_credential_for_keyed_providers():
+    deepseek = PROVIDERS["deepseek"]
+    assert sdk_installed(deepseek) is True
+    assert provider_is_usable(deepseek, {}) is False
+    assert provider_is_usable(deepseek, {"DEEPSEEK_API_KEY": "x"}) is True
+
+
+def test_provider_is_usable_is_false_without_the_sdk(monkeypatch):
+    import core.llm_providers as registry
+
+    monkeypatch.setattr(registry, "sdk_installed", lambda spec: False)
+    assert provider_is_usable(PROVIDERS["huggingface"], {"HF_TOKEN": "x"}) is False
+
+
+def test_provider_is_usable_when_the_endpoint_is_supplied_inline():
+    # ollama has a registry default endpoint; litellm/openai-compatible take one inline
+    # with the default triple, so endpoint satisfiability is enforced at save time (§8).
+    assert provider_is_usable(PROVIDERS["ollama"], {}) is True
+    assert provider_is_usable(PROVIDERS["litellm"], {}) is True
+    assert provider_is_usable(PROVIDERS["openai-compatible"], {}) is True
 
 
 # --- 2. Key-name parity ------------------------------------------------------

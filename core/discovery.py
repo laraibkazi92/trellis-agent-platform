@@ -529,7 +529,7 @@ async def discover_agents(
             "capabilities": config.get("capabilities", []),
             "skills": skills_content,
             "a2a_access": config.get("a2a_access", []),
-            "model": config.get("model", "gemini-3-flash-preview"),
+            "model": config.get("model") or "gemini-3-flash-preview",
             "thinking_level": config.get("thinking_level", "medium"),
             "version": config.get("version", "0.1.0"),
             "external": config.get("external", True),

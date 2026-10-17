@@ -348,6 +348,7 @@
                             <input type="hidden" name="model" id="modal-model-{{ agent.name }}" value="{{ agent.config.get('model') or '' }}">
                             <select id="modal-model-select-{{ agent.name }}" onchange="syncModalModel('{{ agent.name }}')" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono"></select>
                             <input type="text" id="modal-model-custom-{{ agent.name }}" oninput="syncModalModel('{{ agent.name }}')" placeholder="Custom model id" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono mt-2" disabled>
+                            <p class="text-[11px] text-neutral-500 dark:text-neutral-400 mt-1 font-mono">Leave blank to inherit the framework default model.</p>
                         </div>
                         <div>
                             <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">Thinking Level</label>
@@ -365,7 +366,7 @@
                         <div>
                             <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">Provider</label>
                             <select name="provider" id="modal-provider-{{ agent.name }}" onchange="updateModalProviderFields('{{ agent.name }}'); updateThinkingLevel('{{ agent.name }}')" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
-                                <option value="" {{ "selected" if not agent.config.get("provider") else "" }}>Auto (infer from model name)</option>
+                                <option value="" {{ "selected" if not agent.config.get("provider") else "" }}>Auto (infer from model)</option>
                                 {% for p in llm_providers %}
                                 <option value="{{ p.id }}" {{ "selected" if agent.config.get("provider") == p.id else "" }}
                                     data-supports-url="{{ '1' if p.supports_base_url else '0' }}"
@@ -788,6 +789,11 @@
             var hidden = document.getElementById('modal-model-' + agentName);
             while (select.firstChild) select.removeChild(select.firstChild);
 
+            var inheritOption = document.createElement('option');
+            inheritOption.value = '';
+            inheritOption.text = 'Inherit framework default';
+            select.appendChild(inheritOption);
+
             modalProviders.forEach(function(p) {
                 var known = p.known_models || [];
                 if (!known.length) return;
@@ -813,7 +819,11 @@
             Array.prototype.forEach.call(select.options, function(option) {
                 if (saved && option.value === saved) knownModel = true;
             });
-            select.value = knownModel ? saved : MODAL_CUSTOM_MODEL;
+            if (!saved) {
+                select.value = '';
+            } else {
+                select.value = knownModel ? saved : MODAL_CUSTOM_MODEL;
+            }
             var customInput = document.getElementById('modal-model-custom-' + agentName);
             if (customInput) {
                 // Restore a saved custom id, otherwise the custom branch would post "".

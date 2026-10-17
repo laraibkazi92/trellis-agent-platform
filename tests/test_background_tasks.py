@@ -373,3 +373,92 @@ def test_workflows_modal_restores_saved_custom_model(monkeypatch):
     source = (_Path(__file__).resolve().parents[1] / "templates" / "background_workflows.html").read_text()
     assert "customInput.value = saved;" in source
     assert "customInput.disabled = knownModel;" in source
+
+
+# --- LLM defaults Phase 7 (A1): a background agent may be saved with a blank or
+# absent model and then inherits the framework default at build time. ---
+
+
+def test_agent_update_model_accepts_blank_and_absent_model():
+    blank = workflows.AgentUpdateModel(model="", thinking_level="none")
+    assert blank.model == ""
+
+    absent = workflows.AgentUpdateModel(thinking_level="none")
+    assert absent.model is None
+
+
+def test_update_workflow_blank_model_persists_none_for_inheritance(monkeypatch):
+    response, fake_mgr, _ = _run_workflow_update(monkeypatch, _workflow_form(model=""))
+
+    assert response.status_code == 303
+    assert fake_mgr.saved_configs[_AGENT_NAME]["model"] is None
+    assert _persisted_config_yaml()["model"] is None
+
+
+def test_update_workflow_whitespace_model_persists_none(monkeypatch):
+    _run_workflow_update(monkeypatch, _workflow_form(model="   "))
+
+    assert _persisted_config_yaml()["model"] is None
+
+
+def test_update_workflow_stored_model_unchanged_when_resubmitted(monkeypatch):
+    fake_mgr = FakeWorkflowsIdentityManager(
+        configs={
+            _AGENT_NAME: {
+                "name": _AGENT_NAME,
+                "type": "background_agent",
+                "description": "report",
+                "model": "deepseek-chat",
+            }
+        }
+    )
+    _, fake_mgr, _ = _run_workflow_update(
+        monkeypatch,
+        _workflow_form(provider="deepseek", model="deepseek-chat"),
+        fake_mgr=fake_mgr,
+    )
+
+    assert fake_mgr.saved_configs[_AGENT_NAME]["model"] == "deepseek-chat"
+    assert _persisted_config_yaml()["model"] == "deepseek-chat"
+
+
+def test_update_workflow_blank_model_with_pinned_provider_is_preserved(monkeypatch):
+    """Provider-only + inherit model: the provider is kept, the model persists as None."""
+    response, fake_mgr, _ = _run_workflow_update(
+        monkeypatch, _workflow_form(provider="google", model="")
+    )
+
+    assert response.status_code == 303
+    saved = fake_mgr.saved_configs[_AGENT_NAME]
+    assert saved["provider"] == "google"
+    assert saved["model"] is None
+    assert _persisted_config_yaml()["model"] is None
+
+
+def test_workflows_modal_renders_inherit_model_option_and_hint():
+    html = _render_workflows({
+        "name": _AGENT_NAME,
+        "type": "background_agent",
+        "model": None,
+        "provider": None,
+        "thinking_level": "none",
+        "base_url": None,
+        "version": "0.1.0",
+        "description": "report",
+        "allowed_tools": [],
+        "a2a_access": [],
+        "trigger": {},
+    })
+
+    assert "Inherit framework default" in html
+    assert "Leave blank to inherit the framework default model." in html
+
+
+def test_workflows_modal_selects_inherit_for_a_blank_saved_model():
+    """Source-level guard: a blank saved model must select the inherit option, not Custom."""
+    from pathlib import Path as _Path
+    source = (_Path(__file__).resolve().parents[1] / "templates" / "background_workflows.html").read_text()
+
+    assert "inheritOption.value = '';" in source
+    assert "if (!saved) {" in source
+    assert "select.value = '';" in source

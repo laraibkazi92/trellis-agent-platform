@@ -14,9 +14,17 @@ from core.health import HealthMonitor
 from core.llm_factory import ProviderConfigError, infer_provider
 from core.llm_providers import (
     FRAMEWORK_PROVIDER_KEY_ENV,
+    default_model_for,
+    get_spec,
     provider_accepts_base_url,
+    provider_is_usable,
     provider_requires_base_url,
     provider_ui_specs,
+)
+from core.llm_defaults import (
+    get_framework_defaults,
+    reset_defaults_cache,
+    validate_defaults,
 )
 from core.models import Identity, IdentityType, is_agent_internal, coerce_bool_flag, ALLOWED_PROVIDERS
 from core.rules_engine import (
@@ -304,6 +312,18 @@ async def set_rules_engine_model(
             request.session["flash_msg"] = "Confidence threshold must be between 0.0 and 1.0."
             return RedirectResponse(url='/admin', status_code=303)
 
+    # Resolve the model to persist before any write, so a rejected save writes nothing.
+    # A provider override with a blank model must never fall through to the env
+    # RULES_EVALUATION_MODEL, which would egress one vendor's query to another.
+    model_value = model.strip()
+    if not model_value and effective_provider:
+        model_value = default_model_for(effective_provider) or ""
+        if not model_value:
+            request.session["flash_msg"] = (
+                f"Provider '{effective_provider}' requires an explicit model."
+            )
+            return RedirectResponse(url='/admin', status_code=303)
+
     # Empty submission for a field means "clear the override", reverting to its env default.
     if effective_provider:
         await asyncio.to_thread(identity_mgr.set_rules_evaluation_provider, effective_provider)
@@ -315,8 +335,8 @@ async def set_rules_engine_model(
     else:
         await asyncio.to_thread(identity_mgr.clear_config, "rules_evaluation_base_url")
 
-    if model.strip():
-        await asyncio.to_thread(identity_mgr.set_rules_evaluation_model, model.strip())
+    if model_value:
+        await asyncio.to_thread(identity_mgr.set_rules_evaluation_model, model_value)
     else:
         await asyncio.to_thread(identity_mgr.clear_config, "rules_evaluation_model")
 
@@ -675,6 +695,40 @@ async def admin_llm_providers_page(request: Request):
             "value_preview": None,
         })
 
+    # Framework defaults view: the provider select offers only providers that could
+    # actually serve traffic (provider_is_usable); the model select is that provider's
+    # curated known_models. A stored-but-now-unusable default is kept and flagged (D14).
+    stored_provider = (await asyncio.to_thread(identity_mgr.get_default_llm_provider) or "").strip().lower()
+    stored_model = (await asyncio.to_thread(identity_mgr.get_default_llm_model) or "").strip()
+    stored_base_url = (await asyncio.to_thread(identity_mgr.get_default_llm_base_url) or "").strip()
+
+    usable_specs = [
+        spec for spec in provider_ui_specs()
+        if provider_is_usable(get_spec(spec["id"]), llm_keys)
+    ]
+    usable_ids = {spec["id"] for spec in usable_specs}
+    try:
+        stored_spec = get_spec(stored_provider) if stored_provider else None
+    except ProviderConfigError:
+        stored_spec = None
+    # No stored default => leave the None option selected; never invent a provider.
+    selected_provider = stored_provider
+    if stored_spec is not None:
+        selected_spec = stored_spec
+    elif stored_provider:
+        # Unknown stored provider: render it selected-but-flagged with a free-text model.
+        selected_spec = None
+    else:
+        selected_spec = get_spec(usable_specs[0]["id"]) if usable_specs else None
+    model_options = list(selected_spec.known_models) if selected_spec else []
+    selected_model = stored_model or (
+        selected_spec.default_model if (selected_spec and selected_provider) else ""
+    ) or ""
+    model_free_text = selected_spec is None or not selected_spec.known_models
+    stored_provider_unusable = bool(stored_provider) and (
+        stored_spec is None or stored_spec.id not in usable_ids
+    )
+
     flash_msg = request.session.pop("flash_msg", None)
 
     return templates.TemplateResponse(
@@ -684,6 +738,20 @@ async def admin_llm_providers_page(request: Request):
             "user": user,
             "cards": cards,
             "flash_msg": flash_msg,
+            "defaults": {"provider": stored_provider or None, "model": stored_model or None, "base_url": stored_base_url or None},
+            "usable_providers": usable_specs,
+            "selected_provider": selected_provider,
+            "selected_model": selected_model,
+            "model_options": model_options,
+            "model_free_text": model_free_text,
+            "model_free_text_value": stored_model,
+            "stored_provider": stored_provider or None,
+            "stored_provider_label": stored_spec.label if stored_spec else stored_provider,
+            "stored_provider_unusable": stored_provider_unusable,
+            "has_usable": bool(usable_specs),
+            "stored_base_url": stored_base_url,
+            "selected_supports_base_url": bool(selected_provider and selected_spec and selected_spec.supports_base_url),
+            "selected_base_url_placeholder": (selected_spec.base_url_placeholder or selected_spec.default_base_url or "") if selected_spec else "",
         }
     )
 
@@ -709,6 +777,85 @@ async def save_llm_providers(request: Request):
         request.session["flash_msg"] = "LLM provider settings saved."
     else:
         request.session["flash_msg"] = "No changes to LLM provider settings."
+    return RedirectResponse(url='/admin/llm-providers', status_code=303)
+
+@router.post("/admin/llm-providers/defaults")
+async def save_llm_defaults(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    form = await request.form()
+    provider = str(form.get("provider", "")).strip().lower()
+    model = str(form.get("model", "")).strip()
+    base_url = str(form.get("base_url", "")).strip()
+
+    # Provider blank -> clear all three, ignore model/base_url (revert to legacy).
+    if not provider:
+        await asyncio.to_thread(identity_mgr.clear_default_llm_provider)
+        await asyncio.to_thread(identity_mgr.clear_default_llm_model)
+        await asyncio.to_thread(identity_mgr.clear_default_llm_base_url)
+        reset_defaults_cache()
+        request.session["flash_msg"] = "Framework LLM default cleared."
+        return RedirectResponse(url='/admin/llm-providers', status_code=303)
+
+    try:
+        spec = get_spec(provider)
+    except ProviderConfigError as e:
+        request.session["flash_msg"] = str(e)
+        return RedirectResponse(url='/admin/llm-providers', status_code=303)
+
+    # D14: an already-stored provider may be re-saved even when its credential is gone;
+    # only a *newly* selected unusable provider is rejected.
+    stored_provider = (await asyncio.to_thread(identity_mgr.get_default_llm_provider) or "").strip().lower()
+    keys = await asyncio.to_thread(identity_mgr.get_llm_provider_keys)
+    if not provider_is_usable(spec, keys) and provider != stored_provider:
+        request.session["flash_msg"] = (
+            f"Provider '{provider}' has no credential/endpoint configured (or its SDK is missing)."
+        )
+        return RedirectResponse(url='/admin/llm-providers', status_code=303)
+
+    if not model:
+        model = default_model_for(provider) or ""
+        if not model:
+            request.session["flash_msg"] = f"Provider '{provider}' requires an explicit model."
+            return RedirectResponse(url='/admin/llm-providers', status_code=303)
+
+    # Curated allowlist, exempting only the currently-stored (provider, model) pair
+    # (D14: a stored de-listed model is kept/flagged, not silently changed).
+    stored_model = (await asyncio.to_thread(identity_mgr.get_default_llm_model) or "").strip()
+    if (
+        spec.known_models
+        and model not in spec.known_models
+        and not (model == stored_model and provider == stored_provider)
+    ):
+        request.session["flash_msg"] = f"Model '{model}' is not one of the curated models for '{provider}'."
+        return RedirectResponse(url='/admin/llm-providers', status_code=303)
+
+    errors = validate_defaults(provider, model, base_url, check_curated=False)
+    if errors:
+        request.session["flash_msg"] = errors[0]
+        return RedirectResponse(url='/admin/llm-providers', status_code=303)
+
+    await asyncio.to_thread(identity_mgr.set_default_llm_provider, provider)
+    await asyncio.to_thread(identity_mgr.set_default_llm_model, model)
+    if base_url:
+        await asyncio.to_thread(identity_mgr.set_default_llm_base_url, base_url)
+    else:
+        await asyncio.to_thread(identity_mgr.clear_default_llm_base_url)
+    reset_defaults_cache()
+    request.session["flash_msg"] = "Framework LLM default saved."
+    return RedirectResponse(url='/admin/llm-providers', status_code=303)
+
+@router.post("/admin/llm-providers/defaults/clear")
+async def clear_llm_defaults(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    await asyncio.to_thread(identity_mgr.clear_default_llm_provider)
+    await asyncio.to_thread(identity_mgr.clear_default_llm_model)
+    await asyncio.to_thread(identity_mgr.clear_default_llm_base_url)
+    reset_defaults_cache()
+    request.session["flash_msg"] = "Framework LLM default cleared."
     return RedirectResponse(url='/admin/llm-providers', status_code=303)
 
 @router.post("/admin/llm-providers/delete")
@@ -792,7 +939,16 @@ async def editor_page(request: Request, type: str, name: str):
         if not config:
             request.session["flash_msg"] = "Agent not found."
             return RedirectResponse(url='/agents', status_code=303)
-            
+
+        # §9: read-only inherit hint. Display-only -- never prefill config.provider/model.
+        default_llm = await asyncio.to_thread(get_framework_defaults)
+        default_llm_provider_label = None
+        if default_llm.provider:
+            try:
+                default_llm_provider_label = get_spec(default_llm.provider).label
+            except ProviderConfigError:
+                default_llm_provider_label = default_llm.provider
+
         return templates.TemplateResponse(
             request=request,
             name="editor.html", 
@@ -807,7 +963,9 @@ async def editor_page(request: Request, type: str, name: str):
                 "a2a_dependents": a2a_dependents,
                 "all_tools": all_tools,
                 "all_mcps": all_mcps,
-                "error": flash_msg
+                "error": flash_msg,
+                "default_llm": default_llm,
+                "default_llm_provider_label": default_llm_provider_label,
             }
         )
     elif type == "tool":

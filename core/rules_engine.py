@@ -31,7 +31,7 @@ from core.llm_factory import (
     infer_provider,
     resolve_model,
 )
-from core.llm_providers import get_spec, provider_accepts_base_url
+from core.llm_providers import default_model_for, get_spec, provider_accepts_base_url
 from core.models import RuleEvaluationResult, is_agent_external, is_routable_agent_type
 
 logger = logging.getLogger(__name__)
@@ -303,13 +303,22 @@ def _resolve_evaluation_settings() -> tuple[str, str, Optional[str]]:
     from the post-refresh one (``deepseek-chat``), egressing the query and rule catalog
     to the wrong vendor. Read them together so provider inference always uses the same
     model that will be sent.
+
+    A provider override with no model completes from that provider's registry default
+    (never the env ``RULES_EVALUATION_MODEL``, which may belong to another vendor). When
+    there is no provider override, the env model is honoured exactly as before -- the
+    registry default is only a completion for an admin-selected provider, not a global
+    replacement.
     """
     _kick_model_overrides_refresh()
-    model_name = _cached_model_override or RULES_EVALUATION_MODEL
-    provider = (
-        _cached_provider_override
-        or RULES_EVALUATION_PROVIDER
-        or infer_provider(model_name)
+    provider_override = _cached_provider_override
+    provider = provider_override or RULES_EVALUATION_PROVIDER
+    if not provider:
+        provider = infer_provider(_cached_model_override or RULES_EVALUATION_MODEL)
+    model_name = (
+        _cached_model_override
+        or (default_model_for(provider_override) if provider_override else None)
+        or RULES_EVALUATION_MODEL
     )
     base_url = _cached_base_url_override or RULES_EVALUATION_BASE_URL or None
     return provider, model_name, base_url
@@ -422,6 +431,8 @@ def _build_evaluation_agent(
             provider,
         )
         base_url = None
+    # Not a pairing decision: _resolve_evaluation_settings() always supplies a model.
+    # This fallback is only for direct/test callers that pass a provider without one.
     model_name = model_name or _resolve_evaluation_model()
     model = resolve_model(provider, model_name, base_url, api_key=api_key)
     if _evaluation_thinking_style(provider) == "google":

@@ -50,3 +50,74 @@ def test_module_attribute_patch_still_scopes(monkeypatch):
 
     assert tool_search.identity_mgr is not sentinel
     assert tool_search.identity_mgr is get_identity_manager()
+
+
+# --- Framework LLM default accessors (llm-defaults Phase 3) ---
+
+_PROVIDER_PATH = "/config/framework/default_llm_provider"
+_MODEL_PATH = "/config/framework/default_llm_model"
+_BASE_URL_PATH = "/config/framework/default_llm_base_url"
+
+
+def _fake_manager():
+    from core.auth import IdentityManager
+
+    mgr = IdentityManager.__new__(IdentityManager)
+    store = {}
+
+    class FakeClient:
+        def get(self, path):
+            return (store.get(path), None)
+
+        def put(self, path, value):
+            store[path] = value.encode("utf-8") if isinstance(value, str) else value
+
+        def delete(self, path):
+            store.pop(path, None)
+
+    mgr.client = FakeClient()
+    return mgr, store
+
+
+def test_default_llm_provider_round_trip():
+    mgr, store = _fake_manager()
+
+    assert mgr.get_default_llm_provider() is None
+
+    mgr.set_default_llm_provider("deepseek")
+    assert _PROVIDER_PATH in store
+    # Pin the wire format so a symmetric raw-text regression cannot pass.
+    assert store[_PROVIDER_PATH] == b'"deepseek"'
+    assert mgr.get_default_llm_provider() == "deepseek"
+
+    mgr.clear_default_llm_provider()
+    assert _PROVIDER_PATH not in store
+    assert mgr.get_default_llm_provider() is None
+
+
+def test_default_llm_model_round_trip():
+    mgr, store = _fake_manager()
+
+    assert mgr.get_default_llm_model() is None
+
+    mgr.set_default_llm_model("deepseek-chat")
+    assert _MODEL_PATH in store
+    assert mgr.get_default_llm_model() == "deepseek-chat"
+
+    mgr.clear_default_llm_model()
+    assert _MODEL_PATH not in store
+    assert mgr.get_default_llm_model() is None
+
+
+def test_default_llm_base_url_round_trip():
+    mgr, store = _fake_manager()
+
+    assert mgr.get_default_llm_base_url() is None
+
+    mgr.set_default_llm_base_url("http://localhost:11434/v1")
+    assert _BASE_URL_PATH in store
+    assert mgr.get_default_llm_base_url() == "http://localhost:11434/v1"
+
+    mgr.clear_default_llm_base_url()
+    assert _BASE_URL_PATH not in store
+    assert mgr.get_default_llm_base_url() is None

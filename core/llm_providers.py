@@ -13,6 +13,7 @@ never pulls an optional SDK into the process.
 import importlib.util
 import logging
 from dataclasses import dataclass
+from typing import Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class ProviderSpec:
     thinking_style: str = "none"
     model_prefixes: tuple[str, ...] = ()
     known_models: tuple[str, ...] = ()
+    default_model: str | None = None
     sdk_extra: str | None = None
     note: str = ""
 
@@ -60,6 +62,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             "gemini-2.5-flash",
             "gemini-2.5-flash-lite",
         ),
+        default_model="gemini-2.5-flash",
     ),
     "openai": ProviderSpec(
         id="openai",
@@ -70,6 +73,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         thinking_style="openai-effort",
         model_prefixes=("gpt-", "o1", "o3", "o4", "chatgpt"),
         known_models=("gpt-5", "gpt-5-mini", "gpt-4.1", "gpt-4o", "o3", "o4-mini"),
+        default_model="gpt-5-mini",
     ),
     "anthropic": ProviderSpec(
         id="anthropic",
@@ -80,6 +84,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         thinking_style="anthropic",
         model_prefixes=("claude",),
         known_models=("claude-opus-4-6", "claude-sonnet-4-5", "claude-haiku-4-5"),
+        default_model="claude-haiku-4-5",
     ),
     "deepseek": ProviderSpec(
         id="deepseek",
@@ -88,6 +93,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         key_names=("DEEPSEEK_API_KEY",),
         model_prefixes=("deepseek",),
         known_models=("deepseek-chat", "deepseek-reasoner"),
+        default_model="deepseek-chat",
     ),
     "fireworks": ProviderSpec(
         id="fireworks",
@@ -98,6 +104,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             "accounts/fireworks/models/llama-v3p3-70b-instruct",
             "accounts/fireworks/models/deepseek-v3",
         ),
+        default_model="accounts/fireworks/models/llama-v3p3-70b-instruct",
     ),
     "together": ProviderSpec(
         id="together",
@@ -105,6 +112,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         pydantic_name="together",
         key_names=("TOGETHER_API_KEY",),
         known_models=("meta-llama/Llama-3.3-70B-Instruct-Turbo", "Qwen/Qwen2.5-72B-Instruct-Turbo"),
+        default_model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
     ),
     "moonshotai": ProviderSpec(
         id="moonshotai",
@@ -113,6 +121,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         key_names=("MOONSHOTAI_API_KEY",),
         model_prefixes=("kimi",),
         known_models=("kimi-k2-0905-preview", "kimi-latest"),
+        default_model="kimi-latest",
     ),
     "vercel": ProviderSpec(
         id="vercel",
@@ -121,6 +130,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         key_names=("VERCEL_AI_GATEWAY_API_KEY",),
         thinking_style="openai-effort",
         known_models=("openai/gpt-5", "anthropic/claude-sonnet-4.5", "google/gemini-2.5-flash"),
+        default_model="google/gemini-2.5-flash",
     ),
     "zai": ProviderSpec(
         id="zai",
@@ -129,6 +139,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         key_names=("ZAI_API_KEY",),
         model_prefixes=("glm",),
         known_models=("glm-4.6", "glm-4.5-air"),
+        default_model="glm-4.5-air",
     ),
     "openrouter": ProviderSpec(
         id="openrouter",
@@ -141,6 +152,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             "deepseek/deepseek-chat",
             "meta-llama/llama-3.3-70b-instruct",
         ),
+        default_model="deepseek/deepseek-chat",
         note="Model names must be vendor-prefixed (e.g. openai/gpt-5); unprefixed ids are rejected.",
     ),
     "alibaba": ProviderSpec(
@@ -151,6 +163,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         supports_base_url=True,
         model_prefixes=("qwen",),
         known_models=("qwen-max", "qwen-plus", "qwen3-max", "qwen-turbo"),
+        default_model="qwen-plus",
     ),
     "ollama": ProviderSpec(
         id="ollama",
@@ -163,6 +176,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         base_url_placeholder="http://localhost:11434",
         key_placeholder="api-key-not-set",
         known_models=("llama3.2", "qwen2.5", "mistral", "gemma3"),
+        default_model="llama3.2",
         note=(
             "Keyless and local. A base_url is mandatory and defaults to http://localhost:11434; "
             "it is always passed explicitly, so pydantic-ai never reads OLLAMA_BASE_URL."
@@ -179,6 +193,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         base_url_kwarg="api_base",
         key_placeholder="litellm-placeholder",
         known_models=("openai/gpt-4o", "anthropic/claude-sonnet-4-5", "ollama/llama3.2"),
+        default_model="openai/gpt-4o",
         note=(
             "LITELLM_API_KEY is the gateway credential only; LiteLLM resolves sub-provider keys "
             "from its own environment (a scoped exception to the no-env rule)."
@@ -190,6 +205,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         pydantic_name="huggingface",
         key_names=("HF_TOKEN",),
         known_models=("meta-llama/Llama-3.3-70B-Instruct", "Qwen/Qwen2.5-72B-Instruct"),
+        default_model="meta-llama/Llama-3.3-70B-Instruct",
         sdk_extra="huggingface_hub",
     ),
     "openai-compatible": ProviderSpec(
@@ -259,6 +275,32 @@ def sdk_installed(spec: ProviderSpec) -> bool:
         return False
 
 
+def default_model_for(provider_id: str | None) -> str | None:
+    """Registry default model for ``provider_id``; None when it has none or is unknown."""
+    try:
+        return get_spec(provider_id).default_model
+    except ProviderConfigError:
+        return None
+
+
+def provider_is_usable(spec: ProviderSpec, keys: Mapping[str, str]) -> bool:
+    """True when a framework default could actually serve traffic with what is stored.
+
+    Checks the two things knowable from the registry plus the stored secrets: the
+    provider's optional SDK extra is importable, and its required credential (if any)
+    is present. Endpoint satisfiability is enforced at save time by the admin route
+    (§8) -- the keyless gateways (``ollama``/``litellm``/``openai-compatible``) have no
+    global endpoint key, so their base_url is supplied inline with the default triple
+    and cannot be checked here.
+    """
+    keys = keys or {}
+    if not sdk_installed(spec):
+        return False
+    if spec.requires_key and not any(keys.get(name) for name in spec.key_names):
+        return False
+    return True
+
+
 def provider_ui_specs() -> tuple[dict, ...]:
     """JSON-serializable projection of the registry for templates and inline JS."""
     return tuple(
@@ -276,6 +318,7 @@ def provider_ui_specs() -> tuple[dict, ...]:
             "base_url_key": spec.base_url_key_names[0] if spec.base_url_key_names else None,
             "thinking_style": spec.thinking_style,
             "known_models": list(spec.known_models),
+            "default_model": spec.default_model,
             "model_prefixes": list(spec.model_prefixes),
             "sdk_extra": spec.sdk_extra,
             "sdk_installed": sdk_installed(spec),

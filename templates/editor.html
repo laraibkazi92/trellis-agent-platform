@@ -121,6 +121,11 @@
                             <p class="text-xs text-neutral-500 dark:text-neutral-400 mt-2 font-mono">JavaScript is required to change the model. Saved model: <code>{{ config.model or '(unset)' }}</code>.</p>
                         </noscript>
                         <input type="text" id="modelCustomInput" class="form-input mt-2" placeholder="Custom model id" disabled>
+                        {% if not config.provider and not config.model and default_llm and default_llm.provider %}
+                        <p id="inheritDefaultHint" class="text-xs text-neutral-500 dark:text-neutral-400 mt-2 font-mono">
+                            Inherits framework default: {{ default_llm_provider_label }} / {{ default_llm.model }}
+                        </p>
+                        {% endif %}
                     </div>
                     <div>
                         <label class="form-label">Thinking Level</label>
@@ -138,7 +143,7 @@
                     <div>
                         <label class="form-label">Provider</label>
                         <select name="provider" id="providerSelect" class="form-input">
-                            <option value="" {% if not config.provider %}selected{% endif %}>Auto (infer from model name)</option>
+                            <option value="" {% if not config.provider %}selected{% endif %}>Auto (infer from model)</option>
                             {% for p in llm_providers %}
                             <option value="{{ p.id }}" {% if config.provider == p.id %}selected{% endif %}
                                 data-requires-url="{{ '1' if p.requires_base_url else '0' }}"
@@ -510,6 +515,13 @@
                 syncModelValue();
                 updateProviderFields();
                 updateThinkingLevel();
+            });
+
+            // The inherit hint describes the *unset* state only; any operator edit makes
+            // it stale (case B would then use the provider's registry default).
+            $('#providerSelect, #modelSelect, #modelCustomInput').on('change input', function() {
+                var hint = document.getElementById('inheritDefaultHint');
+                if (hint) hint.style.display = 'none';
             });
 
             populateModelOptions();
