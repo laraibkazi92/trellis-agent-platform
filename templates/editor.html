@@ -517,6 +517,13 @@
                 updateThinkingLevel();
             });
 
+            // The inherit hint describes the *unset* state only; any operator edit makes
+            // it stale (case B would then use the provider's registry default).
+            $('#providerSelect, #modelSelect, #modelCustomInput').on('change input', function() {
+                var hint = document.getElementById('inheritDefaultHint');
+                if (hint) hint.style.display = 'none';
+            });
+
             populateModelOptions();
             updateProviderFields();
             updateThinkingLevel(); // Run on init

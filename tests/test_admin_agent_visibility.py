@@ -16,10 +16,18 @@ Covers:
 import asyncio
 from types import SimpleNamespace
 
+import pytest
 import yaml
 from starlette.datastructures import FormData
 
+from core.llm_defaults import FrameworkDefaults
 from core.routers import admin
+
+
+@pytest.fixture(autouse=True)
+def _stub_framework_defaults(monkeypatch):
+    """Keep every editor_page render hermetic (no real etcd read for the defaults)."""
+    monkeypatch.setattr(admin, "get_framework_defaults", lambda: FrameworkDefaults())
 
 
 # --- Shared fakes --------------------------------------------------------------
@@ -683,6 +691,29 @@ def test_editor_page_renders_registry_driven_provider_model_and_thinking_fields(
 
     # The saved model is carried in the hidden field the POST actually submits.
     assert 'id="modelValue" value="deepseek-chat"' in html
+
+
+def test_editor_page_renders_inherit_hint_for_an_unset_agent(monkeypatch):
+    """Route-level: an agent with no provider/model shows the framework-default hint."""
+    monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
+    fake_identity = FakeIdentityManagerAdmin(
+        {"blank-agent": {"name": "blank-agent", "description": "d", "a2a_access": []}}
+    )
+    monkeypatch.setattr(admin, "identity_mgr", fake_identity)
+    monkeypatch.setattr(
+        admin, "get_framework_defaults",
+        lambda: FrameworkDefaults("deepseek", "deepseek-chat", None),
+    )
+
+    response = asyncio.run(admin.editor_page(FakeRequest(session=_admin_session()), "agent", "blank-agent"))
+
+    assert response.status_code == 200
+    html = response.body.decode()
+    assert 'id="inheritDefaultHint"' in html
+    assert "Inherits framework default: DeepSeek / deepseek-chat" in html
+    # Still not prefilled.
+    assert 'id="modelValue" value=""' in html
+    assert '<option value="deepseek" selected' not in html
 
 
 def test_save_agent_empty_provider_stays_none(monkeypatch):

@@ -457,10 +457,12 @@ def test_editor_shows_inherit_hint_when_unset_and_framework_default_present():
 
 def test_editor_hides_inherit_hint_when_agent_is_configured():
     config = _editor_config(provider="deepseek", model="deepseek-chat")
-    html = _render_editor(config, default_llm=FrameworkDefaults("deepseek", "deepseek-chat", None))
+    # A *different* framework default must not leak into the configured agent's controls.
+    html = _render_editor(config, default_llm=FrameworkDefaults("google", "gemini-2.5-flash", None))
 
     assert 'id="inheritDefaultHint"' not in html
     assert "Inherits framework default" not in html
+    assert re.search(r'<option value="google"\s+selected', html) is None
 
 
 def test_editor_inherit_hint_does_not_prefill_provider_or_model():
@@ -477,7 +479,9 @@ def test_editor_inherit_hint_does_not_prefill_provider_or_model():
 
 def test_editor_hides_inherit_hint_when_no_framework_default():
     config = _editor_config(provider=None, model=None)
-    html = _render_editor(config, default_llm=None)
+    # editor_page always passes a FrameworkDefaults instance (truthy); the .provider term
+    # is what must gate the hint.
+    html = _render_editor(config, default_llm=FrameworkDefaults())
 
     assert 'id="inheritDefaultHint"' not in html
     assert "Inherits framework default" not in html
