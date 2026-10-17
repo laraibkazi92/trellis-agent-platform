@@ -30,10 +30,10 @@ from pydantic_ai_shields import CostTracking, ToolGuard
 from pydantic_ai_rlm import create_rlm_toolset
 
 from core.auth import EtcdContentionError, IdentityManager, get_identity_manager, user_id_var
-from core import llm_factory
+from core import llm_defaults, llm_factory
 from core.console_backend import SanitizedLocalBackend
 from core.env_sanitize import sanitized_env
-from core.llm_factory import build_model_settings, resolve_model, resolve_provider
+from core.llm_factory import build_model_settings, resolve_model
 from core.models import AgentConfig, MCPConfig, is_agent_external, is_agent_internal
 from core.health import HealthMonitor, evaluate_health_status
 from core.discovery import is_agent_configured
@@ -426,12 +426,27 @@ async def build_agent(agent_name: str) -> Agent:
             raise Exception(f"Agent '{agent_name}' not found")
             
     config = AgentConfig(**config_data)
-    provider = resolve_provider(config.provider, config.model)
+    if llm_defaults.needs_framework_defaults(config.provider, config.model):
+        defaults = await asyncio.to_thread(llm_defaults.get_framework_defaults)
+    else:
+        defaults = llm_defaults.FrameworkDefaults()
+    effective = llm_defaults.resolve_effective_llm_config(
+        config.provider, config.model, config.base_url, defaults
+    )
+    provider = effective.provider
     # Prefetch the etcd-stored key off the event loop (build_agent already does its
     # other etcd I/O via asyncio.to_thread); resolve_model uses it directly.
     api_key = await asyncio.to_thread(llm_factory.get_provider_api_key, provider)
-    model = resolve_model(provider, config.model, config.base_url, api_key=api_key)
-    model_settings = build_model_settings(provider, config.model, config.thinking_level)
+    model = resolve_model(provider, effective.model, effective.base_url, api_key=api_key)
+    model_settings = build_model_settings(provider, effective.model, config.thinking_level)
+    if effective.source != "explicit":
+        logger.info(
+            "LLM config unresolved for agent '%s'; using framework default %s/%s (source=%s)",
+            agent_name,
+            provider,
+            effective.model,
+            effective.source,
+        )
     
     capabilities = []
     toolsets = []

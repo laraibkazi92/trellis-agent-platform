@@ -42,6 +42,9 @@ async def lifespan(app: FastAPI):
     # Warm the LLM provider-key cache off the event loop so the first request-path
     # lookup is a cache hit instead of a (possibly ~20s) etcd round-trip.
     await asyncio.to_thread(warm_key_cache)
+    # Warm the framework LLM default cache (etcd read) beside the key cache so the
+    # first inherit-the-default build is a cache hit.
+    await asyncio.to_thread(warm_defaults_cache)
     await get_hub_client()
     await discover_external_mcps()
     _spawn_background(prewarm_agents(), "prewarm_agents")
@@ -83,6 +86,7 @@ from core.agent_factory import (
     is_hub_connected,
     SupervisorDeps,
 )
+from core.llm_defaults import warm_defaults_cache
 from core.llm_factory import warm_key_cache
 from core.llm_providers import ProviderConfigError
 from core.memory import get_memory_manager

@@ -20,6 +20,7 @@ from core.agent_factory import (
     get_hub_client,
     install_llm_key_watch,
 )
+from core.llm_defaults import warm_defaults_cache
 from core.llm_factory import warm_key_cache
 
 RESTRICTED_ENV_VARS = {"PATH", "PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "BASH_ENV", "ENV", "HOSTALIASES"}
@@ -103,11 +104,12 @@ def _install_llm_key_watch_on_startup(state) -> None:
 
     The taskiq worker is a separate process from the Host with its own agent
     cache, so it needs its own watch registered at startup. This hook is sync and
-    runs during startup (no event loop to hand off to), so the cache warm is called
+    runs during startup (no event loop to hand off to), so the cache warms are called
     directly rather than via asyncio.to_thread.
     """
     install_llm_key_watch()
     warm_key_cache()
+    warm_defaults_cache()
 
 scheduler = TaskiqScheduler(
     broker=broker,
