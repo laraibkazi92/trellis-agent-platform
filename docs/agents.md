@@ -90,12 +90,16 @@ author: user@example.com          # Required. Creator email or name.
 description: "Does X and Y."      # Required. Shown in the UI. LLM uses this for routing decisions.
 type: user_agent                  # Optional. Defaults to user_agent here; background_agent /
                                   #   background_script configs belong in workspace/workflows/.
-model: gemini-3-flash-preview     # Required. LLM model identifier.
+model: gemini-3-flash-preview     # Optional. LLM model identifier. Blank (with a blank
+                                  #   provider) inherits the framework default; a blank model
+                                  #   on a configured provider resolves to that provider's
+                                  #   registry default. See "Framework LLM defaults" below.
 thinking_level: medium            # Required. One of: none, low, medium, high, n/a (n/a behaves
                                   #   like none; the dashboard editors apply it automatically for
                                   #   models without thinking support).
 provider: google                  # Optional. One of the 15 provider ids in the table
-                                  #   below. Omitted/empty infers from the model name
+                                  #   below. Blank (with a blank model) inherits the framework
+                                  #   default. Omitted/empty infers from the model name
                                   #   prefix (gemini* → google, claude* → anthropic,
                                   #   gpt-*/o1*/o3*/o4*/chatgpt* → openai, deepseek* →
                                   #   deepseek, kimi* → moonshotai, glm* → zai, qwen* →
@@ -186,6 +190,41 @@ Both fields can also be set in the admin agent editor.
 **`a2a_access`**: Enables Agent-to-Agent delegation. The agent can call listed agents as sub-tasks (as if calling a tool). Targets must be `internal: true` (the default) — delegation to agents marked `internal: false` is skipped at build time with a warning. Keep this list small and intentional — the supervisor does not use `a2a_access`; it discovers and delegates dynamically via `search_agents` + `delegate`.
 
 **`rules`**: Optional declarative routing rules evaluated before semantic search — lock matching queries onto this agent deterministically. See the [Rules Engine guide](rules_engine.md) for the full field reference and authoring guidance.
+
+---
+
+### Framework LLM defaults
+
+An admin can set **one org-wide default provider + model** (and an optional `base_url`) in
+**Admin → LLM Providers → Framework defaults**. An agent — or a background workflow — that
+leaves **both `provider` and `model` blank** inherits that pair instead of failing.
+
+The default is applied at build time and is **never written into your YAML**. The agent editor
+shows a read-only `Inherits framework default: <Provider> / <model>` hint under the model
+field while the pair is blank, and nothing is prefilled, so "inherit" survives every edit and
+the agent keeps tracking the org default as it changes.
+
+Resolution priority, highest first:
+
+| Case | `provider` | `model` | Effective provider | Effective model | Effective `base_url` |
+| --- | --- | --- | --- | --- | --- |
+| A — explicit | set | set | as configured | as configured | as configured |
+| B — provider only | set | blank | as configured | the framework model **when the framework provider matches**, otherwise the provider's registry default | the framework `base_url` when the framework provider matches, otherwise as configured |
+| C — model only | blank | set | inferred from the model name (fails if unknown or ambiguous) | as configured | as configured |
+| D — both blank | blank | blank | framework default provider | framework default model | the agent's `base_url`, else the framework default's (dropped if the provider takes none) |
+| E — legacy fallback | blank | blank, framework default unset or invalid | `google` | `gemini-2.5-flash` | as configured |
+
+Notes:
+
+- **Case B inherits the framework `base_url` only when the framework provider is the same
+  provider.** A different provider inherits just the registry default model — never the org's
+  endpoint, which would otherwise point one vendor's key at another vendor's gateway.
+- **Every provider has a registry default model** (e.g. `deepseek` → `deepseek-chat`,
+  `openai` → `gpt-5-mini`), so `provider` set + `model` blank is a valid configuration.
+- **To opt out of inheritance, set both `provider` and `model`.** A fully-specified pair is
+  used verbatim and never consults the framework default.
+- **`openai-compatible` is the exception:** it has no registry default, so it always needs an
+  explicit `model` *and* an explicit `base_url`.
 
 ---
 
