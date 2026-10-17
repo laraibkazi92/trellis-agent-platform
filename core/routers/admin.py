@@ -737,7 +737,11 @@ async def editor_page(request: Request, type: str, name: str):
         return redirect
     
     user = request.session.get('user')
-        
+    # The editor is a standalone page (it does not extend base.html), so a flash set
+    # just before redirecting here -- e.g. by save_agent's provider/base_url checks --
+    # must be rendered through editor.html's own `error` block.
+    flash_msg = request.session.pop("flash_msg", None)
+
     safe_name = sanitize_name(name)
     if not safe_name:
         request.session["flash_msg"] = "Invalid name parameter."
@@ -802,7 +806,8 @@ async def editor_page(request: Request, type: str, name: str):
                 "internal_agents": internal_agents,
                 "a2a_dependents": a2a_dependents,
                 "all_tools": all_tools,
-                "all_mcps": all_mcps
+                "all_mcps": all_mcps,
+                "error": flash_msg
             }
         )
     elif type == "tool":
@@ -817,7 +822,8 @@ async def editor_page(request: Request, type: str, name: str):
                 "user": user,
                 "type": type,
                 "name": safe_name,
-                "config": config
+                "config": config,
+                "error": flash_msg
             }
         )
     elif type == "mcp":
@@ -832,7 +838,8 @@ async def editor_page(request: Request, type: str, name: str):
                 "user": user,
                 "type": type,
                 "name": safe_name,
-                "config": config
+                "config": config,
+                "error": flash_msg
             }
         )
     return RedirectResponse(url='/admin', status_code=303)

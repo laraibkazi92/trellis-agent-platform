@@ -258,6 +258,33 @@ def test_editor_page_no_a2a_dependents_warning_when_absent(monkeypatch):
     assert "delegate to this agent via a2a_access" not in html
 
 
+def test_editor_page_renders_pending_flash_as_error(monkeypatch):
+    """save_agent redirects here on a rejected provider/base_url, so the flash it sets
+    must be visible on the standalone editor page rather than silently dropped."""
+    monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
+    fake_identity = FakeIdentityManagerAdmin(
+        {"data-parser": {"name": "data-parser", "description": "worker"}}
+    )
+    monkeypatch.setattr(admin, "identity_mgr", fake_identity)
+
+    captured = {}
+    real_template_response = admin.templates.TemplateResponse
+
+    def capturing_template_response(request=None, name=None, context=None):
+        captured["context"] = context
+        return real_template_response(request=request, name=name, context=context)
+
+    monkeypatch.setattr(admin.templates, "TemplateResponse", capturing_template_response)
+
+    session = _admin_session()
+    session["flash_msg"] = "Provider 'deepseek' does not accept a base_url; remove it."
+    asyncio.run(admin.editor_page(FakeRequest(session=session), "agent", "data-parser"))
+
+    html = admin.templates.env.get_template("editor.html").render(**captured["context"])
+    assert "does not accept a base_url" in html
+    assert "flash_msg" not in session
+
+
 # --- save_agent (POST) -----------------------------------------------------------
 
 def _form(pairs):
