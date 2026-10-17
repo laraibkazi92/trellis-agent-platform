@@ -627,6 +627,7 @@ def test_rules_engine_provider_infers_from_the_resolved_model(monkeypatch):
     monkeypatch.setattr(rules_engine, "RULES_EVALUATION_MODEL", "gemini-2.5-flash")
 
     assert rules_engine._resolve_evaluation_provider() == "deepseek"
+    assert rules_engine._resolve_evaluation_settings()[:2] == ("deepseek", "deepseek-chat")
 
 
 def test_rules_engine_provider_env_then_etcd_precedence(monkeypatch):
@@ -683,6 +684,30 @@ def test_rules_engine_decider_pins_low_effort_for_reasoning_providers(monkeypatc
         assert settings is not None
         expected_key = "anthropic_effort" if provider == "anthropic" else "openai_reasoning_effort"
         assert settings[expected_key] == "low"
+
+
+def test_rules_engine_build_evaluation_agent_uses_threaded_model_name(monkeypatch):
+    """The decider must build the model the caller resolved, not re-read the cache
+    (a refresh in between would pair one provider with another vendor's model)."""
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, model, **kwargs):
+            self.model = model
+
+    def fake_resolve_model(provider, model, base_url, api_key=None):
+        captured.update(provider=provider, model=model, base_url=base_url)
+        return object()
+
+    monkeypatch.setattr(rules_engine, "Agent", FakeAgent)
+    monkeypatch.setattr(rules_engine, "resolve_model", fake_resolve_model)
+    monkeypatch.setattr(rules_engine, "RULES_EVALUATION_MODEL", "gemini-2.5-flash")
+
+    rules_engine._build_evaluation_agent(
+        provider="deepseek", base_url=None, api_key="k", model_name="deepseek-chat"
+    )
+
+    assert captured == {"provider": "deepseek", "model": "deepseek-chat", "base_url": None}
 
 
 def test_rules_engine_build_evaluation_agent_uses_resolved_provider(monkeypatch):

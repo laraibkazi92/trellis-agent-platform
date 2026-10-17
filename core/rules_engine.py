@@ -294,6 +294,27 @@ def _kick_model_overrides_refresh() -> None:
             _model_overrides_refresh_in_flight = False
 
 
+def _resolve_evaluation_settings() -> tuple[str, str, Optional[str]]:
+    """Resolve ``(provider, model, base_url)`` from one cache snapshot.
+
+    The three overrides are refreshed together in the background, but resolving them
+    through separate helpers lets a refresh land in between: the provider could come
+    from the pre-refresh snapshot (e.g. the env default's Google) while the model came
+    from the post-refresh one (``deepseek-chat``), egressing the query and rule catalog
+    to the wrong vendor. Read them together so provider inference always uses the same
+    model that will be sent.
+    """
+    _kick_model_overrides_refresh()
+    model_name = _cached_model_override or RULES_EVALUATION_MODEL
+    provider = (
+        _cached_provider_override
+        or RULES_EVALUATION_PROVIDER
+        or infer_provider(model_name)
+    )
+    base_url = _cached_base_url_override or RULES_EVALUATION_BASE_URL or None
+    return provider, model_name, base_url
+
+
 def _resolve_evaluation_provider() -> str:
     """Admin etcd override > RULES_EVALUATION_PROVIDER env var > inference from the
     configured model name. A model name that matches no known prefix raises
@@ -301,16 +322,7 @@ def _resolve_evaluation_provider() -> str:
     'google' would egress the untrusted query and the full rule catalog to the
     wrong provider's API before failing. evaluate_rules catches the error and
     fails open to semantic search, matching the engine's fail-open design."""
-    _kick_model_overrides_refresh()
-    if _cached_provider_override:
-        return _cached_provider_override
-    if RULES_EVALUATION_PROVIDER:
-        return RULES_EVALUATION_PROVIDER
-    # Infer from the *resolved* model, not the env default: the admin model override
-    # and the provider override refresh independently, so inferring from the env
-    # default can pair a cached ``deepseek-chat`` with Google's endpoint (and egress
-    # the query to the wrong vendor) during the cache refresh window.
-    return infer_provider(_resolve_evaluation_model())
+    return _resolve_evaluation_settings()[0]
 
 
 def _resolve_evaluation_base_url() -> Optional[str]:
@@ -384,6 +396,7 @@ def _build_evaluation_agent(
     api_key: Optional[str] = None,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
+    model_name: Optional[str] = None,
 ) -> Agent:
     """Construct a fresh single-pass structured-decider Agent for one evaluation call.
 
@@ -392,15 +405,15 @@ def _build_evaluation_agent(
     ``api_key`` (prefetched off the event loop by ``evaluate_rules``) is threaded into
     the model build; when None the key is read here as before.
 
-    ``provider``/``base_url`` may be pre-resolved by the caller. ``evaluate_rules``
-    always threads them so the provider cannot flip (via the async background override
-    refresh) between fetching the key and building the model -- which would pair a key
-    for one vendor with another vendor's model. When omitted (direct callers/tests),
-    they are resolved here as before.
+    ``provider``/``base_url``/``model_name`` may be pre-resolved by the caller.
+    ``evaluate_rules`` always threads them from a single ``_resolve_evaluation_settings``
+    snapshot so neither the provider nor the model can flip (via the async background
+    override refresh) between fetching the key and building the model -- which would
+    pair a key for one vendor with another vendor's model. When omitted (direct
+    callers/tests), they are resolved here as before.
     """
     if provider is None:
-        provider = _resolve_evaluation_provider()
-        base_url = _resolve_evaluation_base_url()
+        provider, model_name, base_url = _resolve_evaluation_settings()
     if base_url and not provider_accepts_base_url(provider):
         # Stale RULES_EVALUATION_BASE_URL for a provider that rejects endpoints
         # would otherwise fail every evaluation instead of failing open.
@@ -409,7 +422,7 @@ def _build_evaluation_agent(
             provider,
         )
         base_url = None
-    model_name = _resolve_evaluation_model()
+    model_name = model_name or _resolve_evaluation_model()
     model = resolve_model(provider, model_name, base_url, api_key=api_key)
     if _evaluation_thinking_style(provider) == "google":
         # Gemini thinking is explicitly zeroed out to keep the decider deterministic
@@ -477,10 +490,11 @@ async def evaluate_rules(
         # Resolve provider/base_url once and thread them into model construction so a
         # concurrent background override refresh cannot flip the provider between the
         # key fetch and the model build (misrouting a key to the wrong vendor).
-        provider = _resolve_evaluation_provider()
-        base_url = _resolve_evaluation_base_url()
+        provider, model_name, base_url = _resolve_evaluation_settings()
         api_key = await asyncio.to_thread(llm_factory.get_provider_api_key, provider)
-        agent = _build_evaluation_agent(provider=provider, base_url=base_url, api_key=api_key)
+        agent = _build_evaluation_agent(
+            provider=provider, base_url=base_url, api_key=api_key, model_name=model_name
+        )
         timeout = _resolve_evaluation_timeout()
         threshold = _resolve_confidence_threshold()
         run_result = await asyncio.wait_for(agent.run(user_prompt), timeout=timeout)
