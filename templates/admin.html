@@ -199,9 +199,6 @@
           {% for p in llm_providers %}
           <option
             value="{{ p.id }}"
-            data-supports-url="{{ '1' if p.supports_base_url else '0' }}"
-            data-requires-url="{{ '1' if p.requires_base_url else '0' }}"
-            data-default-url="{{ p.default_base_url or '' }}"
             {% if rules_engine.provider_override == p.id %}selected{% endif %}
           >{{ p.label or p.id }}</option>
           {% endfor %}

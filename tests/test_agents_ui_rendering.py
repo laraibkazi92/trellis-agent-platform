@@ -666,11 +666,14 @@ def test_admin_rules_card_base_url_field_and_posted_field_names_preserved():
 
 def test_admin_rules_card_inline_script_consumes_shared_registry_payload():
     html = _render_admin()
+    select = _rules_provider_select(html)
 
+    # Options are plain labels; the inline script reads provider metadata from the shared
+    # payload, not from per-option data-* attributes.
+    assert 'value="deepseek"' in select
+    assert "data-supports-url" not in select
     assert "window.LLM_PROVIDERS" in html
     assert "updateRulesProviderFields" in html
-    assert "data-supports-url" in _rules_provider_select(html)
-    assert "data-requires-url" in _rules_provider_select(html)
 
 
 def test_admin_rules_card_never_prefills_a_provider_default_endpoint():

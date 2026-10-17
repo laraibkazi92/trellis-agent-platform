@@ -361,7 +361,7 @@ def test_workflows_modal_keeps_thinking_level_posted_for_style_none_providers():
         "trigger": {},
     })
 
-    assert re.search(r"<option value=\"ollama\"[^>]*data-style=\"none\"", html)
+    assert re.search(r'\{"id": "ollama",[^}]*"thinking_style": "none"', html)
     assert "syncThinkingMirror" in html
     assert "mirror.name = 'thinking_level';" in html
     assert "if (style === 'none')" in html

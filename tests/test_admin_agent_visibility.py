@@ -14,6 +14,7 @@ Covers:
     keeping internal: True targets.
 """
 import asyncio
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -685,9 +686,10 @@ def test_editor_page_renders_registry_driven_provider_model_and_thinking_fields(
     for provider_id in _EXPECTED_PROVIDER_IDS:
         assert f'<option value="{provider_id}"' in html
 
-    # The saved deepseek selection drives the thinking-level style to "none".
+    # The saved deepseek selection drives the thinking-level style to "none"; the inline
+    # JS reads that from the shared payload, not from a per-option data-* attribute.
     assert '<option value="deepseek"' in html
-    assert "data-style=\"none\"" in html
+    assert re.search(r'\{"id": "deepseek",[^}]*"thinking_style": "none"', html)
 
     # The saved model is carried in the hidden field the POST actually submits.
     assert 'id="modelValue" value="deepseek-chat"' in html
