@@ -228,6 +228,7 @@ def resolve_effective_llm_config(
     m = (model or "").strip()
     b = (base_url or "").strip() or None
     has_defaults = bool(defaults and defaults.provider and defaults.model)
+    inherited_url = False
 
     if p and m:
         eff_provider, eff_model, url = p, m, b
@@ -238,6 +239,7 @@ def resolve_effective_llm_config(
             eff_model = defaults.model or spec.default_model
             # §4 precedence: an agent-supplied endpoint always beats the inherited one.
             url = b or defaults.base_url
+            inherited_url = not b and bool(defaults.base_url)
         else:
             eff_model = spec.default_model
             url = b
@@ -256,6 +258,7 @@ def resolve_effective_llm_config(
         eff_provider = defaults.provider
         eff_model = defaults.model
         url = b or defaults.base_url
+        inherited_url = not b and bool(defaults.base_url)
         source = "framework"
     else:
         eff_provider = "google"
@@ -263,8 +266,11 @@ def resolve_effective_llm_config(
         url = b
         source = "legacy"
 
-    if url and not provider_accepts_base_url(eff_provider):
-        logger.warning("Dropping base_url for provider '%s': it does not accept one.", eff_provider)
+    # Only an inherited endpoint is dropped silently. An agent-supplied one is passed
+    # through so resolve_model raises its canonical error (G4: fully-specified agents
+    # keep their previous behaviour).
+    if inherited_url and url and not provider_accepts_base_url(eff_provider):
+        logger.warning("Dropping inherited base_url for provider '%s': it does not accept one.", eff_provider)
         url = None
 
     return EffectiveLLMConfig(provider=eff_provider, model=eff_model, base_url=url, source=source)

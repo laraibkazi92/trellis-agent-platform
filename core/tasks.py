@@ -19,6 +19,7 @@ from core.agent_factory import (
     get_health_monitor,
     get_hub_client,
     install_llm_key_watch,
+    install_llm_defaults_watch,
 )
 from core.llm_defaults import warm_defaults_cache
 from core.llm_factory import warm_key_cache
@@ -108,6 +109,7 @@ def _install_llm_key_watch_on_startup(state) -> None:
     directly rather than via asyncio.to_thread.
     """
     install_llm_key_watch()
+    install_llm_defaults_watch()
     warm_key_cache()
     warm_defaults_cache()
 

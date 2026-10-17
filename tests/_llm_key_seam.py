@@ -64,7 +64,7 @@ def install_provider_keys(
     ``resolve_model``/embeddings client consume, so this covers every credential
     and endpoint read without involving etcd.
     """
-    from core import embeddings, llm_factory
+    from core import embeddings, llm_factory, llm_defaults
 
     seam = ProviderKeySeam(keys, base_urls)
 
@@ -78,6 +78,12 @@ def install_provider_keys(
     monkeypatch.setattr(llm_factory, "get_provider_api_key", fake_get_provider_api_key)
     monkeypatch.setattr(llm_factory, "get_provider_base_url", fake_get_provider_base_url)
     monkeypatch.setattr(embeddings, "get_provider_api_key", fake_get_provider_api_key)
+
+    # The framework-default read is a second etcd path (core/llm_defaults._read_raw_defaults);
+    # neutralize it so a build-path test never touches a real etcd (or picks up a dev box's
+    # configured default). Tests that exercise the defaults matrix patch it themselves.
+    monkeypatch.setattr(llm_defaults, "_read_raw_defaults", lambda: (None, None, None))
+    llm_defaults.reset_defaults_cache()
 
     # The fake bypasses both caches entirely; reset them so a stale real key/client
     # from an earlier test cannot shadow the seam.

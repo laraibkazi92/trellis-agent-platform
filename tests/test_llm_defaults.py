@@ -166,11 +166,19 @@ def test_hand_built_defaults_without_a_model_falls_back_to_legacy_google():
     assert (eff.provider, eff.source) == ("google", "legacy")
 
 
-def test_base_url_dropped_with_a_warning_when_the_provider_rejects_it(caplog):
+def test_inherited_base_url_dropped_with_a_warning_when_the_provider_rejects_it(caplog):
+    defaults = FrameworkDefaults(provider="deepseek", model="deepseek-chat", base_url="http://ignored:1234")
     with caplog.at_level(logging.WARNING, logger="core.llm_defaults"):
-        eff = resolve_effective_llm_config("deepseek", "deepseek-chat", "http://ignored:1234", FrameworkDefaults())
+        eff = resolve_effective_llm_config(None, None, None, defaults)
     assert eff.base_url is None
-    assert "Dropping base_url" in caplog.text
+    assert "Dropping inherited base_url" in caplog.text
+
+
+def test_explicit_agent_base_url_is_passed_through_not_dropped():
+    # G4: a fully-specified agent keeps its previous behaviour -- resolve_model raises
+    # its canonical "does not accept a base_url" error instead of silently dropping it.
+    eff = resolve_effective_llm_config("deepseek", "deepseek-chat", "http://proxy:1234", FrameworkDefaults())
+    assert eff.base_url == "http://proxy:1234"
 
 
 # --- needs_framework_defaults (D6) -------------------------------------------

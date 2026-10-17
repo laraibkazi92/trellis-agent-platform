@@ -707,3 +707,39 @@ def test_build_agent_effective_model_reaches_model_settings(monkeypatch):
 
     assert recorded["build_model_settings"] == [("deepseek", "deepseek-chat", "high")]
 
+
+# --- LLM-defaults etcd watch (Phase 4) ---------------------------------------
+
+def test_llm_defaults_watch_resets_cache_and_evicts_agents(monkeypatch):
+    """A framework-default change must drop the TTL cache and every built agent, else
+    an admin edit would not reach agents already cached in the serving process."""
+    from core import llm_defaults
+
+    calls = {"reset": 0, "evict": 0}
+    monkeypatch.setattr(llm_defaults, "reset_defaults_cache", lambda: calls.__setitem__("reset", calls["reset"] + 1))
+    monkeypatch.setattr(agent_factory, "evict_all_agents", lambda: calls.__setitem__("evict", calls["evict"] + 1))
+
+    agent_factory._on_llm_defaults_change(SimpleNamespace(events=[]))
+
+    assert calls == {"reset": 1, "evict": 1}
+
+
+def test_install_llm_defaults_watch_is_idempotent(monkeypatch):
+    registered = []
+
+    class FakeClient:
+        def add_watch_prefix_callback(self, prefix, callback):
+            registered.append(prefix)
+            return len(registered)
+
+    class FakeIdentity:
+        client = FakeClient()
+
+    monkeypatch.setattr(agent_factory, "_llm_defaults_watch_id", None)
+    monkeypatch.setattr(agent_factory, "get_identity_manager", lambda: FakeIdentity())
+
+    agent_factory.install_llm_defaults_watch()
+    agent_factory.install_llm_defaults_watch()
+
+    assert registered == ["/config/framework/default_llm_"]
+

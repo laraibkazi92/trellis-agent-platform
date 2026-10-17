@@ -691,6 +691,47 @@ def cancel_llm_key_watch() -> None:
         get_identity_manager().client.cancel_watch(watch_id)
 
 
+_llm_defaults_watch_id: Any = None
+
+
+def _on_llm_defaults_change(event) -> None:
+    """Sync etcd watch callback: flush every cache derived from the framework defaults.
+
+    A changed default must drop the TTL cache *and* every already-built agent (which
+    baked in the previous effective model/endpoint), otherwise an org-default change
+    would only take effect after the agent is evicted for some other reason. Runs on
+    the watch thread, so it must not await.
+    """
+    from core import llm_defaults
+
+    llm_defaults.reset_defaults_cache()
+    evict_all_agents()
+
+
+def install_llm_defaults_watch() -> None:
+    """Register the etcd watch that invalidates framework-default-derived caches.
+
+    Idempotent. The host and the taskiq worker are separate processes with separate
+    agent caches, so each calls this once at startup.
+    """
+    global _llm_defaults_watch_id
+    if _llm_defaults_watch_id is not None:
+        return
+    identity_mgr = get_identity_manager()
+    _llm_defaults_watch_id = identity_mgr.client.add_watch_prefix_callback(
+        "/config/framework/default_llm_", _on_llm_defaults_change
+    )
+
+
+def cancel_llm_defaults_watch() -> None:
+    """Cancel the framework-defaults etcd watch and clear the sentinel (idempotent)."""
+    global _llm_defaults_watch_id
+    watch_id = _llm_defaults_watch_id
+    _llm_defaults_watch_id = None
+    if watch_id is not None:
+        get_identity_manager().client.cancel_watch(watch_id)
+
+
 async def prewarm_agents() -> None:
     """Best-effort background build of all non-background agents after startup."""
     identity_mgr = get_identity_manager()
