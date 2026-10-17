@@ -21,7 +21,8 @@ import json
 import re
 
 from core.dependencies import llm_providers_context, templates
-from core.llm_providers import provider_ui_specs
+from core.llm_defaults import FrameworkDefaults
+from core.llm_providers import get_spec, provider_ui_specs
 
 
 class _FakeURL:
@@ -390,7 +391,13 @@ def _editor_config(name="deepseek-agent", **overrides):
     return config
 
 
-def _render_editor(config):
+def _render_editor(config, default_llm=None):
+    default_llm_provider_label = None
+    if default_llm is not None and default_llm.provider:
+        try:
+            default_llm_provider_label = get_spec(default_llm.provider).label
+        except Exception:
+            default_llm_provider_label = default_llm.provider
     context = {
         "request": _FakeRequest(),
         "user": {"name": "Test User", "sub": "test-user"},
@@ -409,6 +416,8 @@ def _render_editor(config):
         "app_name": "Trellis",
         "app_accent_color": "#0055FF",
         "app_accent_color_dark": "#3377FF",
+        "default_llm": default_llm,
+        "default_llm_provider_label": default_llm_provider_label,
     }
     context.update(llm_providers_context(None))
     return templates.env.get_template("editor.html").render(**context)
@@ -434,6 +443,51 @@ def test_editor_renders_registry_provider_labels_and_llm_providers_payload():
     ids = {p["id"] for p in providers}
     assert {"deepseek", "openrouter", "google", "openai-compatible"} <= ids
     assert all("label" in p for p in providers)
+
+
+# --- Editor: framework default inherit hint (llm-defaults §9, D10) -------------
+
+def test_editor_shows_inherit_hint_when_unset_and_framework_default_present():
+    config = _editor_config(provider=None, model=None)
+    html = _render_editor(config, default_llm=FrameworkDefaults("deepseek", "deepseek-chat", None))
+
+    assert 'id="inheritDefaultHint"' in html
+    assert "Inherits framework default: DeepSeek / deepseek-chat" in html
+
+
+def test_editor_hides_inherit_hint_when_agent_is_configured():
+    config = _editor_config(provider="deepseek", model="deepseek-chat")
+    html = _render_editor(config, default_llm=FrameworkDefaults("deepseek", "deepseek-chat", None))
+
+    assert 'id="inheritDefaultHint"' not in html
+    assert "Inherits framework default" not in html
+
+
+def test_editor_inherit_hint_does_not_prefill_provider_or_model():
+    config = _editor_config(provider=None, model=None)
+    html = _render_editor(config, default_llm=FrameworkDefaults("deepseek", "deepseek-chat", None))
+
+    assert 'id="inheritDefaultHint"' in html
+    # Model stays empty in the submitted hidden field.
+    assert re.search(r'<input type="hidden" name="model" id="modelValue" value="">', html)
+    # Provider select keeps the blank "Auto" option selected.
+    assert re.search(r'<option value=""\s+selected\s*>Auto \(infer from model\)</option>', html)
+    assert re.search(r'<option value="deepseek"\s+selected', html) is None
+
+
+def test_editor_hides_inherit_hint_when_no_framework_default():
+    config = _editor_config(provider=None, model=None)
+    html = _render_editor(config, default_llm=None)
+
+    assert 'id="inheritDefaultHint"' not in html
+    assert "Inherits framework default" not in html
+
+
+def test_editor_provider_pill_reads_infer_from_model_not_model_name():
+    html = _render_editor(_editor_config(provider="deepseek", model="deepseek-chat"))
+
+    assert "Auto (infer from model)" in html
+    assert "Auto (infer from model name)" not in html
 
 
 # --- Admin -> Rules Engine card (llm-provider-expansion §9.2) ------------------

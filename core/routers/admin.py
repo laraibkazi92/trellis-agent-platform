@@ -21,7 +21,11 @@ from core.llm_providers import (
     provider_requires_base_url,
     provider_ui_specs,
 )
-from core.llm_defaults import reset_defaults_cache, validate_defaults
+from core.llm_defaults import (
+    get_framework_defaults,
+    reset_defaults_cache,
+    validate_defaults,
+)
 from core.models import Identity, IdentityType, is_agent_internal, coerce_bool_flag, ALLOWED_PROVIDERS
 from core.rules_engine import (
     RULES_EVALUATION_TIMEOUT as RULES_EVALUATION_TIMEOUT_DEFAULT,
@@ -935,7 +939,16 @@ async def editor_page(request: Request, type: str, name: str):
         if not config:
             request.session["flash_msg"] = "Agent not found."
             return RedirectResponse(url='/agents', status_code=303)
-            
+
+        # §9: read-only inherit hint. Display-only -- never prefill config.provider/model.
+        default_llm = await asyncio.to_thread(get_framework_defaults)
+        default_llm_provider_label = None
+        if default_llm.provider:
+            try:
+                default_llm_provider_label = get_spec(default_llm.provider).label
+            except ProviderConfigError:
+                default_llm_provider_label = default_llm.provider
+
         return templates.TemplateResponse(
             request=request,
             name="editor.html", 
@@ -950,7 +963,9 @@ async def editor_page(request: Request, type: str, name: str):
                 "a2a_dependents": a2a_dependents,
                 "all_tools": all_tools,
                 "all_mcps": all_mcps,
-                "error": flash_msg
+                "error": flash_msg,
+                "default_llm": default_llm,
+                "default_llm_provider_label": default_llm_provider_label,
             }
         )
     elif type == "tool":
