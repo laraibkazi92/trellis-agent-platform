@@ -1093,6 +1093,37 @@ def test_chat_completions_500_hides_internal_detail(monkeypatch, caplog):
     )
 
 
+def test_chat_completions_missing_provider_key_returns_actionable_400(monkeypatch):
+    """ProviderConfigError from the agent build (e.g. no key stored for deepseek) is a
+    caller-fixable configuration error, so it must surface as a 400 with the registry's
+    message rather than Starlette's bare 500."""
+    monkeypatch.setattr(host.identity_mgr, "get_disabled_standard_agents", lambda: [])
+    monkeypatch.setattr(
+        host.identity_mgr,
+        "get_agent_config",
+        lambda name: {"name": name, "type": "user_agent", "external": True},
+    )
+    monkeypatch.setattr(host.health_monitor, "get_status", lambda kind, name: {"status": "Online"})
+
+    message = (
+        "No API key configured for provider 'deepseek'. Set DEEPSEEK_API_KEY in "
+        "Admin -> LLM Providers."
+    )
+
+    async def fake_get_agent(name):
+        raise host.ProviderConfigError(message)
+
+    monkeypatch.setattr(host, "get_agent", fake_get_agent)
+
+    request = _make_request("general-agent")
+
+    with pytest.raises(host.HTTPException) as exc_info:
+        asyncio.run(host.chat_completions(request))
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == message
+
+
 def test_chat_completions_get_agent_failure_is_not_wrapped(monkeypatch):
     """`get_agent` runs before the execution try/except, so its failures must
     propagate as-is instead of being converted into a generic 500."""

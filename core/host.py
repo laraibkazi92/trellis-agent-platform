@@ -84,6 +84,7 @@ from core.agent_factory import (
     SupervisorDeps,
 )
 from core.llm_factory import warm_key_cache
+from core.llm_providers import ProviderConfigError
 from core.memory import get_memory_manager
 
 identity_mgr = get_identity_manager()
@@ -193,7 +194,13 @@ async def chat_completions(request: ChatRequest):
     if agent_health.get("status") == "Offline":
         raise HTTPException(status_code=503, detail="Agent offline")
 
-    agent = await get_agent(request.model)
+    try:
+        agent = await get_agent(request.model)
+    except ProviderConfigError as e:
+        # A missing/invalid provider credential is a caller-actionable configuration
+        # error, not an internal failure: return the registry's message so the caller
+        # sees "set DEEPSEEK_API_KEY in Admin -> LLM Providers" instead of a bare 500.
+        raise HTTPException(status_code=400, detail=str(e))
     
     history = []
     for msg in request.messages[:-1]:
