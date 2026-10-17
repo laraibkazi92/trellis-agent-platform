@@ -61,15 +61,15 @@
                     <label for="frameworkDefaultModel" class="font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Model</label>
                     <div id="frameworkDefaultModelWrap">
                     {% if model_free_text %}
-                    <input type="text" name="model" id="frameworkDefaultModel" value="{{ model_free_text_value }}" required placeholder="Model id"
+                    <input type="text" name="model" id="frameworkDefaultModel" value="{{ model_free_text_value }}" {% if selected_provider %}required{% else %}disabled{% endif %} placeholder="Model id"
                            class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
                     {% else %}
-                    <select name="model" id="frameworkDefaultModel"
+                    <select name="model" id="frameworkDefaultModel" {% if not selected_provider %}disabled{% endif %}
                             class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
                         {% for m in model_options %}
                         <option value="{{ m }}" {% if m == selected_model %}selected{% endif %}>{{ m }}</option>
                         {% endfor %}
-                        {% if defaults.model and defaults.model not in model_options %}
+                        {% if defaults.model and defaults.provider == selected_provider and defaults.model not in model_options %}
                         <option value="{{ defaults.model }}" selected>{{ defaults.model }}</option>
                         {% endif %}
                     </select>
@@ -252,7 +252,13 @@ document.addEventListener('DOMContentLoaded', function () {
         function rebuildModel(spec) {
             var models = (spec && spec.known_models) || [];
             var control;
-            if (!spec || models.length === 0) {
+            if (!spec) {
+                control = document.createElement('input');
+                control.type = 'text';
+                control.placeholder = 'Model id';
+                control.value = '';
+                control.disabled = true;
+            } else if (models.length === 0) {
                 control = document.createElement('input');
                 control.type = 'text';
                 control.required = true;
@@ -281,7 +287,9 @@ document.addEventListener('DOMContentLoaded', function () {
             if (baseUrlWrap) baseUrlWrap.classList.toggle('hidden', !supports);
             if (baseUrlInput) {
                 baseUrlInput.disabled = !supports;
-                if (spec) baseUrlInput.placeholder = spec.base_url_placeholder || spec.default_base_url || '';
+                // Never carry one provider's endpoint over to another (D7).
+                baseUrlInput.value = '';
+                baseUrlInput.placeholder = spec ? (spec.base_url_placeholder || spec.default_base_url || '') : '';
             }
         });
     }

@@ -668,6 +668,66 @@ def test_framework_defaults_openai_compatible_renders_text_input(monkeypatch):
     assert "required" in defaults
 
 
+def test_framework_defaults_nothing_stored_selects_the_none_option(monkeypatch):
+    """With no stored default the card must not invent one (G6)."""
+    html = _render_page(monkeypatch, FakeLLMIdentityManager(llm_keys={"DEEPSEEK_API_KEY": "x"}))
+    provider_select = _defaults_html(html).split('name="provider"')[1].split("</select>")[0]
+
+    assert '<option value="" selected>' in provider_select
+    # No provider option may be preselected.
+    assert 'value="deepseek" selected' not in provider_select
+    assert 'value="ollama" selected' not in provider_select
+
+
+def test_framework_defaults_unknown_stored_provider_is_flagged(monkeypatch):
+    identity = FakeLLMIdentityManager(default_provider="nope", default_model="m")
+    html = _render_page(monkeypatch, identity)
+    defaults = _defaults_html(html)
+
+    assert 'value="nope" selected' in defaults
+    assert "not configured" in defaults
+    assert "no longer configured" in defaults
+
+
+def test_framework_defaults_stored_delisted_model_option_is_provider_scoped(monkeypatch):
+    """The D14 kept-model option must only appear for its own stored provider."""
+    identity = FakeLLMIdentityManager(
+        llm_keys={"GEMINI_API_KEY": "x"},
+        default_provider="google", default_model="not-a-model",
+    )
+    defaults = _defaults_html(_render_page(monkeypatch, identity))
+    assert '<option value="not-a-model" selected>' in defaults
+
+
+def test_save_defaults_non_curated_exemption_is_provider_scoped(monkeypatch):
+    """A stored non-curated model must not be reusable for a *different* provider."""
+    identity = FakeLLMIdentityManager(
+        llm_keys={"DEEPSEEK_API_KEY": "x"},
+        default_provider="google", default_model="not-a-model",
+    )
+    _, request, resets = _post_defaults(
+        monkeypatch, identity, provider="deepseek", model="not-a-model", base_url="",
+    )
+
+    assert "not one of the curated models" in request.session["flash_msg"]
+    assert identity.default_provider == "google"  # unchanged
+    assert resets == []
+
+
+def test_save_defaults_blank_base_url_clears_a_stored_one(monkeypatch):
+    identity = FakeLLMIdentityManager(
+        default_provider="ollama", default_model="llama3.2",
+        default_base_url="http://old:11434",
+    )
+    _, request, resets = _post_defaults(
+        monkeypatch, identity, provider="ollama", model="llama3.2", base_url="",
+    )
+
+    assert identity.default_base_url is None
+    assert resets == [True]
+    assert request.session["flash_msg"] == "Framework LLM default saved."
+
+
 # --- Framework defaults (POST) -------------------------------------------------
 
 def _post_defaults(monkeypatch, identity, **fields):

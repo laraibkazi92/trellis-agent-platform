@@ -707,12 +707,23 @@ async def admin_llm_providers_page(request: Request):
         stored_spec = get_spec(stored_provider) if stored_provider else None
     except ProviderConfigError:
         stored_spec = None
-    selected_provider = stored_spec.id if stored_spec else (usable_specs[0]["id"] if usable_specs else "")
-    selected_spec = stored_spec or (get_spec(selected_provider) if selected_provider else None)
+    # No stored default => leave the None option selected; never invent a provider.
+    selected_provider = stored_provider
+    if stored_spec is not None:
+        selected_spec = stored_spec
+    elif stored_provider:
+        # Unknown stored provider: render it selected-but-flagged with a free-text model.
+        selected_spec = None
+    else:
+        selected_spec = get_spec(usable_specs[0]["id"]) if usable_specs else None
     model_options = list(selected_spec.known_models) if selected_spec else []
-    selected_model = stored_model or (selected_spec.default_model if selected_spec else "") or ""
+    selected_model = stored_model or (
+        selected_spec.default_model if (selected_spec and selected_provider) else ""
+    ) or ""
     model_free_text = selected_spec is None or not selected_spec.known_models
-    stored_provider_unusable = bool(stored_spec) and stored_spec.id not in usable_ids
+    stored_provider_unusable = bool(stored_provider) and (
+        stored_spec is None or stored_spec.id not in usable_ids
+    )
 
     flash_msg = request.session.pop("flash_msg", None)
 
@@ -735,7 +746,7 @@ async def admin_llm_providers_page(request: Request):
             "stored_provider_unusable": stored_provider_unusable,
             "has_usable": bool(usable_specs),
             "stored_base_url": stored_base_url,
-            "selected_supports_base_url": bool(selected_spec and selected_spec.supports_base_url),
+            "selected_supports_base_url": bool(selected_provider and selected_spec and selected_spec.supports_base_url),
             "selected_base_url_placeholder": (selected_spec.base_url_placeholder or selected_spec.default_base_url or "") if selected_spec else "",
         }
     )
@@ -805,10 +816,14 @@ async def save_llm_defaults(request: Request):
             request.session["flash_msg"] = f"Provider '{provider}' requires an explicit model."
             return RedirectResponse(url='/admin/llm-providers', status_code=303)
 
-    # Curated allowlist, exempting the currently-stored model (D14: a stored de-listed
-    # model is kept/flagged, not silently changed).
+    # Curated allowlist, exempting only the currently-stored (provider, model) pair
+    # (D14: a stored de-listed model is kept/flagged, not silently changed).
     stored_model = (await asyncio.to_thread(identity_mgr.get_default_llm_model) or "").strip()
-    if spec.known_models and model not in spec.known_models and model != stored_model:
+    if (
+        spec.known_models
+        and model not in spec.known_models
+        and not (model == stored_model and provider == stored_provider)
+    ):
         request.session["flash_msg"] = f"Model '{model}' is not one of the curated models for '{provider}'."
         return RedirectResponse(url='/admin/llm-providers', status_code=303)
 
