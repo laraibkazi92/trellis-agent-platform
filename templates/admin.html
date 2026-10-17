@@ -436,10 +436,6 @@
   const baseUrlInput = document.getElementById('rulesBaseUrlInput');
   if (!select || !baseUrlField || !baseUrlInput) return;
 
-  // Last value auto-filled from a provider default; only that exact value is
-  // cleared/swapped on a provider change, never an operator-typed endpoint.
-  let lastAutoBaseUrl = null;
-
   function inferSpec(modelValue) {
     const value = (modelValue || '').trim().toLowerCase();
     if (!value || value.includes('/')) return null;
@@ -459,8 +455,6 @@
       baseUrlInput.disabled = false;
       baseUrlInput.required = false;
       baseUrlInput.placeholder = 'Base URL (optional)';
-      if (baseUrlInput.value === lastAutoBaseUrl) baseUrlInput.value = '';
-      lastAutoBaseUrl = null;
       return;
     }
 
@@ -468,15 +462,10 @@
     baseUrlField.classList.toggle('hidden', !supports);
     baseUrlInput.disabled = !supports;
     baseUrlInput.required = !!spec.requires_base_url;
+    // A provider's registry default is a build-time fallback, so it is shown as a
+    // placeholder and never written into the field: pre-filling it would persist the
+    // operator's preview of the default as an explicit override.
     baseUrlInput.placeholder = spec.base_url_placeholder || spec.default_base_url || 'Optional endpoint';
-    // Swap a previously auto-filled default instead of leaking it across providers
-    // (ollama -> deepseek -> google would otherwise resubmit the ollama URL);
-    // an operator-typed endpoint is never overwritten.
-    const autoUrl = supports ? (spec.default_base_url || '') : '';
-    if (baseUrlInput.value === lastAutoBaseUrl || !baseUrlInput.value.trim()) {
-      baseUrlInput.value = autoUrl;
-    }
-    lastAutoBaseUrl = autoUrl;
   }
 
   select.addEventListener('change', updateRulesProviderFields);

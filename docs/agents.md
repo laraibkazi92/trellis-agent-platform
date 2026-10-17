@@ -167,7 +167,7 @@ independent of the agent's own `model`.
 | `openrouter` | OpenRouter | `OPENROUTER_API_KEY` | — | not supported | — |
 | `alibaba` | Alibaba (DashScope/Qwen) | `DASHSCOPE_API_KEY`, `ALIBABA_API_KEY` | — | optional | — |
 | `ollama` | Ollama (local) | — | ✅ | optional (defaults to `http://localhost:11434`) | — |
-| `litellm` | LiteLLM | `LITELLM_API_KEY` (optional) | ✅ | optional | — |
+| `litellm` | LiteLLM | `LITELLM_API_KEY` (optional) | ✅ | optional (defaults to `http://localhost:4000`) | — |
 | `huggingface` | Hugging Face | `HF_TOKEN` | — | not supported | — |
 | `openai-compatible` | OpenAI-compatible endpoint | `OPENAI_COMPATIBLE_API_KEY`, `OPENAI_API_KEY` (optional) | ✅ | **required** | — |
 
@@ -178,7 +178,7 @@ Notes:
 - `openai-compatible` points `base_url` at any OpenAI-compatible endpoint (vLLM, LiteLLM, Ollama's `/v1`, …) and is the only provider that **requires** one.
 - `ollama` is keyless and local; its endpoint defaults to `http://localhost:11434` and is always passed explicitly. It can be set per agent or globally on the LLM Providers page (`OLLAMA_BASE_URL`).
 - `openrouter` model ids must be vendor-prefixed (e.g. `openai/gpt-5`); unprefixed ids are rejected.
-- `litellm` routes to sub-providers (`openai/…`, `anthropic/…`) whose own keys LiteLLM resolves from its own environment — the documented exception to the "keys live in etcd, not the env" rule. `LITELLM_API_KEY` itself is the gateway credential and is optional.
+- `litellm` routes to sub-providers (`openai/…`, `anthropic/…`) whose own keys LiteLLM resolves from its own environment — the documented exception to the "keys live in etcd, not the env" rule. `LITELLM_API_KEY` itself is the gateway credential and is optional. With no endpoint set it defaults to `http://localhost:4000`, so set `base_url` when your LiteLLM proxy lives elsewhere (e.g. another container — `localhost` is only reachable inside the same network namespace).
 - `thinking_level` maps per provider: Gemini uses token budgets or thinking levels, Anthropic maps to `anthropic_effort`, `openai` and `vercel` map to `openai_reasoning_effort`; every other provider takes no reasoning setting and runs with the model's own defaults.
 
 Both fields can also be set in the admin agent editor.
@@ -200,9 +200,11 @@ An admin can set **one org-wide default provider + model** (and an optional `bas
 leaves **both `provider` and `model` blank** inherits that pair instead of failing.
 
 The default is applied at build time and is **never written into your YAML**. The agent editor
-shows a read-only `Inherits framework default: <Provider> / <model>` hint under the model
-field while the pair is blank, and nothing is prefilled, so "inherit" survives every edit and
-the agent keeps tracking the org default as it changes.
+shows a read-only hint under the model field while the model is blank and a default can be
+resolved — `Inherits framework default: <Provider> / <model>` when the framework default
+applies, or `Uses <Provider> default: <model>` when a pinned provider falls back to its own
+registry default — and nothing is prefilled, so "inherit" survives every edit and the agent
+keeps tracking the org default as it changes.
 
 Resolution priority, highest first:
 
@@ -223,8 +225,10 @@ Notes:
   `openai` → `gpt-5-mini`), so `provider` set + `model` blank is a valid configuration.
 - **To opt out of inheritance, set both `provider` and `model`.** A fully-specified pair is
   used verbatim and never consults the framework default.
-- **`openai-compatible` is the exception:** it has no registry default, so it always needs an
-  explicit `model` *and* an explicit `base_url`.
+- **`openai-compatible` is the exception:** it has no registry default, so a pinned
+  `openai-compatible` agent must always name a `model` — a blank one raises (case B cannot
+  resolve for it). To inherit an org-wide endpoint instead, leave `provider` blank as well
+  (case D).
 
 ---
 

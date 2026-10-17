@@ -243,6 +243,12 @@ blank inherit it; the value lives only in etcd and is never written into an agen
 - **A provider with a blank model now resolves** to that provider's registry default (e.g.
   `deepseek` → `deepseek-chat`) instead of failing. `openai-compatible` still requires an
   explicit model — it has no registry default.
+- **`litellm` endpoint default.** A `litellm` agent, workflow, or framework default with no
+  `base_url` now resolves to `http://localhost:4000`. Previously no endpoint was passed at all,
+  and the underlying OpenAI SDK silently fell back to `https://api.openai.com/v1` — sending the
+  gateway credential to a host the operator never chose. Set `base_url` explicitly when the
+  LiteLLM proxy runs elsewhere; `localhost` inside the host container is only reachable in the
+  same network namespace.
 - **Workflow schema widening.** `AgentUpdateModel.model` is now optional, so background agents
   can be saved with a blank model (inherit). This is a widening only: every existing stored
   workflow keeps its model and is unaffected.
