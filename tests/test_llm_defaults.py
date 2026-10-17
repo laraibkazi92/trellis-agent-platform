@@ -65,6 +65,13 @@ def test_row_b_same_framework_provider_inherits_model_and_base_url():
     assert eff.source == "provider-default"
 
 
+def test_row_b_same_framework_provider_keeps_an_agent_supplied_base_url():
+    # §4 base_url precedence: agent-supplied > inherited framework default.
+    defaults = FrameworkDefaults(provider="google", model="gemini-3-flash-preview", base_url="http://org:8080")
+    eff = resolve_effective_llm_config("google", "", "http://agent:9090", defaults)
+    assert eff.base_url == "http://agent:9090"
+
+
 def test_row_b_different_framework_provider_uses_registry_default_only():
     defaults = FrameworkDefaults(provider="google", model="gemini-3-flash-preview", base_url="http://gw:8080")
     eff = resolve_effective_llm_config("deepseek", "", None, defaults)
@@ -72,6 +79,12 @@ def test_row_b_different_framework_provider_uses_registry_default_only():
     assert eff.model == "deepseek-chat"
     assert eff.base_url is None  # different provider inherits nothing but the model
     assert eff.source == "provider-default"
+
+
+def test_row_b_different_provider_keeps_the_agent_base_url():
+    defaults = FrameworkDefaults(provider="google", model="gemini-3-flash-preview", base_url="http://org:8080")
+    eff = resolve_effective_llm_config("anthropic", "", "http://proxy:1", defaults)
+    assert eff.base_url == "http://proxy:1"
 
 
 def test_row_b_same_provider_without_default_model_uses_registry_default():
@@ -147,6 +160,12 @@ def test_row_e_empty_defaults_object_falls_back_to_legacy_google():
     assert (eff.provider, eff.model, eff.source) == ("google", PROVIDERS["google"].default_model, "legacy")
 
 
+def test_hand_built_defaults_without_a_model_falls_back_to_legacy_google():
+    # A malformed defaults object must not produce EffectiveLLMConfig(model=None).
+    eff = resolve_effective_llm_config(None, None, None, FrameworkDefaults(provider="deepseek"))
+    assert (eff.provider, eff.source) == ("google", "legacy")
+
+
 def test_base_url_dropped_with_a_warning_when_the_provider_rejects_it(caplog):
     with caplog.at_level(logging.WARNING, logger="core.llm_defaults"):
         eff = resolve_effective_llm_config("deepseek", "deepseek-chat", "http://ignored:1234", FrameworkDefaults())
@@ -188,6 +207,35 @@ def test_normalize_defaults_fills_the_registry_default_model(monkeypatch):
 def test_unknown_stored_provider_is_dropped(monkeypatch):
     monkeypatch.setattr(llm_defaults, "_read_raw_defaults", lambda: ("nonexistent", "whatever", None))
     assert get_framework_defaults() == FrameworkDefaults()
+
+
+def test_unknown_stored_provider_falls_through_to_legacy_google_end_to_end(monkeypatch):
+    monkeypatch.setattr(llm_defaults, "_read_raw_defaults", lambda: ("nonexistent", "whatever", None))
+    eff = resolve_effective_llm_config(None, None, None, get_framework_defaults())
+    assert (eff.provider, eff.source) == ("google", "legacy")
+
+
+def test_stored_non_curated_model_is_kept(monkeypatch):
+    # D14: a model that left known_models must not demote the stored default.
+    monkeypatch.setattr(llm_defaults, "_read_raw_defaults", lambda: ("deepseek", "deepseek-ultra", None))
+    assert get_framework_defaults() == FrameworkDefaults(provider="deepseek", model="deepseek-ultra")
+
+
+def test_stored_curated_model_is_kept_verbatim(monkeypatch):
+    # Guards against a regression that always replaces the model with spec.default_model.
+    monkeypatch.setattr(llm_defaults, "_read_raw_defaults", lambda: ("google", "gemini-2.5-pro", None))
+    assert get_framework_defaults().model == "gemini-2.5-pro"
+
+
+def test_unsupported_stored_base_url_is_dropped_not_demoted(monkeypatch, caplog):
+    monkeypatch.setattr(
+        llm_defaults, "_read_raw_defaults", lambda: ("deepseek", "deepseek-chat", "http://ignored:1")
+    )
+    with caplog.at_level(logging.WARNING, logger="core.llm_defaults"):
+        assert get_framework_defaults() == FrameworkDefaults(
+            provider="deepseek", model="deepseek-chat", base_url=None
+        )
+    assert "Ignoring unsupported base_url" in caplog.text
 
 
 def test_stored_default_missing_a_required_base_url_is_dropped(monkeypatch):
@@ -255,6 +303,49 @@ def test_warm_defaults_cache_never_raises(monkeypatch):
 
     monkeypatch.setattr(llm_defaults, "_read_raw_defaults", boom)
     warm_defaults_cache()  # must not raise
+
+
+def test_warm_defaults_cache_swallows_a_getter_failure(monkeypatch):
+    # Covers warm's own guard, not just get_framework_defaults' fail-open read.
+    def boom():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(llm_defaults, "get_framework_defaults", boom)
+    warm_defaults_cache()  # must not raise
+
+
+def test_cache_expires_after_the_ttl(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_read():
+        calls["n"] += 1
+        return ("google", "gemini-2.5-flash", None)
+
+    monkeypatch.setattr(llm_defaults, "_read_raw_defaults", fake_read)
+
+    get_framework_defaults()
+    # Force expiry instead of sleeping 30s.
+    llm_defaults._defaults_cache_expiry = 0.0
+    get_framework_defaults()
+    assert calls["n"] == 2
+
+
+def test_a_reset_during_the_read_does_not_repopulate_the_cache(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_read():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Simulate an admin save landing while the etcd read is in flight.
+            reset_defaults_cache()
+        return ("google", "gemini-2.5-flash", None)
+
+    monkeypatch.setattr(llm_defaults, "_read_raw_defaults", fake_read)
+
+    get_framework_defaults()
+    get_framework_defaults()
+    # The first (pre-reset) value must not have been cached.
+    assert calls["n"] == 2
 
 
 # --- validate_defaults (§8 rows) ---------------------------------------------

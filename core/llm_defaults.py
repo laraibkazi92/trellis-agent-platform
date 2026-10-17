@@ -26,12 +26,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULTS_CACHE_TTL_SECONDS = 30.0
 
-_defaults_cache = None
-_defaults_cache_expiry = 0.0
-_defaults_generation = 0
-_defaults_lock = threading.Lock()
-_last_logged_invalid = None
-
 
 @dataclass(frozen=True, slots=True)
 class FrameworkDefaults:
@@ -46,6 +40,13 @@ class EffectiveLLMConfig:
     model: str
     base_url: str | None
     source: Literal["explicit", "provider-default", "inferred", "framework", "legacy"]
+
+
+_defaults_cache: FrameworkDefaults | None = None
+_defaults_cache_expiry: float = 0.0
+_defaults_generation = 0
+_defaults_lock = threading.Lock()
+_last_logged_invalid: tuple[str | None, str | None, str | None] | None = None
 
 
 def reset_defaults_cache() -> None:
@@ -85,7 +86,9 @@ def validate_defaults(
 
     A blank provider means "clear/revert" and is always valid. ``check_curated``
     is disabled by the read path so a stored model that has since dropped out of
-    ``known_models`` is kept, not dropped (D14).
+    ``known_models`` is kept, not dropped (D14). Provider *usability* (credential /
+    endpoint / SDK present) is the admin route's job via ``provider_is_usable`` --
+    this function only sees the registry.
     """
     p = (provider or "").strip().lower()
     m = (model or "").strip()
@@ -150,6 +153,14 @@ def _normalize_defaults(raw: tuple[str | None, str | None, str | None]) -> Frame
         if not m:
             return invalid(f"provider '{p}' has no default model")
 
+    # A base_url the provider does not accept is dropped, not treated as invalid:
+    # silently demoting the whole triple to case E would move org traffic to Google.
+    if b and not spec.supports_base_url:
+        logger.warning(
+            "Ignoring unsupported base_url %r on framework default provider '%s'.", b, p
+        )
+        b = None
+
     errors = validate_defaults(p, m, b, check_curated=False)
     if errors:
         return invalid("; ".join(errors))
@@ -173,7 +184,7 @@ def get_framework_defaults() -> FrameworkDefaults:
     try:
         raw = _read_raw_defaults()
     except Exception as e:
-        logger.warning(f"Failed to read framework LLM defaults: {e}")
+        logger.warning("Failed to read framework LLM defaults: %s", e)
         return FrameworkDefaults()
 
     defaults = _normalize_defaults(raw)
@@ -192,7 +203,7 @@ def warm_defaults_cache() -> None:
     try:
         get_framework_defaults()
     except Exception as e:
-        logger.warning(f"Failed to warm framework LLM default cache: {e}")
+        logger.warning("Failed to warm framework LLM default cache: %s", e)
 
 
 def needs_framework_defaults(provider: str | None, model: str | None) -> bool:
@@ -216,7 +227,7 @@ def resolve_effective_llm_config(
     p = (provider or "").strip().lower()
     m = (model or "").strip()
     b = (base_url or "").strip() or None
-    has_defaults = bool(defaults and defaults.provider)
+    has_defaults = bool(defaults and defaults.provider and defaults.model)
 
     if p and m:
         eff_provider, eff_model, url = p, m, b
@@ -225,7 +236,8 @@ def resolve_effective_llm_config(
         spec = get_spec(p)
         if has_defaults and defaults.provider == p:
             eff_model = defaults.model or spec.default_model
-            url = defaults.base_url or b
+            # §4 precedence: an agent-supplied endpoint always beats the inherited one.
+            url = b or defaults.base_url
         else:
             eff_model = spec.default_model
             url = b
