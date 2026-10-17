@@ -536,8 +536,12 @@ def test_editor_never_prefills_a_provider_default_endpoint():
     field would persist it on save and pin the agent away from the endpoint it inherits."""
     html = _render_editor(_editor_config(provider="litellm", model=None))
 
+    # No auto-fill machinery, and nothing ever assigns into the endpoint input.
     assert "lastAutoBaseUrl" not in html
-    assert "$input.attr('placeholder', placeholder)" in html
+    assert "$input.val(" not in html
+    # The stored value is empty and the registry default is only previewed.
+    assert 'id="baseUrlInput" value=""' in html
+    assert "spec.base_url_placeholder || spec.default_base_url" in html
 
 
 def test_editor_provider_pill_reads_infer_from_model_not_model_name():
@@ -674,6 +678,7 @@ def test_admin_rules_card_never_prefills_a_provider_default_endpoint():
     switching ollama -> deepseek -> google can never resubmit ollama's URL."""
     html = _render_admin()
 
-    # No auto-fill machinery: nothing writes default_base_url into the input value.
+    # No auto-fill machinery, and nothing ever assigns into the endpoint input.
     assert "lastAutoBaseUrl" not in html
+    assert "baseUrlInput.value" not in html
     assert "baseUrlInput.placeholder = spec.base_url_placeholder || spec.default_base_url" in html

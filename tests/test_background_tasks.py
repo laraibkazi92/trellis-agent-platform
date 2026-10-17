@@ -320,6 +320,29 @@ def test_workflows_modal_renders_provider_base_url_and_hidden_model_inputs():
     )
 
 
+def test_workflows_modal_never_prefills_a_provider_default_endpoint():
+    """A provider's registry default is a placeholder, never a value: pre-filling it would
+    persist the endpoint on save and pin the workflow away from what it inherits."""
+    html = _render_workflows({
+        "name": _AGENT_NAME,
+        "type": "background_agent",
+        "model": None,
+        "provider": "litellm",
+        "thinking_level": "none",
+        "base_url": None,
+        "version": "0.1.0",
+        "description": "report",
+        "allowed_tools": [],
+        "a2a_access": [],
+        "trigger": {},
+    })
+
+    assert "modalAutoBaseUrls" not in html
+    # The endpoint input is only ever given a placeholder, never a value.
+    assert "input.value" not in html
+    assert "input.placeholder = spec.base_url_placeholder || spec.default_base_url" in html
+
+
 def test_workflows_modal_keeps_thinking_level_posted_for_style_none_providers():
     """Providers with thinking_style 'none' (ollama/deepseek/…) disable the select, and a
     disabled control is not submitted -- the JS mirrors its value into a hidden input
