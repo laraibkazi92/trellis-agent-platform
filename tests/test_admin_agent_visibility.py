@@ -14,6 +14,8 @@ Covers:
     keeping internal: True targets.
 """
 import asyncio
+import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -685,9 +687,15 @@ def test_editor_page_renders_registry_driven_provider_model_and_thinking_fields(
     for provider_id in _EXPECTED_PROVIDER_IDS:
         assert f'<option value="{provider_id}"' in html
 
-    # The saved deepseek selection drives the thinking-level style to "none".
-    assert '<option value="deepseek"' in html
-    assert "data-style=\"none\"" in html
+    # The thinking-level select is driven by the selected provider's `thinking_style` from the
+    # inline payload (deepseek -> "none"), not by a per-option data-* attribute.
+    payload_match = re.search(
+        r"window\.LLM_PROVIDERS = (\[.*?\]);", html, re.DOTALL
+    )
+    assert payload_match, "window.LLM_PROVIDERS payload not found in editor.html"
+    payload = {p["id"]: p for p in json.loads(payload_match.group(1))}
+    assert payload["deepseek"]["thinking_style"] == "none"
+    assert "var style = spec ? spec.thinking_style : null;" in html
 
     # The saved model is carried in the hidden field the POST actually submits.
     assert 'id="modelValue" value="deepseek-chat"' in html

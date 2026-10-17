@@ -15,6 +15,7 @@ workspace YAML, and the modal must render the registry-driven controls.
 """
 
 import asyncio
+import json
 import logging
 import re
 from types import SimpleNamespace
@@ -361,7 +362,12 @@ def test_workflows_modal_keeps_thinking_level_posted_for_style_none_providers():
         "trigger": {},
     })
 
-    assert re.search(r"<option value=\"ollama\"[^>]*data-style=\"none\"", html)
+    payload_match = re.search(
+        r"window\.LLM_PROVIDERS = (\[.*?\]);", html, re.DOTALL
+    )
+    assert payload_match, "window.LLM_PROVIDERS payload not found in background_workflows.html"
+    payload = {p["id"]: p for p in json.loads(payload_match.group(1))}
+    assert payload["ollama"]["thinking_style"] == "none"
     assert "syncThinkingMirror" in html
     assert "mirror.name = 'thinking_level';" in html
     assert "if (style === 'none')" in html

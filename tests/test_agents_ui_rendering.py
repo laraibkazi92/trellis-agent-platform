@@ -666,11 +666,21 @@ def test_admin_rules_card_base_url_field_and_posted_field_names_preserved():
 
 def test_admin_rules_card_inline_script_consumes_shared_registry_payload():
     html = _render_admin()
+    select = _rules_provider_select(html)
 
-    assert "window.LLM_PROVIDERS" in html
+    # Options are plain labels; the inline script reads provider metadata from the shared
+    # payload, not from per-option data-* attributes.
+    assert 'value="deepseek"' in select
+    assert "data-supports-url" not in select
     assert "updateRulesProviderFields" in html
-    assert "data-supports-url" in _rules_provider_select(html)
-    assert "data-requires-url" in _rules_provider_select(html)
+
+    # The payload is actually injected on this page, not merely referenced by the script.
+    payload_match = re.search(
+        r"window\.LLM_PROVIDERS = (\[.*?\]);", html, re.DOTALL
+    )
+    assert payload_match, "window.LLM_PROVIDERS payload not found in admin.html"
+    providers = json.loads(payload_match.group(1))
+    assert {p["id"] for p in providers} >= {"deepseek", "ollama", "openai-compatible"}
 
 
 def test_admin_rules_card_never_prefills_a_provider_default_endpoint():
