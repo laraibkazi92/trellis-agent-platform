@@ -14,7 +14,7 @@
     </a>
     <div class="mb-8">
         <h1 class="text-3xl font-bold tracking-tight uppercase mb-2">Global Tool Configuration</h1>
-        <p class="text-neutral-500 font-mono text-sm">Manage system-wide configurations and API keys. A value set here applies to every user and fills in whatever they have not set themselves &mdash; for tool secrets and variables, a user's own value takes precedence. Framework LLM provider keys (GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY) are stored encrypted in etcd and used by the framework only; no environment variables are read.</p>
+        <p class="text-neutral-500 font-mono text-sm">Manage system-wide configurations and API keys. A value set here applies to every user and fills in whatever they have not set themselves &mdash; for tool secrets and variables, a user's own value takes precedence. LLM provider credentials now live in <a href="/admin/llm-providers" class="underline">Admin &rarr; LLM Providers</a>; this page keeps tool/MCP secrets and variables.</p>
     </div>
 
 {% set search_placeholder = "Search global keys, type, or tools..." %}{% include "partials/_config_search_bar.html" %}

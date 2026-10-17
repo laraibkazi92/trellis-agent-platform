@@ -17,7 +17,11 @@ against synthetic agent payloads with varied `external`/`internal` flags, and as
     `internal: False` (regardless of `external`) — a blocked-delegation advisory in
     place of the snippet, since such agents are silently skipped by the A2A loop.
 """
-from core.dependencies import templates
+import json
+import re
+
+from core.dependencies import llm_providers_context, templates
+from core.llm_providers import provider_ui_specs
 
 
 class _FakeURL:
@@ -367,3 +371,188 @@ def test_admin_panel_not_shown_to_non_admin():
     modal = _configure_modal_block(html, "tool-dependent-agent")
 
     assert "Dependent Tool(s) Offline" not in modal
+
+
+# --- Editor: registry-driven provider select (llm-provider-expansion §11.8) ---
+
+def _editor_config(name="deepseek-agent", **overrides):
+    config = {
+        "name": name,
+        "version": "0.1.0",
+        "description": "A test agent.",
+        "model": "deepseek-chat",
+        "provider": "deepseek",
+        "thinking_level": "none",
+        "base_url": None,
+        "a2a_access": [],
+    }
+    config.update(overrides)
+    return config
+
+
+def _render_editor(config):
+    context = {
+        "request": _FakeRequest(),
+        "user": {"name": "Test User", "sub": "test-user"},
+        "type": "agent",
+        "name": config["name"],
+        "config": config,
+        "skills_content": "",
+        "all_agents": [config["name"]],
+        "internal_agents": {config["name"]: True},
+        "a2a_dependents": [],
+        "all_tools": [],
+        "all_mcps": [],
+        "flash_msg": None,
+        "is_admin": False,
+        "csrf_token": "test-csrf-token",
+        "app_name": "Trellis",
+        "app_accent_color": "#0055FF",
+        "app_accent_color_dark": "#3377FF",
+    }
+    context.update(llm_providers_context(None))
+    return templates.env.get_template("editor.html").render(**context)
+
+
+def test_editor_renders_registry_provider_labels_and_llm_providers_payload():
+    html = _render_editor(_editor_config(provider="deepseek", model="deepseek-chat"))
+
+    # Server-rendered <option>s carry the registry label, not the raw id.
+    assert re.search(r'<option value="deepseek"[^>]*>DeepSeek</option>', html)
+    assert re.search(r'<option value="openrouter"[^>]*>OpenRouter</option>', html)
+    # The saved provider is preselected.
+    assert re.search(r'<option value="deepseek"\s+selected', html)
+
+    # The inline payload the editor JS consumes parses as JSON with every provider.
+    payload_match = re.search(
+        r"window\.LLM_PROVIDERS = (\[.*\]);</script>", html, re.DOTALL
+    )
+    assert payload_match, "window.LLM_PROVIDERS payload not found in editor.html"
+
+    providers = json.loads(payload_match.group(1))
+    assert len(providers) == 15
+    ids = {p["id"] for p in providers}
+    assert {"deepseek", "openrouter", "google", "openai-compatible"} <= ids
+    assert all("label" in p for p in providers)
+
+
+# --- Admin -> Rules Engine card (llm-provider-expansion §9.2) ------------------
+
+_RULES_ENGINE_CONTEXT = {
+    "provider_default": "",
+    "provider_override": None,
+    "model_default": "gemini-2.5-flash",
+    "model_override": None,
+    "base_url_override": None,
+    "confidence_default": 0.7,
+    "confidence_override": None,
+    "timeout_default": 3.0,
+    "timeout_override": None,
+    "effective_timeout": 3.0,
+}
+
+
+def _render_admin(rules_engine=None):
+    context = {
+        "request": _FakeRequest(),
+        "user": {"name": "Test User", "sub": "test-user"},
+        "is_admin": True,
+        "csrf_token": "test-csrf-token",
+        "app_name": "Trellis",
+        "app_accent_color": "#0055FF",
+        "app_accent_color_dark": "#3377FF",
+        "users": [],
+        "stats": {"total_users": 0, "total_keys": 0, "total_agents": 0},
+        "feature_flags": {
+            "agent_memory_enabled": False,
+            "agent_memory_isolated_per_user": False,
+        },
+        "rules_engine": dict(rules_engine or _RULES_ENGINE_CONTEXT),
+    }
+    context.update(llm_providers_context(None))
+    return templates.env.get_template("admin.html").render(**context)
+
+
+def _rules_provider_select(html):
+    marker = 'id="rulesProviderSelect"'
+    marker_start = html.index(marker)
+    start = html.index(">", marker_start) + 1
+    end = html.index("</select>", start)
+    open_start = html.rindex("<select", 0, marker_start)
+    return html[open_start:end]
+
+
+def _rules_model_datalist(html):
+    marker = 'id="rulesModelDatalist"'
+    start = html.index(marker)
+    start = html.index(">", start) + 1
+    end = html.index("</datalist>", start)
+    return html[start:end]
+
+
+def test_admin_rules_card_renders_every_provider_label_not_raw_ids():
+    html = _render_admin()
+    specs = provider_ui_specs()
+    select = _rules_provider_select(html)
+
+    assert len(specs) == 15
+    for spec in specs:
+        assert re.search(
+            rf'<option\s+value="{re.escape(spec["id"])}"', select
+        ), f'missing provider option for {spec["id"]}'
+        assert re.search(
+            rf'<option\s+value="{re.escape(spec["id"])}"[^>]*>{re.escape(spec["label"])}</option>',
+            select,
+        ), f'option {spec["id"]} does not render the registry label {spec["label"]!r}'
+
+    # Regression: the dropdown used to show raw ids as the option text.
+    option_texts = [text.strip() for text in re.findall(r"<option[^>]*>([^<]*)</option>", select)]
+    raw_ids = {spec["id"] for spec in specs}
+    assert all(text not in raw_ids for text in option_texts)
+
+
+def test_admin_rules_card_first_option_is_the_inferred_default():
+    html = _render_admin()
+    select = _rules_provider_select(html)
+    first_option = re.search(r"<option[^>]*>[^<]*</option>", select)
+    assert first_option, "no provider options rendered"
+
+    markup = first_option.group(0)
+    assert 'value=""' in markup
+    assert "default" in markup.lower()
+    assert "inferred" in markup.lower()
+
+
+def test_admin_rules_card_model_datalist_covers_multiple_providers_without_duplicates():
+    html = _render_admin()
+    datalist = _rules_model_datalist(html)
+
+    for model in ("gemini-2.5-pro", "gpt-5", "deepseek-chat", "llama3.2"):
+        assert f'value="{model}"' in datalist, f"{model} missing from #rulesModelDatalist"
+
+    values = re.findall(r'value="([^"]*)"', datalist)
+    assert values, "datalist rendered no model options"
+    assert len(values) == len(set(values)), "duplicate model values in #rulesModelDatalist"
+
+
+def test_admin_rules_card_base_url_field_and_posted_field_names_preserved():
+    html = _render_admin()
+
+    assert 'id="rulesBaseUrlField"' in html
+    assert 'id="rulesBaseUrlInput"' in html
+    assert 'name="base_url"' in html
+
+    # The save form contract must not change with the UI rework.
+    assert 'action="/admin/rules-engine/model"' in html
+    assert 'name="provider"' in _rules_provider_select(html)
+    assert 'name="model"' in html
+    assert 'name="confidence_threshold"' in html
+
+
+def test_admin_rules_card_inline_script_consumes_shared_registry_payload():
+    html = _render_admin()
+
+    assert "window.LLM_PROVIDERS" in html
+    assert "updateRulesProviderFields" in html
+    assert "data-supports-url" in _rules_provider_select(html)
+    assert "data-requires-url" in _rules_provider_select(html)

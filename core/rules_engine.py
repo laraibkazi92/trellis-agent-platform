@@ -31,6 +31,7 @@ from core.llm_factory import (
     infer_provider,
     resolve_model,
 )
+from core.llm_providers import get_spec, provider_accepts_base_url
 from core.models import RuleEvaluationResult, is_agent_external, is_routable_agent_type
 
 logger = logging.getLogger(__name__)
@@ -194,6 +195,9 @@ RULES_CONFIDENCE_THRESHOLD = float(os.getenv("RULES_CONFIDENCE_THRESHOLD", "0.8"
 # override lookup itself fails/times out -- see _resolve_evaluation_timeout below.
 RULES_EVALUATION_TIMEOUT = float(os.getenv("RULES_EVALUATION_TIMEOUT", "2.5"))
 RULES_EVALUATION_MODEL = os.getenv("RULES_EVALUATION_MODEL", "gemini-2.5-flash")
+# Accepts any provider id from the registry in core/llm_providers.py (e.g. google,
+# openai, anthropic, deepseek, ollama, openai-compatible, ...); empty means infer
+# from RULES_EVALUATION_MODEL.
 RULES_EVALUATION_PROVIDER = os.getenv("RULES_EVALUATION_PROVIDER", "")
 RULES_EVALUATION_BASE_URL = os.getenv("RULES_EVALUATION_BASE_URL", "")
 
@@ -360,6 +364,18 @@ def _build_user_prompt(catalog: str, query: str) -> str:
     )
 
 
+def _evaluation_thinking_style(provider: Optional[str]) -> str:
+    """Registry thinking style for ``provider``; "none" for unknown ids.
+
+    Unknown ids are swallowed here on purpose -- the model resolver surfaces the
+    real configuration error, so this helper only decides whether to pin effort.
+    """
+    try:
+        return get_spec(provider or "").thinking_style
+    except ProviderConfigError:
+        return "none"
+
+
 def _build_evaluation_agent(
     api_key: Optional[str] = None,
     provider: Optional[str] = None,
@@ -381,17 +397,28 @@ def _build_evaluation_agent(
     if provider is None:
         provider = _resolve_evaluation_provider()
         base_url = _resolve_evaluation_base_url()
+    if base_url and not provider_accepts_base_url(provider):
+        # Stale RULES_EVALUATION_BASE_URL for a provider that rejects endpoints
+        # would otherwise fail every evaluation instead of failing open.
+        logger.warning(
+            "Ignoring RULES_EVALUATION_BASE_URL for provider '%s' (endpoint not supported).",
+            provider,
+        )
+        base_url = None
     model_name = _resolve_evaluation_model()
     model = resolve_model(provider, model_name, base_url, api_key=api_key)
-    if provider == "google":
+    if _evaluation_thinking_style(provider) == "google":
         # Gemini thinking is explicitly zeroed out to keep the decider deterministic
         # and cheap (preserved from the pre-multi-provider implementation).
         model_settings: Optional[ModelSettings] = GoogleModelSettings(
             google_thinking_config={"thinking_budget": 0, "include_thoughts": False}
         )
-    elif provider in ("openai", "anthropic"):
-        # Their reasoning models default to medium effort, which blows the
-        # sub-3s evaluation timeout; pin the cheapest effort instead.
+    elif _evaluation_thinking_style(provider) in ("openai-effort", "anthropic"):
+        # Reasoning models on OpenAI-effort / anthropic thinking providers default
+        # to medium effort, which blows the sub-3s evaluation timeout; pin the
+        # cheapest effort instead. Providers with thinking_style "none" (generic
+        # OpenAI-compatible endpoints, DeepSeek, Ollama, ...) keep no settings --
+        # an effort hint there would be rejected by the endpoint.
         model_settings = build_model_settings(provider, model_name, "low")
     else:
         model_settings = None

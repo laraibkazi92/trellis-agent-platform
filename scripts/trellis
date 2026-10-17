@@ -81,7 +81,7 @@ def cmd_init(args) -> int:
         print("!!! ADMIN_USERS, ...) before starting the stack.")
         print("!!! LLM provider API keys (agents, Rules Engine, embeddings) are NOT")
         print("!!! read from the environment — configure them in the Admin UI")
-        print("!!! -> Global Tool Configuration after first boot (stored")
+        print("!!! -> LLM Providers after first boot (stored")
         print("!!! Fernet-encrypted in etcd). GEMINI_API_KEY is Hindsight-only.")
         print()
     print("Next steps:")

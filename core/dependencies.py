@@ -3,11 +3,13 @@
 
 import os
 import re
+import json
 import time
 import asyncio
 from fastapi.templating import Jinja2Templates
 from authlib.integrations.starlette_client import OAuth
 from core.auth import get_identity_manager
+from core.llm_providers import provider_ui_specs
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -141,7 +143,20 @@ class CSRFRoute(APIRoute):
             return await original_route_handler(request)
         return custom_route_handler
 
-templates = Jinja2Templates(directory=templates_dir, context_processors=[admin_context, whitelabel_context, csrf_context])
+# Single injection point for the LLM provider registry: every template rendered through
+# `templates` gets `llm_providers` (server-side <option>s) and `llm_providers_json`
+# (inline-JS payload). The specs are pure and static, so they are computed once at import
+# and add no etcd read / SDK import to any render. Per-provider `configured` state is
+# deliberately NOT here -- it needs etcd; only /admin/llm-providers fetches the store.
+_LLM_PROVIDER_UI_SPECS = provider_ui_specs()
+_LLM_PROVIDERS_JSON = json.dumps(_LLM_PROVIDER_UI_SPECS)
+
+
+def llm_providers_context(request):
+    return {"llm_providers": _LLM_PROVIDER_UI_SPECS, "llm_providers_json": _LLM_PROVIDERS_JSON}
+
+
+templates = Jinja2Templates(directory=templates_dir, context_processors=[admin_context, whitelabel_context, csrf_context, llm_providers_context])
 
 # OAuth setup
 OIDC_CLIENT_ID = os.getenv("OIDC_CLIENT_ID")

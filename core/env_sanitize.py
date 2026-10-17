@@ -4,6 +4,8 @@
 import os
 from typing import Optional
 
+from core.llm_providers import FRAMEWORK_PROVIDER_KEY_ENV
+
 # Framework bootstrap secrets that must never leak into a spawned subprocess.
 #
 # This is a denylist of the framework's OWN reserved names. It cannot enumerate
@@ -11,15 +13,16 @@ from typing import Optional
 # secrets configured via the `env:<NAME>` form (core/background/webhooks.py),
 # which read any env var by name. Prefer the etcd-backed `secret:<name>` form for
 # those; env-based webhook secrets remain a documented exception to this scrub.
+# Provider credential names are derived from the registry (core/llm_providers.py).
+# OLLAMA_BASE_URL stays out: it is an endpoint, not a credential, and build_provider always passes it explicitly.
 FRAMEWORK_SECRET_ENV: frozenset[str] = frozenset({
     "SESSION_SECRET", "ENCRYPTION_KEY",
     "GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET",
     "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET", "OIDC_METADATA_URL",
     "ADMIN_USERS", "ALLOWED_DOMAINS",
-    "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
     "HINDSIGHT_API_LLM_API_KEY", "HINDSIGHT_LLM_API_KEY",
     "HINDSIGHT_API_EMBEDDINGS_GEMINI_API_KEY",
-})
+}) | FRAMEWORK_PROVIDER_KEY_ENV
 
 
 def sanitized_env(base: Optional[dict] = None) -> dict:

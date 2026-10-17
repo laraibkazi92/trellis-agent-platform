@@ -63,7 +63,7 @@ docker compose pull && docker compose up -d      # prebuilt image
 
 Orgs pin the engine to a release tag, starting with `v0.2.0` (set `TRELLIS_IMAGE` in `.env`), while `main` tracks upstream development.
 
-Every rebuild syncs `workspace/` into etcd, so new agents and tools go live on the next one. Configure your LLM provider keys in the Dashboard under **Admin → Global Tool Configuration**. They are stored encrypted in etcd and serve Google (Gemini), OpenAI, Anthropic, or any OpenAI-compatible endpoint. Then browse to http://localhost and create an API key, or set `DEV_MODE=true` in `.env` to run without authentication.
+Every rebuild syncs `workspace/` into etcd, so new agents and tools go live on the next one. Configure your LLM provider keys in the Dashboard under **Admin → LLM Providers** — one card per provider, covering 15 of them: Google (Gemini), OpenAI, Anthropic, DeepSeek, OpenRouter, Ollama, any OpenAI-compatible endpoint, and more. They are stored encrypted in etcd and never read from the environment. Then browse to http://localhost and create an API key, or set `DEV_MODE=true` in `.env` to run without authentication.
 
 ## Call an agent
 

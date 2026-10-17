@@ -511,3 +511,209 @@ def test_save_agent_dual_writes_workspace_files(monkeypatch):
     agent_dir = workspace_io.WORKSPACE_DIR / "agents" / "data-parser"
     assert yaml.safe_load((agent_dir / "config.yaml").read_text())["name"] == "data-parser"
     assert (agent_dir / "skills.md").read_text() == "do work"
+
+
+# --- Registry-driven provider/model (llm-provider-expansion §11.7) --------------
+
+_EXPECTED_PROVIDER_IDS = (
+    "google", "openai", "anthropic", "deepseek", "fireworks", "together",
+    "moonshotai", "vercel", "zai", "openrouter", "alibaba", "ollama",
+    "litellm", "huggingface", "openai-compatible",
+)
+
+
+def test_save_agent_persists_deepseek_provider_and_model_to_etcd_and_workspace(monkeypatch):
+    """A non-Google provider picked in the editor must survive both persistence
+    layers: the etcd config dict and the workspace config.yaml that the next
+    rebuild's registry sync re-applies."""
+    monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
+
+    fake_identity = FakeIdentityManagerAdmin({"data-parser": {"name": "data-parser"}})
+    monkeypatch.setattr(admin, "identity_mgr", fake_identity)
+
+    form_data = _form([
+        ("provider", "deepseek"),
+        ("model", "deepseek-chat"),
+        ("thinking_level", "none"),
+        ("version", "0.1.0"),
+        ("description", "worker"),
+        ("skills_content", "do work"),
+    ])
+    request = FakeRequest(session=_admin_session(), form_data=form_data)
+
+    asyncio.run(admin.save_agent(request, "data-parser"))
+
+    saved = fake_identity.saved_configs["data-parser"]
+    assert saved["provider"] == "deepseek"
+    assert saved["model"] == "deepseek-chat"
+
+    from core import workspace_io
+
+    agent_dir = workspace_io.WORKSPACE_DIR / "agents" / "data-parser"
+    on_disk = yaml.safe_load((agent_dir / "config.yaml").read_text())
+    assert on_disk["provider"] == "deepseek"
+    assert on_disk["model"] == "deepseek-chat"
+
+
+def test_save_agent_rejects_unknown_provider_with_flash_and_no_write(monkeypatch):
+    monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
+
+    fake_identity = FakeIdentityManagerAdmin({"data-parser": {"name": "data-parser"}})
+    monkeypatch.setattr(admin, "identity_mgr", fake_identity)
+
+    form_data = _form([
+        ("provider", "not-a-provider"),
+        ("model", "deepseek-chat"),
+        ("thinking_level", "none"),
+        ("version", "0.1.0"),
+        ("description", "worker"),
+        ("skills_content", "do work"),
+    ])
+    request = FakeRequest(session=_admin_session(), form_data=form_data)
+
+    response = asyncio.run(admin.save_agent(request, "data-parser"))
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/editor/agent/data-parser"
+    assert "Invalid provider 'not-a-provider'" in request.session["flash_msg"]
+    assert fake_identity.saved_configs == {}
+
+    from core import workspace_io
+
+    assert not (workspace_io.WORKSPACE_DIR / "agents" / "data-parser" / "config.yaml").exists()
+
+
+def test_save_agent_rejects_openai_compatible_without_base_url(monkeypatch):
+    """A provider that requires an endpoint must not be saved without one."""
+    monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
+
+    fake_identity = FakeIdentityManagerAdmin({"data-parser": {"name": "data-parser"}})
+    monkeypatch.setattr(admin, "identity_mgr", fake_identity)
+
+    form_data = _form([
+        ("provider", "openai-compatible"),
+        ("model", "llama3.2"),
+        ("thinking_level", "none"),
+        ("version", "0.1.0"),
+        ("description", "worker"),
+        ("skills_content", "do work"),
+    ])
+    request = FakeRequest(session=_admin_session(), form_data=form_data)
+
+    response = asyncio.run(admin.save_agent(request, "data-parser"))
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/editor/agent/data-parser"
+    assert "requires a base_url" in request.session["flash_msg"]
+    assert fake_identity.saved_configs == {}
+
+
+def test_editor_page_renders_registry_driven_provider_model_and_thinking_fields(monkeypatch):
+    """The rewritten agent editor branch renders the hidden model value, the
+    registry-driven model/provider selects, the base_url container, and the
+    thinking-level select, all fed by the llm_providers context processor."""
+    monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
+
+    agent_configs = {
+        "deepseek-agent": {
+            "name": "deepseek-agent",
+            "description": "d",
+            "model": "deepseek-chat",
+            "provider": "deepseek",
+            "a2a_access": [],
+        },
+    }
+    fake_identity = FakeIdentityManagerAdmin(agent_configs)
+    monkeypatch.setattr(admin, "identity_mgr", fake_identity)
+
+    request = FakeRequest(session=_admin_session())
+    response = asyncio.run(admin.editor_page(request, "agent", "deepseek-agent"))
+
+    assert response.status_code == 200
+    html = response.body.decode()
+
+    for element_id in (
+        "modelValue",
+        "modelSelect",
+        "modelCustomInput",
+        "baseUrlField",
+        "providerSelect",
+        "thinkingLevelSelect",
+    ):
+        assert f'id="{element_id}"' in html
+
+    # The inline JS payload is injected by core.dependencies.llm_providers_context.
+    assert "window.LLM_PROVIDERS = " in html
+
+    # Every registry provider is offered as an <option>.
+    assert len(_EXPECTED_PROVIDER_IDS) == 15
+    for provider_id in _EXPECTED_PROVIDER_IDS:
+        assert f'<option value="{provider_id}"' in html
+
+    # The saved deepseek selection drives the thinking-level style to "none".
+    assert '<option value="deepseek"' in html
+    assert "data-style=\"none\"" in html
+
+    # The saved model is carried in the hidden field the POST actually submits.
+    assert 'id="modelValue" value="deepseek-chat"' in html
+
+
+def test_save_agent_empty_provider_stays_none(monkeypatch):
+    """Auto/inferred provider must still save as None without tripping validation."""
+    monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
+    fake_identity = FakeIdentityManagerAdmin({"data-parser": {"name": "data-parser"}})
+    monkeypatch.setattr(admin, "identity_mgr", fake_identity)
+
+    request = FakeRequest(session=_admin_session(), form_data=_form([
+        ("provider", ""),
+        ("model", "gemini-2.5-flash"),
+        ("thinking_level", "none"),
+        ("version", "0.1.0"),
+        ("description", "worker"),
+        ("skills_content", "do work"),
+    ]))
+    asyncio.run(admin.save_agent(request, "data-parser"))
+
+    assert fake_identity.saved_configs["data-parser"]["provider"] is None
+
+
+def test_save_agent_rejects_base_url_for_provider_that_does_not_accept_one(monkeypatch):
+    monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
+    fake_identity = FakeIdentityManagerAdmin({"data-parser": {"name": "data-parser"}})
+    monkeypatch.setattr(admin, "identity_mgr", fake_identity)
+
+    request = FakeRequest(session=_admin_session(), form_data=_form([
+        ("provider", "deepseek"),
+        ("model", "deepseek-chat"),
+        ("base_url", "http://stale:1234"),
+        ("thinking_level", "none"),
+        ("version", "0.1.0"),
+        ("description", "worker"),
+        ("skills_content", "do work"),
+    ]))
+    response = asyncio.run(admin.save_agent(request, "data-parser"))
+
+    assert response.status_code == 303
+    assert "does not accept a base_url" in request.session["flash_msg"]
+    assert fake_identity.saved_configs == {}
+
+
+def test_save_agent_auto_provider_accepts_base_url_for_inferred_model(monkeypatch):
+    monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
+    fake_identity = FakeIdentityManagerAdmin({"data-parser": {"name": "data-parser"}})
+    monkeypatch.setattr(admin, "identity_mgr", fake_identity)
+
+    request = FakeRequest(session=_admin_session(), form_data=_form([
+        ("provider", ""),
+        ("model", "qwen2.5"),
+        ("base_url", "http://box:11434"),
+        ("thinking_level", "n/a"),
+        ("version", "0.1.0"),
+        ("description", "worker"),
+        ("skills_content", "do work"),
+    ]))
+    asyncio.run(admin.save_agent(request, "data-parser"))
+
+    saved = fake_identity.saved_configs["data-parser"]
+    assert saved["provider"] is None
+    assert saved["base_url"] == "http://box:11434"

@@ -11,7 +11,13 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import templates, CSRFRoute
 from core.auth import get_identity_manager
 from core.health import HealthMonitor
-from core.llm_factory import LLM_PROVIDER_KEY_NAMES
+from core.llm_factory import ProviderConfigError, infer_provider
+from core.llm_providers import (
+    FRAMEWORK_PROVIDER_KEY_ENV,
+    provider_accepts_base_url,
+    provider_requires_base_url,
+    provider_ui_specs,
+)
 from core.models import Identity, IdentityType, is_agent_internal, coerce_bool_flag, ALLOWED_PROVIDERS
 from core.rules_engine import (
     RULES_EVALUATION_TIMEOUT as RULES_EVALUATION_TIMEOUT_DEFAULT,
@@ -50,13 +56,19 @@ _EMBEDDING_MODEL_WARNING = (
     "re-embedded (rebuild / registry sync) before semantic search works again."
 )
 
-# Framework-level LLM provider API keys, managed under Admin -> Global Tool
-# Configuration. They are stored encrypted in etcd via IdentityManager (never in
-# environment variables). Derived from core.llm_factory's LLM_PROVIDER_KEY_NAMES
-# (first/canonical name per provider, deduped), so adding a provider there surfaces
-# here automatically. OPENAI_API_KEY also serves openai-compatible providers.
-_LLM_PROVIDER_KEY_NAMES = tuple(dict.fromkeys(names[0] for names in LLM_PROVIDER_KEY_NAMES.values()))
-_LLM_PROVIDER_TOOL_LABEL = "Framework (LLM Providers)"
+# Every key name the Admin -> LLM Providers page can write or clear: all accepted
+# credential names (canonical + aliases) and the global base_url key (if any) of
+# each provider. Used as the delete whitelist.
+# The page writes the same encrypted /identities/system/system/llm_keys store as
+# the legacy configuration table, so the etcd watch in
+# core.agent_factory._on_llm_keys_change already resets the key cache and evicts
+# agents after a save.
+_LLM_PROVIDER_PAGE_KEY_NAMES = frozenset(
+    name
+    for spec in provider_ui_specs()
+    for name in (*spec["key_names"], spec["base_url_key"])
+    if name
+)
 
 
 def sanitize_name(name: str) -> str:
@@ -175,7 +187,6 @@ async def admin_dashboard(request: Request):
             "branding": branding,
             "branding_keys": identity_mgr.BRANDING_KEYS,
             "tunables": tunables_ctx,
-            "allowed_providers": sorted(ALLOWED_PROVIDERS),
             "flash_msg": flash_msg
         }
     )
@@ -255,6 +266,32 @@ async def set_rules_engine_model(
         )
         return RedirectResponse(url='/admin', status_code=303)
 
+    # Resolve the effective provider so the (provider, base_url) pair can be
+    # validated and a known, non-inferable model (llama3.2, openai/gpt-5) does not
+    # silently fail every evaluation.
+    from core.llm_providers import PROVIDERS
+    model_clean = model.strip()
+    effective_provider = provider.lower()
+    if not effective_provider and model_clean:
+        try:
+            effective_provider = infer_provider(model_clean)
+        except ProviderConfigError:
+            effective_provider = next(
+                (spec.id for spec in PROVIDERS.values() if model_clean in spec.known_models), ""
+            )
+
+    stripped_url = base_url.strip()
+    if provider_requires_base_url(effective_provider) and not stripped_url:
+        request.session["flash_msg"] = (
+            f"Provider '{effective_provider}' requires a base_url pointing at the endpoint."
+        )
+        return RedirectResponse(url='/admin', status_code=303)
+    if stripped_url and effective_provider and not provider_accepts_base_url(effective_provider):
+        request.session["flash_msg"] = (
+            f"Provider '{effective_provider}' does not accept a base_url; remove it."
+        )
+        return RedirectResponse(url='/admin', status_code=303)
+
     raw_threshold = confidence_threshold.strip()
     threshold: Optional[float] = None
     if raw_threshold:
@@ -268,13 +305,13 @@ async def set_rules_engine_model(
             return RedirectResponse(url='/admin', status_code=303)
 
     # Empty submission for a field means "clear the override", reverting to its env default.
-    if provider:
-        await asyncio.to_thread(identity_mgr.set_rules_evaluation_provider, provider)
+    if effective_provider:
+        await asyncio.to_thread(identity_mgr.set_rules_evaluation_provider, effective_provider)
     else:
         await asyncio.to_thread(identity_mgr.clear_config, "rules_evaluation_provider")
 
-    if base_url.strip():
-        await asyncio.to_thread(identity_mgr.set_rules_evaluation_base_url, base_url.strip())
+    if stripped_url:
+        await asyncio.to_thread(identity_mgr.set_rules_evaluation_base_url, stripped_url)
     else:
         await asyncio.to_thread(identity_mgr.clear_config, "rules_evaluation_base_url")
 
@@ -491,27 +528,6 @@ async def admin_configuration_page(request: Request):
         
     items.sort(key=lambda x: x["key"].lower())
 
-    # Framework LLM provider keys form a distinct leading group. Skip any key a
-    # tool/MCP already declares so it renders exactly once (keep the tool entry).
-    llm_provider_keys = await asyncio.to_thread(identity_mgr.get_llm_provider_keys)
-    already_declared = set(required_secrets) | set(required_variables)
-    llm_items = []
-    for llm_key in _LLM_PROVIDER_KEY_NAMES:
-        if llm_key in already_declared:
-            continue
-        configured = llm_key in llm_provider_keys
-        llm_items.append({
-            "key": llm_key,
-            "type": "secret",
-            "label": "LLM",
-            "tools": [_LLM_PROVIDER_TOOL_LABEL],
-            "is_global": configured,
-            "value": "",
-            "placeholder": "******** (leave blank to keep current)" if configured
-                           else "Set provider key (stored encrypted in etcd)",
-        })
-    items = llm_items + items
-
     flash_msg = request.session.pop("flash_msg", None)
 
     return templates.TemplateResponse(
@@ -573,8 +589,6 @@ async def save_admin_configuration(request: Request):
     system_identity = Identity(id="system", type=IdentityType.SYSTEM)
     current_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
     current_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
-    current_llm_keys = await asyncio.to_thread(identity_mgr.get_llm_provider_keys)
-    llm_keys = dict(current_llm_keys)
     
     secrets_updated = False
     variables_updated = False
@@ -597,23 +611,26 @@ async def save_admin_configuration(request: Request):
                 del current_variables[key]
                 variables_updated = True
 
-    # Framework LLM provider keys live in their own encrypted store; a non-empty
-    # value sets the key, an empty value leaves the stored key unchanged.
-    for llm_key in _LLM_PROVIDER_KEY_NAMES:
-        if llm_key not in form:
-            continue
-        val_str = str(form.get(llm_key)).strip()
-        if val_str:
-            llm_keys[llm_key] = val_str
-
     if secrets_updated:
         await asyncio.to_thread(identity_mgr.save_identity_config, system_identity, "secrets", current_secrets)
     if variables_updated:
         await asyncio.to_thread(identity_mgr.save_identity_config, system_identity, "variables", current_variables)
-    if llm_keys != current_llm_keys:
-        await asyncio.to_thread(identity_mgr.save_llm_provider_keys, llm_keys)
-    
-    request.session["flash_msg"] = "Global configurations and secrets saved successfully."
+
+    # Provider credentials moved to Admin -> LLM Providers. A stale form (opened
+    # before the upgrade) would otherwise look like it saved; say so explicitly.
+    ignored_llm_keys = sorted(
+        key for key in form
+        if key in FRAMEWORK_PROVIDER_KEY_ENV
+        and key not in known_secrets
+        and key not in known_variables
+    )
+    message = "Global configurations and secrets saved successfully."
+    if ignored_llm_keys:
+        message += (
+            " LLM provider keys are managed in Admin -> LLM Providers; ignored: "
+            + ", ".join(ignored_llm_keys) + "."
+        )
+    request.session["flash_msg"] = message
     return RedirectResponse(url='/admin/configuration', status_code=303)
 
 @router.post("/admin/configuration/delete")
@@ -625,13 +642,6 @@ async def delete_admin_configuration_key(request: Request, secret_key: str = For
     current_secrets = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "secrets")
     current_variables = await asyncio.to_thread(identity_mgr.get_identity_config, system_identity, "variables")
 
-    if secret_key in _LLM_PROVIDER_KEY_NAMES:
-        llm_keys = dict(await asyncio.to_thread(identity_mgr.get_llm_provider_keys))
-        if secret_key in llm_keys:
-            del llm_keys[secret_key]
-            await asyncio.to_thread(identity_mgr.save_llm_provider_keys, llm_keys)
-            request.session["flash_msg"] = f"Global secret '{secret_key}' removed."
-
     if secret_key in current_secrets:
         del current_secrets[secret_key]
         await asyncio.to_thread(identity_mgr.save_identity_config, system_identity, "secrets", current_secrets)
@@ -642,6 +652,83 @@ async def delete_admin_configuration_key(request: Request, secret_key: str = For
         request.session["flash_msg"] = f"Global variable '{secret_key}' removed."
         
     return RedirectResponse(url='/admin/configuration', status_code=303)
+
+@router.get("/admin/llm-providers", response_class=HTMLResponse)
+async def admin_llm_providers_page(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    user = request.session.get('user')
+    llm_keys = await asyncio.to_thread(identity_mgr.get_llm_provider_keys)
+
+    cards = []
+    for spec in provider_ui_specs():
+        # An alias (GOOGLE_API_KEY, OPENAI_API_KEY, …) may be the stored name, so
+        # remember which one is actually present: the Clear button must target it.
+        configured_key = next((name for name in spec["key_names"] if llm_keys.get(name)), None)
+        base_url_value = llm_keys.get(spec["base_url_key"]) if spec["base_url_key"] else None
+        cards.append({
+            **spec,
+            "configured": configured_key is not None,
+            "configured_key": configured_key,
+            "base_url_value": base_url_value,
+            "value_preview": None,
+        })
+
+    flash_msg = request.session.pop("flash_msg", None)
+
+    return templates.TemplateResponse(
+        request=request,
+        name="admin_llm_providers.html",
+        context={
+            "user": user,
+            "cards": cards,
+            "flash_msg": flash_msg,
+        }
+    )
+
+@router.post("/admin/llm-providers")
+async def save_llm_providers(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    form = await request.form()
+    current = dict(await asyncio.to_thread(identity_mgr.get_llm_provider_keys))
+    updated = dict(current)
+
+    for spec in provider_ui_specs():
+        for name in (spec["canonical_key"], spec["base_url_key"]):
+            if not name or name not in form:
+                continue
+            value = str(form.get(name)).strip()
+            if value:  # blank keeps the stored value
+                updated[name] = value
+
+    if updated != current:
+        await asyncio.to_thread(identity_mgr.save_llm_provider_keys, updated)
+        request.session["flash_msg"] = "LLM provider settings saved."
+    else:
+        request.session["flash_msg"] = "No changes to LLM provider settings."
+    return RedirectResponse(url='/admin/llm-providers', status_code=303)
+
+@router.post("/admin/llm-providers/delete")
+async def delete_llm_provider_key(request: Request, key_name: str = Form(...)):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    if key_name not in _LLM_PROVIDER_PAGE_KEY_NAMES:
+        request.session["flash_msg"] = "Unknown LLM provider key."
+        return RedirectResponse(url='/admin/llm-providers', status_code=303)
+
+    keys = dict(await asyncio.to_thread(identity_mgr.get_llm_provider_keys))
+    if key_name in keys:
+        del keys[key_name]
+        await asyncio.to_thread(identity_mgr.save_llm_provider_keys, keys)
+        request.session["flash_msg"] = f"'{key_name}' removed."
+    else:
+        request.session["flash_msg"] = f"'{key_name}' was not set."
+
+    return RedirectResponse(url='/admin/llm-providers', status_code=303)
 
 @router.get("/editor/{type}/{name}", response_class=HTMLResponse)
 async def editor_page(request: Request, type: str, name: str):
@@ -800,6 +887,27 @@ async def save_agent(request: Request, name: str):
         return RedirectResponse(url=f'/editor/agent/{safe_name}', status_code=303)
     config["provider"] = provider or None
     config["base_url"] = (form.get("base_url") or "").strip() or None
+    # Auto provider: validate an explicit endpoint against the provider the model
+    # implies, otherwise a legitimate Auto + base_url combination is unsaveable.
+    validation_provider = provider
+    if not validation_provider and config["base_url"]:
+        try:
+            validation_provider = infer_provider(config["model"] or "")
+        except ProviderConfigError:
+            request.session["flash_msg"] = (
+                "Cannot infer a provider for the supplied base_url; select a provider explicitly."
+            )
+            return RedirectResponse(url=f'/editor/agent/{safe_name}', status_code=303)
+    if provider_requires_base_url(validation_provider) and not config["base_url"]:
+        request.session["flash_msg"] = (
+            f"Provider '{validation_provider}' requires a base_url pointing at the endpoint."
+        )
+        return RedirectResponse(url=f'/editor/agent/{safe_name}', status_code=303)
+    if config["base_url"] and not provider_accepts_base_url(validation_provider):
+        request.session["flash_msg"] = (
+            f"Provider '{validation_provider}' does not accept a base_url; remove it."
+        )
+        return RedirectResponse(url=f'/editor/agent/{safe_name}', status_code=303)
     
     config["version"] = form.get("version")
     config["description"] = form.get("description")

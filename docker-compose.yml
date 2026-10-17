@@ -69,8 +69,8 @@ services:
       <<: *common-env
       HOST_URL: http://host:8000
       HUB_URL: http://hub:8001/mcp
-      # Framework LLM provider keys (google/openai/anthropic) are NOT set here: configure
-      # them in the Admin UI -> Global Tool Configuration, stored Fernet-encrypted in etcd.
+      # Framework LLM provider keys (one per provider in the registry) are NOT set here:
+      # configure them in the Admin UI -> LLM Providers, stored Fernet-encrypted in etcd.
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
       REDIS_URL: redis://redis:6379/0
       HINDSIGHT_URL: http://hindsight:8888
@@ -215,8 +215,8 @@ services:
       <<: *common-env
       HOST_URL: http://host:8000
       HUB_URL: http://hub:8001/mcp
-      # Framework LLM provider keys (google/openai/anthropic) are NOT set here: configure
-      # them in the Admin UI -> Global Tool Configuration, stored Fernet-encrypted in etcd.
+      # Framework LLM provider keys (one per provider in the registry) are NOT set here:
+      # configure them in the Admin UI -> LLM Providers, stored Fernet-encrypted in etcd.
       REDIS_URL: redis://redis:6379/0
       HINDSIGHT_URL: http://hindsight:8888
       # Decrypts identity-scoped secrets for background agents/scripts.

@@ -248,8 +248,8 @@ Admin Dashboard -> Trellis Rules Engine:
 | `RULES_CONFIDENCE_THRESHOLD` | `0.8` | Minimum confidence to honor a rule lock. |
 | `RULES_EVALUATION_TIMEOUT` | `2.5` (seconds) | Hard timeout on the LLM call before failing open. |
 | `RULES_EVALUATION_MODEL` | `gemini-2.5-flash` | Model used for the structured decider. |
-| `RULES_EVALUATION_PROVIDER` | *(inferred)* | Provider for the decider. Omitted/empty infers from the model-name prefix (`gemini*` → google, `claude*` → anthropic, `gpt-*`/`o1*`/`o3*`/`o4*`/`chatgpt*` → openai). |
-| `RULES_EVALUATION_BASE_URL` | *(none)* | Custom endpoint for the decider (used by `openai-compatible` providers). |
+| `RULES_EVALUATION_PROVIDER` | *(inferred)* | Provider for the decider — any id from **Admin → LLM Providers**. Omitted/empty infers from the model-name prefix (`gemini*` → google, `claude*` → anthropic, `gpt-*`/`o1*`/`o3*`/`o4*`/`chatgpt*` → openai, `deepseek*`, `kimi*` → moonshotai, `glm*` → zai, `qwen*` → alibaba). Vendor-prefixed model ids (containing `/`) require an explicit provider. |
+| `RULES_EVALUATION_BASE_URL` | *(none)* | Custom endpoint for the decider. Required for `openai-compatible`; only providers that accept an endpoint support it. |
 
 The **Admin Dashboard -> Trellis Rules Engine** is the primary editing surface for the decider:
 timeout (existing field) plus model, provider, base_url and confidence threshold. All four are

@@ -166,7 +166,7 @@ class IdentityManager:
             return {k: v for k, v in resolved.items() if k in keys}
         return resolved
 
-    # --- Framework LLM provider keys (Admin Dashboard -> Global Tool Configuration) ---
+    # --- Framework LLM provider keys (Admin -> LLM Providers) ---
     # Stored encrypted at /identities/system/system/llm_keys. Deliberately NOT in the
     # "secrets" category: tool/workflow subprocesses receive the system "secrets" merge
     # via get_resolved_config, and the framework's private LLM keys must never be
