@@ -14,7 +14,7 @@ from asyncache import cached
 from cachetools import TTLCache
 from fastmcp import FastMCP, Context
 from mcp.types import ToolAnnotations
-from core.auth import AuthMiddleware, get_identity_manager, auth_token_var, user_id_var
+from core.auth import AuthMiddleware, get_identity_manager, auth_token_var, user_id_var, DEV_MODE_AUTH_TOKEN
 from core.devmode import configure_cors, enforce_dev_mode_safety
 from core.discovery import discover_agents, is_agent_configured, is_tool_configured
 from core.agent_search import search_agents as _search_agents_ranked
@@ -416,8 +416,11 @@ async def use_agent(ctx: Context, agent_name: str, prompt: str) -> str:
             logger.error(f"Error checking agent configuration for '{agent_name}': {e}", exc_info=True)
             return f"SYSTEM: Error checking agent configuration for '{agent_name}'. Please try again later."
 
+    # DEV_MODE_AUTH_TOKEN is a marker, not a credential -- forwarding it makes the host
+    # reject the call with 401 (see core.auth). Omit the header so the host's own
+    # DEV_MODE bypass applies instead.
     headers = {}
-    if token:
+    if token and token != DEV_MODE_AUTH_TOKEN:
         headers["Authorization"] = f"Bearer {token}"
 
     await ctx.report_progress(2, 3, message=f"Calling {agent_name}...")
@@ -436,7 +439,19 @@ async def use_agent(ctx: Context, agent_name: str, prompt: str) -> str:
         async def _consume_stream(client_obj):
             host_url = await _resolve_host_url()
             async with client_obj.stream("POST", f"{host_url}/v1/chat/completions", **req_kwargs) as response:
-                response.raise_for_status()
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError:
+                    # raise_for_status() leaves a streaming response's body unread, so
+                    # the handler below could not log it (reading .text raised
+                    # httpx.ResponseNotRead, masking the real status). Buffer it here,
+                    # while the stream is still open. The body is only ever logged, so a
+                    # failed read must not replace the status that was just raised.
+                    try:
+                        await response.aread()
+                    except Exception:
+                        pass
+                    raise
                 async for line in response.aiter_lines():
                     if not line.strip(): continue
                     try:
