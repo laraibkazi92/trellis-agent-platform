@@ -416,10 +416,9 @@ async def use_agent(ctx: Context, agent_name: str, prompt: str) -> str:
             logger.error(f"Error checking agent configuration for '{agent_name}': {e}", exc_info=True)
             return f"SYSTEM: Error checking agent configuration for '{agent_name}'. Please try again later."
 
-    # In DEV_MODE a request with no bearer token is stamped with DEV_MODE_AUTH_TOKEN
-    # (see core.auth). Forwarding that sentinel as a credential makes the host treat it
-    # as a real key and answer 401 -- the host's own DEV_MODE bypass only applies when
-    # no "Bearer " header is present. Omit the header so the host applies that bypass.
+    # DEV_MODE_AUTH_TOKEN is a marker, not a credential -- forwarding it makes the host
+    # reject the call with 401 (see core.auth). Omit the header so the host's own
+    # DEV_MODE bypass applies instead.
     headers = {}
     if token and token != DEV_MODE_AUTH_TOKEN:
         headers["Authorization"] = f"Bearer {token}"
@@ -444,11 +443,14 @@ async def use_agent(ctx: Context, agent_name: str, prompt: str) -> str:
                     response.raise_for_status()
                 except httpx.HTTPStatusError:
                     # raise_for_status() leaves a streaming response's body unread, so
-                    # the handler below could not log it: reading .text raised
-                    # httpx.ResponseNotRead, which replaced the real status with a
-                    # confusing "without having called read()" error. Buffer the body
-                    # here, while the stream is still open, then re-raise.
-                    await response.aread()
+                    # the handler below could not log it (reading .text raised
+                    # httpx.ResponseNotRead, masking the real status). Buffer it here,
+                    # while the stream is still open. The body is only ever logged, so a
+                    # failed read must not replace the status that was just raised.
+                    try:
+                        await response.aread()
+                    except Exception:
+                        pass
                     raise
                 async for line in response.aiter_lines():
                     if not line.strip(): continue

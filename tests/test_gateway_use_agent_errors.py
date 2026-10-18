@@ -126,9 +126,26 @@ class _FakeAsyncByteStream(httpx.AsyncByteStream):
         pass
 
 
+class _FailingAsyncByteStream(httpx.AsyncByteStream):
+    """A body that fails the moment it is read -- e.g. the host resetting the connection
+    while flushing an error response."""
+
+    async def __aiter__(self):
+        raise httpx.ReadError("connection reset")
+        yield b""  # pragma: no cover -- unreachable; makes __aiter__ an async generator
+
+    async def aclose(self):
+        pass
+
+
 def _internal_streaming_error_response(status_code, body):
     request = httpx.Request("POST", "http://host-internal:8000/v1/chat/completions")
     return httpx.Response(status_code, stream=_FakeAsyncByteStream(body), request=request)
+
+
+def _internal_unreadable_error_response(status_code):
+    request = httpx.Request("POST", "http://host-internal:8000/v1/chat/completions")
+    return httpx.Response(status_code, stream=_FailingAsyncByteStream(), request=request)
 
 
 def test_use_agent_http_status_error_returns_generic_and_logs_body(monkeypatch, caplog):
@@ -175,6 +192,28 @@ def test_use_agent_streaming_error_body_is_buffered_before_logging(monkeypatch, 
     assert result == "SYSTEM: Error calling agent 'general-agent'. Please try again later."
     assert "traceback: internal detail" not in result
     assert "traceback: internal detail" in caplog.text
+
+
+def test_use_agent_503_survives_an_unreadable_error_body(monkeypatch):
+    """Buffering the error body is only for logging. If the read itself fails, the
+    status raise_for_status() already produced must still drive the mapping -- here the
+    503 branch -- instead of falling through to the generic connection-failure message."""
+    _patch_external_agent(
+        monkeypatch,
+        configured={"configured": True, "missing_secrets": [], "missing_variables": []},
+    )
+    _patch_http_client(
+        monkeypatch,
+        FakeStreamingClient(_internal_unreadable_error_response(503)),
+    )
+    user_id_var.set("user-1")
+
+    result = asyncio.run(gateway.use_agent(FakeContext(), "general-agent", "hello"))
+
+    assert result == (
+        "SYSTEM: The agent 'general-agent' is currently offline due to technical "
+        "failures and cannot process requests."
+    )
 
 
 def test_use_agent_connect_failure_returns_generic_and_logs_detail(monkeypatch, caplog):
