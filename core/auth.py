@@ -26,6 +26,14 @@ logger = logging.getLogger(__name__)
 auth_token_var = contextvars.ContextVar("auth_token", default=None)
 user_id_var = contextvars.ContextVar("user_id", default=None)
 
+# Sentinel stamped into auth_token_var for a DEV_MODE request that presented no bearer
+# token. It marks "the caller is the dev user"; it is NOT a credential and must never
+# be forwarded downstream as an Authorization header (see core.gateway.use_agent).
+# A downstream service cannot tell a sentinel from a real key: the presence of a
+# "Bearer " header makes it skip its own DEV_MODE bypass, validate the sentinel as a
+# key, and reject the call with 401.
+DEV_MODE_AUTH_TOKEN = "dev-token"
+
 
 class EtcdContentionError(RuntimeError):
     """Raised when an etcd compare-and-swap loop (see
@@ -1237,7 +1245,7 @@ class AuthMiddleware:
                 www_authenticate = f'Bearer realm="mcp", resource_metadata="{resource_metadata_url}"'.encode()
 
                 if self.dev_mode and (not auth_header or not auth_header.startswith("Bearer ")):
-                    auth_token_var.set("dev-token")
+                    auth_token_var.set(DEV_MODE_AUTH_TOKEN)
                     user_id_var.set("dev-user-id")
                     scope["state"] = scope.get("state", {})
                     scope["state"]["user_id"] = "dev-user-id"

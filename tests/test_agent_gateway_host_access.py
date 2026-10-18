@@ -25,7 +25,7 @@ import pytest
 from core import agent_search
 from core import gateway
 from core import host
-from core.auth import user_id_var
+from core.auth import DEV_MODE_AUTH_TOKEN, auth_token_var, user_id_var
 
 
 # --- core.agent_search.search_agents ----------------------------------------
@@ -618,6 +618,87 @@ def test_use_agent_allows_external_true(monkeypatch):
     result = asyncio.run(gateway.use_agent(ctx, "general-agent", "hello"))
 
     assert result == "hello there"
+
+
+class _FakeStreamCtx:
+    def __init__(self, response):
+        self._response = response
+
+    async def __aenter__(self):
+        return self._response
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _CapturingStreamResponse:
+    def raise_for_status(self):
+        pass
+
+    async def aiter_lines(self):
+        import json as _json
+        yield _json.dumps({"choices": [{"message": {"content": "ok"}}]})
+
+
+class _CapturingStreamClient:
+    """Records the kwargs use_agent hands to httpx so the forwarded auth header can be
+    asserted directly."""
+
+    def __init__(self):
+        self.kwargs = None
+
+    def stream(self, method, url, **kwargs):
+        self.kwargs = kwargs
+        return _FakeStreamCtx(_CapturingStreamResponse())
+
+
+def _patch_capturing_stream_client(monkeypatch):
+    monkeypatch.setattr(gateway.identity_mgr, "get_agent_config", lambda name: {"name": name, "external": True})
+
+    async def fake_is_agent_configured(agent_name, user_id):
+        return {"configured": True, "missing_secrets": [], "missing_variables": []}
+
+    monkeypatch.setattr(gateway, "is_agent_configured", fake_is_agent_configured)
+    client = _CapturingStreamClient()
+    monkeypatch.setattr(
+        gateway,
+        "app",
+        SimpleNamespace(state=SimpleNamespace(http_client=client)),
+        raising=False,
+    )
+    return client
+
+
+def test_use_agent_omits_authorization_header_for_dev_mode_sentinel(monkeypatch):
+    """A DEV_MODE request presents no bearer token, so AuthMiddleware stamps the
+    DEV_MODE_AUTH_TOKEN sentinel. Forwarding that sentinel would present a fake
+    credential: the host sees a "Bearer " header, skips its own DEV_MODE bypass,
+    validates the sentinel as a key, and answers 401 -- which is how use_agent over
+    /mcp used to fail in DEV_MODE. The header must be omitted instead."""
+    client = _patch_capturing_stream_client(monkeypatch)
+    user_id_var.set("dev-user-id")
+    token = auth_token_var.set(DEV_MODE_AUTH_TOKEN)
+    try:
+        result = asyncio.run(gateway.use_agent(FakeContext(), "general-agent", "hello"))
+    finally:
+        auth_token_var.reset(token)
+
+    assert result == "ok"
+    assert client.kwargs["headers"] == {}
+
+
+def test_use_agent_forwards_real_bearer_token(monkeypatch):
+    """A real caller token is still forwarded, so the host resolves the actual caller."""
+    client = _patch_capturing_stream_client(monkeypatch)
+    user_id_var.set("user-1")
+    token = auth_token_var.set("tl_real_key")
+    try:
+        result = asyncio.run(gateway.use_agent(FakeContext(), "general-agent", "hello"))
+    finally:
+        auth_token_var.reset(token)
+
+    assert result == "ok"
+    assert client.kwargs["headers"] == {"Authorization": "Bearer tl_real_key"}
 
 
 # --- core.host chat_completions -----------------------------------------------
