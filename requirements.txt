@@ -1,8 +1,8 @@
 pydantic==2.13.4
 pyyaml==6.0.3
 fastapi==0.141.1
-pydantic-ai==2.31.0
-google-genai==2.18.1
+pydantic-ai[huggingface]==2.57.0
+google-genai==2.31.0
 mcp==2.0.0
 fastmcp==4.0.3
 uvicorn==0.52.3

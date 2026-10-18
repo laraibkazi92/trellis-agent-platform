@@ -24,7 +24,9 @@ from core.discovery import (
     get_agent_secret_groups,
     flatten_secret_group_keys,
 )
-from core.models import Identity, IdentityType
+from core.models import ALLOWED_PROVIDERS, Identity, IdentityType
+from core.llm_factory import ProviderConfigError, infer_provider
+from core.llm_providers import provider_accepts_base_url, provider_requires_base_url
 
 from datetime import datetime
 
@@ -129,8 +131,10 @@ class TriggerUpdate(BaseModel):
     webhook_secret: Optional[str] = None
 
 class AgentUpdateModel(TriggerUpdate):
-    model: str
+    model: Optional[str] = None
     thinking_level: str
+    provider: Optional[str] = None
+    base_url: Optional[str] = None
     version: Optional[str] = ""
     description: Optional[str] = ""
     a2a_access: List[str] = []
@@ -511,8 +515,43 @@ async def update_background_trigger(request: Request):
     skills_content = ""
     # Process Agent-specific Settings
     if workflow_type == "background_agent":
-        config_data["model"] = validated_data.model
+        # Multi-provider support: empty provider means "infer from the model name".
+        provider = (validated_data.provider or "").strip().lower()
+        if provider and provider not in ALLOWED_PROVIDERS:
+            request.session["flash_msg"] = (
+                f"Invalid provider '{provider}'. Must be one of: {', '.join(ALLOWED_PROVIDERS)}."
+            )
+            return RedirectResponse(url='/workflows', status_code=303)
+
+        base_url = (validated_data.base_url or "").strip() or None
+        # Auto provider: validate an explicit endpoint against the provider the model
+        # implies, otherwise a legitimate Auto + base_url combination is unsaveable.
+        validation_provider = provider
+        if not validation_provider and base_url:
+            try:
+                validation_provider = infer_provider(validated_data.model)
+            except ProviderConfigError:
+                request.session["flash_msg"] = (
+                    "Cannot infer a provider for the supplied base_url; select a provider explicitly."
+                )
+                return RedirectResponse(url='/workflows', status_code=303)
+        if provider_requires_base_url(validation_provider) and not base_url:
+            request.session["flash_msg"] = (
+                f"Provider '{validation_provider}' requires a base_url pointing at the endpoint."
+            )
+            return RedirectResponse(url='/workflows', status_code=303)
+        if base_url and not provider_accepts_base_url(validation_provider):
+            request.session["flash_msg"] = (
+                f"Provider '{validation_provider}' does not accept a base_url; remove it."
+            )
+            return RedirectResponse(url='/workflows', status_code=303)
+
+        # A blank model means "inherit the framework default": normalize to None.
+        model_value = (validated_data.model or "").strip() or None
+        config_data["model"] = model_value
         config_data["thinking_level"] = validated_data.thinking_level
+        config_data["provider"] = provider or None
+        config_data["base_url"] = base_url
         
         LITE_MODELS = {"gemini-3.1-flash-lite-preview", "gemini-2.5-flash-lite"}
         if config_data.get("model") in LITE_MODELS:

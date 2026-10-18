@@ -535,3 +535,211 @@ def test_registry_refresh_hang_is_isolated_from_default_executor(monkeypatch, ca
     assert default_elapsed < 1.0
     assert recorded["thread_name"].startswith("registry-refresh")
     assert "timed out" in caplog.text
+
+
+# --- Phase 4: framework LLM defaults on the build path -----------------------
+
+class FakeBuildIdentity:
+    """Minimal identity manager for `build_agent` (blank-config agent builds)."""
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+
+    def get_agent_config(self, name):
+        return dict(self.config)
+
+    def get_agent_skills(self, name):
+        return ""
+
+
+class FakeBuildAgent:
+    def __init__(self, model, **kwargs):
+        self.model = model
+        self.kwargs = kwargs
+
+
+class FakeBuildMemory:
+    def active_for(self, config):
+        return False
+
+
+def _install_build_stubs(monkeypatch, config, defaults=None):
+    """Stub every etcd/network seam `build_agent` touches.
+
+    Returns a dict of recorders: ``resolve_model`` args, ``build_model_settings``
+    args, and the framework-defaults reads.
+    """
+    import core.memory as core_memory
+
+    recorded: Dict[str, Any] = {
+        "resolve_model": [],
+        "build_model_settings": [],
+        "defaults_reads": 0,
+        "api_key_providers": [],
+    }
+    sentinel = object()
+
+    def fake_get_framework_defaults():
+        recorded["defaults_reads"] += 1
+        return defaults if defaults is not None else agent_factory.llm_defaults.FrameworkDefaults()
+
+    def fake_resolve_model(provider, model, base_url=None, api_key=None):
+        recorded["resolve_model"].append((provider, model, base_url))
+        return sentinel
+
+    def fake_build_model_settings(provider, model, thinking_level):
+        recorded["build_model_settings"].append((provider, model, thinking_level))
+        return None
+
+    def fake_get_provider_api_key(provider):
+        recorded["api_key_providers"].append(provider)
+        return "test-key"
+
+    async def fake_get_hub_client():
+        return SimpleNamespace()
+
+    async def fake_discover_external_mcps():
+        return None
+
+    monkeypatch.setattr(agent_factory, "get_identity_manager", lambda: FakeBuildIdentity(config))
+    monkeypatch.setattr(agent_factory.llm_defaults, "get_framework_defaults", fake_get_framework_defaults)
+    monkeypatch.setattr(agent_factory, "resolve_model", fake_resolve_model)
+    monkeypatch.setattr(agent_factory, "build_model_settings", fake_build_model_settings)
+    monkeypatch.setattr(
+        agent_factory.llm_factory, "get_provider_api_key", fake_get_provider_api_key
+    )
+    monkeypatch.setattr(agent_factory, "Agent", FakeBuildAgent)
+    monkeypatch.setattr(agent_factory, "get_hub_client", fake_get_hub_client)
+    monkeypatch.setattr(agent_factory, "discover_external_mcps", fake_discover_external_mcps)
+    monkeypatch.setattr(agent_factory, "_hub_tools_cache", [])
+    monkeypatch.setattr(agent_factory, "_external_mcp_tools", {})
+    monkeypatch.setattr(core_memory, "get_memory_manager", lambda: FakeBuildMemory())
+
+    recorded["sentinel"] = sentinel
+    return recorded
+
+
+def test_build_agent_uses_framework_default_pair(monkeypatch, caplog):
+    """provider/model both blank -> the framework default pair is used, and the
+    INFO line names the resolved source (A9)."""
+    defaults = agent_factory.llm_defaults.FrameworkDefaults("deepseek", "deepseek-chat", None)
+    recorded = _install_build_stubs(
+        monkeypatch,
+        {"name": "blank-agent", "provider": None, "model": None},
+        defaults=defaults,
+    )
+
+    with caplog.at_level(logging.INFO, logger="core.agent_factory"):
+        agent = asyncio.run(agent_factory.build_agent("blank-agent"))
+
+    assert isinstance(agent, FakeBuildAgent)
+    assert agent.model is recorded["sentinel"]
+    assert recorded["resolve_model"] == [("deepseek", "deepseek-chat", None)]
+    assert recorded["build_model_settings"] == [("deepseek", "deepseek-chat", None)]
+    assert recorded["defaults_reads"] == 1
+    assert recorded["api_key_providers"] == ["deepseek"]
+    assert "LLM config unresolved for agent 'blank-agent'" in caplog.text
+    assert "deepseek/deepseek-chat (source=framework)" in caplog.text
+
+
+def test_build_agent_provider_only_uses_registry_default(monkeypatch):
+    """A set provider with a blank model resolves to that provider's registry
+    default when no framework default applies (D6 still reads once)."""
+    recorded = _install_build_stubs(
+        monkeypatch,
+        {"name": "provider-only", "provider": "google", "model": ""},
+        defaults=agent_factory.llm_defaults.FrameworkDefaults(),
+    )
+
+    asyncio.run(agent_factory.build_agent("provider-only"))
+
+    assert recorded["resolve_model"] == [("google", "gemini-2.5-flash", None)]
+    assert recorded["build_model_settings"] == [("google", "gemini-2.5-flash", None)]
+
+
+def test_build_agent_explicit_pair_skips_defaults_read(monkeypatch):
+    """A fully-specified agent must never read the framework defaults (D6/G4)."""
+    recorded = _install_build_stubs(
+        monkeypatch,
+        {"name": "explicit-agent", "provider": "deepseek", "model": "deepseek-reasoner"},
+    )
+
+    def exploding_defaults():
+        raise AssertionError("explicit configs must not read the framework defaults")
+
+    monkeypatch.setattr(agent_factory.llm_defaults, "get_framework_defaults", exploding_defaults)
+
+    asyncio.run(agent_factory.build_agent("explicit-agent"))
+
+    assert recorded["defaults_reads"] == 0
+    assert recorded["resolve_model"] == [("deepseek", "deepseek-reasoner", None)]
+    assert recorded["build_model_settings"] == [("deepseek", "deepseek-reasoner", None)]
+
+
+def test_build_agent_inherits_framework_base_url(monkeypatch):
+    """Case D: a blank agent inherits the framework provider/model *and* base_url."""
+    defaults = agent_factory.llm_defaults.FrameworkDefaults(
+        "openai-compatible", "llama3.2:3b", "http://ep/v1"
+    )
+    recorded = _install_build_stubs(
+        monkeypatch,
+        {"name": "inherit-endpoint", "provider": None, "model": None},
+        defaults=defaults,
+    )
+
+    asyncio.run(agent_factory.build_agent("inherit-endpoint"))
+
+    assert recorded["resolve_model"] == [("openai-compatible", "llama3.2:3b", "http://ep/v1")]
+    assert recorded["build_model_settings"] == [("openai-compatible", "llama3.2:3b", None)]
+
+
+def test_build_agent_effective_model_reaches_model_settings(monkeypatch):
+    """`build_model_settings` must see the effective model, not the blank config
+    model (the Gemini budget lookup keys off the real id)."""
+    defaults = agent_factory.llm_defaults.FrameworkDefaults("deepseek", "deepseek-chat", None)
+    recorded = _install_build_stubs(
+        monkeypatch,
+        {"name": "settings-agent", "provider": None, "model": None, "thinking_level": "high"},
+        defaults=defaults,
+    )
+
+    asyncio.run(agent_factory.build_agent("settings-agent"))
+
+    assert recorded["build_model_settings"] == [("deepseek", "deepseek-chat", "high")]
+
+
+# --- LLM-defaults etcd watch (Phase 4) ---------------------------------------
+
+def test_llm_defaults_watch_resets_cache_and_evicts_agents(monkeypatch):
+    """A framework-default change must drop the TTL cache and every built agent, else
+    an admin edit would not reach agents already cached in the serving process."""
+    from core import llm_defaults
+
+    calls = {"reset": 0, "evict": 0}
+    monkeypatch.setattr(llm_defaults, "reset_defaults_cache", lambda: calls.__setitem__("reset", calls["reset"] + 1))
+    monkeypatch.setattr(agent_factory, "evict_all_agents", lambda: calls.__setitem__("evict", calls["evict"] + 1))
+
+    agent_factory._on_llm_defaults_change(SimpleNamespace(events=[]))
+
+    assert calls == {"reset": 1, "evict": 1}
+
+
+def test_install_llm_defaults_watch_is_idempotent(monkeypatch):
+    registered = []
+
+    class FakeClient:
+        def add_watch_prefix_callback(self, prefix, callback):
+            registered.append(prefix)
+            return len(registered)
+
+    class FakeIdentity:
+        client = FakeClient()
+
+    monkeypatch.setattr(agent_factory, "_llm_defaults_watch_id", None)
+    monkeypatch.setattr(agent_factory, "get_identity_manager", lambda: FakeIdentity())
+
+    agent_factory.install_llm_defaults_watch()
+    agent_factory.install_llm_defaults_watch()
+
+    assert registered == ["/config/framework/default_llm_"]
+

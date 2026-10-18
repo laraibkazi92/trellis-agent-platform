@@ -84,7 +84,7 @@ See `values.yaml` for the full list with comments.
 
 - `secrets.*` — rendered into a Secret (`SESSION_SECRET`, `ENCRYPTION_KEY`).
   Agent LLM provider keys are **not** set here: configure them in the Admin UI ->
-  Global Tool Configuration, where they are stored encrypted in etcd. (This chart
+  LLM Providers, where they are stored encrypted in etcd. (This chart
   deploys no Hindsight; an externally-managed Hindsight reads its own LLM key from
   the environment.) **Set `sessionSecret` explicitly — it ships empty, and outside
   DEV_MODE the app refuses to start without `SESSION_SECRET` (or `ENCRYPTION_KEY`)

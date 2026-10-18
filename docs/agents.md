@@ -90,17 +90,25 @@ author: user@example.com          # Required. Creator email or name.
 description: "Does X and Y."      # Required. Shown in the UI. LLM uses this for routing decisions.
 type: user_agent                  # Optional. Defaults to user_agent here; background_agent /
                                   #   background_script configs belong in workspace/workflows/.
-model: gemini-3-flash-preview     # Required. LLM model identifier.
+model: gemini-3-flash-preview     # Optional. LLM model identifier. Blank (with a blank
+                                  #   provider) inherits the framework default; a blank model
+                                  #   on a configured provider resolves to that provider's
+                                  #   registry default. See "Framework LLM defaults" below.
 thinking_level: medium            # Required. One of: none, low, medium, high, n/a (n/a behaves
                                   #   like none; the dashboard editors apply it automatically for
                                   #   models without thinking support).
-provider: google                  # Optional. One of: google, openai, anthropic,
-                                  #   openai-compatible. Omitted/empty infers from the model
-                                  #   name prefix (gemini* → google, claude* → anthropic,
-                                  #   gpt-*/o1*/o3*/o4*/chatgpt* → openai); anything else
-                                  #   fails at build time with a config error.
+provider: google                  # Optional. One of the 15 provider ids in the table
+                                  #   below. Blank (with a blank model) inherits the framework
+                                  #   default. Omitted/empty infers from the model name
+                                  #   prefix (gemini* → google, claude* → anthropic,
+                                  #   gpt-*/o1*/o3*/o4*/chatgpt* → openai, deepseek* →
+                                  #   deepseek, kimi* → moonshotai, glm* → zai, qwen* →
+                                  #   alibaba); anything else fails at build time with a
+                                  #   config error. Vendor-prefixed ids (containing "/")
+                                  #   always require an explicit provider.
 base_url: http://localhost:11434/v1  # Optional. Custom API endpoint. Required for
-                                  #   openai-compatible.
+                                  #   openai-compatible; rejected by providers that do
+                                  #   not accept an endpoint.
 external: true                    # Optional (default true). Set false to hide this agent from
                                   #   the gateway, semantic search, and auto-routing (internal-only
                                   #   worker subagent).
@@ -143,7 +151,37 @@ independent of the agent's own `model`.
 
 **`thinking_level`**: Controls reasoning depth and token cost. `none` is fastest; `high` enables deep chain-of-thought. Match to task complexity.
 
-**`provider` / `base_url`**: Which LLM vendor serves `model`. Provider API keys are configured in the Admin UI → **Global Tool Configuration** and stored Fernet-encrypted in etcd — not in environment variables. `thinking_level` maps per provider: Gemini uses token budgets/levels, Anthropic maps to `anthropic_effort`, OpenAI to `openai_reasoning_effort`; `openai-compatible` runs with its own defaults. `openai-compatible` points `base_url` at any OpenAI-compatible endpoint (vLLM, LiteLLM, Ollama's `/v1`, …). Both fields can also be set in the admin agent editor.
+**`provider` / `base_url`**: Which LLM vendor serves `model`. Provider credentials are configured in **Admin → LLM Providers** — one card per provider, stored Fernet-encrypted in etcd, never read from the environment. Fifteen providers are selectable:
+
+| `provider` | Label | Key name(s) | Keyless | Base URL | `thinking_level` |
+| --- | --- | --- | --- | --- | --- |
+| `google` | Google (Gemini) | `GEMINI_API_KEY`, `GOOGLE_API_KEY` | — | optional | Gemini budgets / levels |
+| `openai` | OpenAI | `OPENAI_API_KEY` | — | optional | reasoning effort |
+| `anthropic` | Anthropic | `ANTHROPIC_API_KEY` | — | optional | reasoning effort |
+| `deepseek` | DeepSeek | `DEEPSEEK_API_KEY` | — | not supported | — |
+| `fireworks` | Fireworks AI | `FIREWORKS_API_KEY` | — | not supported | — |
+| `together` | Together AI | `TOGETHER_API_KEY` | — | not supported | — |
+| `moonshotai` | Moonshot AI (Kimi) | `MOONSHOTAI_API_KEY` | — | not supported | — |
+| `vercel` | Vercel AI Gateway | `VERCEL_AI_GATEWAY_API_KEY` | — | not supported | reasoning effort |
+| `zai` | Z.AI (GLM) | `ZAI_API_KEY` | — | not supported | — |
+| `openrouter` | OpenRouter | `OPENROUTER_API_KEY` | — | not supported | — |
+| `alibaba` | Alibaba (DashScope/Qwen) | `DASHSCOPE_API_KEY`, `ALIBABA_API_KEY` | — | optional | — |
+| `ollama` | Ollama (local) | — | ✅ | optional (defaults to `http://localhost:11434`) | — |
+| `litellm` | LiteLLM | `LITELLM_API_KEY` (optional) | ✅ | optional (defaults to `http://localhost:4000`) | — |
+| `huggingface` | Hugging Face | `HF_TOKEN` | — | not supported | — |
+| `openai-compatible` | OpenAI-compatible endpoint | `OPENAI_COMPATIBLE_API_KEY`, `OPENAI_API_KEY` (optional) | ✅ | **required** | — |
+
+Notes:
+
+- `provider` is optional: when unset, it is inferred from the model prefix (`gemini`, `claude`, `gpt-`/`o1`/`o3`/`o4`/`chatgpt`, `deepseek`, `kimi`, `glm`, `qwen`). Vendor-prefixed model ids (anything containing `/`, e.g. `openai/gpt-5`) are always ambiguous and require an explicit provider.
+- `openai` runs through the chat-completions API (`openai-chat`), not the Responses API.
+- `openai-compatible` points `base_url` at any OpenAI-compatible endpoint (vLLM, LiteLLM, Ollama's `/v1`, …) and is the only provider that **requires** one.
+- `ollama` is keyless and local; its endpoint defaults to `http://localhost:11434` and is always passed explicitly. It can be set per agent or globally on the LLM Providers page (`OLLAMA_BASE_URL`).
+- `openrouter` model ids must be vendor-prefixed (e.g. `openai/gpt-5`); unprefixed ids are rejected.
+- `litellm` routes to sub-providers (`openai/…`, `anthropic/…`) whose own keys LiteLLM resolves from its own environment — the documented exception to the "keys live in etcd, not the env" rule. `LITELLM_API_KEY` itself is the gateway credential and is optional. With no endpoint set it defaults to `http://localhost:4000`, so set `base_url` when your LiteLLM proxy lives elsewhere (e.g. another container — `localhost` is only reachable inside the same network namespace).
+- `thinking_level` maps per provider: Gemini uses token budgets or thinking levels, Anthropic maps to `anthropic_effort`, `openai` and `vercel` map to `openai_reasoning_effort`; every other provider takes no reasoning setting and runs with the model's own defaults.
+
+Both fields can also be set in the admin agent editor.
 
 **`allowed_tools`**: Must exactly match the `name` field in each tool's `tool.yaml`. The hub exposes only listed tools to this agent. Built-in console tools (`ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `execute`) can also be listed. Long-lived background shells (`run_in_background`, `read_output`, `kill_shell`, `list_shells`) are **not** available: their spawn path cannot be env-sanitized, so they are disabled to keep the host's bootstrap secrets out of agent-run commands.
 
@@ -152,6 +190,45 @@ independent of the agent's own `model`.
 **`a2a_access`**: Enables Agent-to-Agent delegation. The agent can call listed agents as sub-tasks (as if calling a tool). Targets must be `internal: true` (the default) — delegation to agents marked `internal: false` is skipped at build time with a warning. Keep this list small and intentional — the supervisor does not use `a2a_access`; it discovers and delegates dynamically via `search_agents` + `delegate`.
 
 **`rules`**: Optional declarative routing rules evaluated before semantic search — lock matching queries onto this agent deterministically. See the [Rules Engine guide](rules_engine.md) for the full field reference and authoring guidance.
+
+---
+
+### Framework LLM defaults
+
+An admin can set **one org-wide default provider + model** (and an optional `base_url`) in
+**Admin → LLM Providers → Framework defaults**. An agent — or a background workflow — that
+leaves **both `provider` and `model` blank** inherits that pair instead of failing.
+
+The default is applied at build time and is **never written into your YAML**. The agent editor
+shows a read-only hint under the model field while the model is blank and a default can be
+resolved — `Inherits framework default: <Provider> / <model>` when the framework default
+applies, or `Uses <Provider> default: <model>` when a pinned provider falls back to its own
+registry default — and nothing is prefilled, so "inherit" survives every edit and the agent
+keeps tracking the org default as it changes.
+
+Resolution priority, highest first:
+
+| Case | `provider` | `model` | Effective provider | Effective model | Effective `base_url` |
+| --- | --- | --- | --- | --- | --- |
+| A — explicit | set | set | as configured | as configured | as configured |
+| B — provider only | set | blank | as configured | the framework model **when the framework provider matches**, otherwise the provider's registry default | the framework `base_url` when the framework provider matches, otherwise as configured |
+| C — model only | blank | set | inferred from the model name (fails if unknown or ambiguous) | as configured | as configured |
+| D — both blank | blank | blank | framework default provider | framework default model | the agent's `base_url`, else the framework default's (dropped if the provider takes none) |
+| E — legacy fallback | blank | blank, framework default unset or invalid | `google` | `gemini-2.5-flash` | as configured |
+
+Notes:
+
+- **Case B inherits the framework `base_url` only when the framework provider is the same
+  provider.** A different provider inherits just the registry default model — never the org's
+  endpoint, which would otherwise point one vendor's key at another vendor's gateway.
+- **Every provider has a registry default model** (e.g. `deepseek` → `deepseek-chat`,
+  `openai` → `gpt-5-mini`), so `provider` set + `model` blank is a valid configuration.
+- **To opt out of inheritance, set both `provider` and `model`.** A fully-specified pair is
+  used verbatim and never consults the framework default.
+- **`openai-compatible` is the exception:** it has no registry default, so a pinned
+  `openai-compatible` agent must always name a `model` — a blank one raises (case B cannot
+  resolve for it). To inherit an org-wide endpoint instead, leave `provider` blank as well
+  (case D).
 
 ---
 

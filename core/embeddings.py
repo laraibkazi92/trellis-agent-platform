@@ -9,6 +9,9 @@ computed at sync time for each agent and at query time for search requests.
 Degrades gracefully: if the Gemini SDK or the etcd-stored Google key is
 unavailable, ``embed_text`` returns ``None`` so callers can fall back to keyword
 matching.
+
+Embeddings remain Google-only by design; they are not part of the provider
+registry (core/llm_providers.py).
 """
 import math
 import logging

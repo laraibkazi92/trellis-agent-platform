@@ -16,6 +16,18 @@ import os
 
 from core.console_backend import SanitizedLocalBackend
 from core.env_sanitize import FRAMEWORK_SECRET_ENV, sanitized_env
+from core.llm_providers import FRAMEWORK_PROVIDER_KEY_ENV
+
+# Non-provider names FRAMEWORK_SECRET_ENV must keep alongside the registry-derived
+# provider credential set.
+_NON_PROVIDER_SECRETS = {
+    "SESSION_SECRET", "ENCRYPTION_KEY",
+    "GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET",
+    "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET", "OIDC_METADATA_URL",
+    "ADMIN_USERS", "ALLOWED_DOMAINS",
+    "HINDSIGHT_API_LLM_API_KEY", "HINDSIGHT_LLM_API_KEY",
+    "HINDSIGHT_API_EMBEDDINGS_GEMINI_API_KEY",
+}
 
 
 def test_sanitized_env_strips_every_framework_secret(monkeypatch):
@@ -26,6 +38,40 @@ def test_sanitized_env_strips_every_framework_secret(monkeypatch):
 
     for name in FRAMEWORK_SECRET_ENV:
         assert name not in result
+
+
+def test_sanitized_env_strips_every_registry_provider_key_name():
+    """Every credential name the registry knows is scrubbed, not just the legacy 4."""
+    base = {**os.environ, **{name: "x" for name in FRAMEWORK_PROVIDER_KEY_ENV}}
+
+    result = sanitized_env(base)
+
+    for name in FRAMEWORK_PROVIDER_KEY_ENV:
+        assert name not in result
+    # Case-insensitive, like the rest of the denylist.
+    lower = {name.lower(): "x" for name in FRAMEWORK_PROVIDER_KEY_ENV}
+    assert sanitized_env({**os.environ, **lower}).keys().isdisjoint(lower)
+
+
+def test_sanitized_env_does_not_strip_ollama_base_url():
+    """Documented decision: OLLAMA_BASE_URL is an endpoint, not a credential."""
+    base = {**os.environ, "OLLAMA_BASE_URL": "http://localhost:11434"}
+
+    result = sanitized_env(base)
+
+    assert "OLLAMA_BASE_URL" not in FRAMEWORK_SECRET_ENV
+    assert result["OLLAMA_BASE_URL"] == "http://localhost:11434"
+
+
+def test_framework_secret_env_derives_provider_names_but_keeps_the_rest():
+    assert FRAMEWORK_PROVIDER_KEY_ENV <= FRAMEWORK_SECRET_ENV
+    assert _NON_PROVIDER_SECRETS <= FRAMEWORK_SECRET_ENV
+    assert FRAMEWORK_SECRET_ENV - FRAMEWORK_PROVIDER_KEY_ENV == _NON_PROVIDER_SECRETS
+    # The 12 new provider credential names are present, a spot check of each vendor.
+    for name in ("DEEPSEEK_API_KEY", "DASHSCOPE_API_KEY", "HF_TOKEN", "ZAI_API_KEY",
+                 "OPENROUTER_API_KEY", "MOONSHOTAI_API_KEY", "TOGETHER_API_KEY",
+                 "FIREWORKS_API_KEY", "VERCEL_AI_GATEWAY_API_KEY", "OPENAI_COMPATIBLE_API_KEY"):
+        assert name in FRAMEWORK_SECRET_ENV
 
 
 def test_sanitized_env_is_case_insensitive(monkeypatch):

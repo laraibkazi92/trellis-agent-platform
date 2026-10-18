@@ -115,17 +115,17 @@
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-8">
                     <div>
                         <label class="form-label">Model Engine</label>
-                        <select name="model" id="modelSelect" class="form-input">
-                            {% if config.model and config.model not in ['gemini-3.1-pro-preview', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite-preview', 'gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro'] %}
-                            <option value="{{ config.model }}" selected>{{ config.model }} (custom)</option>
-                            {% endif %}
-                            <option value="gemini-3.1-pro-preview" {% if config.model == 'gemini-3.1-pro-preview' %}selected{% endif %}>gemini-3.1-pro-preview</option>
-                            <option value="gemini-3-flash-preview" {% if config.model == 'gemini-3-flash-preview' %}selected{% endif %}>gemini-3-flash-preview (default)</option>
-                            <option value="gemini-3.1-flash-lite-preview" {% if config.model == 'gemini-3.1-flash-lite-preview' %}selected{% endif %}>gemini-3.1-flash-lite-preview</option>
-                            <option value="gemini-2.5-flash" {% if config.model == 'gemini-2.5-flash' %}selected{% endif %}>gemini-2.5-flash</option>
-                            <option value="gemini-2.5-flash-lite" {% if config.model == 'gemini-2.5-flash-lite' %}selected{% endif %}>gemini-2.5-flash-lite</option>
-                            <option value="gemini-2.5-pro" {% if config.model == 'gemini-2.5-pro' %}selected{% endif %}>gemini-2.5-pro</option>
-                        </select>
+                        <input type="hidden" name="model" id="modelValue" value="{{ config.model or '' }}">
+                        <select id="modelSelect" class="form-input"></select>
+                        <noscript>
+                            <p class="text-xs text-neutral-500 dark:text-neutral-400 mt-2 font-mono">JavaScript is required to change the model. Saved model: <code>{{ config.model or '(unset)' }}</code>.</p>
+                        </noscript>
+                        <input type="text" id="modelCustomInput" class="form-input mt-2" placeholder="Custom model id" disabled>
+                        {% if inherit_hint %}
+                        <p id="inheritDefaultHint" class="text-xs text-neutral-500 dark:text-neutral-400 mt-2 font-mono">
+                            {{ inherit_hint }}
+                        </p>
+                        {% endif %}
                     </div>
                     <div>
                         <label class="form-label">Thinking Level</label>
@@ -143,16 +143,15 @@
                     <div>
                         <label class="form-label">Provider</label>
                         <select name="provider" id="providerSelect" class="form-input">
-                            <option value="" {% if not config.provider %}selected{% endif %}>Auto (infer from model name)</option>
-                            <option value="google" {% if config.provider == 'google' %}selected{% endif %}>Google (Gemini)</option>
-                            <option value="openai" {% if config.provider == 'openai' %}selected{% endif %}>OpenAI</option>
-                            <option value="anthropic" {% if config.provider == 'anthropic' %}selected{% endif %}>Anthropic</option>
-                            <option value="openai-compatible" {% if config.provider == 'openai-compatible' %}selected{% endif %}>OpenAI-compatible</option>
+                            <option value="" {% if not config.provider %}selected{% endif %}>Auto (infer from model)</option>
+                            {% for p in llm_providers %}
+                            <option value="{{ p.id }}" {% if config.provider == p.id %}selected{% endif %}>{{ p.label }}</option>
+                            {% endfor %}
                         </select>
                     </div>
-                    <div>
+                    <div id="baseUrlField">
                         <label class="form-label">Base URL</label>
-                        <input type="text" name="base_url" id="baseUrlInput" value="{{ config.base_url or '' }}" class="form-input" placeholder="Required for openai-compatible (e.g. http://localhost:11434/v1)">
+                        <input type="text" name="base_url" id="baseUrlInput" value="{{ config.base_url or '' }}" class="form-input" placeholder="Optional endpoint">
                     </div>
                 </div>
 
@@ -282,6 +281,9 @@
         </form>
     </div>
 
+    {% if type == 'agent' %}
+    <script>window.LLM_PROVIDERS = {{ llm_providers_json | safe }};</script>
+    {% endif %}
     <script>
         $(document).ready(function() {
             $('.a2a-select').select2({
@@ -310,9 +312,120 @@
                 });
             });
 
-            // Logic for Thinking Level based on selected model
+            var providers = window.LLM_PROVIDERS || [];
+            var CUSTOM_MODEL = '__custom__';
+            var initialModel = {{ (config.model or '') | tojson }};
+
+            function providerById(providerId) {
+                for (var i = 0; i < providers.length; i++) {
+                    if (providers[i].id === providerId) return providers[i];
+                }
+                return null;
+            }
+
+            function effectiveModel() {
+                var selected = $('#modelSelect').val();
+                if (selected === CUSTOM_MODEL) {
+                    return ($('#modelCustomInput').val() || '').trim();
+                }
+                return selected || '';
+            }
+
+            function inferredProvider(model) {
+                if (!model || model.indexOf('/') !== -1) return null;
+                var lower = model.toLowerCase();
+                for (var i = 0; i < providers.length; i++) {
+                    var prefixes = providers[i].model_prefixes || [];
+                    for (var j = 0; j < prefixes.length; j++) {
+                        var prefix = String(prefixes[j] || '').toLowerCase();
+                        if (prefix && lower.indexOf(prefix) === 0) return providers[i];
+                    }
+                }
+                return null;
+            }
+
+            function effectiveSpec() {
+                var selectedId = $('#providerSelect').val();
+                if (selectedId) return providerById(selectedId);
+                return inferredProvider(effectiveModel());
+            }
+
+            function populateModelOptions() {
+                var $select = $('#modelSelect');
+                providers.forEach(function(p) {
+                    var known = p.known_models || [];
+                    if (!known.length) return;
+                    var $group = $('<optgroup>').attr('label', p.label);
+                    known.forEach(function(model) {
+                        $group.append($('<option>').attr('value', model).attr('data-provider', p.id).text(model));
+                    });
+                    $select.append($group);
+                });
+                $select.append($('<option>').attr('value', CUSTOM_MODEL).text('Custom model…'));
+
+                var isKnown = false;
+                if (initialModel) {
+                    $select.find('option').each(function() {
+                        if ($(this).val() === initialModel) {
+                            isKnown = true;
+                            return false;
+                        }
+                    });
+                }
+
+                if (isKnown) {
+                    $select.val(initialModel);
+                } else {
+                    $select.val(CUSTOM_MODEL);
+                }
+                $('#modelCustomInput').val(initialModel);
+                syncModelValue();
+            }
+
+            function syncModelValue() {
+                var selected = $('#modelSelect').val();
+                var isCustom = selected === CUSTOM_MODEL;
+                var $custom = $('#modelCustomInput');
+
+                $custom.prop('disabled', !isCustom);
+                if (!isCustom) {
+                    // Keep the custom box in step so switching back is seamless.
+                    $custom.val(selected || '');
+                }
+                $('#modelValue').val(effectiveModel());
+            }
+
+            function updateProviderFields() {
+                var $field = $('#baseUrlField');
+                var $input = $('#baseUrlInput');
+                var spec = effectiveSpec();
+
+                if (!spec) {
+                    // Auto with no inferable model: leave the endpoint editable.
+                    $field.show();
+                    $input.prop('disabled', false).prop('required', false);
+                    $input.attr('placeholder', 'Optional endpoint');
+                    return;
+                }
+
+                var supports = !!spec.supports_base_url;
+                var requires = !!spec.requires_base_url;
+                // A provider's registry default is a build-time fallback, so it is shown
+                // as a placeholder and never written into the field: pre-filling it would
+                // persist the endpoint on save and pin the agent away from the org
+                // default it is supposed to inherit.
+                var placeholder = spec.base_url_placeholder || spec.default_base_url || 'Optional endpoint';
+
+                $field.toggle(supports);
+                $input.prop('disabled', !supports).prop('required', requires);
+                $input.attr('placeholder', placeholder);
+            }
+
+            // Logic for Thinking Level based on the effective provider's style
             function updateThinkingLevel() {
-                var selectedModel = $('#modelSelect').val();
+                var spec = effectiveSpec();
+                var style = spec ? spec.thinking_style : null;
+                var selectedModel = effectiveModel();
                 var $thinkingSelect = $('#thinkingLevelSelect');
                 var $noneOption = $thinkingSelect.find('option[value="none"]');
                 var $naOption = $thinkingSelect.find('option[value="n/a"]');
@@ -322,31 +435,81 @@
                 $thinkingSelect.prop('disabled', false);
                 $thinkingSelect.find('option').show();
                 $noneOption.prop('disabled', false);
-                
-                if (!selectedModel) return;
+                $naOption.prop('disabled', false);
 
-                if (selectedModel.includes('lite')) {
-                    // Lite models don't support thinking
+                if (style === 'google') {
+                    if (!selectedModel) return;
+
+                    if (selectedModel.includes('lite')) {
+                        // Lite models don't support thinking
+                        $thinkingSelect.prop('disabled', true);
+                        $thinkingSelect.val('n/a');
+                    } else if (selectedModel === 'gemini-2.5-pro') {
+                        // 2.5 Pro requires thinking, 'none' not allowed
+                        $noneOption.hide();
+                        $noneOption.prop('disabled', true);
+                        $naOption.hide();
+                        if (currentVal === 'none' || currentVal === 'n/a') {
+                            $thinkingSelect.val('low'); // fallback to low
+                        }
+                    } else {
+                        // 2.5 Flash and 3.x support 'none'
+                        $naOption.hide();
+                        if (currentVal === 'n/a') {
+                            $thinkingSelect.val('none'); // fallback to none
+                        }
+                    }
+                } else if (style === 'openai-effort' || style === 'anthropic') {
+                    // Effort-based: none/low/medium/high are all meaningful.
+                    $naOption.hide();
+                    $naOption.prop('disabled', true);
+                    if (currentVal === 'n/a') {
+                        $thinkingSelect.val('none');
+                    }
+                } else if (style === 'none') {
+                    // Nothing to express for this provider.
                     $thinkingSelect.prop('disabled', true);
                     $thinkingSelect.val('n/a');
-                } else if (selectedModel === 'gemini-2.5-pro') {
-                    // 2.5 Pro requires thinking, 'none' not allowed
-                    $noneOption.hide();
-                    $noneOption.prop('disabled', true);
-                    $naOption.hide();
-                    if (currentVal === 'none' || currentVal === 'n/a') {
-                        $thinkingSelect.val('low'); // fallback to low
-                    }
                 } else {
-                    // 2.5 Flash and 3.x support 'none'
+                    // Auto with no inferable provider: preserve the lenient default.
                     $naOption.hide();
                     if (currentVal === 'n/a') {
-                        $thinkingSelect.val('none'); // fallback to none
+                        $thinkingSelect.val('none');
                     }
                 }
             }
 
-            $('#modelSelect').on('change', updateThinkingLevel);
+            $('#providerSelect').on('change', function() {
+                updateProviderFields();
+                updateThinkingLevel();
+            });
+            $('#modelSelect').on('change', function() {
+                // A known model from the registry implies its provider. Persist that
+                // choice when the operator left the provider on Auto, otherwise
+                // aggregator ids (openai/gpt-5) would be saved un-inferable.
+                var implied = $(this).find('option:selected').data('provider');
+                if (!$('#providerSelect').val() && implied) {
+                    $('#providerSelect').val(implied);
+                }
+                syncModelValue();
+                updateProviderFields();
+                updateThinkingLevel();
+            });
+            $('#modelCustomInput').on('input', function() {
+                syncModelValue();
+                updateProviderFields();
+                updateThinkingLevel();
+            });
+
+            // The hint is computed server-side from the saved config and never
+            // recomputed, so the first operator edit invalidates it.
+            $('#providerSelect, #modelSelect, #modelCustomInput').on('change input', function() {
+                var hint = document.getElementById('inheritDefaultHint');
+                if (hint) hint.style.display = 'none';
+            });
+
+            populateModelOptions();
+            updateProviderFields();
             updateThinkingLevel(); // Run on init
         });
         lucide.createIcons();

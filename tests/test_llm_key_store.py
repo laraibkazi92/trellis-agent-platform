@@ -17,9 +17,23 @@ import pytest
 from core import auth
 from core.auth import IdentityManager
 from core.llm_factory import LLM_PROVIDER_KEY_NAMES
+from core.llm_providers import PROVIDERS
 
 _LLM_KEYS_PATH = "/identities/system/system/llm_keys"
-_LLM_KEY_NAMES = {name for names in LLM_PROVIDER_KEY_NAMES.values() for name in names}
+# Credentials plus global endpoints (OLLAMA_BASE_URL) -- both live in the LLM
+# category and must never surface in a tool/workflow secret namespace.
+_LLM_KEY_NAMES = (
+    {name for names in LLM_PROVIDER_KEY_NAMES.values() for name in names}
+    | {name for spec in PROVIDERS.values() for name in spec.base_url_key_names}
+)
+
+# The extended credential set added by the provider-registry expansion.
+_NEW_PROVIDER_KEYS = {
+    "DEEPSEEK_API_KEY": "deepseek-secret",
+    "OLLAMA_BASE_URL": "http://ollama.internal:11434",
+    "OPENAI_COMPATIBLE_API_KEY": "compat-secret",
+    "HF_TOKEN": "hf-secret",
+}
 
 
 class FakeEtcdClient:
@@ -55,20 +69,26 @@ def test_llm_provider_keys_default_to_empty_when_unset(identity_mgr):
 
 
 def test_llm_provider_keys_round_trip(identity_mgr):
-    keys = {"GEMINI_API_KEY": "gem-secret", "OPENAI_API_KEY": "oa-secret"}
+    keys = {"GEMINI_API_KEY": "gem-secret", "OPENAI_API_KEY": "oa-secret", **_NEW_PROVIDER_KEYS}
     identity_mgr.save_llm_provider_keys(keys)
     assert identity_mgr.get_llm_provider_keys() == keys
 
 
 def test_llm_provider_keys_are_encrypted_at_rest(identity_mgr):
-    identity_mgr.save_llm_provider_keys({"GEMINI_API_KEY": "plaintext-should-not-appear"})
+    keys = {
+        "GEMINI_API_KEY": "plaintext-should-not-appear",
+        "ANTHROPIC_API_KEY": "anthropic-plaintext",
+        **_NEW_PROVIDER_KEYS,
+    }
+    identity_mgr.save_llm_provider_keys(keys)
     raw = identity_mgr._fake_client.store[_LLM_KEYS_PATH]
-    assert b"plaintext-should-not-appear" not in raw
-    assert b"GEMINI_API_KEY" not in raw
+    for name, value in keys.items():
+        assert name.encode() not in raw, f"plaintext key name {name} leaked at rest"
+        assert value.encode() not in raw, f"plaintext value for {name} leaked at rest"
 
 
 def test_llm_provider_keys_live_in_their_own_category(identity_mgr):
-    identity_mgr.save_llm_provider_keys({"OPENAI_API_KEY": "oa-secret"})
+    identity_mgr.save_llm_provider_keys({"OPENAI_API_KEY": "oa-secret", **_NEW_PROVIDER_KEYS})
     # The dedicated store is NOT the system secrets category.
     assert identity_mgr.get_identity_config("system", "secrets") == {}
 
@@ -81,6 +101,7 @@ def test_resolved_secrets_never_include_llm_provider_keys(identity_mgr):
         "GOOGLE_API_KEY": "goog-secret",
         "OPENAI_API_KEY": "oa-secret",
         "ANTHROPIC_API_KEY": "anth-secret",
+        **_NEW_PROVIDER_KEYS,
     })
     identity_mgr.save_identity_config("system", "secrets", {"SHARED_TOKEN": "sys-token"})
     identity_mgr.save_identity_config("user-1", "secrets", {"GITHUB_TOKEN": "gh-token"})
@@ -90,10 +111,20 @@ def test_resolved_secrets_never_include_llm_provider_keys(identity_mgr):
     assert resolved["GITHUB_TOKEN"] == "gh-token"
     assert resolved["SHARED_TOKEN"] == "sys-token"
     assert _LLM_KEY_NAMES.isdisjoint(resolved.keys())
+    assert set(_NEW_PROVIDER_KEYS).isdisjoint(resolved.keys())
+
+
+def test_llm_provider_base_urls_do_not_leak_into_system_secrets(identity_mgr):
+    """OLLAMA_BASE_URL is a non-credential but still LLM-scoped: never a tool secret."""
+    identity_mgr.save_llm_provider_keys({"OLLAMA_BASE_URL": "http://ollama.internal:11434"})
+    identity_mgr.save_identity_config("system", "secrets", {"SHARED_TOKEN": "sys-token"})
+
+    assert identity_mgr.get_resolved_config("system", "secrets") == {"SHARED_TOKEN": "sys-token"}
+    assert identity_mgr.get_resolved_config("user-1", "secrets", keys=["OLLAMA_BASE_URL"]) == {}
 
 
 def test_resolved_system_secrets_never_include_llm_provider_keys(identity_mgr):
-    identity_mgr.save_llm_provider_keys({"OPENAI_API_KEY": "oa-secret"})
+    identity_mgr.save_llm_provider_keys({"OPENAI_API_KEY": "oa-secret", **_NEW_PROVIDER_KEYS})
     identity_mgr.save_identity_config("system", "secrets", {"SHARED_TOKEN": "sys-token"})
 
     resolved = identity_mgr.get_resolved_config("system", "secrets")
@@ -116,6 +147,7 @@ def test_simulated_subprocess_env_merge_excludes_llm_provider_keys(identity_mgr)
         "GOOGLE_API_KEY": "goog-secret",
         "OPENAI_API_KEY": "oa-secret",
         "ANTHROPIC_API_KEY": "anth-secret",
+        **_NEW_PROVIDER_KEYS,
     })
     identity_mgr.save_identity_config("user-1", "secrets", {"GITHUB_TOKEN": "gh-token"})
 

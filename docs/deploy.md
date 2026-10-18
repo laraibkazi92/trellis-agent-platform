@@ -167,7 +167,7 @@ Commit the content repo and point a branch or tag at it. See [CLI](cli.md) for `
 
 ## Day-2 operations
 
-**LLM provider keys are not in `.env`.** Configure Google (Gemini), OpenAI, Anthropic, or any OpenAI-compatible endpoint in **Admin UI → Global Tool Configuration**. The keys are stored Fernet-encrypted in etcd; an unset key simply disables that provider. The one exception is `GEMINI_API_KEY` in `.env`, which is consumed only by the Hindsight memory container as the fallback for `HINDSIGHT_LLM_API_KEY`.
+**LLM provider keys are not in `.env`.** Configure them in **Admin → LLM Providers**, one card per provider (Google (Gemini), OpenAI, Anthropic, DeepSeek, OpenRouter, Ollama, any OpenAI-compatible endpoint, and more — 15 in total). Every provider key, new or old, lives only in that etcd store, Fernet-encrypted; an unset key simply disables that provider. The one exception is `GEMINI_API_KEY` in `.env`, which is consumed only by the Hindsight memory container as the fallback for `HINDSIGHT_LLM_API_KEY`. The **Framework defaults** card at the top of that page sets an org-wide default provider and model that agents and workflows leaving both `provider` and `model` blank inherit; it lives in etcd under `/config/framework/default_llm_*`.
 
 **Third-party credentials are not in `.env` either.** Store them as **Tool Secrets** in the UI (Configuration). They are injected into tool and workflow subprocesses at run time through the identity-scoped secret store. Note that `hub` and `taskiq-worker` deliberately do not load `.env` as `env_file`, because they copy their environment into every subprocess they spawn.
 

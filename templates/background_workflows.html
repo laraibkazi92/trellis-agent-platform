@@ -345,14 +345,10 @@
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                         <div>
                             <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">Model Engine</label>
-                            <select name="model" id="modal-model-{{ agent.name }}" onchange="updateThinkingLevel('{{ agent.name }}')" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
-                                <option value="gemini-3.1-pro-preview" {{ "selected" if agent.config.get("model") == "gemini-3.1-pro-preview" else "" }}>gemini-3.1-pro-preview</option>
-                                <option value="gemini-3-flash-preview" {{ "selected" if agent.config.get("model") == "gemini-3-flash-preview" else "" }}>gemini-3-flash-preview</option>
-                                <option value="gemini-3.1-flash-lite-preview" {{ "selected" if agent.config.get("model") == "gemini-3.1-flash-lite-preview" else "" }}>gemini-3.1-flash-lite-preview</option>
-                                <option value="gemini-2.5-flash" {{ "selected" if agent.config.get("model") == "gemini-2.5-flash" else "" }}>gemini-2.5-flash</option>
-                                <option value="gemini-2.5-flash-lite" {{ "selected" if agent.config.get("model") == "gemini-2.5-flash-lite" else "" }}>gemini-2.5-flash-lite</option>
-                                <option value="gemini-2.5-pro" {{ "selected" if agent.config.get("model") == "gemini-2.5-pro" else "" }}>gemini-2.5-pro</option>
-                            </select>
+                            <input type="hidden" name="model" id="modal-model-{{ agent.name }}" value="{{ agent.config.get('model') or '' }}">
+                            <select id="modal-model-select-{{ agent.name }}" onchange="syncModalModel('{{ agent.name }}')" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono"></select>
+                            <input type="text" id="modal-model-custom-{{ agent.name }}" oninput="syncModalModel('{{ agent.name }}')" placeholder="Custom model id" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono mt-2" disabled>
+                            <p class="text-[11px] text-neutral-500 dark:text-neutral-400 mt-1 font-mono">Leave blank to inherit the framework default model.</p>
                         </div>
                         <div>
                             <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">Thinking Level</label>
@@ -363,6 +359,22 @@
                                 <option value="high">High</option>
                                 <option value="n/a" hidden {{ "selected" if agent.config.get("thinking_level") == "n/a" else "" }}>N/A</option>
                             </select>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div>
+                            <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">Provider</label>
+                            <select name="provider" id="modal-provider-{{ agent.name }}" onchange="updateModalProviderFields('{{ agent.name }}'); updateThinkingLevel('{{ agent.name }}')" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
+                                <option value="" {{ "selected" if not agent.config.get("provider") else "" }}>Auto (infer from model)</option>
+                                {% for p in llm_providers %}
+                                <option value="{{ p.id }}" {{ "selected" if agent.config.get("provider") == p.id else "" }}>{{ p.label }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div id="modal-base-url-field-{{ agent.name }}">
+                            <label class="block text-xs font-bold font-mono text-neutral-500 mb-2 uppercase tracking-wide">Base URL</label>
+                            <input type="text" name="base_url" id="modal-base-url-{{ agent.name }}" value="{{ agent.config.get('base_url') or '' }}" placeholder="Optional endpoint" class="w-full bg-transparent border border-neutral-300 dark:border-neutral-700 text-neutral-900 dark:text-neutral-100 text-sm rounded-none focus:ring-accent focus:border-accent block p-2.5 font-mono">
                         </div>
                     </div>
 
@@ -721,10 +733,160 @@
     }
 
     {% if is_admin %}
+    {% if not llm_providers_injected %}
+    window.LLM_PROVIDERS = {{ llm_providers_json | safe }};
+    {% set llm_providers_injected = true %}
+    {% endif %}
+    var MODAL_CUSTOM_MODEL = '__custom__';
+    var modalProviders = window.LLM_PROVIDERS || [];
+
+    function modalProviderById(providerId) {
+        for (var i = 0; i < modalProviders.length; i++) {
+            if (modalProviders[i].id === providerId) return modalProviders[i];
+        }
+        return null;
+    }
+
+    function modalEffectiveModel(agentName) {
+        var select = document.getElementById('modal-model-select-' + agentName);
+        if (!select) return '';
+        if (select.value === MODAL_CUSTOM_MODEL) {
+            var custom = document.getElementById('modal-model-custom-' + agentName);
+            return custom ? (custom.value || '').trim() : '';
+        }
+        return select.value || '';
+    }
+
+    function modalInferredProvider(model) {
+        if (!model || model.indexOf('/') !== -1) return null;
+        var lower = model.toLowerCase();
+        for (var i = 0; i < modalProviders.length; i++) {
+            var prefixes = modalProviders[i].model_prefixes || [];
+            for (var j = 0; j < prefixes.length; j++) {
+                var prefix = String(prefixes[j] || '').toLowerCase();
+                if (prefix && lower.indexOf(prefix) === 0) return modalProviders[i];
+            }
+        }
+        return null;
+    }
+
+    function modalEffectiveSpec(agentName) {
+        var select = document.getElementById('modal-provider-' + agentName);
+        if (select && select.value) return modalProviderById(select.value);
+        return modalInferredProvider(modalEffectiveModel(agentName));
+    }
+
+    function populateModalModels() {
+        document.querySelectorAll('[id^="modal-model-select-"]').forEach(function(select) {
+            var agentName = select.id.replace('modal-model-select-', '');
+            var hidden = document.getElementById('modal-model-' + agentName);
+            while (select.firstChild) select.removeChild(select.firstChild);
+
+            var inheritOption = document.createElement('option');
+            inheritOption.value = '';
+            inheritOption.text = 'Inherit framework default';
+            select.appendChild(inheritOption);
+
+            modalProviders.forEach(function(p) {
+                var known = p.known_models || [];
+                if (!known.length) return;
+                var group = document.createElement('optgroup');
+                group.label = p.label;
+                known.forEach(function(model) {
+                    var option = document.createElement('option');
+                    option.value = model;
+                    option.setAttribute('data-provider', p.id);
+                    option.text = model;
+                    group.appendChild(option);
+                });
+                select.appendChild(group);
+            });
+
+            var customOption = document.createElement('option');
+            customOption.value = MODAL_CUSTOM_MODEL;
+            customOption.text = 'Custom model…';
+            select.appendChild(customOption);
+
+            var saved = hidden ? (hidden.value || '') : '';
+            var knownModel = false;
+            Array.prototype.forEach.call(select.options, function(option) {
+                if (saved && option.value === saved) knownModel = true;
+            });
+            if (!saved) {
+                select.value = '';
+            } else {
+                select.value = knownModel ? saved : MODAL_CUSTOM_MODEL;
+            }
+            var customInput = document.getElementById('modal-model-custom-' + agentName);
+            if (customInput) {
+                // Restore a saved custom id, otherwise the custom branch would post "".
+                customInput.value = saved;
+                customInput.disabled = knownModel;
+            }
+            // Do not pin the provider during initial population: an agent saved
+            // with provider Auto must stay Auto until the operator changes the model.
+            syncModalModel(agentName, false);
+        });
+    }
+
+    function syncModalModel(agentName, allowPinProvider) {
+        var select = document.getElementById('modal-model-select-' + agentName);
+        var custom = document.getElementById('modal-model-custom-' + agentName);
+        var hidden = document.getElementById('modal-model-' + agentName);
+        if (!select || !hidden) return;
+
+        var isCustom = select.value === MODAL_CUSTOM_MODEL;
+        if (custom) {
+            custom.disabled = !isCustom;
+            if (!isCustom) custom.value = select.value || '';
+        }
+        hidden.value = modalEffectiveModel(agentName);
+
+        var option = select.options[select.selectedIndex];
+        var implied = option ? option.getAttribute('data-provider') : null;
+        var providerSelect = document.getElementById('modal-provider-' + agentName);
+        if (allowPinProvider !== false && !isCustom && implied && providerSelect && !providerSelect.value) {
+            providerSelect.value = implied;
+        }
+
+        updateModalProviderFields(agentName);
+        updateThinkingLevel(agentName);
+    }
+
+    function updateModalProviderFields(agentName) {
+        var field = document.getElementById('modal-base-url-field-' + agentName);
+        var input = document.getElementById('modal-base-url-' + agentName);
+        if (!field || !input) return;
+        var spec = modalEffectiveSpec(agentName);
+
+        if (!spec) {
+            // Auto with no inferable model: leave the endpoint editable.
+            field.classList.remove('hidden');
+            input.disabled = false;
+            input.required = false;
+            input.placeholder = 'Optional endpoint';
+            return;
+        }
+
+        var supports = !!spec.supports_base_url;
+        var requires = !!spec.requires_base_url;
+
+        field.classList.toggle('hidden', !supports);
+        input.disabled = !supports;
+        input.required = requires;
+        // A provider's registry default is a build-time fallback, so it is shown as a
+        // placeholder and never written into the field: pre-filling it would persist
+        // the endpoint on save and pin the workflow away from the org default it is
+        // supposed to inherit.
+        input.placeholder = spec.base_url_placeholder || spec.default_base_url || 'Optional endpoint';
+    }
+
     function updateThinkingLevel(agentName) {
-        var selectedModel = document.getElementById('modal-model-' + agentName).value;
         var $thinkingSelect = $('#modal-thinking-level-' + agentName);
         if(!$thinkingSelect.length) return;
+        var spec = modalEffectiveSpec(agentName);
+        var style = spec ? spec.thinking_style : null;
+        var selectedModel = modalEffectiveModel(agentName);
         var $noneOption = $thinkingSelect.find('option[value="none"]');
         var $naOption = $thinkingSelect.find('option[value="n/a"]');
         var currentVal = $thinkingSelect.val();
@@ -732,28 +894,79 @@
         $thinkingSelect.prop('disabled', false);
         $thinkingSelect.find('option').show();
         if($noneOption.length) $noneOption.prop('disabled', false);
-        
-        if (!selectedModel) return;
+        if($naOption.length) $naOption.prop('disabled', false);
 
-        if (selectedModel.includes('lite')) {
+        if (style === 'google') {
+            if (!selectedModel) { syncThinkingMirror(agentName, false); return; }
+
+            if (selectedModel.includes('lite')) {
+                $thinkingSelect.prop('disabled', true);
+                $thinkingSelect.val('n/a');
+            } else if (selectedModel === 'gemini-2.5-pro') {
+                if($noneOption.length) {
+                    $noneOption.hide();
+                    $noneOption.prop('disabled', true);
+                }
+                if($naOption.length) $naOption.hide();
+                if (currentVal === 'none' || currentVal === 'n/a') {
+                    $thinkingSelect.val('low');
+                }
+            } else {
+                if($naOption.length) $naOption.hide();
+                if (currentVal === 'n/a') {
+                    $thinkingSelect.val('none');
+                }
+            }
+        } else if (style === 'openai-effort' || style === 'anthropic') {
+            // Effort-based: none/low/medium/high are all meaningful.
+            if($naOption.length) {
+                $naOption.hide();
+                $naOption.prop('disabled', true);
+            }
+            if (currentVal === 'n/a') {
+                $thinkingSelect.val('none');
+            }
+        } else if (style === 'none') {
+            // Nothing to express for this provider.
             $thinkingSelect.prop('disabled', true);
             $thinkingSelect.val('n/a');
-        } else if (selectedModel === 'gemini-2.5-pro') {
-            if($noneOption.length) {
-                $noneOption.hide();
-                $noneOption.prop('disabled', true);
-            }
-            if($naOption.length) $naOption.hide();
-            if (currentVal === 'none' || currentVal === 'n/a') {
-                $thinkingSelect.val('low');
-            }
         } else {
+            // Auto with no inferable provider: preserve the lenient default.
             if($naOption.length) $naOption.hide();
             if (currentVal === 'n/a') {
                 $thinkingSelect.val('none');
             }
         }
+
+        // A disabled select is not submitted with the form; mirror its value so
+        // the save POST still carries thinking_level.
+        syncThinkingMirror(agentName, $thinkingSelect.prop('disabled'));
     }
+
+    function syncThinkingMirror(agentName, disabled) {
+        var mirrorId = 'modal-thinking-level-mirror-' + agentName;
+        var mirror = document.getElementById(mirrorId);
+        if (!mirror) {
+            mirror = document.createElement('input');
+            mirror.type = 'hidden';
+            mirror.name = 'thinking_level';
+            mirror.id = mirrorId;
+            var select = document.getElementById('modal-thinking-level-' + agentName);
+            if (!select || !select.parentNode) return;
+            select.parentNode.appendChild(mirror);
+        }
+        mirror.disabled = !disabled;
+        mirror.value = $('#modal-thinking-level-' + agentName).val() || '';
+    }
+
+    document.addEventListener('DOMContentLoaded', function() {
+        populateModalModels();
+        document.querySelectorAll('select[id^="modal-provider-"]').forEach(function(select) {
+            var agentName = select.id.replace('modal-provider-', '');
+            updateModalProviderFields(agentName);
+            updateThinkingLevel(agentName);
+        });
+    });
     {% endif %}
 
 </script>

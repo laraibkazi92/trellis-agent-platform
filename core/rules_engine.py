@@ -31,6 +31,7 @@ from core.llm_factory import (
     infer_provider,
     resolve_model,
 )
+from core.llm_providers import default_model_for, get_spec, provider_accepts_base_url
 from core.models import RuleEvaluationResult, is_agent_external, is_routable_agent_type
 
 logger = logging.getLogger(__name__)
@@ -194,6 +195,9 @@ RULES_CONFIDENCE_THRESHOLD = float(os.getenv("RULES_CONFIDENCE_THRESHOLD", "0.8"
 # override lookup itself fails/times out -- see _resolve_evaluation_timeout below.
 RULES_EVALUATION_TIMEOUT = float(os.getenv("RULES_EVALUATION_TIMEOUT", "2.5"))
 RULES_EVALUATION_MODEL = os.getenv("RULES_EVALUATION_MODEL", "gemini-2.5-flash")
+# Accepts any provider id from the registry in core/llm_providers.py (e.g. google,
+# openai, anthropic, deepseek, ollama, openai-compatible, ...); empty means infer
+# from RULES_EVALUATION_MODEL.
 RULES_EVALUATION_PROVIDER = os.getenv("RULES_EVALUATION_PROVIDER", "")
 RULES_EVALUATION_BASE_URL = os.getenv("RULES_EVALUATION_BASE_URL", "")
 
@@ -290,6 +294,36 @@ def _kick_model_overrides_refresh() -> None:
             _model_overrides_refresh_in_flight = False
 
 
+def _resolve_evaluation_settings() -> tuple[str, str, Optional[str]]:
+    """Resolve ``(provider, model, base_url)`` from one cache snapshot.
+
+    The three overrides are refreshed together in the background, but resolving them
+    through separate helpers lets a refresh land in between: the provider could come
+    from the pre-refresh snapshot (e.g. the env default's Google) while the model came
+    from the post-refresh one (``deepseek-chat``), egressing the query and rule catalog
+    to the wrong vendor. Read them together so provider inference always uses the same
+    model that will be sent.
+
+    A provider override with no model completes from that provider's registry default
+    (never the env ``RULES_EVALUATION_MODEL``, which may belong to another vendor). When
+    there is no provider override, the env model is honoured exactly as before -- the
+    registry default is only a completion for an admin-selected provider, not a global
+    replacement.
+    """
+    _kick_model_overrides_refresh()
+    provider_override = _cached_provider_override
+    provider = provider_override or RULES_EVALUATION_PROVIDER
+    if not provider:
+        provider = infer_provider(_cached_model_override or RULES_EVALUATION_MODEL)
+    model_name = (
+        _cached_model_override
+        or (default_model_for(provider_override) if provider_override else None)
+        or RULES_EVALUATION_MODEL
+    )
+    base_url = _cached_base_url_override or RULES_EVALUATION_BASE_URL or None
+    return provider, model_name, base_url
+
+
 def _resolve_evaluation_provider() -> str:
     """Admin etcd override > RULES_EVALUATION_PROVIDER env var > inference from the
     configured model name. A model name that matches no known prefix raises
@@ -297,12 +331,7 @@ def _resolve_evaluation_provider() -> str:
     'google' would egress the untrusted query and the full rule catalog to the
     wrong provider's API before failing. evaluate_rules catches the error and
     fails open to semantic search, matching the engine's fail-open design."""
-    _kick_model_overrides_refresh()
-    if _cached_provider_override:
-        return _cached_provider_override
-    if RULES_EVALUATION_PROVIDER:
-        return RULES_EVALUATION_PROVIDER
-    return infer_provider(RULES_EVALUATION_MODEL)
+    return _resolve_evaluation_settings()[0]
 
 
 def _resolve_evaluation_base_url() -> Optional[str]:
@@ -360,10 +389,23 @@ def _build_user_prompt(catalog: str, query: str) -> str:
     )
 
 
+def _evaluation_thinking_style(provider: Optional[str]) -> str:
+    """Registry thinking style for ``provider``; "none" for unknown ids.
+
+    Unknown ids are swallowed here on purpose -- the model resolver surfaces the
+    real configuration error, so this helper only decides whether to pin effort.
+    """
+    try:
+        return get_spec(provider or "").thinking_style
+    except ProviderConfigError:
+        return "none"
+
+
 def _build_evaluation_agent(
     api_key: Optional[str] = None,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
+    model_name: Optional[str] = None,
 ) -> Agent:
     """Construct a fresh single-pass structured-decider Agent for one evaluation call.
 
@@ -372,26 +414,39 @@ def _build_evaluation_agent(
     ``api_key`` (prefetched off the event loop by ``evaluate_rules``) is threaded into
     the model build; when None the key is read here as before.
 
-    ``provider``/``base_url`` may be pre-resolved by the caller. ``evaluate_rules``
-    always threads them so the provider cannot flip (via the async background override
-    refresh) between fetching the key and building the model -- which would pair a key
-    for one vendor with another vendor's model. When omitted (direct callers/tests),
-    they are resolved here as before.
+    ``provider``/``base_url``/``model_name`` may be pre-resolved by the caller.
+    ``evaluate_rules`` always threads them from a single ``_resolve_evaluation_settings``
+    snapshot so neither the provider nor the model can flip (via the async background
+    override refresh) between fetching the key and building the model -- which would
+    pair a key for one vendor with another vendor's model. When omitted (direct
+    callers/tests), they are resolved here as before.
     """
     if provider is None:
-        provider = _resolve_evaluation_provider()
-        base_url = _resolve_evaluation_base_url()
-    model_name = _resolve_evaluation_model()
+        provider, model_name, base_url = _resolve_evaluation_settings()
+    if base_url and not provider_accepts_base_url(provider):
+        # Stale RULES_EVALUATION_BASE_URL for a provider that rejects endpoints
+        # would otherwise fail every evaluation instead of failing open.
+        logger.warning(
+            "Ignoring RULES_EVALUATION_BASE_URL for provider '%s' (endpoint not supported).",
+            provider,
+        )
+        base_url = None
+    # Not a pairing decision: _resolve_evaluation_settings() always supplies a model.
+    # This fallback is only for direct/test callers that pass a provider without one.
+    model_name = model_name or _resolve_evaluation_model()
     model = resolve_model(provider, model_name, base_url, api_key=api_key)
-    if provider == "google":
+    if _evaluation_thinking_style(provider) == "google":
         # Gemini thinking is explicitly zeroed out to keep the decider deterministic
         # and cheap (preserved from the pre-multi-provider implementation).
         model_settings: Optional[ModelSettings] = GoogleModelSettings(
             google_thinking_config={"thinking_budget": 0, "include_thoughts": False}
         )
-    elif provider in ("openai", "anthropic"):
-        # Their reasoning models default to medium effort, which blows the
-        # sub-3s evaluation timeout; pin the cheapest effort instead.
+    elif _evaluation_thinking_style(provider) in ("openai-effort", "anthropic"):
+        # Reasoning models on OpenAI-effort / anthropic thinking providers default
+        # to medium effort, which blows the sub-3s evaluation timeout; pin the
+        # cheapest effort instead. Providers with thinking_style "none" (generic
+        # OpenAI-compatible endpoints, DeepSeek, Ollama, ...) keep no settings --
+        # an effort hint there would be rejected by the endpoint.
         model_settings = build_model_settings(provider, model_name, "low")
     else:
         model_settings = None
@@ -446,10 +501,11 @@ async def evaluate_rules(
         # Resolve provider/base_url once and thread them into model construction so a
         # concurrent background override refresh cannot flip the provider between the
         # key fetch and the model build (misrouting a key to the wrong vendor).
-        provider = _resolve_evaluation_provider()
-        base_url = _resolve_evaluation_base_url()
+        provider, model_name, base_url = _resolve_evaluation_settings()
         api_key = await asyncio.to_thread(llm_factory.get_provider_api_key, provider)
-        agent = _build_evaluation_agent(provider=provider, base_url=base_url, api_key=api_key)
+        agent = _build_evaluation_agent(
+            provider=provider, base_url=base_url, api_key=api_key, model_name=model_name
+        )
         timeout = _resolve_evaluation_timeout()
         threshold = _resolve_confidence_threshold()
         run_result = await asyncio.wait_for(agent.run(user_prompt), timeout=timeout)

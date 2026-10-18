@@ -5,9 +5,10 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Optional, Literal, Dict, Any, Union
 from enum import Enum
 
-# LLM providers core/llm_factory.py can resolve. `openai-compatible` targets any
-# OpenAI-compatible endpoint via `base_url`.
-ALLOWED_PROVIDERS = ("google", "openai", "anthropic", "openai-compatible")
+from core.llm_providers import ALLOWED_PROVIDERS, provider_requires_base_url
+
+# 15 selectable LLM providers; the registry lives in core/llm_providers.py.
+# `openai-compatible` targets any OpenAI-compatible endpoint via `base_url`.
 
 
 class IdentityType(str, Enum):
@@ -121,7 +122,7 @@ class AgentConfig(BaseModel):
     type: Literal['user_agent', 'background_agent', 'background_script'] = 'user_agent'
     model: Optional[str] = None
     thinking_level: Optional[Literal['none', 'low', 'medium', 'high', 'n/a']] = None
-    provider: Optional[str] = Field(default=None, description="LLM provider. None infers from the model name prefix (gemini*/claude*/gpt-*/o1*/o3*/o4*/chatgpt*).")
+    provider: Optional[str] = Field(default=None, description="LLM provider. None infers from the model name prefix: gemini* -> google; claude* -> anthropic; gpt-*/o1*/o3*/o4*/chatgpt* -> openai; plus deepseek*, kimi*, glm*, qwen* -> their providers.")
     base_url: Optional[str] = Field(default=None, description="Custom API endpoint. Required for 'openai-compatible'.")
     a2a_access: List[str] = Field(default_factory=list, description="List of other agents this agent can call.")
     allowed_tools: List[str] = Field(default_factory=list, description="List of MCP tools this agent is allowed to use.")
@@ -152,12 +153,12 @@ class AgentConfig(BaseModel):
         return (value or "").strip() or None
 
     @model_validator(mode="after")
-    def _require_base_url_for_openai_compatible(self) -> "AgentConfig":
-        """Surface the openai-compatible base_url requirement at config-load time
+    def _require_base_url_for_provider(self) -> "AgentConfig":
+        """Surface a provider's base_url requirement at config-load time
         instead of failing later inside resolve_model mid-build."""
-        if self.provider == "openai-compatible" and not self.base_url:
+        if provider_requires_base_url(self.provider) and not self.base_url:
             raise ValueError(
-                "Provider 'openai-compatible' requires a base_url pointing at the compatible endpoint."
+                f"Provider '{self.provider}' requires a base_url pointing at the endpoint."
             )
         return self
 

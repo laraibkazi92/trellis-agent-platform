@@ -1,0 +1,329 @@
+<!--
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+-->
+
+{% extends "base.html" %}
+
+{% block title %}LLM Providers{% endblock %}
+
+{% block content %}
+<div class="max-w-5xl mx-auto">
+    <a href="/admin" class="font-mono text-xs uppercase tracking-widest text-neutral-500 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark transition-colors mb-6 inline-flex items-center gap-2">
+        <i data-lucide="arrow-left" class="w-4 h-4"></i> BACK TO ADMIN DASHBOARD
+    </a>
+    <div class="mb-8">
+        <h1 class="text-3xl font-bold tracking-tight uppercase mb-2">LLM Providers</h1>
+        <p class="text-neutral-500 dark:text-neutral-400 font-mono text-sm">Provider credentials are stored encrypted in etcd and passed explicitly to the model SDKs &mdash; Trellis never reads them from the environment.</p>
+    </div>
+
+    <!-- Framework defaults: the org-wide provider/model/base_url that agents and
+         workflows with a blank provider/model inherit. Providers are limited to the
+         usable set (credential / endpoint / SDK present); models to that provider's
+         curated known_models. -->
+    {% set empty_state = not has_usable and not stored_provider %}
+    <div id="frameworkDefaultsCard" class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm space-y-4 mb-6">
+        <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+            <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Framework defaults</h2>
+            <span class="font-mono text-[11px] text-neutral-500 dark:text-neutral-400">Agents and workflows that leave provider/model blank inherit this pair.</span>
+        </div>
+
+        {% if stored_provider_unusable %}
+        <div class="flex flex-wrap items-center gap-2 border border-amber-500/30 bg-amber-50 text-amber-600 dark:bg-amber-950/20 dark:text-amber-400 rounded px-3 py-2">
+            <span class="font-mono text-xs">
+                The stored default provider is no longer configured, so inheriting agents will fail until a credential is restored or the default is cleared.
+            </span>
+            <span class="font-mono text-[11px] font-bold uppercase">{{ stored_provider_label }} &mdash; not configured</span>
+        </div>
+        {% endif %}
+
+        {% if empty_state %}
+        <p class="font-mono text-xs text-neutral-500 dark:text-neutral-400">No LLM provider is configured yet. Add a key below, then set a default.</p>
+        {% endif %}
+
+        <form action="/admin/llm-providers/defaults" method="POST" class="space-y-4">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="grid gap-4 md:grid-cols-3">
+                <div class="space-y-1">
+                    <label for="frameworkDefaultProvider" class="font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Provider</label>
+                    <select name="provider" id="frameworkDefaultProvider"
+                            class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
+                        <option value="" {% if not selected_provider %}selected{% endif %}>None &mdash; fall back to model-name inference</option>
+                        {% for p in usable_providers %}
+                        <option value="{{ p.id }}" {% if p.id == selected_provider %}selected{% endif %}>{{ p.label }}</option>
+                        {% endfor %}
+                        {% if stored_provider_unusable %}
+                        <option value="{{ stored_provider }}" selected>{{ stored_provider_label }} &mdash; not configured</option>
+                        {% endif %}
+                    </select>
+                </div>
+                <div class="space-y-1">
+                    <label for="frameworkDefaultModel" class="font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Model</label>
+                    <div id="frameworkDefaultModelWrap">
+                    {% if model_free_text %}
+                    <input type="text" name="model" id="frameworkDefaultModel" value="{{ model_free_text_value }}" {% if selected_provider %}required{% else %}disabled{% endif %} placeholder="Model id"
+                           class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
+                    {% else %}
+                    <select name="model" id="frameworkDefaultModel" {% if not selected_provider %}disabled{% endif %}
+                            class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
+                        {% for m in model_options %}
+                        <option value="{{ m }}" {% if m == selected_model %}selected{% endif %}>{{ m }}</option>
+                        {% endfor %}
+                        {% if defaults.model and defaults.provider == selected_provider and defaults.model not in model_options %}
+                        <option value="{{ defaults.model }}" selected>{{ defaults.model }}</option>
+                        {% endif %}
+                    </select>
+                    {% endif %}
+                    </div>
+                </div>
+                <div id="frameworkDefaultBaseUrlWrap" class="space-y-1 {% if not selected_supports_base_url %}hidden{% endif %}">
+                    <label for="frameworkDefaultBaseUrl" class="font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Base URL</label>
+                    <input type="text" name="base_url" id="frameworkDefaultBaseUrl" value="{{ stored_base_url }}" placeholder="{{ selected_base_url_placeholder }}" {% if not selected_supports_base_url %}disabled{% endif %}
+                           class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
+                </div>
+            </div>
+            <div class="flex justify-end">
+                <button type="submit" {% if empty_state %}disabled{% endif %}
+                        class="bg-accent hover:bg-accent-dark text-white font-mono font-bold text-sm uppercase py-2.5 px-6 transition-colors rounded disabled:opacity-50 disabled:cursor-not-allowed">
+                    Save default
+                </button>
+            </div>
+        </form>
+
+        {% if defaults.provider or defaults.model or defaults.base_url %}
+        <form action="/admin/llm-providers/defaults/clear" method="POST" class="flex justify-end">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit"
+                    class="text-xs text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300 font-mono uppercase transition-colors">
+                Clear default
+            </button>
+        </form>
+        {% endif %}
+    </div>
+
+    <div class="flex flex-col sm:flex-row sm:items-center gap-3 mb-6">
+        <div class="relative flex-1">
+            <i data-lucide="search" class="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400 dark:text-neutral-500"></i>
+            <input type="text" id="llmProviderFilter" placeholder="Filter providers&hellip;" autocomplete="off"
+                   class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 pl-9 pr-3 py-2.5 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
+        </div>
+        <label for="llmOnlyUnconfigured" class="inline-flex items-center gap-2 font-mono text-xs uppercase tracking-widest text-neutral-600 dark:text-neutral-300 cursor-pointer select-none">
+            <input type="checkbox" id="llmOnlyUnconfigured" class="accent-current">
+            Only unconfigured
+        </label>
+        <span id="llmProviderCount" class="font-mono text-xs uppercase tracking-widest text-neutral-500 dark:text-neutral-400 whitespace-nowrap">{{ cards|length }} providers</span>
+    </div>
+
+    <form action="/admin/llm-providers" method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+        <div id="llmProviderCards" class="grid gap-4 md:grid-cols-2">
+            {% for p in cards %}
+            {% set keyless = (not p.requires_key and not p.key_names) %}
+            {% set delete_key = p.base_url_key if (p.base_url_value and not p.configured) else p.configured_key %}
+            <div class="llm-provider-card bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm space-y-3"
+                 data-provider="{{ p.id }}"
+                 data-search="{{ (p.label ~ ' ' ~ p.id ~ ' ' ~ (p.key_names|join(' ')) ~ ' ' ~ (p.base_url_key or ''))|lower }}"
+                 data-configured="{{ '1' if p.configured or p.base_url_value else '0' }}"
+                 data-keyless="{{ '1' if keyless else '0' }}">
+
+                <div class="flex flex-wrap items-center gap-2">
+                    <span class="font-bold text-neutral-900 dark:text-neutral-100">{{ p.label }}</span>
+                    <code class="font-mono text-[11px] text-neutral-500 dark:text-neutral-400 bg-neutral-100 dark:bg-neutral-800 px-1.5 py-0.5 rounded">{{ p.id }}</code>
+
+                    {% if not p.sdk_installed %}
+                    <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-mono font-bold uppercase border border-amber-500/30 bg-amber-50 text-amber-600 dark:bg-amber-950/20 dark:text-amber-400 rounded">
+                        SDK NOT INSTALLED
+                    </span>
+                    {% elif keyless %}
+                    <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-mono font-bold uppercase border border-blue-500/30 bg-blue-50 text-blue-600 dark:bg-blue-950/20 dark:text-blue-400 rounded">
+                        KEYLESS
+                    </span>
+                    {% elif p.configured %}
+                    <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-mono font-bold uppercase border border-emerald-500/30 bg-emerald-50 text-emerald-600 dark:bg-emerald-950/20 dark:text-emerald-400 rounded">
+                        CONFIGURED
+                    </span>
+                    {% else %}
+                    <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-mono font-bold uppercase border border-neutral-500/30 bg-neutral-100 text-neutral-600 dark:bg-neutral-800/40 dark:text-neutral-400 rounded">
+                        NOT SET
+                    </span>
+                    {% endif %}
+
+                    {% if keyless and not p.sdk_installed %}
+                    <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-mono font-bold uppercase border border-blue-500/30 bg-blue-50 text-blue-600 dark:bg-blue-950/20 dark:text-blue-400 rounded">
+                        KEYLESS
+                    </span>
+                    {% endif %}
+                </div>
+
+                {% if p.canonical_key %}
+                <div class="space-y-1">
+                    <input type="password"
+                           name="{{ p.canonical_key }}"
+                           autocomplete="new-password"
+                           value=""
+                           {% if p.configured %}placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull; (leave blank to keep current)"{% else %}placeholder="Paste {{ p.canonical_key }}"{% endif %}
+                           {% if not p.sdk_installed %}disabled{% endif %}
+                           class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded disabled:opacity-50 disabled:cursor-not-allowed">
+                    <p class="font-mono text-[10px] text-neutral-500 dark:text-neutral-400">
+                        {%- if p.key_names|length > 1 %}Also accepts: {{ p.key_names[1:]|join(', ') }}.{% endif %}
+                        {%- if not p.requires_key %} Optional.{% endif -%}
+                    </p>
+                </div>
+                {% endif %}
+
+                {% if p.base_url_key %}
+                <div class="space-y-1">
+                    <input type="text"
+                           name="{{ p.base_url_key }}"
+                           value="{{ p.base_url_value or '' }}"
+                           placeholder="{{ p.base_url_placeholder or '' }}"
+                           {% if not p.sdk_installed %}disabled{% endif %}
+                           class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded disabled:opacity-50 disabled:cursor-not-allowed">
+                    <p class="font-mono text-[10px] text-neutral-500 dark:text-neutral-400">Stored encrypted in etcd.</p>
+                </div>
+                {% endif %}
+
+                {% if p.supports_base_url and not p.base_url_key %}
+                <p class="font-mono text-[11px] text-neutral-500 dark:text-neutral-400">
+                    {% if p.id == 'openai-compatible' %}Required per agent &mdash; set a Base URL in the Editor.{% else %}Per-agent endpoint &mdash; set a Base URL on the agent in the Editor.{% endif %}
+                </p>
+                {% endif %}
+
+                {% if p.note or not p.sdk_installed %}
+                <p class="text-[11px] text-neutral-500 dark:text-neutral-400">
+                    {% if p.note %}{{ p.note }}{% endif %}
+                    {% if not p.sdk_installed %}{% if p.note %} {% endif %}Install with <code class="font-mono bg-neutral-100 dark:bg-neutral-800 px-1 rounded">pip install {{ p.sdk_extra }}</code> and rebuild.{% endif %}
+                </p>
+                {% endif %}
+
+                <div class="flex items-center justify-end pt-1">
+                    {% if delete_key and (p.configured or p.base_url_value) %}
+                    <button type="submit" form="llm-provider-delete-{{ p.id }}"
+                            class="text-xs text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300 font-mono uppercase transition-colors">
+                        Clear
+                    </button>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+
+        <div id="llmProviderEmpty" class="hidden text-neutral-500 dark:text-neutral-400 font-mono text-sm text-center py-12">
+            No providers match.
+        </div>
+
+        <div class="pt-6 mt-6 border-t border-neutral-200 dark:border-neutral-800 flex justify-end">
+            <button type="submit" class="w-full sm:w-auto bg-accent hover:bg-accent-dark text-white font-mono font-bold text-sm uppercase py-3 px-8 transition-colors rounded">
+                Save all
+            </button>
+        </div>
+    </form>
+
+    <!-- Per-card delete forms live outside the save form: a button's `form`
+         attribute may target them, and nested forms stay impossible. -->
+    {% for p in cards %}
+    {% set delete_key = p.base_url_key if (p.base_url_value and not p.configured) else p.configured_key %}
+    {% if delete_key and (p.configured or p.base_url_value) %}
+    <form id="llm-provider-delete-{{ p.id }}" action="/admin/llm-providers/delete" method="POST" class="hidden" onsubmit="return confirm('Remove this stored value?')">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="key_name" value="{{ delete_key }}">
+    </form>
+    {% endif %}
+    {% endfor %}
+</div>
+
+<script>window.LLM_PROVIDERS = {{ llm_providers_json | safe }};</script>
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+    // Framework defaults: rebuild the model control (and toggle base_url) when the
+    // provider select changes, from the registry payload. The server-rendered initial
+    // control is left untouched so a stored de-listed model survives (D14).
+    var providerSelect = document.getElementById('frameworkDefaultProvider');
+    var modelWrap = document.getElementById('frameworkDefaultModelWrap');
+    var baseUrlWrap = document.getElementById('frameworkDefaultBaseUrlWrap');
+    var baseUrlInput = document.getElementById('frameworkDefaultBaseUrl');
+    var controlClass = 'w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded';
+
+    if (providerSelect && modelWrap) {
+        var providers = {};
+        (window.LLM_PROVIDERS || []).forEach(function (p) { providers[p.id] = p; });
+
+        function rebuildModel(spec) {
+            var models = (spec && spec.known_models) || [];
+            var control;
+            if (!spec) {
+                control = document.createElement('input');
+                control.type = 'text';
+                control.placeholder = 'Model id';
+                control.value = '';
+                control.disabled = true;
+            } else if (models.length === 0) {
+                control = document.createElement('input');
+                control.type = 'text';
+                control.required = true;
+                control.placeholder = 'Model id';
+                control.value = '';
+            } else {
+                control = document.createElement('select');
+                models.forEach(function (m) {
+                    var opt = document.createElement('option');
+                    opt.value = m;
+                    opt.textContent = m;
+                    if (m === spec.default_model) opt.selected = true;
+                    control.appendChild(opt);
+                });
+            }
+            control.name = 'model';
+            control.id = 'frameworkDefaultModel';
+            control.className = controlClass;
+            modelWrap.replaceChildren(control);
+        }
+
+        providerSelect.addEventListener('change', function () {
+            var spec = providers[providerSelect.value] || null;
+            rebuildModel(spec);
+            var supports = !!(spec && spec.supports_base_url);
+            if (baseUrlWrap) baseUrlWrap.classList.toggle('hidden', !supports);
+            if (baseUrlInput) {
+                baseUrlInput.disabled = !supports;
+                // Never carry one provider's endpoint over to another (D7).
+                baseUrlInput.value = '';
+                baseUrlInput.placeholder = spec ? (spec.base_url_placeholder || spec.default_base_url || '') : '';
+            }
+        });
+    }
+});
+
+document.addEventListener('DOMContentLoaded', function () {
+    var filter = document.getElementById('llmProviderFilter');
+    var onlyUnconfigured = document.getElementById('llmOnlyUnconfigured');
+    var count = document.getElementById('llmProviderCount');
+    var empty = document.getElementById('llmProviderEmpty');
+    var cards = Array.prototype.slice.call(document.querySelectorAll('.llm-provider-card'));
+    if (!filter || !onlyUnconfigured) return;
+
+    function apply() {
+        var query = (filter.value || '').trim().toLowerCase();
+        var unconfiguredOnly = onlyUnconfigured.checked;
+        var visible = 0;
+
+        cards.forEach(function (card) {
+            var matches = !query || (card.getAttribute('data-search') || '').indexOf(query) !== -1;
+            var unconfigured = card.getAttribute('data-configured') === '0'
+                && card.getAttribute('data-keyless') !== '1';
+            var show = matches && (!unconfiguredOnly || unconfigured);
+            card.classList.toggle('hidden', !show);
+            if (show) visible += 1;
+        });
+
+        if (count) count.textContent = visible + (visible === 1 ? ' provider' : ' providers');
+        if (empty) empty.classList.toggle('hidden', visible !== 0);
+    }
+
+    filter.addEventListener('input', apply);
+    onlyUnconfigured.addEventListener('change', apply);
+    apply();
+});
+</script>
+{% endblock %}

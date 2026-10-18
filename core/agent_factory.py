@@ -30,10 +30,10 @@ from pydantic_ai_shields import CostTracking, ToolGuard
 from pydantic_ai_rlm import create_rlm_toolset
 
 from core.auth import EtcdContentionError, IdentityManager, get_identity_manager, user_id_var
-from core import llm_factory
+from core import llm_defaults, llm_factory
 from core.console_backend import SanitizedLocalBackend
 from core.env_sanitize import sanitized_env
-from core.llm_factory import build_model_settings, resolve_model, resolve_provider
+from core.llm_factory import build_model_settings, resolve_model
 from core.models import AgentConfig, MCPConfig, is_agent_external, is_agent_internal
 from core.health import HealthMonitor, evaluate_health_status
 from core.discovery import is_agent_configured
@@ -426,12 +426,27 @@ async def build_agent(agent_name: str) -> Agent:
             raise Exception(f"Agent '{agent_name}' not found")
             
     config = AgentConfig(**config_data)
-    provider = resolve_provider(config.provider, config.model)
+    if llm_defaults.needs_framework_defaults(config.provider, config.model):
+        defaults = await asyncio.to_thread(llm_defaults.get_framework_defaults)
+    else:
+        defaults = llm_defaults.FrameworkDefaults()
+    effective = llm_defaults.resolve_effective_llm_config(
+        config.provider, config.model, config.base_url, defaults
+    )
+    provider = effective.provider
     # Prefetch the etcd-stored key off the event loop (build_agent already does its
     # other etcd I/O via asyncio.to_thread); resolve_model uses it directly.
     api_key = await asyncio.to_thread(llm_factory.get_provider_api_key, provider)
-    model = resolve_model(provider, config.model, config.base_url, api_key=api_key)
-    model_settings = build_model_settings(provider, config.model, config.thinking_level)
+    model = resolve_model(provider, effective.model, effective.base_url, api_key=api_key)
+    model_settings = build_model_settings(provider, effective.model, config.thinking_level)
+    if effective.source != "explicit":
+        logger.info(
+            "LLM config unresolved for agent '%s'; using framework default %s/%s (source=%s)",
+            agent_name,
+            provider,
+            effective.model,
+            effective.source,
+        )
     
     capabilities = []
     toolsets = []
@@ -672,6 +687,47 @@ def cancel_llm_key_watch() -> None:
     global _llm_key_watch_id
     watch_id = _llm_key_watch_id
     _llm_key_watch_id = None
+    if watch_id is not None:
+        get_identity_manager().client.cancel_watch(watch_id)
+
+
+_llm_defaults_watch_id: Any = None
+
+
+def _on_llm_defaults_change(event) -> None:
+    """Sync etcd watch callback: flush every cache derived from the framework defaults.
+
+    A changed default must drop the TTL cache *and* every already-built agent (which
+    baked in the previous effective model/endpoint), otherwise an org-default change
+    would only take effect after the agent is evicted for some other reason. Runs on
+    the watch thread, so it must not await.
+    """
+    from core import llm_defaults
+
+    llm_defaults.reset_defaults_cache()
+    evict_all_agents()
+
+
+def install_llm_defaults_watch() -> None:
+    """Register the etcd watch that invalidates framework-default-derived caches.
+
+    Idempotent. The host and the taskiq worker are separate processes with separate
+    agent caches, so each calls this once at startup.
+    """
+    global _llm_defaults_watch_id
+    if _llm_defaults_watch_id is not None:
+        return
+    identity_mgr = get_identity_manager()
+    _llm_defaults_watch_id = identity_mgr.client.add_watch_prefix_callback(
+        "/config/framework/default_llm_", _on_llm_defaults_change
+    )
+
+
+def cancel_llm_defaults_watch() -> None:
+    """Cancel the framework-defaults etcd watch and clear the sentinel (idempotent)."""
+    global _llm_defaults_watch_id
+    watch_id = _llm_defaults_watch_id
+    _llm_defaults_watch_id = None
     if watch_id is not None:
         get_identity_manager().client.cancel_watch(watch_id)
 

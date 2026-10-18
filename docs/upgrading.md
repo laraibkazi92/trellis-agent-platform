@@ -171,11 +171,12 @@ The embeddings provider value for Gemini/Google is `google`, not `gemini`.
 #### `AGENT_EMBEDDING_MODEL` and semantic agent discovery
 
 Semantic agent discovery (`search_agents` / `auto_select`) indexes agents at sync time using
-the embeddings model configured in **Admin → Global Tool Configuration**. Changing
-`AGENT_EMBEDDING_MODEL` invalidates every previously stored agent embedding. Re-embed by
-rebuilding / re-running the registry sync (a `docker compose up -d --build`, or
-`python scripts/trellis sync` from inside a container) so `search_agents` works again. Until
-then, semantic search falls back to keyword matching.
+the embeddings model selected in **Admin → Limits & Tuning** (`agent_embedding_model`) and the
+Google key configured in **Admin → LLM Providers**. Changing `AGENT_EMBEDDING_MODEL`
+invalidates every previously stored agent embedding. Re-embed by rebuilding / re-running the
+registry sync (a `docker compose up -d --build`, or `python scripts/trellis sync` from inside
+a container) so `search_agents` works again. Until then, semantic search falls back to
+keyword matching.
 
 #### Hindsight server image vs. `hindsight-client`
 
@@ -192,6 +193,77 @@ grep 'ghcr.io/vectorize-io/hindsight' docker-compose.yml
 The image is the `-slim` variant (no bundled local ML models, relies on the Gemini API for
 LLM and embeddings). Because of that, the `local` reranker is unavailable and the default is
 `rrf` (Reciprocal Rank Fusion passthrough).
+
+### v0.2.1 — 2026-10-18
+
+Changes since `v0.2.0`.
+
+#### LLM provider expansion (pydantic-ai 2.57.0)
+
+Existing agents and etcd data keep working; the only action is a rebuild so the new
+dependencies are installed.
+
+- **Dependencies:** `requirements.txt` now pins `pydantic-ai[huggingface]==2.57.0` and
+  `google-genai==2.31.0` (was `pydantic-ai==2.31.0` / `google-genai==2.18.1`). Do not keep
+  the old `google-genai` pin: it breaks Google model dispatch. Rebuild with
+  `docker compose up -d --build`.
+- **No etcd migration.** Provider credentials are still one flat dict at
+  `/identities/system/system/llm_keys`. The existing `GEMINI_API_KEY`, `GOOGLE_API_KEY`,
+  `OPENAI_API_KEY`, and `ANTHROPIC_API_KEY` entries keep their names and precedence, and
+  the four legacy `provider` values still resolve.
+- **New page.** Provider keys are no longer on the tool/MCP secrets page; they live on
+  **Admin → LLM Providers** — one card per provider. The tool-secrets page keeps tool/MCP
+  secrets and variables. The keys for the 11 new providers (DeepSeek, Fireworks AI, Together AI,
+  Moonshot AI, Vercel AI Gateway, Z.AI, OpenRouter, Alibaba, Ollama, LiteLLM, Hugging Face)
+  are set there.
+- **`openai-compatible` key name:** `OPENAI_COMPATIBLE_API_KEY` is the preferred name;
+  `OPENAI_API_KEY` is still accepted, so deployments that never set the new name keep
+  working.
+- **Ollama needs a base URL.** pydantic-ai 2.57 refuses to guess one, and Trellis always
+  passes an explicit value; it defaults to `http://localhost:11434` and can be overridden
+  per agent or globally on the new page (`OLLAMA_BASE_URL`).
+- **`base_url` is now honoured for `google`/`openai`/`anthropic`.** The old resolver ignored
+  a per-agent `base_url` for these three (it only mattered for `openai-compatible`). A stale
+  endpoint left on an existing agent will now be used — remove it if it was not intentional.
+  Providers that cannot take an endpoint (`deepseek`, `openrouter`, …) reject one with a clear
+  error instead of silently dropping it.
+
+#### Framework LLM defaults
+
+An admin can now set one org-wide default provider + model in **Admin → LLM Providers →
+Framework defaults**. Agents and background workflows that leave both `provider` and `model`
+blank inherit it; the value lives only in etcd and is never written into an agent's YAML.
+
+- **Behaviour change — call this out.** An agent or workflow with `model` blank used to build a
+  model with an **empty id** and fail on the first request. It now resolves — either to the
+  admin's framework default, or, when nothing is configured, to `google` / `gemini-2.5-flash`.
+  A config that has never served a request may therefore start running (and billing). This only
+  affects configurations that were already broken; a fully-specified agent is unchanged.
+- **A provider with a blank model now resolves** to that provider's registry default (e.g.
+  `deepseek` → `deepseek-chat`) instead of failing. `openai-compatible` still requires an
+  explicit model — it has no registry default.
+- **`litellm` endpoint default.** A `litellm` agent, workflow, or framework default with no
+  `base_url` now resolves to `http://localhost:4000`. Previously no endpoint was passed at all,
+  and the underlying OpenAI SDK silently fell back to `https://api.openai.com/v1` — sending the
+  gateway credential to a host the operator never chose. Set `base_url` explicitly when the
+  LiteLLM proxy runs elsewhere; `localhost` inside the host container is only reachable in the
+  same network namespace.
+- **Workflow schema widening.** `AgentUpdateModel.model` is now optional, so background agents
+  can be saved with a blank model (inherit). This is a widening only: every existing stored
+  workflow keeps its model and is unaffected.
+- **New etcd keys, no migration.** The default lives at
+  `/config/framework/default_llm_provider`, `/config/framework/default_llm_model`, and
+  `/config/framework/default_llm_base_url`. All three are empty by default, and empty means
+  today's behaviour apart from the case-E fallback above.
+- **Rules decider pairing.** An admin provider override with a blank model now persists that
+  provider's registry default instead of pairing the override with the environment
+  `RULES_EVALUATION_MODEL` (which could egress to the wrong vendor). Deployments that set only
+  `RULES_EVALUATION_MODEL` with no provider override are unchanged.
+- **Endpoint environment residual.** Trellis always passes a configured `base_url` explicitly
+  to the provider SDK, but for a provider that supports an endpoint and has **no** configured
+  `base_url` — neither per-agent, nor the framework default, nor a global store — the SDK may
+  still read its own endpoint environment variable (for example `OPENAI_BASE_URL`). Set the
+  endpoint explicitly if you do not want that fallback.
 
 ---
 

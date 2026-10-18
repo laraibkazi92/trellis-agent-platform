@@ -185,19 +185,34 @@
         <p class="text-sm text-gray-500 mt-1">
           Model, provider and base_url for the single-pass decider, plus the minimum confidence
           required to accept a match. Blank fields fall back to the env-var defaults
-          (<code class="text-xs bg-gray-100 px-1 py-0.5 rounded">RULES_EVALUATION_MODEL</code> etc.).
+          (<code class="text-xs bg-gray-100 px-1 py-0.5 rounded">RULES_EVALUATION_MODEL</code> etc.),
+          except that a blank model next to a selected provider uses that provider's registry
+          default.
+          Provider credentials are managed in
+          <a href="/admin/llm-providers" class="underline hover:text-gray-900">Admin &rarr; LLM Providers</a>.
         </p>
       </div>
       <form action="/admin/rules-engine/model" method="POST" class="grid grid-cols-2 gap-2 w-full max-w-md shrink-0">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <select name="provider" class="rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-neutral-900">
-          <option value="">Provider: default ({{ rules_engine.provider_default or 'inferred' }})</option>
-          {% for p in allowed_providers %}
-          <option value="{{ p }}" {% if rules_engine.provider_override == p %}selected{% endif %}>{{ p }}</option>
+        <select name="provider" id="rulesProviderSelect" class="rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-neutral-900">
+          <option value="">Provider: default ({{ rules_engine.provider_default or 'infer from model' }})</option>
+          {% for p in llm_providers %}
+          <option
+            value="{{ p.id }}"
+            {% if rules_engine.provider_override == p.id %}selected{% endif %}
+          >{{ p.label or p.id }}</option>
           {% endfor %}
         </select>
-        <input type="text" name="model" value="{{ rules_engine.model_override or '' }}" placeholder="Model (default: {{ rules_engine.model_default }})" class="rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-neutral-900">
-        <input type="text" name="base_url" value="{{ rules_engine.base_url_override or '' }}" placeholder="Base URL (optional)" class="rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-neutral-900">
+        <input type="text" list="rulesModelDatalist" id="rulesModelInput" name="model" value="{{ rules_engine.model_override or '' }}" placeholder="Model (default: {{ rules_engine.model_default }})" class="rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-neutral-900">
+        <div id="rulesBaseUrlField">
+          <input type="text" id="rulesBaseUrlInput" name="base_url" value="{{ rules_engine.base_url_override or '' }}" placeholder="Base URL (optional)" class="w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-neutral-900">
+        </div>
+        {% set seen_models = namespace(items=[]) %}
+        <datalist id="rulesModelDatalist" class="hidden">
+          {% for p in llm_providers %}{% for m in p.known_models %}{% if m not in seen_models.items %}{% set _ = seen_models.items.append(m) %}
+          <option value="{{ m }}"></option>
+          {% endif %}{% endfor %}{% endfor %}
+        </datalist>
         <div class="flex items-center gap-2">
           <input type="number" step="0.05" min="0" max="1" name="confidence_threshold" value="{{ rules_engine.confidence_override if rules_engine.confidence_override is not none else '' }}" placeholder="Threshold: {{ rules_engine.confidence_default }}" class="flex-1 rounded-md border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-neutral-900">
           <button type="submit" class="inline-flex items-center px-4 py-2 bg-neutral-800 text-white text-sm font-medium rounded-md hover:bg-neutral-900 shadow-sm transition-colors uppercase font-mono tracking-wide">
@@ -345,6 +360,17 @@
   </div>
 </div>
 
+<!-- LLM Providers -->
+<div class="bg-white shadow-sm rounded-xl border border-gray-200 mb-8 overflow-hidden">
+  <a href="/admin/llm-providers" class="flex items-center justify-between gap-4 px-6 py-4 hover:bg-gray-50 transition-colors group">
+    <div>
+      <p class="text-lg font-semibold text-gray-900">LLM Providers</p>
+      <p class="text-sm text-gray-500 mt-1">Provider API keys &amp; endpoints</p>
+    </div>
+    <i data-lucide="arrow-right" class="w-5 h-5 shrink-0 text-gray-400 group-hover:text-gray-900 transition-colors"></i>
+  </a>
+</div>
+
 <!-- Global API Keys Table -->
 <div class="bg-white shadow-sm rounded-xl border border-gray-200 overflow-hidden">
   <div class="px-6 py-4 border-b border-gray-200 bg-gray-50">
@@ -396,4 +422,64 @@
     </table>
   </div>
 </div>
+
+<script>window.LLM_PROVIDERS = {{ llm_providers_json | safe }};</script>
+<script>
+(function () {
+  const PROVIDERS = window.LLM_PROVIDERS || [];
+  const select = document.getElementById('rulesProviderSelect');
+  const modelInput = document.getElementById('rulesModelInput');
+  const baseUrlField = document.getElementById('rulesBaseUrlField');
+  const baseUrlInput = document.getElementById('rulesBaseUrlInput');
+  if (!select || !baseUrlField || !baseUrlInput) return;
+
+  function inferSpec(modelValue) {
+    const value = (modelValue || '').trim().toLowerCase();
+    if (!value || value.includes('/')) return null;
+    return PROVIDERS.find(function (p) {
+      return (p.model_prefixes || []).some(function (prefix) {
+        return value.startsWith(String(prefix).toLowerCase());
+      });
+    }) || null;
+  }
+
+  function updateRulesProviderFields() {
+    let spec = PROVIDERS.find(function (p) { return p.id === select.value; }) || null;
+    if (!spec) spec = inferSpec(modelInput ? modelInput.value : '');
+
+    if (!spec) {
+      baseUrlField.classList.remove('hidden');
+      baseUrlInput.disabled = false;
+      baseUrlInput.required = false;
+      baseUrlInput.placeholder = 'Base URL (optional)';
+      return;
+    }
+
+    const supports = !!spec.supports_base_url;
+    baseUrlField.classList.toggle('hidden', !supports);
+    baseUrlInput.disabled = !supports;
+    baseUrlInput.required = !!spec.requires_base_url;
+    // A provider's registry default is a build-time fallback, so it is shown as a
+    // placeholder and never written into the field: pre-filling it would persist the
+    // operator's preview of the default as an explicit override.
+    baseUrlInput.placeholder = spec.base_url_placeholder || spec.default_base_url || 'Optional endpoint';
+  }
+
+  select.addEventListener('change', updateRulesProviderFields);
+  if (modelInput) modelInput.addEventListener('input', function () {
+    // A known model from the registry implies its provider; Auto cannot infer
+    // ids like llama3.2 or openai/gpt-5, which would fail every evaluation.
+    if (!select.value) {
+      const model = (modelInput.value || '').trim();
+      const match = PROVIDERS.find(function (p) {
+        return (p.known_models || []).indexOf(model) !== -1;
+      });
+      if (match) select.value = match.id;
+    }
+    updateRulesProviderFields();
+  });
+  document.addEventListener('DOMContentLoaded', updateRulesProviderFields);
+  if (document.readyState !== 'loading') updateRulesProviderFields();
+})();
+</script>
 {% endblock %}
