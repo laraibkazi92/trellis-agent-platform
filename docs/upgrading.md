@@ -194,10 +194,9 @@ The image is the `-slim` variant (no bundled local ML models, relies on the Gemi
 LLM and embeddings). Because of that, the `local` reranker is unavailable and the default is
 `rrf` (Reciprocal Rank Fusion passthrough).
 
-### Unreleased
+### v0.2.1 — 2026-10-18
 
-Changes in `main` after `v0.2.0`. They land in the next tagged release; if you track
-`main`, apply them now.
+Changes since `v0.2.0`.
 
 #### LLM provider expansion (pydantic-ai 2.57.0)
 
