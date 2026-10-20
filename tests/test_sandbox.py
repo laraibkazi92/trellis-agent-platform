@@ -335,7 +335,9 @@ def test_prepare_execution_env_and_tmpdir(monkeypatch, tmp_path, backend):
 
     if backend is sandbox.Backend.BWRAP:
         assert plan.env["TMPDIR"] == "/tmp"
-        assert "HOME" not in plan.env
+        # /tmp is the private tmpfs: a writable HOME keeps tool caches working
+        # and hides the hub's own home config.
+        assert plan.env["HOME"] == "/tmp"
     else:
         assert plan.env["TMPDIR"] == plan.env["HOME"] == str(plan.tmpdir)
 

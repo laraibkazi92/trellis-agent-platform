@@ -278,7 +278,11 @@ def prepare_execution(
 
     plan_env = sanitized_env() if env is None else dict(env)
     if selected is Backend.BWRAP:
-        plan_env.update({"TMPDIR": "/tmp", "TMP": "/tmp", "TEMP": "/tmp"})
+        # /tmp is a private tmpfs, so a writable HOME keeps npx/pip caches
+        # working and stops tools from reading the hub's own home config.
+        plan_env.update(
+            {"TMPDIR": "/tmp", "TMP": "/tmp", "TEMP": "/tmp", "HOME": "/tmp"}
+        )
     else:
         home = str(tmpdir)
         plan_env.update(

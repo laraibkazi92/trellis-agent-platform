@@ -5,8 +5,8 @@
 
 ``warmup()`` probes the configured backend once at startup and caches a payload
 shaped for ``/healthz``. Phase 2 probes both backends: bubblewrap, and the
-Landlock helper (filesystem confinement plus the uid drop, probed separately so
-a stripped capability is diagnosed as ``landlock_setuid_denied``).
+Landlock helper (filesystem confinement plus the tool identity, probed separately
+so a stripped capability is diagnosed as ``landlock_setuid_denied``).
 """
 
 import copy
@@ -81,9 +81,11 @@ REMEDIATIONS: dict[str, str] = {
         "enabled, or fix bwrap instead (`SANDBOX_BACKEND=bwrap`)."
     ),
     "landlock_setuid_denied": (
-        "The hub cannot chown the run dir or drop the tool's uid. Start the hub "
-        "with CAP_SETUID, CAP_SETGID and CAP_CHOWN (see the compose cap_add), or "
-        "switch to `SANDBOX_BACKEND=bwrap`."
+        "The hub cannot chown the run dir or switch to the tool's uid. A "
+        "non-root hub cannot switch identities at all: SANDBOX_UID/SANDBOX_GID "
+        "must match the hub's own uid/gid (or run the hub as root, with "
+        "CAP_SETUID, CAP_SETGID and CAP_CHOWN from the compose cap_add). "
+        "Alternatively switch to `SANDBOX_BACKEND=bwrap`."
     ),
     "ptrace_scope_unrestricted": (
         "ptrace is unrestricted. Set `kernel.yama.ptrace_scope=1` (or higher) on "
@@ -118,6 +120,7 @@ _SECCOMP_OFF = frozenset({"off", "0", "false", "no"})
 _STATUS_CACHE: dict = {}
 _WARNED_BACKEND = False
 _WARNED_ROOT_UID = False
+_WARNED_IDENTITY = False
 
 
 def _read_text(path: str) -> str:
@@ -352,7 +355,8 @@ def _classify_helper_result(backend: str, proc) -> ProbeResult:
             remediation=REMEDIATIONS["unknown"],
         )
 
-    # A failed chown/setuid means the hub is missing CAP_SETUID/CAP_SETGID.
+    # A failed chown/setuid means either the hub lacks CAP_SETUID/CAP_SETGID or
+    # a non-root hub asked for an identity it cannot switch to.
     if any(
         marker in text
         for marker in ("setuid", "setgid", "setgroups", "chown", "epriv", "eperm")
@@ -386,7 +390,7 @@ def _classify_helper_result(backend: str, proc) -> ProbeResult:
 def _run_helper(
     backend: str, helper: str, grants: list[str], timeout: float
 ) -> ProbeResult:
-    """Run the helper with ``grants`` plus the shared uid-drop tail."""
+    """Run the helper with ``grants`` plus the shared identity tail."""
     uid, gid = resolve_sandbox_identity()
     try:
         tmpdir = tempfile.mkdtemp(prefix="trellis-probe-")
@@ -483,7 +487,7 @@ def probe_landlock(
 def probe_privilege_drop(
     helper: str | None = None, timeout: float = 5.0
 ) -> ProbeResult:
-    """Probe only the uid drop (no ``--rw``), isolating ``SETUID``/``SETGID``."""
+    """Probe only the tool identity (no ``--rw``), isolating ``SETUID``/``SETGID``."""
     helper = helper or helper_path()
 
     if landlock_abi_version() == 0:
@@ -500,6 +504,23 @@ def probe_privilege_drop(
         return missing
 
     return _run_helper("privilege", helper, ["--ro", "/"], timeout)
+
+
+def _warn_if_identity_unreachable(uid: int) -> None:
+    """Warn once when a non-root hub cannot switch to the resolved uid."""
+    global _WARNED_IDENTITY
+    euid = os.geteuid()
+    if euid == 0 or uid == euid or _WARNED_IDENTITY:
+        return
+    logger.warning(
+        "SANDBOX_UID=%s differs from the hub uid %s, and the hub is not root: "
+        "the helper cannot switch identities without privilege, so every "
+        "Landlock run will fail at chown/setgid. Set SANDBOX_UID/SANDBOX_GID to "
+        "the hub uid, or run the hub as root.",
+        uid,
+        euid,
+    )
+    _WARNED_IDENTITY = True
 
 
 def resolve_sandbox_identity() -> tuple[int, int]:
@@ -528,8 +549,10 @@ def resolve_sandbox_identity() -> tuple[int, int]:
     except KeyError:
         fallback_uid, fallback_gid = 1000, 1000
 
+    resolved_uid = uid if uid is not None else fallback_uid
+    _warn_if_identity_unreachable(resolved_uid)
     return (
-        uid if uid is not None else fallback_uid,
+        resolved_uid,
         gid if gid is not None else fallback_gid,
     )
 
@@ -751,7 +774,8 @@ def build_healthz_payload() -> tuple[int, dict]:
 
 
 def reset_for_tests() -> None:
-    global _STATUS_CACHE, _WARNED_BACKEND, _WARNED_ROOT_UID
+    global _STATUS_CACHE, _WARNED_BACKEND, _WARNED_ROOT_UID, _WARNED_IDENTITY
     _STATUS_CACHE = {}
     _WARNED_BACKEND = False
     _WARNED_ROOT_UID = False
+    _WARNED_IDENTITY = False

@@ -1,15 +1,18 @@
 /* trellis-sandbox: privilege drop + Landlock confinement + exec.
  *
- * Opens every granted path while still privileged, drops to the target uid/gid,
- * zeroes capabilities, lowers resource limits, installs a Landlock filesystem
- * domain, installs a seccomp deny-list, then execs the command in place (no
- * fork, so exit codes and signals pass through). --no-seccomp skips the
- * deny-list.
+ * Opens every granted path before changing identity, drops to the target
+ * uid/gid, zeroes capabilities, lowers resource limits, installs a Landlock
+ * filesystem domain, installs a seccomp deny-list, then execs the command in
+ * place (no fork, so exit codes and signals pass through). --no-seccomp skips
+ * the deny-list.
  *
- * When the caller already runs as the target identity (unprivileged test runs)
- * the identity change is skipped; supplementary groups may survive the attempt
- * when the caller lacks CAP_SETGID, which is reported on stderr. Capabilities,
- * limits, Landlock and seccomp are applied either way.
+ * The helper does not assume it starts as root. When the caller already runs as
+ * the target identity (a hub that runs as the sandbox uid, unprivileged test
+ * runs) the chown and the identity syscalls are skipped; supplementary groups
+ * may survive the attempt when the caller lacks CAP_SETGID, which is reported on
+ * stderr. A non-root caller that asks for a different identity cannot switch
+ * and exits 68. Capabilities, limits, Landlock and seccomp are applied either
+ * way.
  *
  * Exit: 64 usage, 65 Landlock unavailable/failure, 66 seccomp install failure,
  * 67 path grant failure, 68 privilege drop failure, 69 rlimit failure,
@@ -376,8 +379,14 @@ static void zero_capabilities(void)
 
 static void drop_privileges(const struct opts *o, const char *tmpdir)
 {
-    if (chown(tmpdir, o->uid, o->gid))
-        die_errno(EXIT_PRIVDROP, "chown(tmpdir)");
+    /* Re-owning the run dir is part of the identity change, not something a
+     * same-identity caller needs: a non-root hub at the target uid would only
+     * perform a same-owner no-op, and one at any other uid fails here with
+     * EPERM -- which is correct, it cannot switch. */
+    if (geteuid() != o->uid || getegid() != o->gid) {
+        if (chown(tmpdir, o->uid, o->gid))
+            die_errno(EXIT_PRIVDROP, "chown(tmpdir)");
+    }
     /* An unprivileged caller cannot clear groups, so EPERM here is expected
      * when it already runs as the target identity. Warn if groups survived:
      * a silent assumption that they are gone would overstate the isolation. */
@@ -670,8 +679,8 @@ int main(int argc, char **argv)
     if (abi <= 0)
         die(EXIT_LANDLOCK, "landlock unavailable (ABI 0)");
 
-    /* 2. Open every grant while still root, so the target uid need not be able
-     * to traverse the path. */
+    /* 2. Open every grant before the identity change, so the target uid need
+     * not be able to traverse the path. */
     if (ro.n) {
         ro_fds = calloc(ro.n, sizeof(*ro_fds));
         if (!ro_fds)

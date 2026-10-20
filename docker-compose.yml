@@ -99,11 +99,14 @@ services:
     build: *app-build
     image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.2.1}
     container_name: tool-hub
+    # Runs as the operator uid -- the same identity that owns the bind-mounted
+    # workspace, so tools run as the workspace owner and no capabilities are
+    # needed. The sandbox helper only performs a uid drop when it starts as root;
+    # at this identity it runs tools directly as this uid.
+    user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     # PID 1 must reap orphaned tool children: the Landlock backend runs tools as
     # direct children, so a tool that daemonizes would otherwise leave zombies.
     init: true
-    # Runs as ROOT on purpose (bubblewrap, and the Landlock helper needs root to
-    # drop the tool to the workspace uid). Do NOT add a user: here.
     command: python core/hub.py
     restart: unless-stopped
     # /healthz is cached from the startup probes (no per-request bwrap fork) and
@@ -121,22 +124,14 @@ services:
     # --die-with-parent), with a Landlock helper (core/sandbox.py +
     # /usr/local/bin/trellis-sandbox) as the fallback when bwrap cannot run (no
     # AppArmor profile, no user namespaces). Landlock confines filesystem writes and
-    # drops the tool to the workspace owner uid; it does not create namespaces.
-    # What bwrap needs inside a container, and nothing more (empirically verified
-    # with the exact syscall sequence bwrap uses under this Docker daemon):
-    #   - SYS_ADMIN: docker's default seccomp profile gates clone(CLONE_NEWUSER)
-    #     on this capability; full `privileged: true` is NOT required.
-    #   - SETFCAP: the hub runs as root and bwrap writes an identity uid_map
-    #     (0->0); the kernel requires CAP_SETFCAP for a root process to map its
-    #     own uid into a new user namespace.
-    #   - SETUID/SETGID: used ONLY by the Landlock backend so the helper can drop
-    #     the tool to the workspace owner uid/gid (SANDBOX_UID/SANDBOX_GID, default
-    #     1000). The bwrap path never uses them; without them the helper cannot
-    #     setuid and /healthz reports landlock_setuid_denied instead of running
-    #     tools as root.
-    #   - CHOWN: the helper chowns the per-run tmpdir to that uid/gid before
-    #     dropping, so the tool owns its TMPDIR/HOME. Dropped before execve; it
-    #     never reaches the tool.
+    # runs the tool at the hub's own identity; it does not create namespaces.
+    # Posture: the hub runs as TRELLIS_UID, the uid that owns the workspace. Every
+    # tool therefore runs as the workspace owner -- bwrap maps that uid 1:1 inside
+    # the user namespace it creates and drops every capability; Landlock needs no
+    # setuid/chown because there is no identity to drop. That is why cap_add is
+    # empty: as the target uid the hub needs no capabilities at all.
+    # What bwrap still needs inside a container, and nothing more (empirically
+    # verified with the exact syscall sequence bwrap uses under this Docker daemon):
     #   - systempaths=unconfined: docker's masked /proc submounts (/proc/sys,
     #     /proc/bus, ...) leave /proc not "fully visible", so the kernel rejects
     #     bwrap's fresh proc mount with "Operation not permitted". This only
@@ -145,26 +140,26 @@ services:
     #     pivot_root(2), which bwrap calls to build the sandbox root; without it
     #     EVERY tool invocation dies with "bwrap: pivot_root: Operation not
     #     permitted". Disabling the filter is the standard requirement for
-    #     running bwrap (itself a sandbox) inside a container — the capabilities
-    #     above plus bwrap's own ro-bind/namespace isolation are what confine the
-    #     tool.
+    #     running bwrap (itself a sandbox) inside a container — bwrap's own
+    #     ro-bind/namespace isolation is what confines the tool.
     #   - no-new-privileges: tools cannot regain privileges via setuid/file caps.
-    # Escape hatch: if tool execution still fails with bwrap/userns errors on an
-    # exotic host, restoring `privileged: true` locally still works.
+    #   - bwrap itself receives CAP_SYS_ADMIN inside its own user namespace,
+    #     which is what allows its mounts; the container's capability set stays
+    #     empty (cap_drop ALL, no cap_add).
+    # Fallback: if tool execution still fails with bwrap/userns errors on an
+    # exotic host, the ONLY capability to re-add is SYS_ADMIN. Never add
+    # SETUID/SETGID/CHOWN: the hub is not root, so they would hand a normal
+    # process privilege escalation instead of enabling a uid drop.
     cap_drop: [ALL]
-    # SETUID/SETGID/CHOWN exist only so the Landlock helper can chown the run
-    # dir and drop the tool to the workspace owner uid/gid (default 1000); the
-    # bwrap path never uses them, and all three are cleared before exec.
-    cap_add: [SYS_ADMIN, SETFCAP, SETUID, SETGID, CHOWN]
     # Docker's docker-default AppArmor profile contains `deny mount,`. AppArmor is an
     # LSM independent of seccomp, so unconfining seccomp is not enough: it still blocks
     # bwrap's bind/proc/tmpfs mounts and its pivot_root. `apparmor=unconfined` is the
     # AppArmor analogue of `seccomp=unconfined`.
     # Residual risk: seccomp was already unconfined above, so mount was already
-    # permitted for hub processes running outside bwrap. Containment rests on the
-    # capability set plus the container's own mount namespace. Orgs that forbid
+    # permitted for hub processes running outside bwrap. Containment rests on bwrap's
+    # own namespace isolation and the empty capability set. Orgs that forbid
     # unconfined profiles should ship the custom profile in deploy/apparmor/trellis-hub
-    # (Phase 4) instead of this line.
+    # instead of this line.
     security_opt:
       - "no-new-privileges:true"
       - "systempaths=unconfined"
@@ -190,6 +185,8 @@ services:
       # Sandbox backend: auto | bwrap | landlock (see core/sandbox.py).
       SANDBOX_BACKEND: ${SANDBOX_BACKEND:-auto}
       # Target uid/gid for the Landlock backend; matches the operator-owned workspace.
+      # Defaults to TRELLIS_UID/TRELLIS_GID, i.e. the hub's own identity, so the
+      # helper has no identity to drop on the default deployment.
       SANDBOX_UID: ${SANDBOX_UID:-${TRELLIS_UID:-1000}}
       SANDBOX_GID: ${SANDBOX_GID:-${TRELLIS_GID:-1000}}
       # Syscall deny-list for the Landlock backend (on|off).

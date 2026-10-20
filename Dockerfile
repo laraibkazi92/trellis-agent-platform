@@ -72,9 +72,9 @@ COPY --chmod=0755 --from=sandbox-build /out/trellis-sandbox /usr/local/bin/trell
 # as PUID/PGID so files written into the bind-mounted workspace/ are owned by the operator
 # instead of root. /app/data is created here and owned by that user: the `health-data`
 # named volume inherits this ownership when Docker first populates it (first `up`).
-# NOTE: the hub service deliberately runs as root (bubblewrap needs CAP_SETFCAP + a root
-# uid_map; the Landlock helper needs root only to drop the tool to the workspace uid) and
-# overrides this with its own `user:` in docker-compose.yml.
+# Every app service — the hub included — runs as ${TRELLIS_UID:-1000} via compose's
+# `user:`; the sandbox helper drops identity only when it starts privileged (a root hub),
+# so on the default non-root hub tools run at this same uid, which is the workspace owner.
 ARG PUID=1000
 ARG PGID=1000
 RUN groupadd -g ${PGID} trellis \

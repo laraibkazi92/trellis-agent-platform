@@ -160,13 +160,30 @@ def run_in_sandbox(cmd, backend, timeout):
 
 
 def _run_as_sandbox_uid(action):
-    """Run ``action`` in a child dropped to the sandbox uid/gid.
+    """Run ``action`` as the sandbox uid/gid.
 
-    The hub is root but does not hold CAP_DAC_OVERRIDE (by design), so it cannot
-    create or remove entries in an operator-owned (1000:1000 0755) workspace.
-    Forking with CAP_SETUID is enough; the parent stays root.
+    The hub normally runs as that uid already (compose sets ``user:`` to
+    ``TRELLIS_UID``), so the action runs in-process. A root hub — the legacy
+    posture, still supported — forks and drops with setgid/setuid instead, and
+    the parent stays root.
     """
     uid, gid = sandbox_preflight.resolve_sandbox_identity()
+    if os.geteuid() != 0:
+        if os.geteuid() != uid:
+            _log(
+                f"sandbox uid {uid} differs from hub euid {os.geteuid()}: "
+                "cannot switch identity without root"
+            )
+            return False
+        try:
+            action()
+        except BaseException as exc:
+            _log(
+                f"sandbox-uid action failed as {uid}:{gid}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+        return True
     pid = os.fork()
     if pid == 0:
         try:
@@ -320,8 +337,8 @@ def check_confinement(backend, timeout):
         ["bash", "-c", f'echo escape > "{host_tmp}"'], backend, timeout
     )
 
-    # The documented bwrap limitation: uid 0 without CAP_DAC_OVERRIDE cannot
-    # write an operator-owned 0755 directory. Landlock runs as the owner and can.
+    # Workspace-write contract: tools run as the workspace owner (the hub uid),
+    # so an operator-owned 0755 directory is writable in both backends.
     if not _run_as_sandbox_uid(lambda: os.mkdir(locked, 0o755)):
         errors.append(f"could not create {locked}")
     _log("confinement: operator-owned 0755 workspace dir")
@@ -329,12 +346,10 @@ def check_confinement(backend, timeout):
         ["bash", "-c", f'echo ok > "{locked}/file"'], backend, timeout
     )
     locked_ok = locked_result["returncode"] == 0
-    expected_locked_ok = backend is sandbox.Backend.LANDLOCK
-    if locked_ok != expected_locked_ok:
+    if not locked_ok:
         errors.append(
-            f"0755 workspace write exit {locked_result['returncode']}, "
-            f"expected {'success' if expected_locked_ok else 'denial'}: "
-            f"{_short(_observed(locked_result))}"
+            f"0755 workspace write exit {locked_result['returncode']}, expected "
+            f"success: {_short(_observed(locked_result))}"
         )
 
     root_visible = root_escape.exists()
@@ -372,7 +387,7 @@ def check_confinement(backend, timeout):
         },
         "workspace_0755_write": {
             **_command_entry(locked_result),
-            "expected_to_succeed": expected_locked_ok,
+            "expected_to_succeed": True,
         },
         "root_escape_visible": root_visible,
         "host_tmp_visible": host_visible,
@@ -392,20 +407,26 @@ def check_confinement(backend, timeout):
 def check_privilege(backend, timeout):
     """Assert the tool's identity, capabilities, and /proc isolation."""
     errors = []
-    sandbox_uid, _ = sandbox_preflight.resolve_sandbox_identity()
-    # Documented asymmetry: bwrap keeps host uid 0 inside its namespaces,
-    # Landlock drops to the workspace owner.
-    expected_euid = 0 if backend is sandbox.Backend.BWRAP else sandbox_uid
+    hub_euid = os.geteuid()
+    sandbox_uid, sandbox_gid = sandbox_preflight.resolve_sandbox_identity()
+    # bwrap maps the hub's uid 1:1 inside its namespaces (the hub is no longer
+    # root); Landlock runs the tool as SANDBOX_UID, which defaults to the hub
+    # uid. On the default deployment both are the same operator uid.
+    expected_euid = hub_euid if backend is sandbox.Backend.BWRAP else sandbox_uid
+    _log(
+        f"privilege: hub euid {hub_euid}, expected tool euid {expected_euid} "
+        f"({backend.value})"
+    )
     scratch = _workspace_scratch("trellis-smoke-priv-")
     written = scratch / "written.txt"
 
     sibling_kwargs = {}
-    if os.geteuid() == 0:
+    if hub_euid == 0:
         # Tool↔tool boundary: the sibling must have the same uid as the tool,
         # otherwise plain DAC (not Yama/Landlock) would deny the /proc read.
         sibling_kwargs = {
             "user": sandbox_uid,
-            "group": sandbox_preflight.resolve_sandbox_identity()[1],
+            "group": sandbox_gid,
             "extra_groups": [],
         }
     sibling = subprocess.Popen(
@@ -457,12 +478,11 @@ def check_privilege(backend, timeout):
         payload = {
             "ok": not errors,
             "backend": backend.value,
+            "hub_euid": hub_euid,
             "expected_euid": expected_euid,
             "expected_file_uid": expected_euid,
             "sibling_pid": sibling.pid,
-            "sibling_uid": (
-                sandbox_uid if os.geteuid() == 0 else os.geteuid()
-            ),
+            "sibling_uid": sandbox_uid if hub_euid == 0 else hub_euid,
             "euid": info.get("euid") if isinstance(info, dict) else None,
             "capeff": info.get("capeff") if isinstance(info, dict) else None,
             "environ_read": info.get("environ_read") if isinstance(info, dict) else None,

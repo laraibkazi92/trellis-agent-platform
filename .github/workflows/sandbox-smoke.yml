@@ -65,8 +65,10 @@ jobs:
         # host/ui declare `env_file: .env`, which is not tracked in git.
         # DEV_MODE keeps the UI startable without an identity provider; the
         # sandbox checks use the hub only and never exercise auth.
-        # The sandbox uid must own the checkout: GitHub runners run as 1001,
-        # not 1000, and the hub deliberately lacks CAP_DAC_OVERRIDE.
+        # TRELLIS_UID/TRELLIS_GID make every app container — the hub included —
+        # run as the runner uid, which owns the checkout. GitHub runners use
+        # 1001, not the image default of 1000, and on a non-root hub tools run
+        # at that same identity (there is no uid drop to perform).
         run: |
           cat > .env <<ENV
           DEV_MODE=true

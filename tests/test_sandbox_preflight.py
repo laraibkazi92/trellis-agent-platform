@@ -590,3 +590,47 @@ def test_resolve_sandbox_identity_rejects_root_uid(monkeypatch, caplog):
 
     assert preflight.resolve_sandbox_identity() == (1000, 1000)
     assert any("root" in record.getMessage() for record in caplog.records)
+
+
+def _identity_messages(caplog):
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+        and "differs from the hub uid" in record.getMessage()
+    ]
+
+
+def test_resolve_sandbox_identity_warns_once_when_hub_cannot_switch(
+    monkeypatch, caplog
+):
+    monkeypatch.setenv("SANDBOX_UID", "4242")
+    monkeypatch.setenv("SANDBOX_GID", "4343")
+    monkeypatch.setattr(preflight.os, "geteuid", lambda: 1000)
+
+    assert preflight.resolve_sandbox_identity() == (4242, 4343)
+    assert preflight.resolve_sandbox_identity() == (4242, 4343)
+
+    messages = _identity_messages(caplog)
+    assert len(messages) == 1
+    assert "4242" in messages[0] and "1000" in messages[0]
+    assert "SANDBOX_UID" in messages[0]
+    assert "root" in messages[0]
+
+
+def test_resolve_sandbox_identity_silent_when_ids_match(monkeypatch, caplog):
+    monkeypatch.setenv("SANDBOX_UID", "1000")
+    monkeypatch.setenv("SANDBOX_GID", "1000")
+    monkeypatch.setattr(preflight.os, "geteuid", lambda: 1000)
+
+    assert preflight.resolve_sandbox_identity() == (1000, 1000)
+    assert _identity_messages(caplog) == []
+
+
+def test_resolve_sandbox_identity_silent_for_root_hub(monkeypatch, caplog):
+    monkeypatch.setenv("SANDBOX_UID", "4242")
+    monkeypatch.setenv("SANDBOX_GID", "4343")
+    monkeypatch.setattr(preflight.os, "geteuid", lambda: 0)
+
+    assert preflight.resolve_sandbox_identity() == (4242, 4343)
+    assert _identity_messages(caplog) == []

@@ -11,9 +11,11 @@
 #      independent of seccomp, which is why `seccomp=unconfined` alone does not
 #      help.
 #   2. `userns,` is added. bwrap creates a user namespace (`--unshare-user`);
-#      on hosts with `kernel.apparmor_restrict_unprivileged_userns=1`
-#      (Ubuntu 24.04+), a confined profile without this rule is refused and
-#      surfaces as "bwrap: setting up uid map: Permission denied".
+#      the hub runs as the operator uid (not root), so that namespace is
+#      unprivileged and maps that uid 1:1. On hosts with
+#      `kernel.apparmor_restrict_unprivileged_userns=1` (Ubuntu 24.04+), a
+#      confined profile without this rule is refused and surfaces as
+#      "bwrap: setting up uid map: Permission denied".
 #
 # Install this profile on the HOST and load it there -- AppArmor profiles are
 # applied by the host kernel, not from inside the container:

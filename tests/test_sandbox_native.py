@@ -218,6 +218,35 @@ def test_same_identity_groups(tmp_path):
         assert GID in gids
 
 
+def test_same_identity_skips_chown(tmp_path):
+    """A caller already at the target identity owns the run dir: no chown."""
+    result = run_helper([*_granted_args(tmp_path), "--", "/bin/true"])
+
+    assert result.returncode == 0, result.stderr
+    assert "chown(tmpdir)" not in result.stderr
+    assert (tmp_path / "run").stat().st_uid == UID
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0, reason="root can switch identities; this is the refusal"
+)
+def test_different_identity_without_privilege_fails(tmp_path):
+    """An unprivileged hub at another identity cannot switch: exit 68."""
+    other = UID + 1 if UID < 65534 else UID - 1
+    result = run_helper(
+        [
+            "--ro", "/",
+            "--tmpdir", str(tmp_path),
+            "--uid", str(other),
+            "--gid", str(GID),
+            "--", "/bin/true",
+        ]
+    )
+
+    assert result.returncode == 68
+    assert any(marker in result.stderr for marker in ("chown", "setgid"))
+
+
 def test_exec_failure_reports_real_errno(tmp_path):
     result = run_helper(
         [*_granted_args(tmp_path), "--", "/nonexistent/trellis-sandbox-cmd"]

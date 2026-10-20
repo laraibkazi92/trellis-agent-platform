@@ -58,17 +58,19 @@ Every tool invocation runs in one of two sandbox backends, chosen once at hub st
 | --- | --- | --- |
 | Write confinement | `/` read-only, `/app/workspace` read-write, private tmpfs `/tmp` | `/` read-only, `/app/workspace` and a per-run `TMPDIR` read-write (equivalent) |
 | Process isolation | private PID/IPC/UTS namespaces | shared; `kill -0` on an outside process returns `EPERM` at ABI >= 6 |
-| `/proc` | fresh procfs | shared, read-only; uid separation + Yama keep other processes' data out |
+| `/proc` | fresh procfs | shared, read-only; Yama `ptrace_scope>=1` keeps other processes' data out |
 | `/tmp` | private per run | shared between runs (per-run `0700` dir, same uid) |
 | `/dev/shm` | available in the private `/dev` | not writable (POSIX shm fails) |
 | PTY (`/dev/ptmx`) | available | not granted (`pexpect`, `node-pty`, `script` fail) |
-| Tool identity | host uid 0 in its namespaces, `CapEff=0` | operator uid (`SANDBOX_UID`, default 1000), capabilities cleared |
+| Tool identity | the hub uid (`TRELLIS_UID`, the workspace owner) mapped 1:1 in its namespaces, `CapEff=0` | operator uid (`SANDBOX_UID`, default = hub uid = workspace owner), capabilities cleared |
+
+Tools run as `SANDBOX_UID`, which defaults to the hub's own uid — the workspace owner — so in both backends they can write anywhere you can. `HOME` is `/tmp` under bwrap and the per-run tmpdir under Landlock.
 
 What that means for tool code:
 
 - Use `$TMPDIR` (also `HOME` under Landlock) for scratch work. It is writable in both backends and removed after the run.
 - **Never persist secrets in `$TMPDIR`.** Under Landlock it is shared between concurrent runs (same uid), so a `0700` directory is not a boundary. Keep credentials in memory or in the injected environment.
-- Keep files the host should see under `/app/workspace` — it is the only path guaranteed to survive the run. Normal Unix permissions still apply: under bwrap the tool is uid 0 **without** `CAP_DAC_OVERRIDE`, so writing into an operator-owned `0755` directory fails; use a writable output directory (`0777`) or `$TMPDIR`. Under Landlock the tool runs as the workspace owner and writes normally.
+- Keep files the host should see under `/app/workspace` — it is the only path guaranteed to survive the run. Normal Unix permissions still apply, but because the tool runs as the workspace owner, writes into operator-owned directories (including `0755`) work in both backends. Use `$TMPDIR` for throwaway scratch.
 - Avoid POSIX shared memory and PTY allocation under Landlock; use `$TMPDIR` files and subprocess pipes instead.
 
 ### Directory Structure
