@@ -456,49 +456,26 @@ jobs:
         run: test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = "1"
 
       - name: Load deploy/apparmor/trellis-hub on the runner kernel
-        # The profile is loaded into the HOST kernel (AppArmor is global, not
-        # namespaced), the same way an operator would install it. A privileged
-        # container is enough: it gets CAP_SYS_ADMIN and an unconfined profile,
-        # which is what writing to /sys/kernel/security/apparmor requires. The
-        # runner needs no apparmor package of its own.
+        # Load it on the HOST, the same way an operator installs a profile
+        # (AppArmor is global, not namespaced). The runner VM has the AppArmor
+        # kernel support; only the userspace parser needs installing. Doing this
+        # on the host also avoids handing Docker a bind mount for the profile.
         #
         # `apparmor_parser -r` is idempotent, so a re-run replaces the profile.
-        # The explicit `grep ... (enforce)` makes a silent compile/no-load fail
-        # here instead of later as an opaque `docker compose up` error.
+        # The explicit `(enforce)` grep makes a silent compile/no-load fail here
+        # instead of later as an opaque `docker compose up` error.
         run: |
           set -eux
           test "$(cat /sys/module/apparmor/parameters/enabled)" = "Y" || {
             echo "AppArmor is not enabled on this runner; cannot validate the profile" >&2
             exit 1
           }
-          # securityfs carries /sys/kernel/security/apparmor. systemd normally
-          # mounts it on the runner; mount it here if the image does not.
-          if ! mountpoint -q /sys/kernel/security; then
-            sudo mount -t securityfs none /sys/kernel/security || true
-          fi
-          docker run --rm --privileged \
-            -v /sys/kernel/security:/sys/kernel/security \
-            -v "$PWD/deploy/apparmor:/profiles:ro" \
-            ubuntu:24.04 bash -c '
-              set -eux
-              apt-get update -qq
-              apt-get install -y -qq apparmor
-              # If the host bind mount was an empty directory (no securityfs),
-              # mounting it here reaches the same host kernel interface.
-              if [ ! -e /sys/kernel/security/apparmor/profiles ]; then
-                mount -t securityfs none /sys/kernel/security
-              fi
-              apparmor_parser --version
-              # -r: replace (idempotent). Include resolution for <abi/4.0> and
-              # <abstractions/base> comes from the package's /etc/apparmor.d.
-              # -K: load without the policy cache; writing /var/cache/apparmor
-              # is refused in this container (the cache is a host-level
-              # optimization and irrelevant for a one-shot load).
-              apparmor_parser -r -K /profiles/trellis-hub
-              aa-status
-              cat /sys/kernel/security/apparmor/profiles
-              grep -E "^trellis-hub \(enforce\)" /sys/kernel/security/apparmor/profiles
-            '
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq apparmor
+          sudo apparmor_parser -r deploy/apparmor/trellis-hub
+          sudo aa-status
+          sudo cat /sys/kernel/security/apparmor/profiles
+          sudo cat /sys/kernel/security/apparmor/profiles | grep -E "^trellis-hub \(enforce\)"
 
       - name: Seed the .env the compose file expects
         # Same seeding as the matrix job: the hub runs as the runner uid (which
