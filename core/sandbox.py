@@ -32,10 +32,13 @@ logger = logging.getLogger(__name__)
 BWRAP_ARGS = sandbox_preflight.BWRAP_BASE_ARGS
 
 _VALID_BACKENDS = frozenset({"auto", "bwrap", "landlock"})
+_VALID_NET_POLICIES = frozenset({"allow", "none"})
+_DEFAULT_NET_POLICY = "allow"
 _DEFAULT_TMP_ROOT = "/tmp/trellis"
 
 _SELECTED: dict[str, "Backend"] = {}
 _WARNED_INVALID: set[str] = set()
+_WARNED_INVALID_NET: set[str] = set()
 _LOGGED_SELECTION = False
 _LOGGED_FAILURES: set[tuple[str, str]] = set()
 
@@ -68,6 +71,7 @@ class SandboxPlan:
     env: dict[str, str]
     tmpdir: Path
     backend: Backend
+    network: str = _DEFAULT_NET_POLICY
     _cleaned: bool = field(default=False, repr=False, compare=False)
 
     def cleanup(self) -> None:
@@ -102,6 +106,31 @@ def _normalize(requested: str | None) -> str:
 def configured_backend() -> str:
     """Return the normalized ``SANDBOX_BACKEND`` value (default ``auto``)."""
     return _normalize(None)
+
+
+def _normalize_net(requested: str | None) -> str:
+    """Normalize a network policy, warning once for invalid values."""
+    raw = (
+        (os.getenv("SANDBOX_NET_DEFAULT") or _DEFAULT_NET_POLICY)
+        if requested is None
+        else requested
+    )
+    value = str(raw).strip().lower()
+    if value not in _VALID_NET_POLICIES:
+        if value not in _WARNED_INVALID_NET:
+            logger.warning(
+                "Invalid network policy %r; falling back to '%s'.",
+                raw,
+                _DEFAULT_NET_POLICY,
+            )
+            _WARNED_INVALID_NET.add(value)
+        return _DEFAULT_NET_POLICY
+    return value
+
+
+def net_policy_default() -> str:
+    """Return the deployment-wide ``SANDBOX_NET_DEFAULT`` (``allow`` or ``none``)."""
+    return _normalize_net(None)
 
 
 def select_backend(force: str | None = None) -> Backend:
@@ -170,7 +199,11 @@ def classify_failure(
     else:
         if "trellis-sandbox:" not in text.lower():
             return None
-        if returncode == 65:
+        if "net access control requires abi" in text.lower():
+            # A per-tool `network: none` refusal on an old kernel is exit 65
+            # too; report the policy cause, not "Landlock unavailable".
+            code = "landlock_net_unsupported"
+        elif returncode == 65:
             code = "landlock_unavailable"
         elif returncode == 68:
             code = "landlock_setuid_denied"
@@ -219,11 +252,17 @@ def build_cmd(
     tmpdir: Path,
     uid: int,
     gid: int,
+    network: str | None = None,
 ) -> list[str]:
     """Build the sandbox argv that wraps ``cmd``."""
     backend = Backend(backend)
+    deny_net = _normalize_net(network) == "none"
     if backend is Backend.BWRAP:
-        return list(BWRAP_ARGS) + list(cmd)
+        args = list(BWRAP_ARGS)
+        if deny_net:
+            # A private network namespace with no interfaces: loopback included.
+            args.append("--unshare-net")
+        return args + list(cmd)
 
     argv = [
         sandbox_preflight.helper_path(),
@@ -235,6 +274,8 @@ def build_cmd(
     ]
     if _seccomp_disabled():
         argv.append("--no-seccomp")
+    if deny_net:
+        argv.append("--deny-net")
     return argv + ["--"] + list(cmd)
 
 
@@ -252,10 +293,12 @@ def prepare_execution(
     tool_dir: Path,
     backend: Backend | str | None = None,
     env: dict[str, str] | None = None,
+    network: str | None = None,
 ) -> SandboxPlan:
     """Create the per-run tmpdir, env, and argv for one tool invocation."""
     tool_dir = Path(tool_dir)
     selected = Backend(backend) if backend is not None else select_backend()
+    policy = _normalize_net(network)
     uid, gid = sandbox_preflight.resolve_sandbox_identity()
 
     root = _tmp_root()
@@ -294,10 +337,13 @@ def prepare_execution(
         )
 
     return SandboxPlan(
-        argv=build_cmd(selected, list(cmd), tool_dir, tmpdir, uid, gid),
+        argv=build_cmd(
+            selected, list(cmd), tool_dir, tmpdir, uid, gid, network=policy
+        ),
         env=plan_env,
         tmpdir=tmpdir,
         backend=selected,
+        network=policy,
     )
 
 
@@ -306,6 +352,7 @@ def reset_for_tests() -> None:
     global _LOGGED_SELECTION
     _SELECTED.clear()
     _WARNED_INVALID.clear()
+    _WARNED_INVALID_NET.clear()
     _LOGGED_FAILURES.clear()
     _LOGGED_SELECTION = False
     sandbox_preflight.reset_for_tests()

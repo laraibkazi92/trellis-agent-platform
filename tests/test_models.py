@@ -1,6 +1,9 @@
 # Copyright (C) 2026 Laraib Kazi
 # SPDX-License-Identifier: Apache-2.0
 
+import pytest
+from pydantic import ValidationError
+
 from core.models import ToolConfig, MCPConfig, is_routable_agent_type
 
 
@@ -29,6 +32,21 @@ def test_tool_config_retry_and_timeout_defaults():
     config = ToolConfig(**_tool_kwargs())
     assert config.retry_on_transient is True
     assert config.timeout_seconds is None
+
+
+def test_tool_config_network_defaults_to_allow():
+    config = ToolConfig(**_tool_kwargs())
+    assert config.network == "allow"
+
+
+def test_tool_config_network_accepts_none():
+    config = ToolConfig(**_tool_kwargs(network="none"))
+    assert config.network == "none"
+
+
+def test_tool_config_network_rejects_invalid_values():
+    with pytest.raises(ValidationError):
+        ToolConfig(**_tool_kwargs(network="deny"))
 
 
 def test_mcp_config_public_defaults():

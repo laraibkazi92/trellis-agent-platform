@@ -178,6 +178,8 @@ except Exception as e:
       - BG_SERVICE_URL
   public: false                   # Optional. Expose this tool for direct execution by external MCP
                                   #   clients via the Gateway's search_tools/use_tool (no agent hop).
+  network: allow                  # Optional. allow (default) or none. "none" gives the tool no
+                                  #   network at all, loopback included.
   optional_secrets:               # Optional. Injected when present; never required for the tool to run.
     - MY_OPTIONAL_TOKEN
 ```
@@ -198,6 +200,8 @@ variables:
 **`public` tools**: Setting `public: true` exposes the tool through the Gateway MCP's `search_tools`/`use_tool`, so external MCP clients can execute it directly with no intermediate agent hop. Only public tools are embedded for tool search at registry-sync time. MCP servers can do the same per server (`public`) or per tool (`public_tools`) — see the [MCP guide](mcp.md).
 
 **`optional_secrets` / `secret_groups`**: `optional_secrets` are injected when the caller has stored them but never count against configuration readiness. `secret_groups` is a UI hint that renders a set of optional secrets as a single card with a selector (e.g. an environment dropdown) on the configuration page; each group is `{label, select_label, options: [{value, label, fields: [{key, label, type}]}]}`.
+
+**`network`**: Set `none` for every tool that does not call an external API — it is the cheapest exfiltration control, since a compromised tool then has nowhere to send the workspace or its injected secrets. `none` also blocks loopback, so a tool that must reach the framework API itself needs `allow`. Under the Landlock backend the policy requires kernel Landlock ABI 4+ (Linux 6.7+); bwrap always supports it with `--unshare-net`. Deployments can flip the default for all tools with `SANDBOX_NET_DEFAULT=none`.
 
 ---
 

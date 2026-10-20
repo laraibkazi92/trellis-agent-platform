@@ -8,9 +8,11 @@ unprivileged: the helper is given the caller's own uid/gid, so it early-returns
 from the identity change while still applying Landlock confinement.
 """
 
+import errno
 import json
 import os
 import shlex
+import socket
 import subprocess
 import sys
 
@@ -61,7 +63,7 @@ def test_version():
     result = run_helper(["--version"])
 
     assert result.returncode == 0
-    assert result.stdout.strip() == "trellis-sandbox 0.3.0"
+    assert result.stdout.strip() == "trellis-sandbox 0.4.0"
 
 
 def test_print_plan(tmp_path):
@@ -95,6 +97,72 @@ def test_print_plan(tmp_path):
         assert mask & (1 << 14), "TRUNCATE missing"
     if abi >= 5:
         assert mask & (1 << 15), "IOCTL_DEV missing"
+
+    assert plan["deny_net"] is False
+    assert plan["handled_access_net"] == "0x0"
+
+    if abi >= 4:
+        denied = json.loads(
+            run_helper(
+                [
+                    "--print-plan",
+                    *_granted_args(tmp_path),
+                    "--deny-net",
+                    "--",
+                    "/bin/true",
+                ]
+            ).stdout
+        )
+        assert denied["deny_net"] is True
+        assert int(denied["handled_access_net"], 16) == 0x3
+
+
+CONNECT_CODE = (
+    "import socket, sys\n"
+    "sock = socket.socket()\n"
+    "try:\n"
+    "    sock.connect(('127.0.0.1', int(sys.argv[1])))\n"
+    "except OSError as exc:\n"
+    "    print(exc.errno)\n"
+    "else:\n"
+    "    print('OK')\n"
+)
+
+
+def test_deny_net_blocks_loopback_connect(tmp_path):
+    """--deny-net must make the exact same connect fail that succeeds without it."""
+    if sandbox_preflight.landlock_abi_version() < 4:
+        pytest.skip("Landlock ABI < 4 has no network access control")
+
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    port = str(listener.getsockname()[1])
+    try:
+        allowed = run_helper(
+            [
+                *_granted_args(tmp_path),
+                "--",
+                sys.executable, "-c", CONNECT_CODE, port,
+            ]
+        )
+        denied = run_helper(
+            [
+                *_granted_args(tmp_path),
+                "--deny-net",
+                "--",
+                sys.executable, "-c", CONNECT_CODE, port,
+            ]
+        )
+    finally:
+        listener.close()
+
+    assert allowed.returncode == 0, allowed.stderr
+    assert allowed.stdout.strip() == "OK"
+
+    assert denied.returncode == 0, denied.stderr
+    assert denied.stdout.strip() == str(errno.EACCES)
 
 
 def test_confinement_and_identity(tmp_path):

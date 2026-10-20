@@ -328,7 +328,17 @@ async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[
         default_timeout = resolve_tunable("tool_execution_timeout")
         timeout = config.timeout_seconds if getattr(config, "timeout_seconds", None) else default_timeout
 
-        plan = sandbox.prepare_execution(cmd, tool_dir, env=env)
+        # Only an explicitly configured policy may override the deployment
+        # default; pydantic's "allow" default would otherwise mask
+        # SANDBOX_NET_DEFAULT=none for every tool that never set the field.
+        explicit_net = (
+            config.network
+            if "network" in getattr(config, "model_fields_set", ())
+            else None
+        )
+        plan = sandbox.prepare_execution(
+            cmd, tool_dir, env=env, network=explicit_net
+        )
         try:
             process = await asyncio.create_subprocess_exec(
                 *plan.argv,

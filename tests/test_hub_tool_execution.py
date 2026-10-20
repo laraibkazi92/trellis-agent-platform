@@ -578,6 +578,63 @@ def test_sandbox_classified_failure_is_not_retried(monkeypatch, tmp_path):
     assert any(event["is_success"] is False for event in health_events)
 
 
+def test_run_tool_network_none_reaches_the_sandbox_argv(monkeypatch, tmp_path):
+    """The per-tool network policy must survive the config -> argv path."""
+    install_sandbox(monkeypatch)
+    install_fake_identity(monkeypatch)
+    install_fake_health(monkeypatch)
+
+    denied_spawns = install_fake_subprocess(
+        monkeypatch, [FakeProcess(returncode=0, stdout=b'{"ok": true}')]
+    )
+    result = asyncio.run(
+        _run_tool_scenario(
+            make_config(network="none"), make_tool_dir(tmp_path), {}
+        )
+    )
+
+    assert result == {"ok": True}
+    assert "--unshare-net" in denied_spawns[0]["cmd"]
+
+    allowed_spawns = install_fake_subprocess(
+        monkeypatch, [FakeProcess(returncode=0, stdout=b'{"ok": true}')]
+    )
+    result = asyncio.run(
+        _run_tool_scenario(make_config(), make_tool_dir(tmp_path), {})
+    )
+
+    assert result == {"ok": True}
+    assert "--unshare-net" not in allowed_spawns[0]["cmd"]
+
+
+def test_run_tool_net_default_applies_and_explicit_policy_overrides(
+    monkeypatch, tmp_path
+):
+    """SANDBOX_NET_DEFAULT must reach tools that never set `network`."""
+    install_sandbox(monkeypatch)
+    install_fake_identity(monkeypatch)
+    install_fake_health(monkeypatch)
+    monkeypatch.setenv("SANDBOX_NET_DEFAULT", "none")
+
+    implicit_spawns = install_fake_subprocess(
+        monkeypatch, [FakeProcess(returncode=0, stdout=b'{"ok": true}')]
+    )
+    assert asyncio.run(
+        _run_tool_scenario(make_config(), make_tool_dir(tmp_path), {})
+    ) == {"ok": True}
+    assert "--unshare-net" in implicit_spawns[0]["cmd"]
+
+    explicit_spawns = install_fake_subprocess(
+        monkeypatch, [FakeProcess(returncode=0, stdout=b'{"ok": true}')]
+    )
+    assert asyncio.run(
+        _run_tool_scenario(
+            make_config(network="allow"), make_tool_dir(tmp_path), {}
+        )
+    ) == {"ok": True}
+    assert "--unshare-net" not in explicit_spawns[0]["cmd"]
+
+
 def test_run_tool_reports_sandbox_unavailable(monkeypatch, tmp_path):
     from core import sandbox
 

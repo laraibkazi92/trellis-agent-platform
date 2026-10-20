@@ -10,8 +10,9 @@ harness exercises the same argv/env the hub uses for real tools, then reports
 one JSON object on stdout for diffing between backends.
 
 The default run (no check flags) is ``--runtime-matrix`` plus the security
-checks (confinement, privilege, seccomp); ``--tool`` is only exercised when
-named. Tools run without an identity, so prefer read-only tools in smoke runs.
+checks (confinement, privilege, seccomp); ``--check-net`` and ``--tool`` are only
+exercised when named. Tools run without an identity, so prefer read-only tools
+in smoke runs.
 Exit codes are 0 for a fully green run, 1 for any failed check, and 2 when the
 environment itself is not usable (no backend, no ``/app/workspace``).
 """
@@ -102,15 +103,18 @@ def _command_entry(result):
     }
 
 
-def run_in_sandbox(cmd, backend, timeout):
+def run_in_sandbox(cmd, backend, timeout, network=None):
     """Run ``cmd`` through the sandbox and return its exit status and output.
 
     The per-run tmpdir is always cleaned up. ``GOCACHE``/``npm_config_cache``
     are pointed at the plan's TMPDIR (the private tmpfs under bwrap, the
     per-run dir under Landlock) instead of the host's, so runtime caches never
-    leak into a shared location.
+    leak into a shared location. The generated ``argv`` is returned too, so
+    checks can assert the policy reached the command line.
     """
-    plan = sandbox.prepare_execution(cmd, WORKSPACE, backend=backend, env=sanitized_env())
+    plan = sandbox.prepare_execution(
+        cmd, WORKSPACE, backend=backend, env=sanitized_env(), network=network
+    )
     try:
         run_env = dict(plan.env)
         tmpdir = run_env.get("TMPDIR") or str(plan.tmpdir)
@@ -136,6 +140,7 @@ def run_in_sandbox(cmd, backend, timeout):
                 "returncode": None,
                 "stdout": "",
                 "stderr": f"could not start {cmd[0]!r}: {exc}",
+                "argv": plan.argv,
             }
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
@@ -149,11 +154,13 @@ def run_in_sandbox(cmd, backend, timeout):
                 "returncode": None,
                 "stdout": stdout or "",
                 "stderr": f"timed out after {timeout:g}s",
+                "argv": plan.argv,
             }
         return {
             "returncode": proc.returncode,
             "stdout": stdout,
             "stderr": stderr,
+            "argv": plan.argv,
         }
     finally:
         plan.cleanup()
@@ -631,6 +638,60 @@ print(json.dumps(info))
     return {"ok": not errors, "observed": info}, errors
 
 
+HUB_PORT = 8001
+
+
+def _net_flag(backend):
+    """The argv switch that enforces ``network: none`` on this backend."""
+    if backend is sandbox.Backend.BWRAP:
+        return "--unshare-net"
+    return "--deny-net"
+
+
+def check_net(backend, timeout, port=HUB_PORT):
+    """Prove ``network: none`` changes reality, using ``allow`` as control.
+
+    The hub's own ``/healthz`` listener is the target: tools share the hub's
+    network namespace under ``allow``, so a loopback TCP connect must succeed
+    there and fail under ``none`` (bwrap: private netns with no listener;
+    Landlock: EACCES from the handled net rights).
+    """
+    errors = []
+    cmd = ["bash", "-c", f"exec 3<>/dev/tcp/127.0.0.1/{port}"]
+    flag = _net_flag(backend)
+
+    _log(f"net: allow -> 127.0.0.1:{port} (positive control)")
+    allowed = run_in_sandbox(cmd, backend, timeout, network="allow")
+    _log(f"net: none -> 127.0.0.1:{port}")
+    denied = run_in_sandbox(cmd, backend, timeout, network="none")
+
+    if flag not in denied.get("argv", []):
+        errors.append(f"{flag} missing from the network: none argv: {denied.get('argv')}")
+    if flag in allowed.get("argv", []):
+        errors.append(f"{flag} present in the network: allow argv: {allowed.get('argv')}")
+
+    if allowed["returncode"] != 0:
+        errors.append(
+            f"positive control failed: connect to 127.0.0.1:{port} must work "
+            f"under network: allow (is the hub listening?): "
+            f"{_short(_observed(allowed))}"
+        )
+    if denied["returncode"] in (0, None):
+        errors.append(
+            f"network: none did not block a connect to 127.0.0.1:{port} "
+            f"(exit {denied['returncode']}): {_short(_observed(denied))}"
+        )
+
+    return {
+        "ok": not errors,
+        "backend": backend.value,
+        "policy_flag": flag,
+        "port": port,
+        "allow": _command_entry(allowed),
+        "none": _command_entry(denied),
+    }, errors
+
+
 def check_tools(names):
     """Execute registered hub tools through ``hub.run_tool`` (same path as MCP)."""
     errors = []
@@ -733,6 +794,14 @@ def build_parser():
         help="Assert the Landlock deny-list (unshare EPERM, io_uring ENOSYS).",
     )
     parser.add_argument(
+        "--check-net",
+        action="store_true",
+        help=(
+            "Assert network: none blocks a loopback TCP connect while "
+            "network: allow reaches the hub's /healthz listener."
+        ),
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=120.0,
@@ -761,6 +830,7 @@ def main(argv=None):
             "confinement": None,
             "privilege": None,
             "seccomp": None,
+            "net": None,
             "tools": None,
         },
         "ok": False,
@@ -807,6 +877,7 @@ def main(argv=None):
         or args.check_confinement
         or args.check_privilege
         or args.check_seccomp
+        or args.check_net
         or args.tool
     )
     runners = {
@@ -814,6 +885,7 @@ def main(argv=None):
         "confinement": lambda: check_confinement(selected, timeout),
         "privilege": lambda: check_privilege(selected, timeout),
         "seccomp": lambda: check_seccomp(selected, timeout),
+        "net": lambda: check_net(selected, timeout),
     }
     if args.runtime_matrix or run_default:
         _run_check(report, "runtime_matrix", runners["runtime_matrix"])
@@ -823,6 +895,8 @@ def main(argv=None):
         _run_check(report, "privilege", runners["privilege"])
     if args.check_seccomp or run_default:
         _run_check(report, "seccomp", runners["seccomp"])
+    if args.check_net:
+        _run_check(report, "net", runners["net"])
     if args.tool:
         _run_check(report, "tools", lambda: check_tools(args.tool))
 

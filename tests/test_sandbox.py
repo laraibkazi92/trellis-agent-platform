@@ -8,6 +8,7 @@ monkeypatched, so the suite runs on any host (no root, containers, or LSMs).
 The argv builders and the per-run tmpdir lifecycle are pinned exactly.
 """
 
+import logging
 import stat
 from pathlib import Path
 
@@ -46,6 +47,7 @@ def _isolated_sandbox(monkeypatch):
     for name in (
         "SANDBOX_BACKEND",
         "SANDBOX_SECCOMP",
+        "SANDBOX_NET_DEFAULT",
         "SANDBOX_UID",
         "SANDBOX_GID",
         "SANDBOX_TMP_ROOT",
@@ -314,6 +316,108 @@ def test_landlock_argv_no_seccomp_flag(monkeypatch):
     assert argv[-2:] == ["bash", "x"]
 
 
+POLICY_ARGS = {
+    sandbox.Backend.BWRAP: "--unshare-net",
+    sandbox.Backend.LANDLOCK: "--deny-net",
+}
+
+
+@pytest.mark.parametrize(
+    "backend,network,expected",
+    [
+        (sandbox.Backend.BWRAP, None, False),
+        (sandbox.Backend.BWRAP, "allow", False),
+        (sandbox.Backend.BWRAP, "none", True),
+        (sandbox.Backend.LANDLOCK, None, False),
+        (sandbox.Backend.LANDLOCK, "allow", False),
+        (sandbox.Backend.LANDLOCK, "none", True),
+    ],
+)
+def test_network_policy_reaches_the_argv(backend, network, expected):
+    argv = sandbox.build_cmd(
+        backend,
+        ["bash", "x"],
+        Path("/app/workspace/tools/t"),
+        Path("/tmp/trellis-x"),
+        1234,
+        5678,
+        network=network,
+    )
+    flag = POLICY_ARGS[backend]
+
+    assert (flag in argv) is expected
+    assert argv[-2:] == ["bash", "x"]
+
+
+def test_deny_net_flag_precedes_the_separator():
+    argv = sandbox.build_cmd(
+        sandbox.Backend.LANDLOCK,
+        ["bash", "x"],
+        Path("/app/workspace/tools/t"),
+        Path("/tmp/trellis-x"),
+        1234,
+        5678,
+        network="none",
+    )
+
+    assert argv[argv.index("--") - 1] == "--deny-net"
+
+
+def test_net_default_env_none_makes_allow_the_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("SANDBOX_NET_DEFAULT", "none")
+
+    assert sandbox.net_policy_default() == "none"
+    for backend in (sandbox.Backend.BWRAP, sandbox.Backend.LANDLOCK):
+        default = sandbox.build_cmd(
+            backend, ["true"], tmp_path, tmp_path, 1000, 1000
+        )
+        override = sandbox.build_cmd(
+            backend, ["true"], tmp_path, tmp_path, 1000, 1000, network="allow"
+        )
+        assert POLICY_ARGS[backend] in default
+        assert POLICY_ARGS[backend] not in override
+
+
+@pytest.mark.parametrize("raw", ["bogus", "off", "deny"])
+def test_invalid_net_default_warns_once_and_falls_back_to_allow(
+    monkeypatch, caplog, raw
+):
+    monkeypatch.setenv("SANDBOX_NET_DEFAULT", raw)
+
+    assert sandbox.net_policy_default() == "allow"
+    assert sandbox.net_policy_default() == "allow"
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "network policy" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+
+
+def test_plan_carries_the_network_policy(monkeypatch, tmp_path):
+    monkeypatch.setenv("SANDBOX_TMP_ROOT", str(tmp_path / "sroot"))
+
+    denied = sandbox.prepare_execution(
+        ["true"],
+        tmp_path / "tools" / "t",
+        backend=sandbox.Backend.BWRAP,
+        env={},
+        network="none",
+    )
+    allowed = sandbox.prepare_execution(
+        ["true"],
+        tmp_path / "tools" / "t",
+        backend=sandbox.Backend.BWRAP,
+        env={},
+    )
+
+    assert denied.network == "none"
+    assert allowed.network == "allow"
+    denied.cleanup()
+    allowed.cleanup()
+
+
 @pytest.mark.parametrize("backend", [sandbox.Backend.BWRAP, sandbox.Backend.LANDLOCK])
 def test_prepare_execution_env_and_tmpdir(monkeypatch, tmp_path, backend):
     sroot = tmp_path / "sroot"
@@ -482,6 +586,18 @@ def test_classify_failure_maps_helper_exit_codes(returncode, stderr, expected):
 
     assert result is not None
     assert result.code == expected
+    assert result.remediation
+
+
+def test_classify_failure_maps_net_policy_refusal():
+    result = sandbox.classify_failure(
+        "trellis-sandbox: landlock net access control requires ABI 4 (have 3)",
+        sandbox.Backend.LANDLOCK,
+        65,
+    )
+
+    assert result is not None
+    assert result.code == "landlock_net_unsupported"
     assert result.remediation
 
 

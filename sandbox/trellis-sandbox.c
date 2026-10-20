@@ -4,7 +4,8 @@
  * uid/gid, zeroes capabilities, lowers resource limits, installs a Landlock
  * filesystem domain, installs a seccomp deny-list, then execs the command in
  * place (no fork, so exit codes and signals pass through). --no-seccomp skips
- * the deny-list.
+ * the deny-list. --deny-net handles the Landlock network rights (ABI 4+) with no
+ * rule beneath them, which denies all TCP connect/bind.
  *
  * The helper does not assume it starts as root. When the caller already runs as
  * the target identity (a hub that runs as the sandbox uid, unprivileged test
@@ -44,7 +45,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define VERSION "0.3.0"
+#define VERSION "0.4.0"
 
 #define MB (1024ULL * 1024ULL)
 
@@ -72,6 +73,11 @@
 #define LL_REFER (1ULL << 13)      /* ABI 2 */
 #define LL_TRUNCATE (1ULL << 14)   /* ABI 3 */
 #define LL_IOCTL_DEV (1ULL << 15)  /* ABI 5 */
+/* Network access rights share a namespace of their own (ABI 4). Handling a
+ * right without adding any net rule beneath it denies it outright, so --deny-net
+ * needs no rules: it is a deny-all TCP policy. */
+#define LL_NET_BIND (1ULL << 0)
+#define LL_NET_CONNECT (1ULL << 1)
 #define LL_SCOPE_ABSTRACT_UNIX_SOCKET (1U << 0) /* ABI 6 */
 #define LL_SCOPE_SIGNAL (1U << 1)               /* ABI 6 */
 
@@ -134,7 +140,7 @@ struct opts {
     const char *tmpdir;
     uid_t uid;
     gid_t gid;
-    int have_uid, have_gid, no_seccomp, dry_run, print_plan;
+    int have_uid, have_gid, no_seccomp, deny_net, dry_run, print_plan;
     char **cmd;
 };
 
@@ -163,7 +169,8 @@ static void usage(void)
 {
     fputs("Usage: trellis-sandbox --ro DIR [--ro DIR]... --rw DIR [--rw DIR]...\n"
           "                      --tmpdir DIR [--uid UID --gid GID] [--no-seccomp]\n"
-          "                      [--dry-run] [--print-plan] -- CMD [ARG...]\n"
+          "                      [--deny-net] [--dry-run] [--print-plan]\n"
+          "                      -- CMD [ARG...]\n"
           "       trellis-sandbox --version\n", stderr);
 }
 
@@ -215,6 +222,10 @@ static void parse_args(int argc, char **argv, struct opts *o)
         }
         if (!strcmp(a, "--no-seccomp")) {
             o->no_seccomp = 1;
+            continue;
+        }
+        if (!strcmp(a, "--deny-net")) {
+            o->deny_net = 1;
             continue;
         }
         if (!strcmp(a, "--dry-run")) {
@@ -342,6 +353,8 @@ static void json_list(const char *key, const struct list *l)
 static void print_plan(const struct opts *o, const struct list *ro,
                        const struct list *rw, const char *tmpdir, int abi)
 {
+    uint64_t net = o->deny_net && abi >= 4 ? (LL_NET_BIND | LL_NET_CONNECT) : 0;
+
     printf("{\"helper_version\":\"%s\",\"abi\":%d,\"uid\":", VERSION, abi);
     if (o->have_uid)
         printf("%lu", (unsigned long)o->uid);
@@ -358,10 +371,13 @@ static void print_plan(const struct opts *o, const struct list *ro,
     json_list("ro", ro);
     putchar(',');
     json_list("rw", rw);
-    printf(",\"handled_access_fs\":\"0x%llx\",\"scoped\":%d,\"seccomp\":%s}\n",
+    printf(",\"handled_access_fs\":\"0x%llx\",\"scoped\":%d,\"seccomp\":%s,"
+           "\"deny_net\":%s,\"handled_access_net\":\"0x%llx\"}\n",
            (unsigned long long)handled_mask(abi),
            abi >= 6 ? (LL_SCOPE_ABSTRACT_UNIX_SOCKET | LL_SCOPE_SIGNAL) : 0,
-           o->no_seccomp ? "false" : "true");
+           o->no_seccomp ? "false" : "true",
+           o->deny_net ? "true" : "false",
+           (unsigned long long)net);
 }
 
 static void zero_capabilities(void)
@@ -749,6 +765,15 @@ int main(int argc, char **argv)
     mask = handled_mask(abi);
     memset(&attr, 0, sizeof(attr));
     attr.handled_access_fs = mask;
+    /* Net access control is ABI 4+. Handling both TCP rights without adding a
+     * rule beneath them denies every connect and bind, which is exactly the
+     * --deny-net policy; no net rules are added below. */
+    if (o.deny_net) {
+        if (abi < 4)
+            die(EXIT_LANDLOCK,
+                "landlock net access control requires ABI 4 (have %d)", abi);
+        attr.handled_access_net = LL_NET_BIND | LL_NET_CONNECT;
+    }
     if (abi >= 6)
         attr.scoped = LL_SCOPE_ABSTRACT_UNIX_SOCKET | LL_SCOPE_SIGNAL;
     ruleset_fd = (int)syscall(SYS_LL_CREATE, &attr, attr_size(abi), 0);

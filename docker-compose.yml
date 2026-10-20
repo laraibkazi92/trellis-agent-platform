@@ -192,6 +192,9 @@ services:
       SANDBOX_GID: ${SANDBOX_GID:-${TRELLIS_GID:-1000}}
       # Syscall deny-list for the Landlock backend (on|off).
       SANDBOX_SECCOMP: ${SANDBOX_SECCOMP:-on}
+      # Deployment default network policy for tools (allow|none). Per-tool
+      # `network:` overrides it; `allow` is the default.
+      SANDBOX_NET_DEFAULT: ${SANDBOX_NET_DEFAULT:-allow}
       # Parent for per-run tmpdirs; empty = the helper's default (/tmp/trellis).
       SANDBOX_TMP_ROOT: ${SANDBOX_TMP_ROOT:-}
       # Limits are applied per tool by the Landlock helper only; the helper is

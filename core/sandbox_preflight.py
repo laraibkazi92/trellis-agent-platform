@@ -6,7 +6,9 @@
 ``warmup()`` probes the configured backend once at startup and caches a payload
 shaped for ``/healthz``. Phase 2 probes both backends: bubblewrap, and the
 Landlock helper (filesystem confinement plus the tool identity, probed separately
-so a stripped capability is diagnosed as ``landlock_setuid_denied``).
+so a stripped capability is diagnosed as ``landlock_setuid_denied``). When the
+Landlock backend is probed, a ``--deny-net`` run also reports whether this kernel
+can enforce a tool's ``network: none`` policy (Landlock ABI 4+).
 """
 
 import copy
@@ -30,6 +32,7 @@ CODES: frozenset[str] = frozenset({
     "selinux_denied",
     "landlock_unavailable",
     "landlock_setuid_denied",
+    "landlock_net_unsupported",
     "rlimit_denied",
     "ptrace_scope_unrestricted",
     "mount_denied_unknown_lsm",
@@ -94,6 +97,13 @@ REMEDIATIONS: dict[str, str] = {
         "then the container's ulimits (compose `ulimits:`/`--ulimit`, e.g. "
         "`as`, `cpu`, `fsize`), or lower the matching SANDBOX_RLIMIT_* setting."
     ),
+    "landlock_net_unsupported": (
+        "The kernel's Landlock ABI is below 4, so the Landlock backend cannot "
+        "enforce a `network: none` tool policy and those tools fail closed. Use "
+        "`SANDBOX_BACKEND=bwrap` (which supports `--unshare-net`) or upgrade to "
+        "a kernel with Landlock ABI 4+ (Linux 6.7+). Policies left at the "
+        "default `allow` are unaffected."
+    ),
     "ptrace_scope_unrestricted": (
         "ptrace is unrestricted. Set `kernel.yama.ptrace_scope=1` (or higher) on "
         "the host to limit process tracing."
@@ -120,6 +130,15 @@ class ProbeResult:
     code: str | None = None
     detail: str = ""
     remediation: str = ""
+
+
+@dataclass(frozen=True)
+class NetProbeResult:
+    """Whether this kernel can enforce the ``network: none`` policy."""
+
+    supported: bool
+    detail: str = ""
+    abi: int = 0
 
 
 _VALID_BACKENDS = frozenset({"auto", "bwrap", "landlock"})
@@ -330,6 +349,18 @@ def _classify_helper_result(backend: str, proc) -> ProbeResult:
     detail = _probe_detail(proc)
     text = (detail or "").lower()
 
+    # The net-policy refusal is exit 65 too, so its marker must win over the
+    # generic Landlock-unavailable branch. It is also checked before the
+    # setuid/chown markers so a warning line cannot swallow it.
+    if "net access control requires abi" in text:
+        return ProbeResult(
+            backend=backend,
+            ok=False,
+            code="landlock_net_unsupported",
+            detail=_truncate(detail),
+            remediation=REMEDIATIONS["landlock_net_unsupported"],
+        )
+
     if proc.returncode == 65:
         return ProbeResult(
             backend=backend,
@@ -414,11 +445,34 @@ def _classify_helper_result(backend: str, proc) -> ProbeResult:
     )
 
 
+def _helper_argv(
+    helper: str,
+    grants: list[str],
+    tmpdir: str,
+    extra_args: list[str] | None = None,
+    command: list[str] | None = None,
+) -> list[str]:
+    """Assemble a helper invocation with the shared identity tail."""
+    uid, gid = resolve_sandbox_identity()
+    return [
+        helper,
+        *grants,
+        "--tmpdir", tmpdir,
+        "--uid", str(uid),
+        "--gid", str(gid),
+        # Probe the same argv the hub will run, including the escape hatch.
+        *(["--no-seccomp"] if seccomp_disabled() else []),
+        *(extra_args or []),
+        "--",
+        *(command or ["/bin/sh", "-c", "id -u"]),
+    ]
+
+
 def _run_helper(
     backend: str, helper: str, grants: list[str], timeout: float
 ) -> ProbeResult:
     """Run the helper with ``grants`` plus the shared identity tail."""
-    uid, gid = resolve_sandbox_identity()
+    uid, _ = resolve_sandbox_identity()
     try:
         tmpdir = tempfile.mkdtemp(prefix="trellis-probe-")
     except OSError as exc:
@@ -430,18 +484,9 @@ def _run_helper(
             remediation=REMEDIATIONS["unknown"],
         )
 
-    argv = [
-        helper,
-        *grants,
-        "--tmpdir", tmpdir,
-        "--uid", str(uid),
-        "--gid", str(gid),
-        # Probe the same argv the hub will run, including the escape hatch.
-        *(["--no-seccomp"] if seccomp_disabled() else []),
-        # Assert the identity, not just exit 0: a helper that forgot to drop
-        # must not make /healthz green.
-        "--", "/bin/sh", "-c", "id -u",
-    ]
+    # Assert the identity, not just exit 0: a helper that forgot to drop
+    # must not make /healthz green.
+    argv = _helper_argv(helper, grants, tmpdir)
     try:
         proc = subprocess.run(
             argv,
@@ -531,6 +576,80 @@ def probe_privilege_drop(
         return missing
 
     return _run_helper("privilege", helper, ["--ro", "/"], timeout)
+
+
+def probe_landlock_net(
+    helper: str | None = None, timeout: float = 5.0
+) -> NetProbeResult:
+    """Check whether the helper can deny TCP with ``--deny-net``.
+
+    Advisory only: the default policy is ``allow``, so an unsupported kernel
+    must not fail the preflight. Deliberately not routed through
+    ``_classify_helper_result``: a failure here says nothing about whether the
+    filesystem/identity sandbox works.
+    """
+    helper = helper or helper_path()
+    abi = landlock_abi_version()
+    if abi < 4:
+        return NetProbeResult(
+            supported=False,
+            detail=(
+                f"Landlock ABI {abi} has no network access control (needs 4+); "
+                "tools with network: none fail closed under this backend."
+            ),
+            abi=abi,
+        )
+
+    missing = _helper_probe_error("landlock", helper)
+    if missing is not None:
+        return NetProbeResult(supported=False, detail=missing.detail, abi=abi)
+
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="trellis-probe-net-")
+    except OSError as exc:
+        return NetProbeResult(
+            supported=False,
+            detail=_truncate(f"could not create probe tmpdir: {exc}"),
+            abi=abi,
+        )
+
+    argv = _helper_argv(
+        helper,
+        ["--ro", "/"],
+        tmpdir,
+        extra_args=["--deny-net"],
+        command=["/bin/true"],
+    )
+    try:
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd="/",
+        )
+    except subprocess.TimeoutExpired:
+        return NetProbeResult(
+            supported=False,
+            detail=_truncate(f"net probe timed out after {timeout}s"),
+            abi=abi,
+        )
+    except Exception as exc:
+        return NetProbeResult(
+            supported=False,
+            detail=_truncate(f"net probe failed to start: {exc}"),
+            abi=abi,
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    if proc.returncode == 0:
+        return NetProbeResult(
+            supported=True, detail=f"--deny-net accepted (ABI {abi})", abi=abi
+        )
+    return NetProbeResult(
+        supported=False, detail=_truncate(_probe_detail(proc)), abi=abi
+    )
 
 
 def _warn_if_identity_unreachable(uid: int, gid: int) -> None:
@@ -634,19 +753,24 @@ def _base_payload(requested: str) -> dict:
 
 
 def _failure_payload(
-    requested: str, code: str, detail: str, checks: dict | None = None
+    requested: str,
+    code: str,
+    detail: str,
+    checks: dict | None = None,
+    base: dict | None = None,
 ) -> dict:
-    try:
-        base = _base_payload(requested)
-    except Exception:
-        base = {
-            "requested": requested,
-            "landlock_abi": 0,
-            "sandbox_uid": 1000,
-            "ptrace_scope": None,
-            "evidence": {},
-            "checked_at": datetime.now(timezone.utc).isoformat(),
-        }
+    if base is None:
+        try:
+            base = _base_payload(requested)
+        except Exception:
+            base = {
+                "requested": requested,
+                "landlock_abi": 0,
+                "sandbox_uid": 1000,
+                "ptrace_scope": None,
+                "evidence": {},
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            }
     return {
         **base,
         "ok": False,
@@ -682,14 +806,35 @@ def _safe_probe(name: str, probe) -> ProbeResult:
         )
 
 
-def _ptrace_failure(requested: str, checks: dict) -> dict:
+def _ptrace_failure(requested: str, checks: dict, base: dict | None = None) -> dict:
     return _failure_payload(
         requested,
         "ptrace_scope_unrestricted",
         "Landlock would be selected, but kernel.yama.ptrace_scope is 0; a tool "
         "could read a sibling process's /proc/<pid>/environ.",
         checks,
+        base,
     )
+
+
+def _attach_net_evidence(base: dict) -> None:
+    """Add the network-policy probe to a payload, advisory only.
+
+    Only called when the Landlock backend was probed: bwrap supports
+    ``--unshare-net`` unconditionally, so on a bwrap-only run the evidence key
+    is omitted rather than reporting a Landlock verdict that was never taken.
+    """
+    try:
+        net = probe_landlock_net()
+    except Exception as exc:  # advisory: never fail the payload
+        net = NetProbeResult(False, _truncate(f"net probe crashed: {exc}"))
+    base.setdefault("evidence", {})["net"] = {
+        "deny_supported": net.supported,
+        "detail": net.detail,
+        "abi": net.abi,
+    }
+    if not net.supported:
+        base.setdefault("warnings", []).append("landlock_net_unsupported")
 
 
 def _run_probes(requested: str) -> dict:
@@ -711,13 +856,14 @@ def _run_probes(requested: str) -> dict:
         privilege = _safe_probe("privilege", probe_privilege_drop)
         checks["landlock"] = _check(landlock)
         checks["privilege"] = _check(privilege)
+        _attach_net_evidence(base)
         if landlock.ok and privilege.ok:
             if scope == 0:
-                return _ptrace_failure(requested, checks)
+                return _ptrace_failure(requested, checks, base)
             return {**base, "ok": True, "backend": "landlock", "checks": checks}
         failed = landlock if not landlock.ok else privilege
         return _failure_payload(
-            requested, failed.code or "unknown", failed.detail, checks
+            requested, failed.code or "unknown", failed.detail, checks, base
         )
 
     # auto: prefer bwrap (zero behavior change), fall back to Landlock.
@@ -730,9 +876,10 @@ def _run_probes(requested: str) -> dict:
     privilege = _safe_probe("privilege", probe_privilege_drop)
     checks["landlock"] = _check(landlock)
     checks["privilege"] = _check(privilege)
+    _attach_net_evidence(base)
     if landlock.ok and privilege.ok:
         if scope == 0:
-            return _ptrace_failure(requested, checks)
+            return _ptrace_failure(requested, checks, base)
         return {**base, "ok": True, "backend": "landlock", "checks": checks}
 
     # Both backends failed: prefer the fallback's diagnosis because it is the
@@ -745,7 +892,7 @@ def _run_probes(requested: str) -> dict:
     else:
         failed = bwrap
     return _failure_payload(
-        requested, failed.code or "unknown", failed.detail, checks
+        requested, failed.code or "unknown", failed.detail, checks, base
     )
 
 

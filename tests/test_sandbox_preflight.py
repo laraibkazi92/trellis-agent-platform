@@ -542,6 +542,154 @@ def test_probe_landlock_without_kernel_support(monkeypatch):
     assert preflight.probe_landlock().code == "landlock_unavailable"
 
 
+def _landlock_payload(monkeypatch, net_result, abi=6):
+    monkeypatch.setenv("SANDBOX_BACKEND", "landlock")
+    monkeypatch.setattr(preflight, "landlock_abi_version", lambda: abi)
+    monkeypatch.setattr(
+        preflight, "_read_text",
+        lambda path: "1\n" if path.endswith("ptrace_scope") else "",
+    )
+    monkeypatch.setattr(preflight, "probe_landlock", lambda *a, **k: _probe(True))
+    monkeypatch.setattr(
+        preflight, "probe_privilege_drop", lambda *a, **k: _probe(True)
+    )
+    monkeypatch.setattr(
+        preflight, "probe_landlock_net", lambda *a, **k: net_result
+    )
+    return preflight.warmup()
+
+
+def test_healthz_reports_net_policy_support(monkeypatch):
+    payload = _landlock_payload(
+        monkeypatch, preflight.NetProbeResult(True, "--deny-net accepted", 6)
+    )
+
+    assert payload["ok"] is True
+    assert payload["evidence"]["net"] == {
+        "deny_supported": True,
+        "detail": "--deny-net accepted",
+        "abi": 6,
+    }
+    assert "landlock_net_unsupported" not in payload["warnings"]
+
+
+def test_unsupported_net_abi_is_advisory_only(monkeypatch):
+    payload = _landlock_payload(
+        monkeypatch,
+        preflight.NetProbeResult(False, "Landlock ABI 3 has no net control", 3),
+        abi=3,
+    )
+
+    # The default policy is allow, so an unenforceable `none` must not fail
+    # startup or block backend selection.
+    assert payload["ok"] is True
+    assert payload["backend"] == "landlock"
+    assert payload["evidence"]["net"]["deny_supported"] is False
+    assert payload["evidence"]["net"]["abi"] == 3
+    assert "landlock_net_unsupported" in payload["warnings"]
+
+
+def test_bwrap_only_probe_omits_landlock_net_evidence(monkeypatch):
+    monkeypatch.setenv("SANDBOX_BACKEND", "bwrap")
+    monkeypatch.setattr(preflight, "landlock_abi_version", lambda: 6)
+    monkeypatch.setattr(
+        preflight, "_read_text",
+        lambda path: "1\n" if path.endswith("ptrace_scope") else "",
+    )
+    monkeypatch.setattr(preflight, "probe_bwrap", lambda *a, **k: _probe(True))
+    monkeypatch.setattr(
+        preflight,
+        "probe_landlock_net",
+        lambda *a, **k: pytest.fail("bwrap-only probe must not run the net probe"),
+    )
+
+    payload = preflight.warmup()
+
+    assert payload["ok"] is True
+    # bwrap supports --unshare-net unconditionally, so no Landlock verdict is
+    # reported rather than a misleading one.
+    assert "net" not in payload["evidence"]
+
+
+def test_probe_landlock_net_gated_on_abi(monkeypatch):
+    monkeypatch.setattr(preflight, "landlock_abi_version", lambda: 3)
+    monkeypatch.setattr(
+        preflight.subprocess,
+        "run",
+        lambda *a, **k: pytest.fail("ABI gate must run before the helper"),
+    )
+
+    result = preflight.probe_landlock_net()
+
+    assert result.supported is False
+    assert result.abi == 3
+    assert "ABI 3" in result.detail
+
+
+def test_probe_landlock_net_argv_and_success(monkeypatch):
+    seen = []
+
+    def _run(argv, **kwargs):
+        seen.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(preflight, "landlock_abi_version", lambda: 6)
+    monkeypatch.setattr(preflight, "_helper_probe_error", lambda *a, **k: None)
+    monkeypatch.setattr(preflight, "resolve_sandbox_identity", lambda: (1000, 1000))
+    monkeypatch.setattr(preflight.subprocess, "run", _run)
+
+    result = preflight.probe_landlock_net(helper="/h")
+
+    assert result.supported is True
+    assert result.abi == 6
+    argv = seen[0]
+    assert argv[0] == "/h"
+    assert argv[argv.index("--") - 1] == "--deny-net"
+    assert argv[-1] == "/bin/true"
+    assert "--no-seccomp" not in argv
+
+
+def test_probe_landlock_net_reports_helper_failure(monkeypatch):
+    monkeypatch.setattr(preflight, "landlock_abi_version", lambda: 6)
+    monkeypatch.setattr(preflight, "_helper_probe_error", lambda *a, **k: None)
+    monkeypatch.setattr(preflight, "resolve_sandbox_identity", lambda: (1000, 1000))
+    monkeypatch.setattr(
+        preflight.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(
+            argv,
+            65,
+            "",
+            "trellis-sandbox: landlock net access control requires ABI 4 (have 3)",
+        ),
+    )
+
+    result = preflight.probe_landlock_net(helper="/h")
+
+    assert result.supported is False
+    assert "ABI 4" in result.detail
+
+
+@pytest.mark.parametrize("returncode", [1, 65])
+def test_net_marker_is_classified_before_generic_landlock(monkeypatch, returncode):
+    _install_helper_probe(
+        monkeypatch,
+        subprocess.CompletedProcess(
+            [],
+            returncode,
+            "",
+            "trellis-sandbox: landlock net access control requires ABI 4 (have 3)",
+        ),
+    )
+
+    result = preflight.probe_landlock(helper="/usr/local/bin/trellis-sandbox")
+
+    assert result.ok is False
+    assert result.code == "landlock_net_unsupported"
+    assert result.remediation == preflight.REMEDIATIONS["landlock_net_unsupported"]
+    assert "bwrap" in result.remediation
+
+
 @pytest.mark.parametrize(
     "returncode,stderr,expected",
     [
