@@ -377,6 +377,28 @@ static void zero_capabilities(void)
         die_errno(EXIT_PRIVDROP, "capset");
 }
 
+/* True only when a group other than the sandbox's primary gid survives. */
+static int has_extra_groups(gid_t primary)
+{
+    int i, n = getgroups(0, NULL);
+    gid_t *groups;
+
+    if (n <= 0)
+        return 0;
+    groups = malloc((size_t)n * sizeof(*groups));
+    if (!groups)
+        return 0; /* a diagnostic must not fail the run */
+    n = getgroups(n, groups);
+    for (i = 0; i < n; i++) {
+        if (groups[i] != primary) {
+            free(groups);
+            return 1;
+        }
+    }
+    free(groups);
+    return 0;
+}
+
 static void drop_privileges(const struct opts *o, const char *tmpdir)
 {
     /* Re-owning the run dir is part of the identity change, not something a
@@ -388,11 +410,12 @@ static void drop_privileges(const struct opts *o, const char *tmpdir)
             die_errno(EXIT_PRIVDROP, "chown(tmpdir)");
     }
     /* An unprivileged caller cannot clear groups, so EPERM here is expected
-     * when it already runs as the target identity. Warn if groups survived:
-     * a silent assumption that they are gone would overstate the isolation. */
+     * when it already runs as the target identity. Warn only when a group
+     * other than the primary one survives: Docker always lists the primary gid
+     * in the supplementary set, which is harmless. */
     if (setgroups(0, NULL) && errno != EPERM)
         die_errno(EXIT_PRIVDROP, "setgroups");
-    if (getgroups(0, NULL) > 0)
+    if (has_extra_groups(o->gid))
         fputs("trellis-sandbox: warning: supplementary groups retained "
               "(needs CAP_SETGID)\n", stderr);
     /* Already at the target identity (unprivileged test runs): the remaining

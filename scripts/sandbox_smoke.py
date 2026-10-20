@@ -300,14 +300,18 @@ def check_runtime_matrix(backend, timeout):
 def check_confinement(backend, timeout):
     """Writes outside the grants must fail; TMPDIR writes must succeed."""
     errors = []
-    root_escape = Path("/root/trellis-smoke-escape")
+    # Root-only fixtures cannot be created by a non-root hub, so use paths that
+    # already exist with root-only permissions: reading /etc/shadow must be
+    # denied and writing into /etc must fail.
+    shadow_path = Path("/etc/shadow")
+    etc_escape = Path("/etc/trellis-smoke-escape")
     host_tmp = Path(f"/tmp/trellis-smoke-{os.getpid()}")
     removed = []
     scratch = _workspace_scratch("trellis-smoke-conf-")
     locked = scratch / "locked"
 
     # A stale artefact from an earlier failed run would mask the real result.
-    for path in (root_escape, host_tmp):
+    for path in (etc_escape, host_tmp):
         if path.exists() or path.is_symlink():
             try:
                 path.unlink()
@@ -320,16 +324,21 @@ def check_confinement(backend, timeout):
         ["bash", "-c", 'echo ok > "$TMPDIR/ok"'], backend, timeout
     )
 
-    _log("confinement: TMPDIR write then /root escape")
+    _log("confinement: TMPDIR write then root-only read")
     combined_result = run_in_sandbox(
-        ["bash", "-c", 'echo ok > "$TMPDIR/ok" && echo escape > /root/trellis-smoke-escape'],
+        ["bash", "-c", f'echo ok > "$TMPDIR/ok" && cat "{shadow_path}"'],
         backend,
         timeout,
     )
 
-    _log("confinement: /root escape only")
-    root_result = run_in_sandbox(
-        ["bash", "-c", "echo escape > /root/trellis-smoke-escape"], backend, timeout
+    _log("confinement: root-only read only")
+    shadow_result = run_in_sandbox(
+        ["bash", "-c", f'cat "{shadow_path}"'], backend, timeout
+    )
+
+    _log("confinement: /etc write")
+    etc_result = run_in_sandbox(
+        ["bash", "-c", f'echo escape > "{etc_escape}"'], backend, timeout
     )
 
     _log(f"confinement: host /tmp write ({host_tmp})")
@@ -352,22 +361,26 @@ def check_confinement(backend, timeout):
             f"success: {_short(_observed(locked_result))}"
         )
 
-    root_visible = root_escape.exists()
+    etc_visible = etc_escape.exists()
     host_visible = host_tmp.exists()
 
     if tmpdir_result["returncode"] != 0:
         errors.append(f"TMPDIR write failed: {_short(_observed(tmpdir_result))}")
     if combined_result["returncode"] in (0, None):
         errors.append(
-            "combined TMPDIR+/root write unexpectedly succeeded "
+            "combined TMPDIR+root-only-read unexpectedly succeeded "
             f"(exit {combined_result['returncode']})"
         )
-    if root_result["returncode"] in (0, None):
+    if shadow_result["returncode"] in (0, None):
         errors.append(
-            f"/root write was not denied (exit {root_result['returncode']})"
+            f"{shadow_path} read was not denied (exit {shadow_result['returncode']})"
         )
-    if root_visible:
-        errors.append(f"{root_escape} exists on the hub filesystem")
+    if etc_result["returncode"] in (0, None):
+        errors.append(
+            f"/etc write was not denied (exit {etc_result['returncode']})"
+        )
+    if etc_visible:
+        errors.append(f"{etc_escape} exists on the hub filesystem")
     if host_visible:
         errors.append(f"{host_tmp} is visible on the hub filesystem")
     # bwrap mounts a private tmpfs on /tmp, so a successful write there is
@@ -379,7 +392,8 @@ def check_confinement(backend, timeout):
         "ok": not errors,
         "tmpdir_write": _command_entry(tmpdir_result),
         "combined": _command_entry(combined_result),
-        "root_write": _command_entry(root_result),
+        "root_only_read": _command_entry(shadow_result),
+        "etc_write": _command_entry(etc_result),
         "host_tmp_write": {
             **_command_entry(host_result),
             "expected_to_fail": backend is sandbox.Backend.LANDLOCK,
@@ -389,12 +403,12 @@ def check_confinement(backend, timeout):
             **_command_entry(locked_result),
             "expected_to_succeed": True,
         },
-        "root_escape_visible": root_visible,
+        "etc_escape_visible": etc_visible,
         "host_tmp_visible": host_visible,
         "pre_existing_paths_removed": removed,
     }
 
-    for path in (root_escape, host_tmp):
+    for path in (etc_escape, host_tmp):
         try:
             path.unlink()
         except OSError:
