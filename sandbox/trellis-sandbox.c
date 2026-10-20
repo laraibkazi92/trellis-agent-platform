@@ -5,7 +5,9 @@
  * filesystem domain, installs a seccomp deny-list, then execs the command in
  * place (no fork, so exit codes and signals pass through). --no-seccomp skips
  * the deny-list. --deny-net handles the Landlock network rights (ABI 4+) with no
- * rule beneath them, which denies all TCP connect/bind.
+ * rule beneath them, which denies all TCP connect/bind; because Landlock covers
+ * TCP only, --deny-net also adds a seccomp rule refusing AF_INET/AF_INET6
+ * datagram and raw sockets so UDP cannot be used as an egress channel.
  *
  * The helper does not assume it starts as root. When the caller already runs as
  * the target identity (a hub that runs as the sandbox uid, unprivileged test
@@ -40,6 +42,7 @@
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -78,6 +81,12 @@
  * needs no rules: it is a deny-all TCP policy. */
 #define LL_NET_BIND (1ULL << 0)
 #define LL_NET_CONNECT (1ULL << 1)
+
+/* glibc/musl expose this via <sys/socket.h>; Go passes SOCK_NONBLOCK and
+ * SOCK_CLOEXEC in the same argument, so the type must be masked. */
+#ifndef SOCK_TYPE_MASK
+#define SOCK_TYPE_MASK 0xf
+#endif
 #define LL_SCOPE_ABSTRACT_UNIX_SOCKET (1U << 0) /* ABI 6 */
 #define LL_SCOPE_SIGNAL (1U << 1)               /* ABI 6 */
 
@@ -542,7 +551,7 @@ static uint32_t errno_ret(int err)
     return SECCOMP_RET_ERRNO | ((uint32_t)err & SECCOMP_RET_DATA);
 }
 
-static void install_seccomp(void)
+static void install_seccomp(int deny_net)
 {
     /* Errno choice matters: probing runtimes degrade cleanly on ENOSYS, while
      * EPERM is reserved for operations nothing legitimate probes. */
@@ -687,6 +696,39 @@ static void install_seccomp(void)
     emit_ret(&insns[0], &n, errno_ret(EPERM));
 #endif
 
+    /* Landlock's network scope is TCP only, so a `network: none` run would
+     * still have a UDP/raw-IP egress path. Refuse AF_INET/AF_INET6 datagram or
+     * raw sockets here; AF_UNIX and TCP sockets stay allowed (Landlock then
+     * refuses the TCP connect). Appended only for --deny-net, so the
+     * `network: allow` filter is unchanged. A jump lands at the final ALLOW. */
+    if (deny_net) {
+        size_t seg = n, end = n + 9; /* 9 instructions: 8 checks + deny */
+
+#define JUMP_TO_END (uint8_t)(end - n - 1)
+        emit(&insns[0], &n, (struct sock_filter)BPF_JUMP(
+            BPF_JMP | BPF_JEQ | BPF_K, __NR_socket, 0, JUMP_TO_END));
+        emit(&insns[0], &n, (struct sock_filter)BPF_STMT(
+            BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0])));
+        /* args[0] is the address family; AF_INET skips the AF_INET6 test. */
+        emit(&insns[0], &n, (struct sock_filter)BPF_JUMP(
+            BPF_JMP | BPF_JEQ | BPF_K, AF_INET, 1, 0));
+        emit(&insns[0], &n, (struct sock_filter)BPF_JUMP(
+            BPF_JMP | BPF_JEQ | BPF_K, AF_INET6, 0, JUMP_TO_END));
+        emit(&insns[0], &n, (struct sock_filter)BPF_STMT(
+            BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[1])));
+        emit(&insns[0], &n, (struct sock_filter)BPF_STMT(
+            BPF_ALU | BPF_AND | BPF_K, SOCK_TYPE_MASK));
+        emit(&insns[0], &n, (struct sock_filter)BPF_JUMP(
+            BPF_JMP | BPF_JEQ | BPF_K, SOCK_DGRAM, 1, 0));
+        emit(&insns[0], &n, (struct sock_filter)BPF_JUMP(
+            BPF_JMP | BPF_JEQ | BPF_K, SOCK_RAW, 0, JUMP_TO_END));
+        emit_ret(&insns[0], &n, errno_ret(EACCES));
+#undef JUMP_TO_END
+
+        if (n != end)
+            die(EXIT_SECCOMP, "internal error: socket segment length %zu", n - seg);
+    }
+
     emit_ret(&insns[0], &n, SECCOMP_RET_ALLOW);
 
     prog.len = (unsigned short)n;
@@ -799,9 +841,9 @@ int main(int argc, char **argv)
         die_errno(EXIT_LANDLOCK, "landlock_restrict_self");
 
     /* 11. Seccomp last, after the uid drop and Landlock, so the filter never has
-     * to allow setuid/setgid/chown. */
+     * to allow setuid/setgid/chown. --deny-net adds the UDP/raw-socket denial. */
     if (!o.no_seccomp)
-        install_seccomp();
+        install_seccomp(o.deny_net);
 
     for (i = 0; i < ro.n; i++)
         close(ro_fds[i]);

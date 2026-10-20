@@ -451,6 +451,96 @@ def _run_python(tmp_path, code, extra=()):
     )
 
 
+# --deny-net needs Landlock ABI 4+ (the helper refuses to start otherwise).
+requires_deny_net = pytest.mark.skipif(
+    sandbox_preflight.landlock_abi_version() < 4,
+    reason="Landlock ABI < 4 cannot run --deny-net",
+)
+
+UDP_SEND_CODE = (
+    "import socket\n"
+    "sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+    "sock.sendto(b'x', ('127.0.0.1', 9))\n"
+    "print('SENT')\n"
+)
+
+RAW_SOCKET_CODE = (
+    "import socket\n"
+    "sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)\n"
+    "print('RAW')\n"
+)
+
+# EACCES from the seccomp rule; EAFNOSUPPORT/EPERM kept as platform fallbacks.
+NET_DENIED_MARKERS = (
+    "Errno 13",
+    "Permission denied",
+    "Errno 97",
+    "Address family not supported",
+    "Errno 1",
+    "Operation not permitted",
+)
+
+
+@requires_deny_net
+def test_deny_net_blocks_udp_sockets(tmp_path):
+    """Landlock covers TCP only; the seccomp rule must close the UDP path."""
+    result = _run_python(tmp_path, UDP_SEND_CODE, extra=["--deny-net"])
+
+    assert result.returncode != 0
+    assert "SENT" not in result.stdout
+    assert any(marker in result.stderr for marker in NET_DENIED_MARKERS), (
+        result.stderr
+    )
+
+
+@requires_deny_net
+def test_deny_net_blocks_raw_sockets(tmp_path):
+    result = _run_python(tmp_path, RAW_SOCKET_CODE, extra=["--deny-net"])
+
+    assert result.returncode != 0
+    assert "RAW" not in result.stdout
+    # Seccomp refuses with EACCES before the CAP_NET_RAW check; a host that
+    # already forbids raw sockets reports EPERM, which is just as good.
+    assert any(marker in result.stderr for marker in NET_DENIED_MARKERS), (
+        result.stderr
+    )
+
+
+def test_allow_udp_send_succeeds(tmp_path):
+    """Positive control: the default policy must not touch UDP."""
+    result = _run_python(tmp_path, UDP_SEND_CODE)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "SENT"
+
+
+@requires_deny_net
+def test_deny_net_keeps_af_unix_datagrams(tmp_path):
+    """The socket rule must not be over-broad: AF_UNIX stays usable."""
+    code = (
+        "import socket\n"
+        "raw = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\n"
+        "left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)\n"
+        "left.send(b'x')\n"
+        "print('UNIX', right.recv(1))\n"
+    )
+    result = _run_python(tmp_path, code, extra=["--deny-net"])
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "UNIX b'x'"
+
+
+@requires_deny_net
+def test_deny_net_no_seccomp_allows_udp_again(tmp_path):
+    """--no-seccomp must skip the socket rules, keeping the escape hatch."""
+    result = _run_python(
+        tmp_path, UDP_SEND_CODE, extra=["--deny-net", "--no-seccomp"]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "SENT"
+
+
 def test_seccomp_denies_userns_creation(tmp_path):
     result = _run_python(
         tmp_path,
