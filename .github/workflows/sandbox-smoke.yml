@@ -120,6 +120,17 @@ jobs:
           TRELLIS_GID=$(id -g)
           ENV
 
+      - name: Allow unprivileged user namespaces on the bwrap leg
+        if: matrix.backend == 'bwrap'
+        # Ubuntu 24.04 restricts unprivileged user namespaces to processes whose
+        # AppArmor profile mediates the `userns` permission. This leg runs the
+        # container unconfined (compose default), which the restriction refuses,
+        # so bwrap cannot create its namespace. The point here is bwrap's own
+        # confinement, not Ubuntu's userns policy, and the runner VM is
+        # ephemeral. The `apparmor` job exercises the profile path (with
+        # `userns,` in the profile) and leaves this sysctl at its default.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Build and start the stack (auto backend)
         run: docker compose up -d --build
 
