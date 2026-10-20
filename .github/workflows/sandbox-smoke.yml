@@ -1,0 +1,124 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+#
+# Phase 4 regression test: prove the Landlock fallback works on a host where
+# Docker's stock AppArmor profile is enforcing ("docker-default" denies mount).
+# bwrap cannot mount there, so the hub must select Landlock and every sandbox
+# check must pass. This runs only the smoke harness — not the unit suite.
+
+name: Sandbox smoke
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "core/sandbox*"
+      - "core/hub.py"
+      - "sandbox/**"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "scripts/sandbox_smoke.py"
+      - "tests/test_sandbox*.py"
+      - "deploy/apparmor/**"
+      - ".github/workflows/sandbox-smoke.yml"
+      - "docs/deploy.md"
+  pull_request:
+    paths:
+      - "core/sandbox*"
+      - "core/hub.py"
+      - "sandbox/**"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "scripts/sandbox_smoke.py"
+      - "tests/test_sandbox*.py"
+      - "deploy/apparmor/**"
+      - ".github/workflows/sandbox-smoke.yml"
+      - "docs/deploy.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sandbox-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  landlock:
+    name: Landlock under AppArmor (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Record host sandbox evidence
+        run: |
+          echo "kernel: $(uname -r)"
+          echo "apparmor enabled: $(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || echo absent)"
+          echo "yama ptrace_scope: $(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo absent)"
+          docker info --format '{{json .SecurityOptions}}' || true
+
+      - name: Drop apparmor=unconfined so docker-default stays enforced
+        run: sed -i '/apparmor=unconfined/d' docker-compose.yml
+
+      - name: Seed the .env the compose file expects
+        # host/ui declare `env_file: .env`, which is not tracked in git.
+        # DEV_MODE keeps the UI startable without an identity provider; the
+        # sandbox checks use the hub only and never exercise auth.
+        # The sandbox uid must own the checkout: GitHub runners run as 1001,
+        # not 1000, and the hub deliberately lacks CAP_DAC_OVERRIDE.
+        run: |
+          cat > .env <<ENV
+          DEV_MODE=true
+          SESSION_SECRET=sandbox-smoke-ci
+          ADMIN_USERS=dev-user@local.host
+          TRELLIS_UID=$(id -u)
+          TRELLIS_GID=$(id -g)
+          ENV
+
+      - name: Build and start the stack (auto backend)
+        run: docker compose up -d --build
+
+      - name: Wait for /healthz and assert auto fell back to Landlock
+        run: |
+          : > healthz.json
+          for attempt in $(seq 1 60); do
+            body=$(docker compose exec -T hub curl -s http://127.0.0.1:8001/healthz 2>/dev/null || true)
+            if printf '%s' "$body" | grep -q '"backend"'; then
+              printf '%s' "$body" > healthz.json
+              break
+            fi
+            sleep 5
+          done
+          if [ ! -s healthz.json ]; then
+            echo "hub /healthz did not answer within 5 minutes" >&2
+            exit 1
+          fi
+          cat healthz.json
+          echo
+          python3 - <<'PY'
+          import json
+          p = json.load(open("healthz.json"))
+          print(json.dumps(p, indent=2, sort_keys=True))
+          assert p.get("requested") == "auto", p
+          assert p.get("backend") == "landlock", p
+          assert p.get("ok") is True, p
+          assert (p.get("checks") or {}).get("bwrap", {}).get("ok") is False, p
+          assert (p.get("checks") or {}).get("bwrap", {}).get("code") == "apparmor_mount_denied", p
+          PY
+
+      - name: Run the sandbox smoke harness (auto-selected Landlock)
+        run: |
+          docker compose exec -T hub python scripts/sandbox_smoke.py \
+            --backend auto \
+            --tool text_stats \
+            --check-confinement \
+            --check-privilege \
+            --check-seccomp
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          docker compose logs hub || true
+          docker compose logs db-sync || true
+          docker compose ps || true

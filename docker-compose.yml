@@ -99,11 +99,26 @@ services:
     build: *app-build
     image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.2.1}
     container_name: tool-hub
-    # Runs as ROOT on purpose (bubblewrap). Do NOT add a user: here.
+    # Runs as ROOT on purpose (bubblewrap, and the Landlock helper needs root to
+    # drop the tool to the workspace uid). Do NOT add a user: here.
     command: python core/hub.py
     restart: unless-stopped
-    # Least-privilege sandbox: the hub wraps every tool execution in bubblewrap
-    # (core/hub.py: --ro-bind / /, --unshare-user/pid/ipc/uts, --die-with-parent).
+    # /healthz is cached from the startup probes (no per-request bwrap fork) and
+    # returns 503 when the sandbox cannot execute tools.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8001/healthz > /dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      # Go tools are pre-compiled before uvicorn binds; a cold rebuild can take a
+      # while. Do not report a slow-but-healthy hub as a sandbox failure.
+      start_period: 60s
+    # Least-privilege sandbox: the hub wraps every tool execution in a sandbox —
+    # bubblewrap by default (core/hub.py: --ro-bind / /, --unshare-user/pid/ipc/uts,
+    # --die-with-parent), with a Landlock helper (core/sandbox.py +
+    # /usr/local/bin/trellis-sandbox) as the fallback when bwrap cannot run (no
+    # AppArmor profile, no user namespaces). Landlock confines filesystem writes and
+    # drops the tool to the workspace owner uid; it does not create namespaces.
     # What bwrap needs inside a container, and nothing more (empirically verified
     # with the exact syscall sequence bwrap uses under this Docker daemon):
     #   - SYS_ADMIN: docker's default seccomp profile gates clone(CLONE_NEWUSER)
@@ -111,6 +126,14 @@ services:
     #   - SETFCAP: the hub runs as root and bwrap writes an identity uid_map
     #     (0->0); the kernel requires CAP_SETFCAP for a root process to map its
     #     own uid into a new user namespace.
+    #   - SETUID/SETGID: used ONLY by the Landlock backend so the helper can drop
+    #     the tool to the workspace owner uid/gid (SANDBOX_UID/SANDBOX_GID, default
+    #     1000). The bwrap path never uses them; without them the helper cannot
+    #     setuid and /healthz reports landlock_setuid_denied instead of running
+    #     tools as root.
+    #   - CHOWN: the helper chowns the per-run tmpdir to that uid/gid before
+    #     dropping, so the tool owns its TMPDIR/HOME. Dropped before execve; it
+    #     never reaches the tool.
     #   - systempaths=unconfined: docker's masked /proc submounts (/proc/sys,
     #     /proc/bus, ...) leave /proc not "fully visible", so the kernel rejects
     #     bwrap's fresh proc mount with "Operation not permitted". This only
@@ -126,8 +149,24 @@ services:
     # Escape hatch: if tool execution still fails with bwrap/userns errors on an
     # exotic host, restoring `privileged: true` locally still works.
     cap_drop: [ALL]
-    cap_add: [SYS_ADMIN, SETFCAP]
-    security_opt: ["no-new-privileges:true", "systempaths=unconfined", "seccomp=unconfined"]
+    # SETUID/SETGID/CHOWN exist only so the Landlock helper can chown the run
+    # dir and drop the tool to the workspace owner uid/gid (default 1000); the
+    # bwrap path never uses them, and all three are cleared before exec.
+    cap_add: [SYS_ADMIN, SETFCAP, SETUID, SETGID, CHOWN]
+    # Docker's docker-default AppArmor profile contains `deny mount,`. AppArmor is an
+    # LSM independent of seccomp, so unconfining seccomp is not enough: it still blocks
+    # bwrap's bind/proc/tmpfs mounts and its pivot_root. `apparmor=unconfined` is the
+    # AppArmor analogue of `seccomp=unconfined`.
+    # Residual risk: seccomp was already unconfined above, so mount was already
+    # permitted for hub processes running outside bwrap. Containment rests on the
+    # capability set plus the container's own mount namespace. Orgs that forbid
+    # unconfined profiles should ship the custom profile in deploy/apparmor/trellis-hub
+    # (Phase 4) instead of this line.
+    security_opt:
+      - "no-new-privileges:true"
+      - "systempaths=unconfined"
+      - "seccomp=unconfined"
+      - "apparmor=unconfined"
     # NOTE: no `env_file: .env` here on purpose. The hub copies os.environ into every
     # tool subprocess it spawns (core/hub.py), so loading the whole .env would hand
     # tools every framework secret it holds (e.g. GEMINI_API_KEY, SESSION_SECRET).
@@ -145,6 +184,13 @@ services:
       TOOL_EXECUTION_TIMEOUT: ${TOOL_EXECUTION_TIMEOUT:-}
       HEALTH_FAILURE_THRESHOLD: ${HEALTH_FAILURE_THRESHOLD:-}
       HEALTH_COOLDOWN_SECONDS: ${HEALTH_COOLDOWN_SECONDS:-}
+      # Sandbox backend: auto | bwrap | landlock (see core/sandbox.py).
+      SANDBOX_BACKEND: ${SANDBOX_BACKEND:-auto}
+      # Target uid/gid for the Landlock backend; matches the operator-owned workspace.
+      SANDBOX_UID: ${SANDBOX_UID:-${TRELLIS_UID:-1000}}
+      SANDBOX_GID: ${SANDBOX_GID:-${TRELLIS_GID:-1000}}
+      # Syscall deny-list for the Landlock backend (on|off).
+      SANDBOX_SECCOMP: ${SANDBOX_SECCOMP:-on}
     depends_on:
       etcd:
         condition: service_healthy

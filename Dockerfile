@@ -1,3 +1,12 @@
+# Static Landlock sandbox helper (core/sandbox.py). Built on the same base image
+# as the runtime stage so the static binary matches its architecture.
+FROM python:3.12-slim AS sandbox-build
+COPY sandbox/trellis-sandbox.c /src/trellis-sandbox.c
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && mkdir -p /out \
+    && gcc -O2 -Wall -Wextra -static -s -o /out/trellis-sandbox /src/trellis-sandbox.c \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
 # Use Python 3.12 slim as the base image
 FROM python:3.12-slim
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
@@ -56,12 +65,16 @@ COPY templates/ templates/
 COPY scripts/ scripts/
 COPY docs/ docs/
 
+# Landlock + uid-drop sandbox helper used when bwrap cannot run.
+COPY --chmod=0755 --from=sandbox-build /out/trellis-sandbox /usr/local/bin/trellis-sandbox
+
 # Non-root runtime user. docker-compose passes the host uid:gid (TRELLIS_UID/TRELLIS_GID)
 # as PUID/PGID so files written into the bind-mounted workspace/ are owned by the operator
 # instead of root. /app/data is created here and owned by that user: the `health-data`
 # named volume inherits this ownership when Docker first populates it (first `up`).
 # NOTE: the hub service deliberately runs as root (bubblewrap needs CAP_SETFCAP + a root
-# uid_map) and overrides this with its own `user:` in docker-compose.yml.
+# uid_map; the Landlock helper needs root only to drop the tool to the workspace uid) and
+# overrides this with its own `user:` in docker-compose.yml.
 ARG PUID=1000
 ARG PGID=1000
 RUN groupadd -g ${PGID} trellis \

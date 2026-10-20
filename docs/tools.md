@@ -52,7 +52,24 @@ Check the tool's `tool.yaml` for required `inputs`, `secrets`, and `variables` b
 
 ### Sandbox Model
 
-Every tool invocation runs inside a bubblewrap (bwrap) sandbox: read-only root bind, a writable bind for `/app/workspace`, tmpfs `/tmp`, and unshared user/pid/ipc/uts namespaces. The hub container itself is least-privilege — all capabilities dropped except `SYS_ADMIN` + `SETFCAP` (the minimum bwrap needs to create its user namespace as root), with unmasked system paths (so the kernel permits a fresh `/proc` inside the sandbox), an unrestricted seccomp filter (so bwrap's `pivot_root` isn't blocked from building the sandbox root) and `no-new-privileges` — so tools cannot write outside the workspace/tmp or regain privileges via setuid binaries or file capabilities.
+Every tool invocation runs in one of two sandbox backends, chosen once at hub startup. `auto` (the default) prefers **bwrap** and falls back to **Landlock** when bwrap cannot run; both drop all capabilities. The confinement they provide differs:
+
+| Property | bwrap | Landlock |
+| --- | --- | --- |
+| Write confinement | `/` read-only, `/app/workspace` read-write, private tmpfs `/tmp` | `/` read-only, `/app/workspace` and a per-run `TMPDIR` read-write (equivalent) |
+| Process isolation | private PID/IPC/UTS namespaces | shared; `kill -0` on an outside process returns `EPERM` at ABI >= 6 |
+| `/proc` | fresh procfs | shared, read-only; uid separation + Yama keep other processes' data out |
+| `/tmp` | private per run | shared between runs (per-run `0700` dir, same uid) |
+| `/dev/shm` | available in the private `/dev` | not writable (POSIX shm fails) |
+| PTY (`/dev/ptmx`) | available | not granted (`pexpect`, `node-pty`, `script` fail) |
+| Tool identity | host uid 0 in its namespaces, `CapEff=0` | operator uid (`SANDBOX_UID`, default 1000), capabilities cleared |
+
+What that means for tool code:
+
+- Use `$TMPDIR` (also `HOME` under Landlock) for scratch work. It is writable in both backends and removed after the run.
+- **Never persist secrets in `$TMPDIR`.** Under Landlock it is shared between concurrent runs (same uid), so a `0700` directory is not a boundary. Keep credentials in memory or in the injected environment.
+- Keep files the host should see under `/app/workspace` — it is the only path guaranteed to survive the run. Normal Unix permissions still apply: under bwrap the tool is uid 0 **without** `CAP_DAC_OVERRIDE`, so writing into an operator-owned `0755` directory fails; use a writable output directory (`0777`) or `$TMPDIR`. Under Landlock the tool runs as the workspace owner and writes normally.
+- Avoid POSIX shared memory and PTY allocation under Landlock; use `$TMPDIR` files and subprocess pipes instead.
 
 ### Directory Structure
 

@@ -22,7 +22,15 @@ A rebuild or upgrade replaces the engine only. The content mount and the `etcd-d
 
 ## Prerequisites
 
-Docker only — Engine with the Compose v2 plugin. The prebuilt image bundles the full toolchain (Python, Node, Go), so no language runtimes are needed on the host.
+Docker Engine with the Compose v2 plugin is the only host dependency — the prebuilt image bundles the full toolchain (Python, Node, Go), so no language runtimes are needed on the host. The host kernel and LSM decide which sandbox backend can run tools; the hub probes both at startup and reports the verdict at `/healthz` (`backend`, `code`, `remediation`):
+
+| Host | bwrap | Landlock | Support |
+| --- | --- | --- | --- |
+| Rootful Docker, AppArmor relaxed (`apparmor=unconfined`) | ✅ | ✅ | **Primary path**; bwrap itself validated on AppArmor-disabled hosts, the AppArmor fix is the CI fallback case |
+| Rootful Docker + the `deploy/apparmor/trellis-hub` profile | ✅ | ✅ | Profile shipped; **not yet loaded in CI** — validate on a real AppArmor host before relying on it |
+| AppArmor locked, SELinux disabled, rootless Docker / userns-remap | ❌ | ✅ | **Supported, auto-fallback**; covered by the `sandbox-smoke` CI job on Ubuntu 24.04 |
+| SELinux enforcing (RHEL/CentOS/Fedora) | ❌ | ✅ | **Not certified** — needs a real-host validation |
+| Kernel < 5.13, or Landlock blocked by an LSM/seccomp policy | ❌ | ❌ | Unsupported; `/healthz` returns 503 with a diagnosis |
 
 ## Install path A: pull prebuilt images (recommended)
 
@@ -254,7 +262,55 @@ The clone ships three samples: `workspace/agents/demo-assistant/`, `workspace/to
 - **Front door.** `nginx-gateway` publishes ports 80 and 443 and is the single entry point for the stack. Set `SSL_ENABLED=True` and `SSL_DNS_NAME=<your-domain>` in `.env` to serve HTTPS; certificates are read from `SSL_CERT_DIR` (default `./gateway/ssl`, expecting `cert.pem` and `key.pem`). The cert-directory volume mount is commented out in `docker-compose.yml` — enable it by uncommenting that block, or via a local `docker-compose.override.yml`, which keeps the engine clone pristine.
 - **Bind address.** `HOST_BIND` defaults to `0.0.0.0`, so published ports are reachable from anywhere. Set `HOST_BIND=127.0.0.1` to keep them loopback-only — this also covers the Hindsight ports (8888 API, 9999 Control Plane UI). etcd and Redis are never published regardless.
 - **Authentication.** Keep `DEV_MODE=false` for anything shared: `true` disables API-key auth, UI login, and MCP auth across `host`, `hub`, `gateway`, and `ui`, and only logs a startup warning — it does not restrict the bind host. Optional SSO is configured with `GITHUB_CLIENT_ID`/`GITHUB_CLIENT_SECRET` or the `OIDC_*` variables, plus `ALLOWED_DOMAINS` to restrict by email domain.
-- **Tool sandbox.** The `hub` container runs least-privilege — all capabilities dropped except `SYS_ADMIN` and `SETFCAP`, plus `no-new-privileges` and unmasked system paths — because every tool executes inside a bubblewrap sandbox and the container must not hold more rights than bwrap needs. If tool execution still fails with bwrap/userns errors on an exotic kernel or hardened seccomp policy, the documented local fallback is replacing the hub's `cap_drop`/`cap_add`/`security_opt` block with `privileged: true`, which grants much broader container access.
+- **Tool sandbox.** Every tool invocation runs in one of two sandbox backends, selected once at hub startup (`core/sandbox.py`): `auto` (the default) prefers **bwrap** and falls back to **Landlock** when bwrap cannot run. The container drops all capabilities and keeps `no-new-privileges`; the compose file adds back only the capabilities the sandbox backends need.
+  - **bwrap** is the stronger isolation and stays the default wherever it works. Each tool gets a read-only bind of `/`, a read-write bind of `/app/workspace`, a private tmpfs `/tmp`, a fresh `/proc`, and its own user, PID, IPC, and UTS namespaces, with every capability dropped (`--cap-drop ALL`). To build that root bwrap calls `mount(2)` and `pivot_root(2)`, so the container needs `SYS_ADMIN` + `SETFCAP`, `seccomp=unconfined` (Docker's seccomp profile blocks `pivot_root`), and `systempaths=unconfined` (bwrap mounts a fresh `/proc`). It also needs **`apparmor=unconfined`**: AppArmor is independent of seccomp, and Docker's `docker-default` profile contains `deny mount,`, which blocks every tool's first bind mount. Orgs that forbid unconfined profiles can use the shipped `deploy/apparmor/trellis-hub` profile instead (see below).
+  - **Landlock** is the unprivileged fallback: a static helper (`/usr/local/bin/trellis-sandbox`) confines filesystem writes (`/` read-only; `/app/workspace` and a per-run `TMPDIR` writable), installs a syscall deny-list unless `SANDBOX_SECCOMP=off`, and drops the tool to the operator uid with capabilities cleared. It creates no namespaces and needs no mounts, so it works under `docker-default`, SELinux, and rootless Docker.
+  - **Identity differs by backend, by design.** bwrap tools keep host uid 0 inside their namespaces (bwrap's `--uid` maps the namespace uid back to the caller, which breaks workspace writes) but run with `CapEff=0`; files they create under `/app/workspace` are root-owned on the host. Landlock tools run as the operator uid (`SANDBOX_UID`, default 1000) with no capabilities, and their workspace files are operator-owned — the same ownership contract as the rest of the stack (`TRELLIS_UID`).
+  - **Filesystem permissions still apply.** The hub runs as root but with `CAP_DAC_OVERRIDE` dropped, so a bwrap tool (uid 0, caps cleared) cannot write into an operator-owned `0755` directory under `/app/workspace`; use `$TMPDIR` for scratch, make an explicit output directory writable (`0777`), or run the hub as the operator uid (the follow-up that also removes `SETUID`/`SETGID`). Landlock tools are the workspace owner and do not have this limitation.
+  - **Landlock limitations.** It restores filesystem blast-radius control and privilege separation, not bwrap's process isolation. `/proc` is shared; the uid split (hub root, tools not) plus Yama `kernel.yama.ptrace_scope >= 1` keeps other processes' environments out, and the hub returns 503 when the scope is 0 or missing. `/tmp` is shared too: each run gets a `0700` directory, but tools share one uid, so **never write secrets there**. `/dev/shm` is not writable, so POSIX shared memory (numpy/torch multiprocessing) fails. `/dev/ptmx` is not granted, so PTY allocation fails (`pexpect`, `node-pty`, `script`). `truncate` on a read-only file is unconfined at Landlock ABI 2 (Debian 12). At ABI >= 6, signal scoping makes `kill -0` on a process outside the sandbox return `EPERM` instead of `ESRCH`.
+  - **Last resort.** If tool execution still fails with bwrap/userns errors on an exotic host, replacing the hub's `cap_drop`/`cap_add`/`security_opt` block with `privileged: true` restores broad container access. It also removes every container-level control above, so treat it as a temporary host workaround and record why.
+
+The AppArmor profile is `docker-default` with `deny mount,` removed and `userns,` added (plus `abi <3.0>,` to match upstream). It is not a hardening win over `apparmor=unconfined` — it is the policy-compliance option. It has not been loaded in CI yet, so validate it on a real AppArmor host. `userns,` requires an AppArmor parser with user-namespace mediation; on older userspace, delete that one rule (those kernels have no AppArmor userns restriction to lift). It is not used when the hub keeps `apparmor=unconfined`. Install it on the **host** — profiles load on the host kernel, not inside the container — and select it for the hub:
+
+```bash
+sudo install -m 0644 deploy/apparmor/trellis-hub /etc/apparmor.d/trellis-hub
+sudo apparmor_parser -r /etc/apparmor.d/trellis-hub
+```
+
+```yaml
+    security_opt:
+      - "apparmor=trellis-hub"
+```
+
+### Sandbox settings and rollback
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `SANDBOX_BACKEND` | `auto` | `auto` (bwrap, then Landlock), `bwrap`, or `landlock`. An invalid value warns and behaves as `auto`. |
+| `SANDBOX_SECCOMP` | `on` | Landlock helper's syscall deny-list. `off` passes `--no-seccomp`; use it if the filter breaks a runtime. |
+| `SANDBOX_UID` / `SANDBOX_GID` | image `trellis` user (compose: `${SANDBOX_UID:-${TRELLIS_UID}}`, default `1000`) | uid/gid Landlock tools run as (and own the per-run `TMPDIR`). `0` is rejected. **This uid must own the `/app/workspace` tree**, otherwise Landlock tools cannot write there. |
+| `SANDBOX_TMP_ROOT` | `/tmp/trellis` | Parent for per-run tmpdirs; created `0711`. Point it at a larger filesystem if `/tmp` is small. |
+
+The backend and probe results are cached at startup, so apply any change with `docker compose up -d hub` (no rebuild needed). `SANDBOX_SECCOMP=off` must be set **before** the hub starts for the same reason: the preflight caches its verdict, including the helper argv it probes with.
+
+Rollback levers, cheapest first: `SANDBOX_BACKEND=bwrap` (one env var, no rebuild), `SANDBOX_SECCOMP=off` (disables the syscall filter but keeps filesystem confinement), and reverting the hub's `cap_add`/`security_opt` block if a host-level change must be undone.
+
+### Hardened Landlock-only variant
+
+If you never want bwrap's container-level exceptions, pin the Landlock backend. The helper only *adds* restrictions (it runs unprivileged, applies Landlock, drops the uid, and installs seccomp), so Docker's default seccomp and AppArmor profiles are **expected** to be fine — this variant is not exercised in CI yet, so validate it against your Docker version before standardising on it:
+
+```yaml
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, CHOWN]
+    security_opt:
+      - "no-new-privileges:true"
+    environment:
+      SANDBOX_BACKEND: landlock
+```
+
+This drops `SYS_ADMIN` and `SETFCAP` (bwrap-only) and the three `*=unconfined` options (`systempaths=unconfined`, `seccomp=unconfined`, `apparmor=unconfined`). Keep `SETUID`, `SETGID`, and `CHOWN` while the hub runs as root: the helper needs them to chown the per-run directory and drop the tool to the operator uid, and all three are cleared before the tool starts. `cap_add` and `security_opt` are lists, so a plain `docker-compose.override.yml` appends to the base values instead of replacing them — edit the hub block directly, or replace those lists with Compose's `!override` tag (Compose 2.24+).
+
+One caveat: `docker compose up --wait` fails when `/healthz` returns 503 — that is the intended signal, not a broken deploy. `host` depends on `hub` with `condition: service_started`, not `service_healthy`, so chat-only agents still start.
 
 ## Verifying the deployment
 
@@ -262,6 +318,10 @@ The clone ships three samples: `workspace/agents/demo-assistant/`, `workspace/to
 docker compose ps                       # every service up; db-sync exited 0
 curl -sI localhost                      # front door answers through nginx
 docker compose exec host curl -sf http://127.0.0.1:8000/health
+docker compose exec hub curl -s localhost:8001/healthz | python -m json.tool
+docker compose exec hub trellis-sandbox --version
 docker compose logs db-sync             # sync counts
 docker compose exec host python scripts/trellis logs --limit 5
 ```
+
+`/healthz` returning 503 is a real sandbox diagnosis (`code` + `remediation`), not a dead deployment: the hub is up, chat-only agents keep working, and only local tool calls fail until the cause is fixed. The verdict is cached at startup, so fix the host and restart the hub to re-probe.

@@ -4,20 +4,22 @@
 import sys
 import json
 import os
+import signal
 import subprocess
 import asyncio
 import logging
-import shutil
 import stamina
 from pathlib import Path
 import typing
 from typing import Dict, Any, Optional
 from fastmcp import FastMCP
+from starlette.responses import JSONResponse
 from core.models import ToolConfig
 from core.auth import get_identity_manager
 from core.env_sanitize import sanitized_env
 from core.devmode import enforce_dev_mode_safety
 from core.tunables import resolve as resolve_tunable
+from core import sandbox, sandbox_preflight
 from core.background.tasks import (
     background_tasks as _background_tasks,
     drain_background_tasks as _drain_background_tasks,
@@ -35,6 +37,20 @@ identity_mgr = get_identity_manager()
 health_monitor = HealthMonitor(identity_mgr)
 
 logger = logging.getLogger(__name__)
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def healthz(request):
+    """Sandbox health probe for the container healthcheck.
+
+    The payload is cached from the startup probes in ``sandbox_preflight.warmup()``
+    -- no per-request bubblewrap fork, so this stays cheap enough for a 15s
+    healthcheck interval. Container-internal only: FastMCP custom routes bypass
+    MCP auth, so do not publish this port outside the compose network.
+    """
+    status_code, payload = sandbox_preflight.build_healthz_payload()
+    return JSONResponse(payload, status_code=status_code)
+
 
 class _LifespanDrainWrapper:
     """Delegates ASGI calls to the wrapped app, draining background tasks on shutdown.
@@ -87,6 +103,28 @@ def load_tool_configs() -> Dict[str, tuple[ToolConfig, Path]]:
 class TransientToolError(Exception):
     pass
 
+
+def _kill_process_tree(process) -> None:
+    """Kill the child's whole session, not just the direct child.
+
+    bwrap tears its PID namespace down with the parent, but the Landlock backend
+    runs the tool directly: its own children would otherwise survive a timeout
+    as unreaped orphans in the hub (container PID 1).
+    """
+    pid = getattr(process, "pid", None)
+    if pid:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+
 @stamina.retry(on=TransientToolError, attempts=3)
 async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any], user_id: Optional[str]) -> Dict[str, Any]:
     """Executes a tool as a subprocess and handles JSON stdin/stdout."""
@@ -108,24 +146,6 @@ async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[
         cmd = ["bash", str(entrypoint_path)]
     else:
         return {"error": f"Unsupported runtime: {config.runtime}"}
-
-    if not shutil.which("bwrap"):
-        raise RuntimeError("bwrap not found on system. Sandboxing is required.")
-
-    bwrap_cmd = [
-        "bwrap",
-        "--ro-bind", "/", "/",
-        "--bind", "/app/workspace", "/app/workspace",
-        "--dev", "/dev",
-        "--proc", "/proc",
-        "--tmpfs", "/tmp",
-        "--unshare-user",
-        "--unshare-pid",
-        "--unshare-ipc",
-        "--unshare-uts",
-        "--die-with-parent"
-    ]
-    cmd = bwrap_cmd + cmd
 
     try:
         env = sanitized_env()
@@ -180,39 +200,38 @@ async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[
         default_timeout = resolve_tunable("tool_execution_timeout")
         timeout = config.timeout_seconds if getattr(config, "timeout_seconds", None) else default_timeout
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=str(tool_dir),
-            env=env
-        )
-
+        plan = sandbox.prepare_execution(cmd, tool_dir, env=env)
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(input=input_json), timeout=timeout)
-        except asyncio.TimeoutError:
+            process = await asyncio.create_subprocess_exec(
+                *plan.argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(tool_dir),
+                env=plan.env,
+                start_new_session=True,
+            )
+
             try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-            try:
-                await process.wait()
-            except Exception:
-                pass
-            error_msg = f"Tool execution timed out after {timeout:.0f}s."
-            await asyncio.to_thread(health_monitor.record_event, "tool", config.name, False, error_msg)
-            return {"error": error_msg}
-        except asyncio.CancelledError:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-            try:
-                await process.wait()
-            except Exception:
-                pass
-            raise
+                stdout, stderr = await asyncio.wait_for(process.communicate(input=input_json), timeout=timeout)
+            except asyncio.TimeoutError:
+                _kill_process_tree(process)
+                try:
+                    await process.wait()
+                except Exception:
+                    pass
+                error_msg = f"Tool execution timed out after {timeout:.0f}s."
+                await asyncio.to_thread(health_monitor.record_event, "tool", config.name, False, error_msg)
+                return {"error": error_msg}
+            except asyncio.CancelledError:
+                _kill_process_tree(process)
+                try:
+                    await process.wait()
+                except Exception:
+                    pass
+                raise
+        finally:
+            plan.cleanup()
 
         if stderr:
             stderr_text = stderr.decode().strip()
@@ -223,6 +242,29 @@ async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[
 
         if process.returncode != 0:
             stderr_str = stderr.decode().strip()
+            failure = sandbox.classify_failure(
+                stderr_str, plan.backend, process.returncode
+            )
+            if failure:
+                sandbox.log_failure_once(failure)
+                error_msg = (
+                    f"Tool failed inside the {plan.backend.value} sandbox "
+                    f"({failure.code}): {failure.detail}"
+                )
+                await asyncio.to_thread(health_monitor.record_event, "tool", config.name, False, error_msg)
+                # A sandbox denial can never succeed on retry: skip the
+                # TransientToolError path even if stderr happens to contain a
+                # transient keyword.
+                return {
+                    "error": error_msg,
+                    "stderr": stderr_str,
+                    "sandbox": {
+                        "backend": plan.backend.value,
+                        "code": failure.code,
+                        "remediation": failure.remediation,
+                    },
+                }
+
             error_msg = f"Tool exited with code {process.returncode}: {stderr_str}"
             await asyncio.to_thread(health_monitor.record_event, "tool", config.name, False, error_msg)
             config_retry = getattr(config, "retry_on_transient", True)
@@ -256,6 +298,17 @@ async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[
             await asyncio.to_thread(health_monitor.record_event, "tool", config.name, False, error_msg)
             return {"output": stdout.decode().strip(), "warning": error_msg}
 
+    except sandbox.SandboxUnavailable as e:
+        error_msg = f"Sandbox unavailable ({e.code}): {e.detail or e.remediation}"
+        await asyncio.to_thread(health_monitor.record_event, "tool", config.name, False, error_msg)
+        return {
+            "error": error_msg,
+            "sandbox": {
+                "backend": e.backend,
+                "code": e.code,
+                "remediation": e.remediation,
+            },
+        }
     except TransientToolError:
         raise
     except Exception as e:
@@ -379,6 +432,9 @@ if __name__ == "__main__":
     # Startup gate: refuse to serve an unauthenticated DEV_MODE instance on a
     # remotely reachable bind host (see core/devmode.py).
     enforce_dev_mode_safety("hub")
+    # Startup probes for /healthz. Never raises: a broken sandbox must not block
+    # the hub from starting, it only flips the health payload to 503.
+    sandbox_preflight.warmup()
     register_tools()
     import uvicorn
     app = _LifespanDrainWrapper(mcp.http_app(host_origin_protection=False))

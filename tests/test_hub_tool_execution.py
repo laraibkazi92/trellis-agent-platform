@@ -158,8 +158,14 @@ def install_fake_health(monkeypatch):
     return events
 
 
-def install_bwrap(monkeypatch):
-    monkeypatch.setattr(hub.shutil, "which", lambda name: "/usr/bin/bwrap" if name == "bwrap" else None)
+def install_sandbox(monkeypatch, backend="bwrap"):
+    """Select a backend without probing; temp dirs still exercise real cleanup."""
+    from core import sandbox
+
+    sandbox.reset_for_tests()
+    monkeypatch.setattr(
+        sandbox, "select_backend", lambda force=None: sandbox.Backend(backend)
+    )
 
 
 async def _run_tool_scenario(config, tool_dir, arguments):
@@ -170,7 +176,7 @@ async def _run_tool_scenario(config, tool_dir, arguments):
 
 
 def test_run_tool_preserves_user_id_across_retries(monkeypatch, tmp_path):
-    install_bwrap(monkeypatch)
+    install_sandbox(monkeypatch)
     monkeypatch.setenv("DEV_MODE", "false")
     fake_identity = install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
@@ -193,7 +199,7 @@ def test_run_tool_preserves_user_id_across_retries(monkeypatch, tmp_path):
 
 
 def test_run_tool_records_usage_once_across_retries(monkeypatch, tmp_path):
-    install_bwrap(monkeypatch)
+    install_sandbox(monkeypatch)
     monkeypatch.setenv("DEV_MODE", "false")
     fake_identity = install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
@@ -212,7 +218,7 @@ def test_run_tool_records_usage_once_across_retries(monkeypatch, tmp_path):
 
 
 def test_run_tool_does_not_mutate_caller_arguments(monkeypatch, tmp_path):
-    install_bwrap(monkeypatch)
+    install_sandbox(monkeypatch)
     install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
     install_fake_subprocess(monkeypatch, [FakeProcess(returncode=0, stdout=b'{"ok": true}')])
@@ -251,7 +257,7 @@ def test_run_tool_handler_does_not_log_raw_kwargs(monkeypatch, tmp_path, capsys)
 def test_run_tool_handler_reports_retry_exhaustion_and_records_usage_once(monkeypatch, tmp_path):
     config = make_config()
     tool_dir = make_tool_dir(tmp_path)
-    install_bwrap(monkeypatch)
+    install_sandbox(monkeypatch)
     fake_identity = install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
 
@@ -278,7 +284,7 @@ def test_run_tool_handler_reports_retry_exhaustion_and_records_usage_once(monkey
 
 
 def test_run_tool_times_out_hung_subprocess(monkeypatch, tmp_path):
-    install_bwrap(monkeypatch)
+    install_sandbox(monkeypatch)
     monkeypatch.setenv("TOOL_EXECUTION_TIMEOUT", "0.1")
     install_fake_identity(monkeypatch)
     health_events = install_fake_health(monkeypatch)
@@ -301,7 +307,7 @@ def test_run_tool_times_out_hung_subprocess(monkeypatch, tmp_path):
 
 
 def test_run_tool_timeout_process_already_dead_is_handled(monkeypatch, tmp_path):
-    install_bwrap(monkeypatch)
+    install_sandbox(monkeypatch)
     monkeypatch.setenv("TOOL_EXECUTION_TIMEOUT", "0.1")
     install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
@@ -323,7 +329,7 @@ def test_run_tool_timeout_process_already_dead_is_handled(monkeypatch, tmp_path)
 
 
 def test_run_tool_timeout_per_tool_override(monkeypatch, tmp_path):
-    install_bwrap(monkeypatch)
+    install_sandbox(monkeypatch)
     monkeypatch.setenv("TOOL_EXECUTION_TIMEOUT", "30")
     install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
@@ -339,7 +345,7 @@ def test_run_tool_timeout_per_tool_override(monkeypatch, tmp_path):
 
 
 def test_run_tool_transient_stderr_still_retries(monkeypatch, tmp_path):
-    install_bwrap(monkeypatch)
+    install_sandbox(monkeypatch)
     install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
 
@@ -354,7 +360,7 @@ def test_run_tool_transient_stderr_still_retries(monkeypatch, tmp_path):
 
 
 def test_run_tool_preserves_agent_name_across_retries(monkeypatch, tmp_path):
-    install_bwrap(monkeypatch)
+    install_sandbox(monkeypatch)
     install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
 
@@ -373,7 +379,7 @@ def test_run_tool_preserves_agent_name_across_retries(monkeypatch, tmp_path):
 
 
 def test_run_tool_skips_retry_when_retry_on_transient_false(monkeypatch, tmp_path):
-    install_bwrap(monkeypatch)
+    install_sandbox(monkeypatch)
     install_fake_identity(monkeypatch)
     health_events = install_fake_health(monkeypatch)
 
@@ -390,7 +396,7 @@ def test_run_tool_skips_retry_when_retry_on_transient_false(monkeypatch, tmp_pat
 def test_run_tool_logs_truncation_warning(monkeypatch, tmp_path, caplog):
     """Oversized outputs are still truncated, and the warning now goes through
     the module logger (Phase 5, Task 5.2) rather than a bare print()."""
-    install_bwrap(monkeypatch)
+    install_sandbox(monkeypatch)
     install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
 
@@ -410,7 +416,7 @@ def test_run_tool_logs_truncation_warning(monkeypatch, tmp_path, caplog):
 def test_run_tool_stderr_log_bounded_but_result_full(monkeypatch, tmp_path, caplog):
     """The stderr warning is truncated for the log line, while the error dict
     returned to the caller preserves the full stderr payload."""
-    install_bwrap(monkeypatch)
+    install_sandbox(monkeypatch)
     install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
 
@@ -431,9 +437,21 @@ def test_run_tool_stderr_log_bounded_but_result_full(monkeypatch, tmp_path, capl
 def test_run_tool_cancellation_kills_subprocess(monkeypatch, tmp_path):
     """Cancelling the handler (MCP disconnect / shutdown) must kill the child and
     re-raise CancelledError without recording a health event."""
-    install_bwrap(monkeypatch)
+    from core import sandbox
+
+    install_sandbox(monkeypatch)
     install_fake_identity(monkeypatch)
     health_events = install_fake_health(monkeypatch)
+
+    run_dirs = []
+    real_prepare = sandbox.prepare_execution
+
+    def _prepare(*args, **kwargs):
+        plan = real_prepare(*args, **kwargs)
+        run_dirs.append(plan.tmpdir)
+        return plan
+
+    monkeypatch.setattr(sandbox, "prepare_execution", _prepare)
 
     blocked = BlockingProcess()
     spawns = install_fake_subprocess(monkeypatch, [blocked])
@@ -458,6 +476,138 @@ def test_run_tool_cancellation_kills_subprocess(monkeypatch, tmp_path):
     assert blocked.kill_calls == 1
     assert blocked.wait_calls == 1
     assert health_events == []
+    assert run_dirs and not run_dirs[0].exists()
+
+
+def test_sandbox_classified_failure_is_not_retried(monkeypatch, tmp_path):
+    """A denial is permanent: do not burn the transient-stderr retry budget."""
+    from core import sandbox
+    from core import sandbox_preflight
+
+    install_sandbox(monkeypatch)
+    install_fake_identity(monkeypatch)
+    health_events = install_fake_health(monkeypatch)
+
+    spawns = install_fake_subprocess(
+        monkeypatch,
+        [FakeProcess(returncode=1, stderr=b"timeout: seccomp denied syscall")],
+    )
+    monkeypatch.setattr(
+        sandbox,
+        "classify_failure",
+        lambda stderr, backend, returncode: sandbox_preflight.ProbeResult(
+            backend="landlock",
+            ok=False,
+            code="helper_failed",
+            detail=stderr,
+            remediation="rebuild the image",
+        ),
+    )
+    logged = []
+    monkeypatch.setattr(sandbox, "log_failure_once", logged.append)
+
+    result = asyncio.run(
+        _run_tool_scenario(make_config(), make_tool_dir(tmp_path), {})
+    )
+
+    assert len(spawns) == 1
+    assert result["sandbox"] == {
+        "backend": "bwrap",
+        "code": "helper_failed",
+        "remediation": "rebuild the image",
+    }
+    assert result["error"].startswith("Tool failed inside the bwrap sandbox")
+    assert len(logged) == 1
+    assert any(event["is_success"] is False for event in health_events)
+
+
+def test_run_tool_reports_sandbox_unavailable(monkeypatch, tmp_path):
+    from core import sandbox
+
+    install_fake_identity(monkeypatch)
+    health_events = install_fake_health(monkeypatch)
+
+    def _unavailable(*args, **kwargs):
+        raise sandbox.SandboxUnavailable(
+            "apparmor_mount_denied",
+            "bwrap: Can't mount proc",
+            "add apparmor=unconfined",
+            backend="none",
+        )
+
+    monkeypatch.setattr(sandbox, "prepare_execution", _unavailable)
+
+    result = asyncio.run(
+        _run_tool_scenario(make_config(), make_tool_dir(tmp_path), {})
+    )
+
+    assert "Sandbox unavailable" in result["error"]
+    assert result["sandbox"]["code"] == "apparmor_mount_denied"
+    assert result["sandbox"]["remediation"] == "add apparmor=unconfined"
+    assert any(event["is_success"] is False for event in health_events)
+
+
+def test_run_tool_cleans_tmpdir_on_timeout(monkeypatch, tmp_path):
+    from core import sandbox
+
+    install_fake_identity(monkeypatch)
+    install_fake_health(monkeypatch)
+    monkeypatch.setenv("TOOL_EXECUTION_TIMEOUT", "0.1")
+
+    run_dir = tmp_path / "trellis-tmpltool-run"
+    run_dir.mkdir()
+    plan = sandbox.SandboxPlan(
+        argv=["bwrap", "/bin/true"],
+        env={},
+        tmpdir=run_dir,
+        backend=sandbox.Backend.BWRAP,
+    )
+
+    monkeypatch.setattr(sandbox, "prepare_execution", lambda *a, **k: plan)
+    install_fake_subprocess(monkeypatch, [FakeProcess(hang=True)])
+
+    result = asyncio.run(
+        _run_tool_scenario(make_config(), make_tool_dir(tmp_path), {})
+    )
+
+    assert "timed out" in result["error"]
+    assert not run_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "ok,status_code",
+    [(True, 200), (False, 503)],
+)
+def test_healthz_route_serves_cached_payload(monkeypatch, ok, status_code):
+    """The route must expose the cached preflight verdict with no auth prompt."""
+    from httpx import ASGITransport, AsyncClient
+
+    from core import sandbox_preflight
+
+    monkeypatch.setattr(
+        sandbox_preflight,
+        "cached_status",
+        lambda: {
+            "ok": ok,
+            "backend": "bwrap" if ok else "none",
+            "code": None if ok else "unknown",
+            "remediation": "" if ok else "fix it",
+        },
+    )
+
+    app = hub.mcp.http_app()
+
+    async def _scenario():
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://hub") as client:
+            return await client.get("/healthz")
+
+    response = asyncio.run(_scenario())
+
+    assert response.status_code == status_code
+    payload = response.json()
+    assert payload["ok"] is ok
+    assert payload["backend"] == ("bwrap" if ok else "none")
 
 
 def test_hub_drain_background_tasks_waits_for_completion():
