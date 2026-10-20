@@ -298,20 +298,47 @@ def check_runtime_matrix(backend, timeout):
 
 
 def check_confinement(backend, timeout):
-    """Writes outside the grants must fail; TMPDIR writes must succeed."""
+    """Writes outside the grants must fail; TMPDIR writes must succeed.
+
+    The checks here prove two different things and must not be conflated:
+
+    * **Identity/DAC** (the ``identity_*`` keys): ``/etc/shadow`` is unreadable
+      and ``/etc`` is unwritable because the tool is not root. Plain Unix
+      permissions alone would produce that, so these say "not root", not
+      "Landlock/bwrap confines writes". They still catch a regression to a
+      root tool identity, so they stay.
+    * **Confinement** (``tmpdir_write``/``host_tmp_write``/``var_tmp_write``):
+      targets the tool's own DAC permissions allow, which only the sandbox can
+      deny.
+    """
     errors = []
-    # Root-only fixtures cannot be created by a non-root hub, so use paths that
-    # already exist with root-only permissions: reading /etc/shadow must be
-    # denied and writing into /etc must fail.
+    # Root-only fixtures cannot be created by a non-root hub, so the /etc
+    # fixtures use paths that already exist with root-only permissions.
     shadow_path = Path("/etc/shadow")
     etc_escape = Path("/etc/trellis-smoke-escape")
     host_tmp = Path(f"/tmp/trellis-smoke-{os.getpid()}")
+    # /var/tmp is 1777: DAC allows the tool's uid to create a file there, so a
+    # denial is attributable to the sandbox alone (bwrap: `/` is a read-only
+    # bind; Landlock: no grant). This is the check that actually discriminates.
+    var_tmp = Path(f"/var/tmp/trellis-smoke-{os.getpid()}")
     removed = []
     scratch = _workspace_scratch("trellis-smoke-conf-")
     locked = scratch / "locked"
 
-    # A stale artefact from an earlier failed run would mask the real result.
-    for path in (etc_escape, host_tmp):
+    # /tmp and /var/tmp are hub-uid writable, so a stale artefact from an
+    # earlier aborted run can be cleaned up here. /etc/trellis-smoke-escape is
+    # deliberately never unlinked: only a privileged (legacy root) hub could
+    # have created it, so its presence is itself a finding an operator must
+    # clear by hand.
+    if etc_escape.exists() or etc_escape.is_symlink():
+        etc_stale = True
+        errors.append(
+            f"{etc_escape} already exists; a non-root hub cannot remove it. "
+            f"Remove it manually (rm -f {etc_escape}) and rerun."
+        )
+    else:
+        etc_stale = False
+    for path in (host_tmp, var_tmp):
         if path.exists() or path.is_symlink():
             try:
                 path.unlink()
@@ -331,12 +358,12 @@ def check_confinement(backend, timeout):
         timeout,
     )
 
-    _log("confinement: root-only read only")
+    _log("confinement: root-only read only (identity/DAC, not sandbox)")
     shadow_result = run_in_sandbox(
         ["bash", "-c", f'cat "{shadow_path}"'], backend, timeout
     )
 
-    _log("confinement: /etc write")
+    _log("confinement: /etc write (identity/DAC, not sandbox)")
     etc_result = run_in_sandbox(
         ["bash", "-c", f'echo escape > "{etc_escape}"'], backend, timeout
     )
@@ -344,6 +371,11 @@ def check_confinement(backend, timeout):
     _log(f"confinement: host /tmp write ({host_tmp})")
     host_result = run_in_sandbox(
         ["bash", "-c", f'echo escape > "{host_tmp}"'], backend, timeout
+    )
+
+    _log(f"confinement: world-writable /var/tmp write ({var_tmp})")
+    var_tmp_result = run_in_sandbox(
+        ["bash", "-c", f'echo escape > "{var_tmp}"'], backend, timeout
     )
 
     # Workspace-write contract: tools run as the workspace owner (the hub uid),
@@ -363,6 +395,7 @@ def check_confinement(backend, timeout):
 
     etc_visible = etc_escape.exists()
     host_visible = host_tmp.exists()
+    var_tmp_visible = var_tmp.exists()
 
     if tmpdir_result["returncode"] != 0:
         errors.append(f"TMPDIR write failed: {_short(_observed(tmpdir_result))}")
@@ -373,16 +406,30 @@ def check_confinement(backend, timeout):
         )
     if shadow_result["returncode"] in (0, None):
         errors.append(
-            f"{shadow_path} read was not denied (exit {shadow_result['returncode']})"
+            f"{shadow_path} read was not denied (exit {shadow_result['returncode']}); "
+            "the tool is not running as a non-root identity"
         )
     if etc_result["returncode"] in (0, None):
         errors.append(
-            f"/etc write was not denied (exit {etc_result['returncode']})"
+            f"/etc write was not denied (exit {etc_result['returncode']}); "
+            "the tool is not running as a non-root identity"
         )
-    if etc_visible:
+    if etc_visible and not etc_stale:
+        # A pre-existing /etc artefact is reported above with the manual removal
+        # instruction; only a fresh escape is reported here.
         errors.append(f"{etc_escape} exists on the hub filesystem")
     if host_visible:
         errors.append(f"{host_tmp} is visible on the hub filesystem")
+    # The discriminating check: DAC permits this write for the tool's uid, so a
+    # success means the sandbox is not confining writes on *either* backend.
+    if var_tmp_result["returncode"] in (0, None):
+        errors.append(
+            "world-writable /var/tmp write was not denied "
+            f"(exit {var_tmp_result['returncode']}): DAC alone allows it, so the "
+            f"sandbox is not confining writes: {_short(_observed(var_tmp_result))}"
+        )
+    if var_tmp_visible:
+        errors.append(f"{var_tmp} is visible on the hub filesystem")
     # bwrap mounts a private tmpfs on /tmp, so a successful write there is
     # expected and only host invisibility matters. Landlock must refuse it.
     if backend is sandbox.Backend.LANDLOCK and host_result["returncode"] == 0:
@@ -392,12 +439,19 @@ def check_confinement(backend, timeout):
         "ok": not errors,
         "tmpdir_write": _command_entry(tmpdir_result),
         "combined": _command_entry(combined_result),
-        "root_only_read": _command_entry(shadow_result),
-        "etc_write": _command_entry(etc_result),
+        # Identity/DAC evidence: fails for any non-root tool, sandbox or not.
+        "identity_root_only_read": _command_entry(shadow_result),
+        "identity_etc_write": _command_entry(etc_result),
+        # Confinement evidence: DAC would allow these, the sandbox must not.
         "host_tmp_write": {
             **_command_entry(host_result),
             "expected_to_fail": backend is sandbox.Backend.LANDLOCK,
             "host_visible": host_visible,
+        },
+        "var_tmp_write": {
+            **_command_entry(var_tmp_result),
+            "expected_to_fail": True,
+            "host_visible": var_tmp_visible,
         },
         "workspace_0755_write": {
             **_command_entry(locked_result),
@@ -405,10 +459,11 @@ def check_confinement(backend, timeout):
         },
         "etc_escape_visible": etc_visible,
         "host_tmp_visible": host_visible,
+        "var_tmp_visible": var_tmp_visible,
         "pre_existing_paths_removed": removed,
     }
 
-    for path in (etc_escape, host_tmp):
+    for path in (host_tmp, var_tmp):
         try:
             path.unlink()
         except OSError:
@@ -645,7 +700,10 @@ def build_parser():
     parser.add_argument(
         "--check-confinement",
         action="store_true",
-        help="Assert writes outside the grants fail and TMPDIR writes succeed.",
+        help=(
+            "Assert TMPDIR writes succeed and writes outside the grants fail, "
+            "including a DAC-permitted /var/tmp write the sandbox must deny."
+        ),
     )
     parser.add_argument(
         "--check-privilege",

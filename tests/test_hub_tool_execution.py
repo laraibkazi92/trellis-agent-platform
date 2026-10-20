@@ -15,11 +15,18 @@ Pins the contracts introduced by the Hub hardening plan:
 - subprocess output is collected with bounded buffers (stdout/stderr caps plus a
   truncation marker) while still draining the pipes to EOF, and sandbox cleanup
   runs off the event loop.
+- a timeout during output flooding returns promptly: the pipe transports are
+  closed after the readers are cancelled so the child's exit waiter resolves.
+- the non-JSON fallback is bounded too, so a multi-megabyte payload cannot flood
+  the model context via `output` plus `warning`.
+- the helper's benign sandbox warning is not logged as a tool failure.
 """
 
 import asyncio
 import json
 import logging
+import sys
+import time
 
 import pytest
 
@@ -82,7 +89,9 @@ class FakeProcess:
     """Duck-types the subset of asyncio.subprocess.Process that run_tool uses."""
 
     def __init__(self, returncode=0, stdout=b"", stderr=b"", hang=False, stdin_broken=False):
-        self.returncode = returncode
+        # Like the real Process, the returncode is unknown until wait() reaps.
+        self.returncode = None
+        self._final_returncode = returncode
         self.stdout = FakeStream(stdout, hang=hang)
         self.stderr = FakeStream(stderr, hang=hang)
         self.stdin = FakeStdin(broken=stdin_broken)
@@ -96,6 +105,8 @@ class FakeProcess:
 
     async def wait(self):
         self.wait_calls += 1
+        if self.returncode is None:
+            self.returncode = self._final_returncode
         return self.returncode
 
 
@@ -262,13 +273,18 @@ def test_run_tool_does_not_mutate_caller_arguments(monkeypatch, tmp_path):
     install_sandbox(monkeypatch)
     install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
-    install_fake_subprocess(monkeypatch, [FakeProcess(returncode=0, stdout=b'{"ok": true}')])
+    process = FakeProcess(returncode=0, stdout=b'{"ok": true}')
+    install_fake_subprocess(monkeypatch, [process])
 
     arguments = {"__user_id": "user-1", "q": "x"}
     result = asyncio.run(_run_tool_scenario(make_config(), make_tool_dir(tmp_path), arguments))
 
     assert result == {"ok": True}
     assert arguments == {"__user_id": "user-1", "q": "x"}
+    # The fake reports no returncode until reaped, so _communicate_bounded had
+    # to take its exit-awaiter branch to classify the process correctly.
+    assert process.wait_calls == 1
+    assert process.returncode == 0
 
 
 def test_run_tool_handler_does_not_log_raw_kwargs(monkeypatch, tmp_path, capsys):
@@ -623,7 +639,7 @@ def test_run_tool_truncates_stdout_flood(monkeypatch, tmp_path):
     install_fake_health(monkeypatch)
     monkeypatch.setenv("TOOL_EXECUTION_TIMEOUT", "5")
 
-    flood = b"x" * (9 * 1024 * 1024)
+    flood = b"x" * (hub.MAX_STDOUT_BYTES + 1024)
     # The flooding tool never reads stdin, so the hub's write hits a closed pipe.
     install_fake_subprocess(
         monkeypatch, [FakeProcess(returncode=0, stdout=flood, stdin_broken=True)]
@@ -636,11 +652,91 @@ def test_run_tool_truncates_stdout_flood(monkeypatch, tmp_path):
 
     result = asyncio.run(_scenario())
 
-    # The flood is not valid JSON, so it surfaces through the JSONDecodeError path.
+    # The flood is not valid JSON, so it surfaces through the JSONDecodeError
+    # path, which previews 90k and reports the truncation flag.
     assert "output truncated by hub" in result["output"]
-    assert len(result["output"].encode()) == (
-        hub.MAX_STDOUT_BYTES + len(hub.TRUNCATION_MARKER)
+    assert result["truncated"] is True
+    assert len(result["output"]) == 90000 + len(hub.TRUNCATION_MARKER.decode())
+    assert result["warning"].startswith("Output was not valid JSON: ")
+    assert len(result["warning"]) <= 2048 + len("Output was not valid JSON: ")
+
+
+def test_oversized_valid_json_is_bounded(monkeypatch, tmp_path):
+    """A valid JSON payload over the 8 MiB stdout cap must not reach the model
+    twice over: the preview is 90k and the warning is capped."""
+    install_sandbox(monkeypatch)
+    install_fake_identity(monkeypatch)
+    install_fake_health(monkeypatch)
+    monkeypatch.setenv("TOOL_EXECUTION_TIMEOUT", "5")
+
+    oversized = json.dumps({"data": "x" * 10_000_000}).encode()
+    install_fake_subprocess(monkeypatch, [FakeProcess(returncode=0, stdout=oversized)])
+
+    result = asyncio.run(_run_tool_scenario(make_config(), make_tool_dir(tmp_path), {}))
+
+    assert len(json.dumps(result)) < 100_000
+    assert "not valid JSON" in result["warning"]
+    assert result["truncated"] is True
+
+
+def test_timeout_with_flooding_output_returns_promptly():
+    """A tool flooding stdout must not hang the hub after the timeout fires.
+
+    Cancelling a reader that asyncio paused on a full pipe leaves the transport
+    open, so EOF is never seen and ``process.wait()`` can stay pending forever
+    unless ``_communicate_bounded`` closes the pipes. Real subprocess on purpose.
+    """
+    script = (
+        "import sys\n"
+        "while True:\n"
+        "    sys.stdout.write('x' * 65536)\n"
+        "    sys.stdout.flush()\n"
     )
+
+    async def _scenario():
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            script,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        started = time.monotonic()
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await hub._communicate_bounded(process, b"{}", 0.3)
+            elapsed = time.monotonic() - started
+        finally:
+            hub._kill_process_tree(process)
+            # The regression: this wait used to never resolve.
+            await asyncio.wait_for(process.wait(), 2)
+
+        assert process.returncode is not None
+        return elapsed
+
+    elapsed = asyncio.run(_scenario())
+
+    assert elapsed < 2.0, f"timeout took {elapsed:.2f}s"
+
+
+def test_sandbox_warning_only_stderr_is_not_logged(monkeypatch, tmp_path, caplog):
+    """The helper's benign warning must not be logged as a tool failure."""
+    install_sandbox(monkeypatch)
+    install_fake_identity(monkeypatch)
+    install_fake_health(monkeypatch)
+
+    warning = b"trellis-sandbox: warning: supplementary groups retained (needs CAP_SETGID)\n"
+    install_fake_subprocess(
+        monkeypatch, [FakeProcess(returncode=0, stdout=b'{"ok": true}', stderr=warning)]
+    )
+
+    with caplog.at_level(logging.WARNING, logger="core.hub"):
+        result = asyncio.run(_run_tool_scenario(make_config(), make_tool_dir(tmp_path), {}))
+
+    assert result == {"ok": True}
+    assert caplog.records == []
 
 
 def test_run_tool_truncates_stderr_flood(monkeypatch, tmp_path):

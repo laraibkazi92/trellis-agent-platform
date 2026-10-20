@@ -63,6 +63,9 @@ Every tool invocation runs in one of two sandbox backends, chosen once at hub st
 | `/dev/shm` | available in the private `/dev` | not writable (POSIX shm fails) |
 | PTY (`/dev/ptmx`) | available | not granted (`pexpect`, `node-pty`, `script` fail) |
 | Tool identity | the hub uid (`TRELLIS_UID`, the workspace owner) mapped 1:1 in its namespaces, `CapEff=0` | operator uid (`SANDBOX_UID`, default = hub uid = workspace owner), capabilities cleared |
+| Resource limits | none per tool — the hub container's limits (`pids_limit`, and `mem_limit`/`deploy.resources` if you set one) apply to every tool | address space 4 GiB / CPU 600 s / file size 64 MiB, applied by the helper before `exec` and configurable via `SANDBOX_RLIMIT_AS_MB`, `SANDBOX_RLIMIT_CPU_S`, `SANDBOX_RLIMIT_FSIZE_MB` (`0` disables) |
+
+Writes past the Landlock file-size limit fail with `SIGXFSZ` (the tool is killed, it does not just get an `EFBIG`); allocations past the address-space limit fail with `ENOMEM`. bwrap has no equivalent per-tool caps, so size a container limit around its heaviest tool.
 
 Tools run as `SANDBOX_UID`, which defaults to the hub's own uid — the workspace owner — so in both backends they can write anywhere you can. `HOME` is `/tmp` under bwrap and the per-run tmpdir under Landlock.
 

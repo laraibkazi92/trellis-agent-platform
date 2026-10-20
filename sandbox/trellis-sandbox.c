@@ -456,8 +456,15 @@ static unsigned long long env_limit_mb(const char *var, unsigned long long def)
 
 static void set_rlimit(int resource, const char *what, unsigned long long value)
 {
-    struct rlimit rl = {(rlim_t)value, (rlim_t)value};
+    struct rlimit cur, rl;
 
+    if (getrlimit(resource, &cur))
+        die_errno(EXIT_RLIMIT, what);
+    /* setrlimit cannot raise the hard limit above the inherited one, so a
+     * host that hardened with ulimits must win: clamp instead of failing. */
+    if (cur.rlim_max != RLIM_INFINITY && value > (unsigned long long)cur.rlim_max)
+        value = (unsigned long long)cur.rlim_max;
+    rl.rlim_cur = rl.rlim_max = (rlim_t)value;
     if (setrlimit(resource, &rl))
         die_errno(EXIT_RLIMIT, what);
 }
@@ -786,7 +793,8 @@ int main(int argc, char **argv)
     {
         int err = errno;
 
-        errno = err; /* die_errno's fputs may clobber it before perror */
-        die_errno(err == ENOENT ? 127 : 126, "exec");
+        /* die_errno is unusable here: its fputs runs before perror and
+         * clobbers errno, so format the message from a saved value instead. */
+        die(err == ENOENT ? 127 : 126, "exec: %s", strerror(err));
     }
 }

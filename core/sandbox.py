@@ -174,6 +174,8 @@ def classify_failure(
             code = "landlock_unavailable"
         elif returncode == 68:
             code = "landlock_setuid_denied"
+        elif returncode == 69:
+            code = "rlimit_denied"
         elif returncode in (66, 67):
             code = "helper_failed"
         else:

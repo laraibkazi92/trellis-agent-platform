@@ -292,12 +292,12 @@ sudo apparmor_parser -r /etc/apparmor.d/trellis-hub
 | `SANDBOX_SECCOMP` | `on` | Landlock helper's syscall deny-list. `off` passes `--no-seccomp`; use it if the filter breaks a runtime. |
 | `SANDBOX_UID` / `SANDBOX_GID` | the hub's own uid (compose: `${SANDBOX_UID:-${TRELLIS_UID}}`, default `1000`) | uid/gid Landlock tools run as (and own the per-run `TMPDIR`). `0` is rejected. **This uid must own the `/app/workspace` tree**, otherwise Landlock tools cannot write there. On a non-root hub it must equal the hub's uid — there is no privileged helper to drop to a different one. bwrap is unaffected: it maps the hub uid 1:1 inside its namespaces. |
 | `SANDBOX_TMP_ROOT` | `/tmp/trellis` | Parent for per-run tmpdirs; created `0711`. Point it at a larger filesystem if `/tmp` is small. Compose forwards it to the hub; empty means the default. |
-| `SANDBOX_RLIMIT_AS_MB` | `4096` (4 GiB) | Address-space cap for each tool. `0` disables the limit. |
-| `SANDBOX_RLIMIT_CPU_S` | `600` | CPU-seconds cap for each tool. `0` disables the limit. |
-| `SANDBOX_RLIMIT_NPROC` | disabled | Process/thread cap for the tool's uid. Off by default because it counts every process of that uid on the host (containers share the kernel uid table), so a shared operator uid sits near the limit; set it only when the sandbox uid is dedicated. The container's `pids_limit` is the per-container backstop. |
-| `SANDBOX_RLIMIT_FSIZE_MB` | `64` | Largest file a tool may write (MiB). `0` disables the limit. |
+| `SANDBOX_RLIMIT_AS_MB` | `4096` (4 GiB) | Address-space cap for each tool, **Landlock backend only**. `0` disables the limit. |
+| `SANDBOX_RLIMIT_CPU_S` | `600` | CPU-seconds cap for each tool, **Landlock backend only**. `0` disables the limit. |
+| `SANDBOX_RLIMIT_NPROC` | disabled | Process/thread cap for the tool's uid, **Landlock backend only**. Off by default because it counts every process of that uid on the host (containers share the kernel uid table), so a shared operator uid sits near the limit; set it only when the sandbox uid is dedicated. The container's `pids_limit` is the per-container backstop. |
+| `SANDBOX_RLIMIT_FSIZE_MB` | `64` | Largest file a tool may write (MiB), **Landlock backend only**. `0` disables the limit. |
 
-Limits are applied by the helper before `exec`, so they are inherited by everything the tool spawns and are much harder to raise after the sandbox drop.
+These limits are `setrlimit(2)` calls made by the Landlock helper (`sandbox/trellis-sandbox.c`) just before `exec`, so they are inherited by everything the tool spawns and are much harder to raise after the sandbox drop. **They apply to the Landlock backend only**: the helper is not in bwrap's argv and the hub passes no rlimit flags to bwrap, so under bwrap nothing is capped per tool. The container's own limits are the backstop on that path — `pids_limit`, plus `mem_limit` or `deploy.resources` if you need a hard memory bound. A tool that exceeds `SANDBOX_RLIMIT_FSIZE_MB` is killed by `SIGXFSZ`; one that exceeds `SANDBOX_RLIMIT_AS_MB` fails the allocation with `ENOMEM`.
 
 The backend and probe results are cached at startup, so apply any change with `docker compose up -d hub` (no rebuild needed). `SANDBOX_SECCOMP=off` must be set **before** the hub starts for the same reason: the preflight caches its verdict, including the helper argv it probes with.
 

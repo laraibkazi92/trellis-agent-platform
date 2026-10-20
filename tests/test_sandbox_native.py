@@ -37,22 +37,9 @@ def run_helper(args, input=None, env=None):
         capture_output=True,
         text=True,
         input=input,
-        env=_test_env(env),
+        env={**os.environ, **(env or {})},
         timeout=120,
     )
-
-
-def _test_env(env):
-    """Default harness env.
-
-    This suite runs as the developer's own uid, which on a desktop already owns
-    thousands of tasks; the helper's NPROC budget is sized for a dedicated
-    sandbox uid, so the production default would starve every fork here. Tests
-    that assert on limits pass their own env instead.
-    """
-    if env is not None:
-        return env
-    return {**os.environ, "SANDBOX_RLIMIT_NPROC": "0"}
 
 
 def _granted_args(tmp_path):
@@ -202,6 +189,29 @@ def test_core_dumps_disabled(tmp_path):
     assert result.stdout.strip() == "0"
 
 
+def test_rlimit_clamp_keeps_lower_inherited_hard_limit(tmp_path):
+    """A host ulimit below SANDBOX_RLIMIT_AS_MB clamps instead of exiting 69.
+
+    setrlimit cannot raise a hard limit above the inherited one, so a hardened
+    host (`ulimits:`/`--ulimit`) must stay authoritative.
+    """
+    argv = [HELPER, *_granted_args(tmp_path), "--", "/bin/sh", "-c", "ulimit -v"]
+    result = subprocess.run(
+        ["/bin/bash", "-c", 'ulimit -v 1048576 || exit 99; exec "$0" "$@"', *argv],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "SANDBOX_RLIMIT_AS_MB": "4096"},
+        timeout=120,
+    )
+
+    if result.returncode == 99:
+        pytest.skip("this shell cannot lower RLIMIT_AS with 'ulimit -v'")
+
+    assert result.returncode == 0, result.stderr
+    # The helper asked for 4 GiB but the inherited 1 GiB hard limit wins.
+    assert int(result.stdout) == 1048576
+
+
 def test_same_identity_groups(tmp_path):
     result = run_helper(
         [*_granted_args(tmp_path), "--", "/bin/sh", "-c", "id -G"]
@@ -218,13 +228,25 @@ def test_same_identity_groups(tmp_path):
         assert GID in gids
 
 
-def test_same_identity_skips_chown(tmp_path):
-    """A caller already at the target identity owns the run dir: no chown."""
-    result = run_helper([*_granted_args(tmp_path), "--", "/bin/true"])
+def test_same_identity_run_dir_usable(tmp_path):
+    """The caller already owns the run dir, so it stays usable with no chown.
+
+    The same-identity guard is a correctness elision, not an observable
+    syscall: a chown to the caller's own uid/gid would succeed as a no-op, so
+    asserting its absence would prove nothing. Assert the usable outcome.
+    """
+    result = run_helper(
+        [
+            *_granted_args(tmp_path),
+            "--",
+            "/bin/sh", "-c", 'printf ok > "$TMPDIR/wrote"',
+        ]
+    )
 
     assert result.returncode == 0, result.stderr
-    assert "chown(tmpdir)" not in result.stderr
-    assert (tmp_path / "run").stat().st_uid == UID
+    run = tmp_path / "run"
+    assert run.stat().st_uid == UID
+    assert (run / "wrote").read_text() == "ok"
 
 
 @pytest.mark.skipif(

@@ -548,6 +548,8 @@ def test_probe_landlock_without_kernel_support(monkeypatch):
         (65, "landlock unavailable (ABI 0)", "landlock_unavailable"),
         (67, "path grant failed", "helper_failed"),
         (68, "chown(tmpdir): Operation not permitted", "landlock_setuid_denied"),
+        (69, "setrlimit(RLIMIT_AS): Operation not permitted", "rlimit_denied"),
+        (1, "setrlimit(RLIMIT_FSIZE): Invalid argument", "rlimit_denied"),
         (1, "setgroups: Operation not permitted", "landlock_setuid_denied"),
         (1, "something else", "unknown"),
     ],
@@ -597,7 +599,7 @@ def _identity_messages(caplog):
         record.getMessage()
         for record in caplog.records
         if record.levelno == logging.WARNING
-        and "differs from the hub uid" in record.getMessage()
+        and "differs from the hub" in record.getMessage()
     ]
 
 
@@ -607,6 +609,7 @@ def test_resolve_sandbox_identity_warns_once_when_hub_cannot_switch(
     monkeypatch.setenv("SANDBOX_UID", "4242")
     monkeypatch.setenv("SANDBOX_GID", "4343")
     monkeypatch.setattr(preflight.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(preflight.os, "getegid", lambda: 1000)
 
     assert preflight.resolve_sandbox_identity() == (4242, 4343)
     assert preflight.resolve_sandbox_identity() == (4242, 4343)
@@ -615,13 +618,30 @@ def test_resolve_sandbox_identity_warns_once_when_hub_cannot_switch(
     assert len(messages) == 1
     assert "4242" in messages[0] and "1000" in messages[0]
     assert "SANDBOX_UID" in messages[0]
+    assert "SANDBOX_GID" in messages[0]
     assert "root" in messages[0]
+
+
+def test_resolve_sandbox_identity_warns_on_gid_only_mismatch(monkeypatch, caplog):
+    """A gid-only mismatch takes the chown branch too, so it must be reported."""
+    monkeypatch.setenv("SANDBOX_UID", "1000")
+    monkeypatch.setenv("SANDBOX_GID", "4343")
+    monkeypatch.setattr(preflight.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(preflight.os, "getegid", lambda: 1000)
+
+    assert preflight.resolve_sandbox_identity() == (1000, 4343)
+
+    messages = _identity_messages(caplog)
+    assert len(messages) == 1
+    assert "SANDBOX_GID=4343" in messages[0]
+    assert "differs from the hub uid" not in messages[0]
 
 
 def test_resolve_sandbox_identity_silent_when_ids_match(monkeypatch, caplog):
     monkeypatch.setenv("SANDBOX_UID", "1000")
     monkeypatch.setenv("SANDBOX_GID", "1000")
     monkeypatch.setattr(preflight.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(preflight.os, "getegid", lambda: 1000)
 
     assert preflight.resolve_sandbox_identity() == (1000, 1000)
     assert _identity_messages(caplog) == []

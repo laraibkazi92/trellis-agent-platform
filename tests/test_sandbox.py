@@ -474,6 +474,7 @@ def test_classify_failure_ignores_tool_stderr(monkeypatch):
         (66, "helper_failed"),
         (67, "helper_failed"),
         (68, "landlock_setuid_denied"),
+        (69, "rlimit_denied"),
     ],
 )
 def test_classify_failure_maps_helper_exit_codes(returncode, expected):

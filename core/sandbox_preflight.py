@@ -30,6 +30,7 @@ CODES: frozenset[str] = frozenset({
     "selinux_denied",
     "landlock_unavailable",
     "landlock_setuid_denied",
+    "rlimit_denied",
     "ptrace_scope_unrestricted",
     "mount_denied_unknown_lsm",
     "helper_failed",
@@ -86,6 +87,13 @@ REMEDIATIONS: dict[str, str] = {
         "must match the hub's own uid/gid (or run the hub as root, with "
         "CAP_SETUID, CAP_SETGID and CAP_CHOWN from the compose cap_add). "
         "Alternatively switch to `SANDBOX_BACKEND=bwrap`."
+    ),
+    "rlimit_denied": (
+        "The sandbox helper could not apply its resource limits. The host's hard "
+        "limit is below the configured SANDBOX_RLIMIT_* value, and a hard limit "
+        "cannot be raised from inside the container: raise the container's "
+        "ulimit (compose `ulimits:`/`--ulimit`, e.g. `as`, `cpu`, `fsize`) or "
+        "lower the matching SANDBOX_RLIMIT_* setting."
     ),
     "ptrace_scope_unrestricted": (
         "ptrace is unrestricted. Set `kernel.yama.ptrace_scope=1` (or higher) on "
@@ -341,6 +349,15 @@ def _classify_helper_result(backend: str, proc) -> ProbeResult:
             remediation=REMEDIATIONS["landlock_setuid_denied"],
         )
 
+    if proc.returncode == 69:
+        return ProbeResult(
+            backend=backend,
+            ok=False,
+            code="rlimit_denied",
+            detail=_truncate(detail),
+            remediation=REMEDIATIONS["rlimit_denied"],
+        )
+
     # A missing bind source is a deployment problem, not a Landlock refusal.
     # Phase 1 made the same call for bwrap; do not mislabel it ``bwrap_missing``.
     if "/app/workspace" in text and any(
@@ -353,6 +370,17 @@ def _classify_helper_result(backend: str, proc) -> ProbeResult:
             code="unknown",
             detail=_truncate(detail),
             remediation=REMEDIATIONS["unknown"],
+        )
+
+    # A failed rlimit is a host-hardening conflict, not an identity problem, so
+    # it must be checked before the generic setuid/chown markers below.
+    if "setrlimit" in text:
+        return ProbeResult(
+            backend=backend,
+            ok=False,
+            code="rlimit_denied",
+            detail=_truncate(detail),
+            remediation=REMEDIATIONS["rlimit_denied"],
         )
 
     # A failed chown/setuid means either the hub lacks CAP_SETUID/CAP_SETGID or
@@ -506,19 +534,23 @@ def probe_privilege_drop(
     return _run_helper("privilege", helper, ["--ro", "/"], timeout)
 
 
-def _warn_if_identity_unreachable(uid: int) -> None:
-    """Warn once when a non-root hub cannot switch to the resolved uid."""
+def _warn_if_identity_unreachable(uid: int, gid: int) -> None:
+    """Warn once when a non-root hub cannot switch to the resolved identity."""
     global _WARNED_IDENTITY
     euid = os.geteuid()
-    if euid == 0 or uid == euid or _WARNED_IDENTITY:
+    egid = os.getegid()
+    if euid == 0 or (uid == euid and gid == egid) or _WARNED_IDENTITY:
         return
+    mismatches = []
+    if uid != euid:
+        mismatches.append(f"SANDBOX_UID={uid} differs from the hub uid {euid}")
+    if gid != egid:
+        mismatches.append(f"SANDBOX_GID={gid} differs from the hub gid {egid}")
     logger.warning(
-        "SANDBOX_UID=%s differs from the hub uid %s, and the hub is not root: "
-        "the helper cannot switch identities without privilege, so every "
-        "Landlock run will fail at chown/setgid. Set SANDBOX_UID/SANDBOX_GID to "
-        "the hub uid, or run the hub as root.",
-        uid,
-        euid,
+        "%s, and the hub is not root: the helper cannot switch identities "
+        "without privilege, so every Landlock run will fail at chown/setgid. "
+        "Set SANDBOX_UID/SANDBOX_GID to the hub uid/gid, or run the hub as root.",
+        "; ".join(mismatches),
     )
     _WARNED_IDENTITY = True
 
@@ -550,11 +582,9 @@ def resolve_sandbox_identity() -> tuple[int, int]:
         fallback_uid, fallback_gid = 1000, 1000
 
     resolved_uid = uid if uid is not None else fallback_uid
-    _warn_if_identity_unreachable(resolved_uid)
-    return (
-        resolved_uid,
-        gid if gid is not None else fallback_gid,
-    )
+    resolved_gid = gid if gid is not None else fallback_gid
+    _warn_if_identity_unreachable(resolved_uid, resolved_gid)
+    return resolved_uid, resolved_gid
 
 
 def _env_int(name: str) -> int | None:

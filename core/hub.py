@@ -120,8 +120,10 @@ def _kill_process_tree(process) -> None:
     """Kill the child's whole session, not just the direct child.
 
     bwrap tears its PID namespace down with the parent, but the Landlock backend
-    runs the tool directly: its own children would otherwise survive a timeout
-    as unreaped orphans in the hub (container PID 1).
+    runs the tool directly, so its own children are only killed by this signal.
+    Compose runs the hub with ``init: true``: tini is PID 1 and reaps whatever
+    survives, but reaping a live grandchild is not enough -- kill the session so
+    it does not keep running after the timeout.
     """
     pid = getattr(process, "pid", None)
     if pid:
@@ -187,10 +189,30 @@ async def _write_stdin(process, input_bytes: bytes) -> None:
             pass
 
 
-async def _communicate_bounded(process, input_bytes: bytes, timeout: float) -> tuple[bytes, bytes]:
-    """``communicate()`` with bounded buffers and unchanged timeout semantics."""
+async def _wait_bounded(process, timeout: float = 5.0) -> None:
+    """Await exit, but never let a wedged pipe pin the request.
 
-    async def _run() -> tuple[bytes, bytes]:
+    A killed child normally resolves in milliseconds; this is the backstop for
+    the pathological case where even asyncio's exit waiter never fires.
+    """
+    try:
+        await asyncio.wait_for(process.wait(), timeout=timeout)
+    except (asyncio.TimeoutError, ProcessLookupError):
+        pass
+
+
+async def _communicate_bounded(
+    process, input_bytes: bytes, timeout: float
+) -> tuple[bytes, bool, bytes, bool]:
+    """``communicate()`` with bounded buffers and unchanged timeout semantics.
+
+    Returns ``(stdout, stdout_truncated, stderr, stderr_truncated)``. Timeout
+    semantics match ``asyncio.subprocess.Process.communicate()`` for the caller;
+    the only addition is a bounded post-kill wait, so a pathological pipe state
+    cannot pin a request indefinitely.
+    """
+
+    async def _run() -> tuple[bytes, bool, bytes, bool]:
         tasks = [
             asyncio.ensure_future(_write_stdin(process, input_bytes)),
             asyncio.ensure_future(_collect_stream(process.stdout, MAX_STDOUT_BYTES)),
@@ -198,17 +220,33 @@ async def _communicate_bounded(process, input_bytes: bytes, timeout: float) -> t
         ]
         try:
             results = await asyncio.gather(*tasks)
-            stdout, stderr = results[1][0], results[2][0]
+            stdout, stdout_truncated = results[1]
+            stderr, stderr_truncated = results[2]
             # communicate() also awaited exit; without this the caller can race
             # returncode and classify a finished tool as "exited with code None".
             if process.returncode is None:
-                await process.wait()
-            return stdout, stderr
+                await _wait_bounded(process)
+            return stdout, stdout_truncated, stderr, stderr_truncated
         finally:
             for task in tasks:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            # Cancelling a reader that asyncio paused on a full pipe leaves the
+            # transport open: EOF is never observed, connection_lost() never
+            # runs and the exit waiter a timeout handler awaits can stay pending
+            # forever. Closing the pipes forces that callback. `_transport` is
+            # private, but it is the only handle asyncio exposes on a
+            # StreamReader's pipe.
+            for stream in (process.stdout, process.stderr):
+                transport = getattr(stream, "_transport", None)
+                if transport is None:
+                    continue
+                try:
+                    if not transport.is_closing():
+                        transport.close()
+                except Exception:
+                    logger.debug("Failed to close tool pipe transport", exc_info=True)
 
     return await asyncio.wait_for(_run(), timeout=timeout)
 
@@ -301,37 +339,39 @@ async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[
             )
 
             try:
-                stdout, stderr = await _communicate_bounded(process, input_json, timeout)
+                stdout, stdout_truncated, stderr, _stderr_truncated = await _communicate_bounded(process, input_json, timeout)
             except asyncio.TimeoutError:
                 _kill_process_tree(process)
-                try:
-                    await process.wait()
-                except Exception:
-                    pass
+                await _wait_bounded(process)
                 error_msg = f"Tool execution timed out after {timeout:.0f}s."
                 await asyncio.to_thread(health_monitor.record_event, "tool", config.name, False, error_msg)
                 return {"error": error_msg}
             except asyncio.CancelledError:
                 _kill_process_tree(process)
-                try:
-                    await process.wait()
-                except Exception:
-                    pass
+                await _wait_bounded(process)
                 raise
         finally:
             # rmtree is blocking; keep it off the event loop so concurrent tool
             # calls are not serialized behind cleanup.
             await asyncio.to_thread(plan.cleanup)
 
-        if stderr:
-            stderr_text = stderr.decode().strip()
-            if len(stderr_text) > 2048:
-                logger.warning(f"Tool {config.name} stderr ({len(stderr_text)} chars): {stderr_text[:2048]}... [truncated]")
+        # The sandbox helper emits a benign "supplementary groups retained"
+        # warning on successful runs. It is not tool output, so keep it out of
+        # the hub log (raw stderr still feeds error classification below).
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+        loggable_stderr = "\n".join(
+            line
+            for line in stderr_text.splitlines()
+            if not line.startswith("trellis-sandbox: warning:")
+        ).strip()
+        if loggable_stderr:
+            if len(loggable_stderr) > 2048:
+                logger.warning(f"Tool {config.name} stderr ({len(loggable_stderr)} chars): {loggable_stderr[:2048]}... [truncated]")
             else:
-                logger.warning(f"Tool {config.name} stderr: {stderr_text}")
+                logger.warning(f"Tool {config.name} stderr: {loggable_stderr}")
 
         if process.returncode != 0:
-            stderr_str = stderr.decode().strip()
+            stderr_str = stderr.decode("utf-8", errors="replace").strip()
             failure = sandbox.classify_failure(
                 stderr_str, plan.backend, process.returncode
             )
@@ -370,7 +410,7 @@ async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[
             }
 
         try:
-            result = json.loads(stdout.decode())
+            result = json.loads(stdout.decode("utf-8", errors="replace"))
             # Global Safety Net: Safely truncate tool outputs exceeding 24k tokens (96,000 characters)
             stringified = json.dumps(result)
             if len(stringified) > 96000:
@@ -379,14 +419,28 @@ async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[
                     "error": f"Global Safety Net: The tool '{config.name}' output exceeded the 24k token limit (96,000 characters). Output was safely truncated to prevent model context crashes.",
                     "partial_data_preview": stringified[:90000] + "... [TRUNCATED DUE TO SAFETY LIMITS]"
                 }
+            elif stdout_truncated and isinstance(result, dict):
+                # Valid JSON cannot actually hit the stdout cap (truncation
+                # breaks the parse), but keep the flag consistent with the
+                # non-JSON path below.
+                result["truncated"] = True
             # A valid JSON output with an 'error' key is considered a User-Scoped Failure,
             # which does NOT trip the global circuit breaker. We count it as a success for global health.
             await asyncio.to_thread(health_monitor.record_event, "tool", config.name, True)
             return result
         except json.JSONDecodeError:
-            error_msg = f"Output was not valid JSON: {stdout.decode().strip()}"
+            # stdout is capped at MAX_STDOUT_BYTES, which is far above the 96k
+            # JSON safety net: returning it whole (plus the same text in the
+            # warning) would flood the model context, so bound both.
+            decoded = stdout.decode("utf-8", errors="replace").strip()
+            preview = decoded[:90000]
+            truncated = stdout_truncated
+            if len(decoded) > len(preview):
+                preview += TRUNCATION_MARKER.decode()
+                truncated = True
+            error_msg = f"Output was not valid JSON: {decoded[:2048]}"
             await asyncio.to_thread(health_monitor.record_event, "tool", config.name, False, error_msg)
-            return {"output": stdout.decode().strip(), "warning": error_msg}
+            return {"output": preview, "warning": error_msg, "truncated": truncated}
 
     except sandbox.SandboxUnavailable as e:
         error_msg = f"Sandbox unavailable ({e.code}): {e.detail or e.remediation}"

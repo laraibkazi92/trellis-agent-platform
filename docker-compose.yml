@@ -106,6 +106,7 @@ services:
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     # PID 1 must reap orphaned tool children: the Landlock backend runs tools as
     # direct children, so a tool that daemonizes would otherwise leave zombies.
+    # With `init: true` tini is PID 1 and does the reaping (the hub is not).
     init: true
     command: python core/hub.py
     restart: unless-stopped
@@ -193,8 +194,10 @@ services:
       SANDBOX_SECCOMP: ${SANDBOX_SECCOMP:-on}
       # Parent for per-run tmpdirs; empty = the helper's default (/tmp/trellis).
       SANDBOX_TMP_ROOT: ${SANDBOX_TMP_ROOT:-}
-      # Limits are applied per tool by the helper; 0/unset = helper default
-      # (4 GiB AS, 600 s CPU, 64 MiB file size; NPROC off — it is host-uid-wide).
+      # Limits are applied per tool by the Landlock helper only; the helper is
+      # not in the bwrap argv, so under bwrap these do nothing and the container
+      # limits below are the backstop. 0/unset = helper default (4 GiB AS,
+      # 600 s CPU, 64 MiB file size; NPROC off — it is host-uid-wide).
       SANDBOX_RLIMIT_AS_MB: ${SANDBOX_RLIMIT_AS_MB:-}
       SANDBOX_RLIMIT_CPU_S: ${SANDBOX_RLIMIT_CPU_S:-}
       SANDBOX_RLIMIT_NPROC: ${SANDBOX_RLIMIT_NPROC:-}
@@ -202,6 +205,9 @@ services:
     # Per-container backstop against fork bombs: RLIMIT_NPROC counts the whole
     # host uid, while pids.max counts only this container's processes/threads.
     pids_limit: 1024
+    # Optional hard memory bound for the container (bwrap tools have no per-tool
+    # RLIMIT_AS). Uncomment and size it around your heaviest tool.
+    # mem_limit: 4g
     depends_on:
       etcd:
         condition: service_healthy

@@ -144,6 +144,38 @@ Fix workspace file ownership on the content checkout (outside Docker) with `chow
 as you would for any other directory. The `hub` service runs as `${TRELLIS_UID:-1000}` like
 the rest of the app containers; this does not affect the other services.
 
+#### Root-owned files in the workspace from the old root-hub posture
+
+The hub and its tools now run as `TRELLIS_UID` with no capabilities (`cap_drop: [ALL]`, no
+`cap_add`). That applies to tool subprocesses too: under bwrap they are no longer uid 0
+inside their namespaces. Deployments that previously ran the hub as root may therefore have
+root-owned files and directories under `/app/workspace` that bwrap tools created as uid 0.
+
+What you see: a tool that used to work now fails with `Permission denied` when writing to
+one of those paths (the tool can read them, since world-readable, but not create or replace
+entries). The failure is DAC, not the sandbox — the same write would fail for any
+non-root user.
+
+Remedy, outside Docker, on the host that holds the bind mount:
+
+```bash
+# whole workspace (simplest)
+sudo chown -R "$TRELLIS_UID:$TRELLIS_GID" ./workspace
+# or only the offending trees, e.g.
+sudo chown -R "$TRELLIS_UID:$TRELLIS_GID" ./workspace/tools/foo/data
+```
+
+Also confirm `SANDBOX_UID`/`SANDBOX_GID` match the hub uid — they default to
+`TRELLIS_UID`/`TRELLIS_GID`, and a non-root hub cannot drop to a different identity, so a
+mismatch means Landlock tools run as an identity that does not own the workspace.
+`SANDBOX_UID` no longer defaults to a separate "tool" identity; on the default deployment it
+is the hub's own uid.
+
+Rollback to the root-hub posture (removing the hub's `user:` line and restoring the old
+capabilities) is only justified when a host cannot run bwrap as a non-root user at all — it
+reintroduces the privilege-separation problem this migration removed. See
+[deploy.md](deploy.md#sandbox-settings-and-rollback).
+
 #### Hindsight embeddings: model, provider, or dimensions
 
 Agent memory is backed by Hindsight. Its embedding provider, model, and output dimension are
