@@ -9,6 +9,10 @@ Landlock helper (filesystem confinement plus the tool identity, probed separatel
 so a stripped capability is diagnosed as ``landlock_setuid_denied``). When the
 Landlock backend is probed, a ``--deny-net`` run also reports whether this kernel
 can enforce a tool's ``network: none`` policy (Landlock ABI 4+).
+
+A classified tool failure calls ``invalidate()``: the cached verdict goes stale
+so the next health check or backend selection re-probes a host whose LSM policy
+may have changed under the running hub. Invalidation is cooldown-bounded.
 """
 
 import copy
@@ -19,6 +23,7 @@ import pwd
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -144,9 +149,20 @@ class NetProbeResult:
 _VALID_BACKENDS = frozenset({"auto", "bwrap", "landlock"})
 _SECCOMP_OFF = frozenset({"off", "0", "false", "no"})
 _STATUS_CACHE: dict = {}
+# Set by invalidate(): the cached verdict is stale, so the next reader re-probes.
+_STATUS_STALE = False
+_LAST_INVALIDATION: float | None = None
+# A persistently failing sandbox would otherwise fork a probe per failed tool
+# call; at most one invalidation (and therefore one re-probe) per window.
+_REPROBE_COOLDOWN_S = 60.0
 _WARNED_BACKEND = False
 _WARNED_ROOT_UID = False
 _WARNED_IDENTITY = False
+
+
+def _monotonic() -> float:
+    """Monotonic clock, isolated so tests can drive the invalidation cooldown."""
+    return time.monotonic()
 
 
 def _read_text(path: str) -> str:
@@ -902,7 +918,7 @@ def warmup(requested: str | None = None) -> dict:
     ``requested`` overrides ``SANDBOX_BACKEND`` when given. Never raises: a
     probe failure is reported in the payload so chat-only agents keep working.
     """
-    global _STATUS_CACHE
+    global _STATUS_CACHE, _STATUS_STALE
     selected = _normalize_requested(requested)
     try:
         payload = _run_probes(selected)
@@ -926,6 +942,7 @@ def warmup(requested: str | None = None) -> dict:
         )
 
     _STATUS_CACHE = payload
+    _STATUS_STALE = False
     return copy.deepcopy(payload)
 
 
@@ -934,14 +951,48 @@ def cached_status() -> dict:
     return copy.deepcopy(_STATUS_CACHE)
 
 
+def invalidate(reason: str) -> bool:
+    """Drop the cached verdict so the next reader re-probes.
+
+    Called after a sandbox-classified tool failure: the host configuration may
+    have changed under the running hub (LSM policy reload, a broken bwrap), which
+    would otherwise leave ``/healthz`` serving a stale "healthy" payload.
+
+    Cooldown-bounded by ``_REPROBE_COOLDOWN_S``: a persistently failing sandbox
+    re-probes at most once per window instead of forking a probe per failed tool
+    call. Returns whether this call actually invalidated the cache.
+    """
+    global _STATUS_CACHE, _STATUS_STALE, _LAST_INVALIDATION
+
+    now = _monotonic()
+    if (
+        _LAST_INVALIDATION is not None
+        and now - _LAST_INVALIDATION < _REPROBE_COOLDOWN_S
+    ):
+        return False
+
+    _LAST_INVALIDATION = now
+    _STATUS_STALE = True
+    _STATUS_CACHE = {}
+    logger.info(
+        "Sandbox preflight verdict invalidated (%s); re-probing on next use.",
+        reason,
+    )
+    return True
+
+
 def build_healthz_payload() -> tuple[int, dict]:
     """Return (200, payload) when ready, else (503, payload).
 
-    Pure and cheap: the probe result is cached by ``warmup()`` at startup, so a
-    healthcheck request never forks a sandbox probe. Before warmup the route
-    reports not-ready instead of probing on the event loop.
+    Cheap in steady state: the probe result is cached by ``warmup()``. A cold
+    process (startup, before warmup) reports not-ready instead of probing on the
+    request path. An *invalidated* cache is different -- the verdict is known to
+    be stale, so it is re-probed here (the invalidation cooldown bounds how often
+    that can happen) rather than reporting a verdict nobody trusts.
     """
     payload = cached_status()
+    if not payload and _STATUS_STALE:
+        payload = warmup()
     if not payload:
         payload = _failure_payload(
             _requested_backend(), "unknown", "Sandbox preflight has not run."
@@ -950,8 +1001,11 @@ def build_healthz_payload() -> tuple[int, dict]:
 
 
 def reset_for_tests() -> None:
-    global _STATUS_CACHE, _WARNED_BACKEND, _WARNED_ROOT_UID, _WARNED_IDENTITY
+    global _STATUS_CACHE, _STATUS_STALE, _LAST_INVALIDATION
+    global _WARNED_BACKEND, _WARNED_ROOT_UID, _WARNED_IDENTITY
     _STATUS_CACHE = {}
+    _STATUS_STALE = False
+    _LAST_INVALIDATION = None
     _WARNED_BACKEND = False
     _WARNED_ROOT_UID = False
     _WARNED_IDENTITY = False

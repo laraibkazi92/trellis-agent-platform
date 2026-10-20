@@ -629,3 +629,76 @@ def test_log_failure_once(caplog):
     messages = [r for r in caplog.records if r.levelname == "ERROR"]
     assert len(messages) == 1
     assert "landlock" in messages[0].getMessage()
+
+
+def _stub_preflight(monkeypatch, calls):
+    """Make selection depend on a counted, cache-less warmup."""
+    monkeypatch.setattr(sandbox_preflight, "cached_status", lambda: {})
+
+    def _warmup(requested=None):
+        calls.append(requested)
+        return {"ok": True, "backend": "bwrap", "requested": requested or "auto"}
+
+    monkeypatch.setattr(sandbox_preflight, "warmup", _warmup)
+
+
+def test_reset_selection_forces_reselection(monkeypatch):
+    calls = []
+    _stub_preflight(monkeypatch, calls)
+
+    assert sandbox.select_backend() is sandbox.Backend.BWRAP
+    assert sandbox.select_backend() is sandbox.Backend.BWRAP
+    assert len(calls) == 1
+
+    sandbox.reset_selection()
+
+    assert sandbox.select_backend() is sandbox.Backend.BWRAP
+    assert len(calls) == 2
+
+
+def test_reset_selection_keeps_failure_log_dedupe(caplog):
+    result = sandbox_preflight.ProbeResult(
+        backend="landlock",
+        ok=False,
+        code="helper_failed",
+        detail="x",
+        remediation="fix it",
+    )
+
+    with caplog.at_level("ERROR", logger="core.sandbox"):
+        sandbox.log_failure_once(result)
+        sandbox.reset_selection()
+        sandbox.log_failure_once(result)
+
+    assert len([r for r in caplog.records if r.levelname == "ERROR"]) == 1
+
+
+def test_invalidate_after_failure_clears_the_selection(monkeypatch):
+    calls = []
+    _stub_preflight(monkeypatch, calls)
+    reasons = []
+    monkeypatch.setattr(
+        sandbox_preflight,
+        "invalidate",
+        lambda reason: reasons.append(reason) or True,
+    )
+
+    assert sandbox.select_backend() is sandbox.Backend.BWRAP
+    assert sandbox.invalidate_after_failure("apparmor_mount_denied") is True
+    assert sandbox.select_backend() is sandbox.Backend.BWRAP
+
+    assert len(calls) == 2
+    assert reasons == ["tool failure: apparmor_mount_denied"]
+
+
+def test_invalidate_after_failure_keeps_the_selection_within_cooldown(monkeypatch):
+    calls = []
+    _stub_preflight(monkeypatch, calls)
+    monkeypatch.setattr(sandbox_preflight, "invalidate", lambda reason: False)
+
+    assert sandbox.select_backend() is sandbox.Backend.BWRAP
+    assert sandbox.invalidate_after_failure("helper_failed") is False
+    assert sandbox.select_backend() is sandbox.Backend.BWRAP
+
+    # Nothing new to select from: the memoized backend is still valid.
+    assert len(calls) == 1

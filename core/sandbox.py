@@ -175,6 +175,15 @@ def select_backend(force: str | None = None) -> Backend:
     return selected
 
 
+def reset_selection() -> None:
+    """Drop the memoized backend so the next ``select_backend`` re-selects it.
+
+    ``_LOGGED_FAILURES`` is deliberately kept: the log de-duplication must
+    survive a re-probe, or a flapping sandbox would re-log every diagnosis.
+    """
+    _SELECTED.clear()
+
+
 def classify_failure(
     stderr: str,
     backend: Backend | str,
@@ -239,6 +248,22 @@ def log_failure_once(result: sandbox_preflight.ProbeResult) -> None:
         result.code,
         result.remediation,
     )
+
+
+def invalidate_after_failure(code: str) -> bool:
+    """Mark the preflight verdict stale after a classified sandbox failure.
+
+    The host may have changed under the running hub (LSM policy reload, a broken
+    bwrap), so the cached verdict and the selected backend are dropped; the next
+    ``select_backend``/``/healthz`` re-probes instead of trusting a verdict that
+    just failed in practice. Returns whether the verdict was actually invalidated
+    -- ``sandbox_preflight.invalidate`` is cooldown-bounded, and the selection is
+    only dropped when there is something fresh to re-select from.
+    """
+    if not sandbox_preflight.invalidate(f"tool failure: {code}"):
+        return False
+    reset_selection()
+    return True
 
 
 def _seccomp_disabled() -> bool:

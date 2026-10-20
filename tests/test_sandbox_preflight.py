@@ -802,3 +802,145 @@ def test_resolve_sandbox_identity_silent_for_root_hub(monkeypatch, caplog):
 
     assert preflight.resolve_sandbox_identity() == (4242, 4343)
     assert _identity_messages(caplog) == []
+
+
+def _install_stable_host(monkeypatch):
+    """Make every non-monkeypatched probe deterministic and host-independent."""
+    monkeypatch.delenv("SANDBOX_BACKEND", raising=False)
+    monkeypatch.setattr(preflight, "landlock_abi_version", lambda: 5)
+    monkeypatch.setattr(
+        preflight,
+        "_read_text",
+        lambda path: "1\n" if path.endswith("ptrace_scope") else "",
+    )
+    monkeypatch.setattr(
+        preflight,
+        "probe_landlock_net",
+        lambda *a, **k: preflight.NetProbeResult(False, "stubbed for tests", 5),
+    )
+
+
+def _install_ok_bwrap_probe(monkeypatch, calls):
+    def _run(*args, **kwargs):
+        calls.append(1)
+        return _probe(True)
+
+    monkeypatch.setattr(preflight, "probe_bwrap", _run)
+
+
+def test_invalidate_clears_the_cached_verdict(monkeypatch, caplog):
+    _install_stable_host(monkeypatch)
+    monkeypatch.setattr(preflight, "probe_bwrap", lambda *a, **k: _probe(True))
+    preflight.warmup()
+    assert preflight.cached_status()["ok"] is True
+
+    with caplog.at_level(logging.INFO, logger=preflight.logger.name):
+        assert preflight.invalidate("tool failure: helper_failed") is True
+
+    assert preflight.cached_status() == {}
+    infos = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.INFO and "invalidated" in record.getMessage()
+    ]
+    assert len(infos) == 1
+    assert "helper_failed" in infos[0]
+
+
+def test_invalidate_is_cooldown_bounded(monkeypatch):
+    _install_stable_host(monkeypatch)
+    monkeypatch.setattr(preflight, "probe_bwrap", lambda *a, **k: _probe(True))
+    clock = [1000.0]
+    monkeypatch.setattr(preflight, "_monotonic", lambda: clock[0])
+
+    assert preflight._REPROBE_COOLDOWN_S == 60.0
+    assert preflight.invalidate("first") is True
+
+    preflight.warmup()  # the re-probe that follows an invalidation
+    assert preflight.invalidate("second") is False
+    # Inside the cooldown the fresh verdict must survive untouched.
+    assert preflight.cached_status()["ok"] is True
+
+    clock[0] += preflight._REPROBE_COOLDOWN_S
+    assert preflight.invalidate("third") is True
+    assert preflight.cached_status() == {}
+
+
+def test_invalidate_logs_once_per_window(monkeypatch, caplog):
+    clock = [0.0]
+    monkeypatch.setattr(preflight, "_monotonic", lambda: clock[0])
+
+    with caplog.at_level(logging.INFO, logger=preflight.logger.name):
+        assert preflight.invalidate("first") is True
+        assert preflight.invalidate("suppressed") is False
+
+    infos = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.INFO and "invalidated" in record.getMessage()
+    ]
+    assert len(infos) == 1
+    assert "suppressed" not in infos[0]
+
+
+def test_reset_for_tests_clears_the_cooldown(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(preflight, "_monotonic", lambda: clock[0])
+    assert preflight.invalidate("first") is True
+    assert preflight.invalidate("second") is False
+
+    preflight.reset_for_tests()
+
+    assert preflight.invalidate("after reset") is True
+
+
+def test_invalidated_healthz_reprobes_and_serves_a_fresh_payload(monkeypatch):
+    calls = []
+    _install_stable_host(monkeypatch)
+    _install_ok_bwrap_probe(monkeypatch, calls)
+
+    preflight.warmup()
+    assert len(calls) == 1
+
+    assert preflight.invalidate("tool failure: apparmor_mount_denied") is True
+    assert preflight.cached_status() == {}
+
+    status, payload = preflight.build_healthz_payload()
+
+    assert len(calls) == 2
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["backend"] == "bwrap"
+    # The re-probe re-caches, so the next request stays probe-free again.
+    assert preflight.cached_status()["ok"] is True
+    preflight.build_healthz_payload()
+    assert len(calls) == 2
+
+
+def test_invalidated_healthz_reports_a_newly_broken_backend(monkeypatch):
+    """The point of the re-probe: /healthz must stop calling a broken host healthy."""
+    _install_stable_host(monkeypatch)
+    monkeypatch.setattr(preflight, "probe_bwrap", lambda *a, **k: _probe(True))
+    preflight.warmup()
+    assert preflight.build_healthz_payload()[0] == 200
+
+    monkeypatch.setattr(
+        preflight,
+        "probe_bwrap",
+        lambda *a, **k: _probe(False, "apparmor_mount_denied"),
+    )
+    monkeypatch.setattr(
+        preflight,
+        "probe_landlock",
+        lambda *a, **k: _probe(False, "helper_failed"),
+    )
+    monkeypatch.setattr(
+        preflight, "probe_privilege_drop", lambda *a, **k: _probe(True)
+    )
+    assert preflight.invalidate("tool failure: helper_failed") is True
+
+    status, payload = preflight.build_healthz_payload()
+
+    assert status == 503
+    assert payload["ok"] is False
+    assert payload["code"] == "helper_failed"

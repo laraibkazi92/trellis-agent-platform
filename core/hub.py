@@ -55,12 +55,17 @@ _PIPE_CHUNK_BYTES = 64 * 1024
 async def healthz(request):
     """Sandbox health probe for the container healthcheck.
 
-    The payload is cached from the startup probes in ``sandbox_preflight.warmup()``
-    -- no per-request bubblewrap fork, so this stays cheap enough for a 15s
-    healthcheck interval. Container-internal only: FastMCP custom routes bypass
-    MCP auth, so do not publish this port outside the compose network.
+    The payload normally comes from the startup probes cached by
+    ``sandbox_preflight.warmup()``. After a classified tool failure invalidates
+    that cache, this re-probes so the verdict reflects the host as it is now
+    (cooldown-bounded). Probing forks helper processes, so it runs off the event
+    loop instead of stalling in-flight tool I/O. Container-internal only:
+    FastMCP custom routes bypass MCP auth, so do not publish this port outside
+    the compose network.
     """
-    status_code, payload = sandbox_preflight.build_healthz_payload()
+    status_code, payload = await asyncio.to_thread(
+        sandbox_preflight.build_healthz_payload
+    )
     return JSONResponse(payload, status_code=status_code)
 
 
@@ -389,6 +394,9 @@ async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[
             )
             if failure:
                 sandbox.log_failure_once(failure)
+                # The cached verdict no longer matches reality; let the next
+                # selection and /healthz re-probe (cooldown-bounded).
+                sandbox.invalidate_after_failure(failure.code)
                 error_msg = (
                     f"Tool failed inside the {plan.backend.value} sandbox "
                     f"({failure.code}): {failure.detail}"

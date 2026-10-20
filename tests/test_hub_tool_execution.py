@@ -578,6 +578,76 @@ def test_sandbox_classified_failure_is_not_retried(monkeypatch, tmp_path):
     assert any(event["is_success"] is False for event in health_events)
 
 
+def test_sandbox_classified_failure_invalidates_the_cached_verdict(
+    monkeypatch, tmp_path
+):
+    """A denial proves the cached verdict stale: re-probe on the next reader."""
+    from core import sandbox, sandbox_preflight
+
+    install_sandbox(monkeypatch)
+    install_fake_identity(monkeypatch)
+    install_fake_health(monkeypatch)
+    install_fake_subprocess(
+        monkeypatch, [FakeProcess(returncode=65, stderr=b"trellis-sandbox: nope")]
+    )
+    monkeypatch.setattr(
+        sandbox,
+        "classify_failure",
+        lambda *a, **k: sandbox_preflight.ProbeResult(
+            backend="landlock",
+            ok=False,
+            code="landlock_unavailable",
+            detail="nope",
+            remediation="rebuild the image",
+        ),
+    )
+    monkeypatch.setattr(sandbox, "log_failure_once", lambda result: None)
+    invalidations = []
+    monkeypatch.setattr(
+        sandbox_preflight,
+        "invalidate",
+        lambda reason: invalidations.append(reason) or True,
+    )
+
+    result = asyncio.run(
+        _run_tool_scenario(make_config(), make_tool_dir(tmp_path), {})
+    )
+
+    assert result["sandbox"]["code"] == "landlock_unavailable"
+    assert invalidations == ["tool failure: landlock_unavailable"]
+
+
+@pytest.mark.parametrize(
+    "returncode,stdout,stderr",
+    [
+        (1, b"", b"boom"),  # no sandbox provenance: ordinary tool failure
+        (0, b'{"ok": true}', b""),  # successful run
+    ],
+)
+def test_non_sandbox_outcomes_do_not_invalidate(
+    monkeypatch, tmp_path, returncode, stdout, stderr
+):
+    from core import sandbox_preflight
+
+    install_sandbox(monkeypatch)
+    install_fake_identity(monkeypatch)
+    install_fake_health(monkeypatch)
+    install_fake_subprocess(
+        monkeypatch,
+        [FakeProcess(returncode=returncode, stdout=stdout, stderr=stderr)],
+    )
+    invalidations = []
+    monkeypatch.setattr(
+        sandbox_preflight,
+        "invalidate",
+        lambda reason: invalidations.append(reason) or True,
+    )
+
+    asyncio.run(_run_tool_scenario(make_config(), make_tool_dir(tmp_path), {}))
+
+    assert invalidations == []
+
+
 def test_run_tool_network_none_reaches_the_sandbox_argv(monkeypatch, tmp_path):
     """The per-tool network policy must survive the config -> argv path."""
     install_sandbox(monkeypatch)
