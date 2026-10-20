@@ -174,7 +174,9 @@ def classify_failure(
             code = "landlock_unavailable"
         elif returncode == 68:
             code = "landlock_setuid_denied"
-        elif returncode == 69:
+        elif returncode == 69 and "setrlimit" in text.lower():
+            # The helper also exits 69 for a refused setrlimit; require its
+            # marker so a tool's own EX_UNAVAILABLE exit is not misclassified.
             code = "rlimit_denied"
         elif returncode in (66, 67):
             code = "helper_failed"

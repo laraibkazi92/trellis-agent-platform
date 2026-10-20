@@ -346,6 +346,22 @@ def check_confinement(backend, timeout):
             except OSError:
                 pass
 
+    # Positive control for the discriminating /var/tmp check: DAC must allow
+    # the tool's uid to write there. On a read-only or unusually mounted
+    # /var/tmp the in-sandbox denial would prove nothing, so say so explicitly
+    # instead of reporting a false pass.
+    var_tmp_control = _run_as_sandbox_uid(lambda: var_tmp.write_text("ok"))
+    if var_tmp_control:
+        try:
+            var_tmp.unlink()
+        except OSError:
+            pass
+    else:
+        errors.append(
+            f"cannot verify /var/tmp confinement: {var_tmp} is not writable "
+            "outside the sandbox either (DAC, not the sandbox)"
+        )
+
     _log("confinement: TMPDIR write")
     tmpdir_result = run_in_sandbox(
         ["bash", "-c", 'echo ok > "$TMPDIR/ok"'], backend, timeout
@@ -452,6 +468,7 @@ def check_confinement(backend, timeout):
             **_command_entry(var_tmp_result),
             "expected_to_fail": True,
             "host_visible": var_tmp_visible,
+            "positive_control_writable": var_tmp_control,
         },
         "workspace_0755_write": {
             **_command_entry(locked_result),

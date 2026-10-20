@@ -460,10 +460,13 @@ static void set_rlimit(int resource, const char *what, unsigned long long value)
 
     if (getrlimit(resource, &cur))
         die_errno(EXIT_RLIMIT, what);
-    /* setrlimit cannot raise the hard limit above the inherited one, so a
-     * host that hardened with ulimits must win: clamp instead of failing. */
+    /* setrlimit cannot raise a hard limit above the inherited one, and the
+     * host's soft limit is likewise authoritative, so a hardened host wins:
+     * clamp instead of failing (or silently undoing its soft cap). */
     if (cur.rlim_max != RLIM_INFINITY && value > (unsigned long long)cur.rlim_max)
         value = (unsigned long long)cur.rlim_max;
+    if (cur.rlim_cur != RLIM_INFINITY && value > (unsigned long long)cur.rlim_cur)
+        value = (unsigned long long)cur.rlim_cur;
     rl.rlim_cur = rl.rlim_max = (rlim_t)value;
     if (setrlimit(resource, &rl))
         die_errno(EXIT_RLIMIT, what);

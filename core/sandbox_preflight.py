@@ -89,11 +89,10 @@ REMEDIATIONS: dict[str, str] = {
         "Alternatively switch to `SANDBOX_BACKEND=bwrap`."
     ),
     "rlimit_denied": (
-        "The sandbox helper could not apply its resource limits. The host's hard "
-        "limit is below the configured SANDBOX_RLIMIT_* value, and a hard limit "
-        "cannot be raised from inside the container: raise the container's "
-        "ulimit (compose `ulimits:`/`--ulimit`, e.g. `as`, `cpu`, `fsize`) or "
-        "lower the matching SANDBOX_RLIMIT_* setting."
+        "The sandbox helper's setrlimit call was refused after clamping to the "
+        "inherited hard limit. Check the configured SANDBOX_RLIMIT_* values, "
+        "then the container's ulimits (compose `ulimits:`/`--ulimit`, e.g. "
+        "`as`, `cpu`, `fsize`), or lower the matching SANDBOX_RLIMIT_* setting."
     ),
     "ptrace_scope_unrestricted": (
         "ptrace is unrestricted. Set `kernel.yama.ptrace_scope=1` (or higher) on "

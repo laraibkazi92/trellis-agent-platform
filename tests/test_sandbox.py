@@ -468,23 +468,33 @@ def test_classify_failure_ignores_tool_stderr(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "returncode,expected",
+    "returncode,stderr,expected",
     [
-        (65, "landlock_unavailable"),
-        (66, "helper_failed"),
-        (67, "helper_failed"),
-        (68, "landlock_setuid_denied"),
-        (69, "rlimit_denied"),
+        (65, "trellis-sandbox: something failed", "landlock_unavailable"),
+        (66, "trellis-sandbox: something failed", "helper_failed"),
+        (67, "trellis-sandbox: something failed", "helper_failed"),
+        (68, "trellis-sandbox: something failed", "landlock_setuid_denied"),
+        (69, "trellis-sandbox: setrlimit(RLIMIT_AS): Invalid argument", "rlimit_denied"),
     ],
 )
-def test_classify_failure_maps_helper_exit_codes(returncode, expected):
-    result = sandbox.classify_failure(
-        "trellis-sandbox: something failed", sandbox.Backend.LANDLOCK, returncode
-    )
+def test_classify_failure_maps_helper_exit_codes(returncode, stderr, expected):
+    result = sandbox.classify_failure(stderr, sandbox.Backend.LANDLOCK, returncode)
 
     assert result is not None
     assert result.code == expected
     assert result.remediation
+
+
+def test_classify_failure_exit_69_without_setrlimit_is_not_sandbox():
+    """A tool that exits 69 itself must keep normal error handling."""
+    assert (
+        sandbox.classify_failure(
+            "trellis-sandbox: warning: supplementary groups retained",
+            sandbox.Backend.LANDLOCK,
+            69,
+        )
+        is None
+    )
 
 
 def test_log_failure_once(caplog):

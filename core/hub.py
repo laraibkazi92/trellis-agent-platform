@@ -197,7 +197,9 @@ async def _wait_bounded(process, timeout: float = 5.0) -> None:
     """
     try:
         await asyncio.wait_for(process.wait(), timeout=timeout)
-    except (asyncio.TimeoutError, ProcessLookupError):
+    except asyncio.TimeoutError:
+        logger.warning("Tool process did not exit within %.0fs after kill", timeout)
+    except ProcessLookupError:
         pass
 
 
@@ -419,11 +421,9 @@ async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[
                     "error": f"Global Safety Net: The tool '{config.name}' output exceeded the 24k token limit (96,000 characters). Output was safely truncated to prevent model context crashes.",
                     "partial_data_preview": stringified[:90000] + "... [TRUNCATED DUE TO SAFETY LIMITS]"
                 }
-            elif stdout_truncated and isinstance(result, dict):
-                # Valid JSON cannot actually hit the stdout cap (truncation
-                # breaks the parse), but keep the flag consistent with the
-                # non-JSON path below.
-                result["truncated"] = True
+            # A valid JSON payload cannot hit the stdout cap: truncation appends
+            # a marker and breaks the parse, so the flag is only meaningful on
+            # the JSONDecodeError path below.
             # A valid JSON output with an 'error' key is considered a User-Scoped Failure,
             # which does NOT trip the global circuit breaker. We count it as a success for global health.
             await asyncio.to_thread(health_monitor.record_event, "tool", config.name, True)
