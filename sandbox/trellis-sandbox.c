@@ -1,13 +1,19 @@
 /* trellis-sandbox: privilege drop + Landlock confinement + exec.
  *
- * Runs as root in the tool-hub container: opens every granted path while still
- * privileged, drops to the target uid/gid, zeroes capabilities, installs a
- * Landlock filesystem domain, installs a seccomp deny-list, then execs the
- * command in place (no fork, so exit codes and signals pass through).
- * --no-seccomp skips the deny-list.
+ * Opens every granted path while still privileged, drops to the target uid/gid,
+ * zeroes capabilities, lowers resource limits, installs a Landlock filesystem
+ * domain, installs a seccomp deny-list, then execs the command in place (no
+ * fork, so exit codes and signals pass through). --no-seccomp skips the
+ * deny-list.
+ *
+ * When the caller already runs as the target identity (unprivileged test runs)
+ * the identity change is skipped; supplementary groups may survive the attempt
+ * when the caller lacks CAP_SETGID, which is reported on stderr. Capabilities,
+ * limits, Landlock and seccomp are applied either way.
  *
  * Exit: 64 usage, 65 Landlock unavailable/failure, 66 seccomp install failure,
- * 67 path grant failure, 68 privilege drop failure, 126/127 exec failure.
+ * 67 path grant failure, 68 privilege drop failure, 69 rlimit failure,
+ * 126/127 exec failure.
  */
 
 #define _GNU_SOURCE
@@ -20,6 +26,7 @@
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <linux/types.h>
+#include <limits.h>
 #include <sched.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -28,12 +35,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 
-#define VERSION "0.2.0"
+#define VERSION "0.3.0"
+
+#define MB (1024ULL * 1024ULL)
 
 /* asm-generic syscall numbers, valid on x86_64 and arm64 */
 #define SYS_LL_CREATE 444
@@ -108,7 +118,7 @@ static const char *const dev_nodes[] = {
 
 enum {
     EXIT_USAGE = 64, EXIT_LANDLOCK = 65, EXIT_SECCOMP = 66,
-    EXIT_GRANT = 67, EXIT_PRIVDROP = 68,
+    EXIT_GRANT = 67, EXIT_PRIVDROP = 68, EXIT_RLIMIT = 69,
 };
 
 struct list {
@@ -368,16 +378,83 @@ static void drop_privileges(const struct opts *o, const char *tmpdir)
 {
     if (chown(tmpdir, o->uid, o->gid))
         die_errno(EXIT_PRIVDROP, "chown(tmpdir)");
-    /* Already at the target identity (unprivileged test runs): the identity
-     * syscalls would only fail with EPERM. */
+    /* An unprivileged caller cannot clear groups, so EPERM here is expected
+     * when it already runs as the target identity. Warn if groups survived:
+     * a silent assumption that they are gone would overstate the isolation. */
+    if (setgroups(0, NULL) && errno != EPERM)
+        die_errno(EXIT_PRIVDROP, "setgroups");
+    if (getgroups(0, NULL) > 0)
+        fputs("trellis-sandbox: warning: supplementary groups retained "
+              "(needs CAP_SETGID)\n", stderr);
+    /* Already at the target identity (unprivileged test runs): the remaining
+     * identity syscalls would only fail with EPERM. */
     if (geteuid() == o->uid && getegid() == o->gid)
         return;
-    if (setgroups(0, NULL))
-        die_errno(EXIT_PRIVDROP, "setgroups");
     if (setgid(o->gid))
         die_errno(EXIT_PRIVDROP, "setgid");
     if (setuid(o->uid))
         die_errno(EXIT_PRIVDROP, "setuid");
+}
+
+/* Unset falls back to the default; an explicit 0 leaves the inherited limit
+ * alone (usually "unlimited"). */
+static unsigned long long env_limit(const char *var, unsigned long long def)
+{
+    const char *s = getenv(var);
+    char *end = NULL;
+    unsigned long long v;
+
+    if (!s || !*s)
+        return def;
+    errno = 0;
+    v = strtoull(s, &end, 10);
+    if (*s == '-' || errno || end == s || *end)
+        die(EXIT_USAGE, "invalid %s value '%s'", var, s);
+    return v;
+}
+
+static unsigned long long env_limit_mb(const char *var, unsigned long long def)
+{
+    unsigned long long mb = env_limit(var, def);
+
+    if (mb > ULLONG_MAX / MB)
+        die(EXIT_USAGE, "%s value is too large", var);
+    return mb * MB;
+}
+
+static void set_rlimit(int resource, const char *what, unsigned long long value)
+{
+    struct rlimit rl = {(rlim_t)value, (rlim_t)value};
+
+    if (setrlimit(resource, &rl))
+        die_errno(EXIT_RLIMIT, what);
+}
+
+/* Lowering a limit is allowed unprivileged, so this works before and after the
+ * identity drop; the earlier it runs, the less the remaining setup can consume
+ * and the harder it is for the exec'd command to raise the limit again. */
+static void apply_rlimits(void)
+{
+    unsigned long long v;
+
+    v = env_limit_mb("SANDBOX_RLIMIT_AS_MB", 4096);
+    if (v)
+        set_rlimit(RLIMIT_AS, "setrlimit(RLIMIT_AS)", v);
+    v = env_limit("SANDBOX_RLIMIT_CPU_S", 600);
+    if (v)
+        set_rlimit(RLIMIT_CPU, "setrlimit(RLIMIT_CPU)", v);
+    /* Off by default: RLIMIT_NPROC counts every process of the real uid on the
+     * host (containers share the kernel uid table), so a shared operator uid is
+     * already near the limit. Use the container's pids_limit, which is per
+     * container, unless the sandbox uid is dedicated. */
+    v = env_limit("SANDBOX_RLIMIT_NPROC", 0);
+    if (v)
+        set_rlimit(RLIMIT_NPROC, "setrlimit(RLIMIT_NPROC)", v);
+    v = env_limit_mb("SANDBOX_RLIMIT_FSIZE_MB", 64);
+    if (v)
+        set_rlimit(RLIMIT_FSIZE, "setrlimit(RLIMIT_FSIZE)", v);
+    /* Core dumps would write megabytes into the tmpdir on every crash. */
+    set_rlimit(RLIMIT_CORE, "setrlimit(RLIMIT_CORE)", 0);
 }
 
 static void add_rule(int ruleset, int parent, uint64_t rights, const char *path)
@@ -618,6 +695,10 @@ int main(int argc, char **argv)
         drop_privileges(&o, tmpdir);
     zero_capabilities();
 
+    /* Limits go in now: lowering works unprivileged, and once the target
+     * identity is active they can never be raised again. */
+    apply_rlimits();
+
     /* 6. Required for unprivileged Landlock. */
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
         die_errno(EXIT_LANDLOCK, "prctl(PR_SET_NO_NEW_PRIVS)");
@@ -672,6 +753,8 @@ int main(int argc, char **argv)
     execvp(o.cmd[0], o.cmd);
     {
         int err = errno;
+
+        errno = err; /* die_errno's fputs may clobber it before perror */
         die_errno(err == ENOENT ? 127 : 126, "exec");
     }
 }

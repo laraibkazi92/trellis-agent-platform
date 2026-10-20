@@ -289,7 +289,13 @@ sudo apparmor_parser -r /etc/apparmor.d/trellis-hub
 | `SANDBOX_BACKEND` | `auto` | `auto` (bwrap, then Landlock), `bwrap`, or `landlock`. An invalid value warns and behaves as `auto`. |
 | `SANDBOX_SECCOMP` | `on` | Landlock helper's syscall deny-list. `off` passes `--no-seccomp`; use it if the filter breaks a runtime. |
 | `SANDBOX_UID` / `SANDBOX_GID` | image `trellis` user (compose: `${SANDBOX_UID:-${TRELLIS_UID}}`, default `1000`) | uid/gid Landlock tools run as (and own the per-run `TMPDIR`). `0` is rejected. **This uid must own the `/app/workspace` tree**, otherwise Landlock tools cannot write there. |
-| `SANDBOX_TMP_ROOT` | `/tmp/trellis` | Parent for per-run tmpdirs; created `0711`. Point it at a larger filesystem if `/tmp` is small. |
+| `SANDBOX_TMP_ROOT` | `/tmp/trellis` | Parent for per-run tmpdirs; created `0711`. Point it at a larger filesystem if `/tmp` is small. Compose forwards it to the hub; empty means the default. |
+| `SANDBOX_RLIMIT_AS_MB` | `4096` (4 GiB) | Address-space cap for each tool. `0` disables the limit. |
+| `SANDBOX_RLIMIT_CPU_S` | `600` | CPU-seconds cap for each tool. `0` disables the limit. |
+| `SANDBOX_RLIMIT_NPROC` | disabled | Process/thread cap for the tool's uid. Off by default because it counts every process of that uid on the host (containers share the kernel uid table), so a shared operator uid sits near the limit; set it only when the sandbox uid is dedicated. The container's `pids_limit` is the per-container backstop. |
+| `SANDBOX_RLIMIT_FSIZE_MB` | `64` | Largest file a tool may write (MiB). `0` disables the limit. |
+
+Limits are applied by the helper before `exec`, so they are inherited by everything the tool spawns and are much harder to raise after the sandbox drop.
 
 The backend and probe results are cached at startup, so apply any change with `docker compose up -d hub` (no rebuild needed). `SANDBOX_SECCOMP=off` must be set **before** the hub starts for the same reason: the preflight caches its verdict, including the helper argv it probes with.
 

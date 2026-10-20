@@ -99,6 +99,9 @@ services:
     build: *app-build
     image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.2.1}
     container_name: tool-hub
+    # PID 1 must reap orphaned tool children: the Landlock backend runs tools as
+    # direct children, so a tool that daemonizes would otherwise leave zombies.
+    init: true
     # Runs as ROOT on purpose (bubblewrap, and the Landlock helper needs root to
     # drop the tool to the workspace uid). Do NOT add a user: here.
     command: python core/hub.py
@@ -191,6 +194,17 @@ services:
       SANDBOX_GID: ${SANDBOX_GID:-${TRELLIS_GID:-1000}}
       # Syscall deny-list for the Landlock backend (on|off).
       SANDBOX_SECCOMP: ${SANDBOX_SECCOMP:-on}
+      # Parent for per-run tmpdirs; empty = the helper's default (/tmp/trellis).
+      SANDBOX_TMP_ROOT: ${SANDBOX_TMP_ROOT:-}
+      # Limits are applied per tool by the helper; 0/unset = helper default
+      # (4 GiB AS, 600 s CPU, 64 MiB file size; NPROC off — it is host-uid-wide).
+      SANDBOX_RLIMIT_AS_MB: ${SANDBOX_RLIMIT_AS_MB:-}
+      SANDBOX_RLIMIT_CPU_S: ${SANDBOX_RLIMIT_CPU_S:-}
+      SANDBOX_RLIMIT_NPROC: ${SANDBOX_RLIMIT_NPROC:-}
+      SANDBOX_RLIMIT_FSIZE_MB: ${SANDBOX_RLIMIT_FSIZE_MB:-}
+    # Per-container backstop against fork bombs: RLIMIT_NPROC counts the whole
+    # host uid, while pids.max counts only this container's processes/threads.
+    pids_limit: 1024
     depends_on:
       etcd:
         condition: service_healthy

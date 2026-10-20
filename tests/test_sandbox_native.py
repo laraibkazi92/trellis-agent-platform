@@ -31,14 +31,28 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def run_helper(args, input=None):
+def run_helper(args, input=None, env=None):
     return subprocess.run(
         [HELPER, *args],
         capture_output=True,
         text=True,
         input=input,
+        env=_test_env(env),
         timeout=120,
     )
+
+
+def _test_env(env):
+    """Default harness env.
+
+    This suite runs as the developer's own uid, which on a desktop already owns
+    thousands of tasks; the helper's NPROC budget is sized for a dedicated
+    sandbox uid, so the production default would starve every fork here. Tests
+    that assert on limits pass their own env instead.
+    """
+    if env is not None:
+        return env
+    return {**os.environ, "SANDBOX_RLIMIT_NPROC": "0"}
 
 
 def _granted_args(tmp_path):
@@ -60,7 +74,7 @@ def test_version():
     result = run_helper(["--version"])
 
     assert result.returncode == 0
-    assert result.stdout.strip() == "trellis-sandbox 0.2.0"
+    assert result.stdout.strip() == "trellis-sandbox 0.3.0"
 
 
 def test_print_plan(tmp_path):
@@ -134,6 +148,85 @@ def test_exec_exit_code_passthrough(tmp_path):
     )
 
     assert result.returncode == 42
+
+
+RLIMIT_ENV = {
+    "SANDBOX_RLIMIT_AS_MB": "256",
+    "SANDBOX_RLIMIT_CPU_S": "30",
+    "SANDBOX_RLIMIT_NPROC": "64",
+    "SANDBOX_RLIMIT_FSIZE_MB": "8",
+}
+
+
+def _ulimit(tmp_path, flag):
+    # ulimit units: -v KiB, -t seconds, -u processes, -f blocks (bash uses
+    # 1024-byte blocks, POSIX shells 512-byte ones).
+    return run_helper(
+        [*_granted_args(tmp_path), "--", "/bin/bash", "-c", f"ulimit {flag}"],
+        env={**os.environ, **RLIMIT_ENV},
+    )
+
+
+def test_rlimits_applied(tmp_path):
+    as_result = _ulimit(tmp_path, "-v")
+    assert as_result.returncode == 0, as_result.stderr
+    as_kib = int(as_result.stdout)
+    assert 0 < as_kib <= 256 * 1024
+
+    cpu_result = _ulimit(tmp_path, "-t")
+    assert cpu_result.returncode == 0, cpu_result.stderr
+    cpu_s = int(cpu_result.stdout)
+    assert 0 < cpu_s <= 30
+
+    fsize_result = _ulimit(tmp_path, "-f")
+    assert fsize_result.returncode == 0, fsize_result.stderr
+    fsize_blocks = int(fsize_result.stdout)
+    # Tolerate either block-size convention while still rejecting "unlimited"
+    # and any limit meaningfully above the requested 8 MiB.
+    assert fsize_blocks * 512 <= 8 * 1024 * 1024
+    assert fsize_blocks >= 8 * 1024 * 1024 // 1024
+
+    nproc_result = _ulimit(tmp_path, "-u")
+    if nproc_result.returncode == 0 and nproc_result.stdout.strip().isdigit():
+        assert 0 < int(nproc_result.stdout) <= 64
+    else:
+        pytest.skip("platform does not expose 'ulimit -u'")
+
+
+def test_core_dumps_disabled(tmp_path):
+    result = run_helper(
+        [*_granted_args(tmp_path), "--", "/bin/sh", "-c", "ulimit -c"]
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "0"
+
+
+def test_same_identity_groups(tmp_path):
+    result = run_helper(
+        [*_granted_args(tmp_path), "--", "/bin/sh", "-c", "id -G"]
+    )
+
+    assert result.returncode == 0, result.stderr
+    gids = [int(g) for g in result.stdout.split()]
+    assert gids[0] == GID
+    if os.geteuid() == 0:
+        assert gids == [GID]
+    else:
+        # Unprivileged runs cannot clear supplementary groups (EPERM); the
+        # helper keeps the primary gid first and warns about the rest.
+        assert GID in gids
+
+
+def test_exec_failure_reports_real_errno(tmp_path):
+    result = run_helper(
+        [*_granted_args(tmp_path), "--", "/nonexistent/trellis-sandbox-cmd"]
+    )
+
+    assert result.returncode in (126, 127)
+    assert "exec:" in result.stderr
+    assert "No such file or directory" in result.stderr
+    assert "Success" not in result.stderr
 
 
 def test_usage_errors(tmp_path):

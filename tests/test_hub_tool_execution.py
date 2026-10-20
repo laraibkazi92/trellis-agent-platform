@@ -12,6 +12,9 @@ Pins the contracts introduced by the Hub hardening plan:
 - tool usage is recorded exactly once per invocation, not once per stamina
   retry attempt.
 - the tool handler never logs raw kwargs (`RECEIVED KWARGS` is deleted).
+- subprocess output is collected with bounded buffers (stdout/stderr caps plus a
+  truncation marker) while still draining the pipes to EOF, and sandbox cleanup
+  runs off the event loop.
 """
 
 import asyncio
@@ -27,23 +30,65 @@ from core.models import ToolConfig
 ENTRYPOINT_SOURCE = "import json, sys\nprint(json.dumps({}))\n"
 
 
+class FakeStream:
+    """Duck-types the read side of a subprocess pipe."""
+
+    def __init__(self, data=b"", hang=False, started=None, release=None):
+        self._data = data
+        self._offset = 0
+        self._hang = hang
+        self._started = started
+        self._release = release
+        self.read_calls = 0
+
+    async def read(self, n=-1):
+        self.read_calls += 1
+        if self._started is not None and not self._started.is_set():
+            self._started.set()
+        if self._release is not None:
+            await self._release.wait()
+        if self._hang:
+            await asyncio.sleep(60)
+        if self._offset >= len(self._data):
+            return b""
+        size = len(self._data) if n is None or n < 0 else n
+        chunk = self._data[self._offset:self._offset + size]
+        self._offset += len(chunk)
+        return chunk
+
+
+class FakeStdin:
+    """Duck-types asyncio's subprocess StreamWriter."""
+
+    def __init__(self, broken=False):
+        self.writes = []
+        self.closed = False
+        self._broken = broken
+
+    def write(self, data):
+        if self._broken:
+            raise BrokenPipeError()
+        self.writes.append(data)
+
+    async def drain(self):
+        if self._broken:
+            raise BrokenPipeError()
+
+    def close(self):
+        self.closed = True
+
+
 class FakeProcess:
     """Duck-types the subset of asyncio.subprocess.Process that run_tool uses."""
 
-    def __init__(self, returncode=0, stdout=b"", stderr=b"", hang=False):
+    def __init__(self, returncode=0, stdout=b"", stderr=b"", hang=False, stdin_broken=False):
         self.returncode = returncode
-        self.stdout_data = stdout
-        self.stderr_data = stderr
-        self.hang = hang
-        self.communicate_calls = []
+        self.stdout = FakeStream(stdout, hang=hang)
+        self.stderr = FakeStream(stderr, hang=hang)
+        self.stdin = FakeStdin(broken=stdin_broken)
+        self.stdin_writes = self.stdin.writes
         self.kill_calls = 0
         self.wait_calls = 0
-
-    async def communicate(self, input=None):
-        self.communicate_calls.append(input)
-        if self.hang:
-            await asyncio.sleep(60)
-        return self.stdout_data, self.stderr_data
 
     def kill(self):
         self.kill_calls += 1
@@ -55,18 +100,14 @@ class FakeProcess:
 
 
 class BlockingProcess(FakeProcess):
-    """communicate() parks until released, so task cancellation can be exercised."""
+    """Pipes park until released, so task cancellation can be exercised."""
 
     def __init__(self):
         super().__init__()
-        self.communicate_started = asyncio.Event()
+        self.read_started = asyncio.Event()
         self.release = asyncio.Event()
-
-    async def communicate(self, input=None):
-        self.communicate_calls.append(input)
-        self.communicate_started.set()
-        await self.release.wait()
-        return self.stdout_data, self.stderr_data
+        self.stdout = FakeStream(started=self.read_started, release=self.release)
+        self.stderr = FakeStream(started=self.read_started, release=self.release)
 
 
 class FakeIdentityManager:
@@ -374,7 +415,7 @@ def test_run_tool_preserves_agent_name_across_retries(monkeypatch, tmp_path):
 
     assert result == {"ok": True}
     assert len(spawns) == 2
-    second_stdin = json.loads(spawns[1]["process"].communicate_calls[0].decode())
+    second_stdin = json.loads(spawns[1]["process"].stdin_writes[0].decode())
     assert second_stdin["__agent_name"] == "triage"
 
 
@@ -459,7 +500,7 @@ def test_run_tool_cancellation_kills_subprocess(monkeypatch, tmp_path):
     async def _scenario():
         task = asyncio.create_task(hub.run_tool(make_config(), make_tool_dir(tmp_path), {}))
         try:
-            await asyncio.wait_for(blocked.communicate_started.wait(), timeout=2)
+            await asyncio.wait_for(blocked.read_started.wait(), timeout=2)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
@@ -572,6 +613,95 @@ def test_run_tool_cleans_tmpdir_on_timeout(monkeypatch, tmp_path):
 
     assert "timed out" in result["error"]
     assert not run_dir.exists()
+
+
+def test_run_tool_truncates_stdout_flood(monkeypatch, tmp_path):
+    """A tool flooding stdout is capped at MAX_STDOUT_BYTES instead of being
+    buffered whole, and the hub keeps draining so the child never blocks."""
+    install_sandbox(monkeypatch)
+    install_fake_identity(monkeypatch)
+    install_fake_health(monkeypatch)
+    monkeypatch.setenv("TOOL_EXECUTION_TIMEOUT", "5")
+
+    flood = b"x" * (9 * 1024 * 1024)
+    # The flooding tool never reads stdin, so the hub's write hits a closed pipe.
+    install_fake_subprocess(
+        monkeypatch, [FakeProcess(returncode=0, stdout=flood, stdin_broken=True)]
+    )
+
+    async def _scenario():
+        return await asyncio.wait_for(
+            _run_tool_scenario(make_config(), make_tool_dir(tmp_path), {}), timeout=10
+        )
+
+    result = asyncio.run(_scenario())
+
+    # The flood is not valid JSON, so it surfaces through the JSONDecodeError path.
+    assert "output truncated by hub" in result["output"]
+    assert len(result["output"].encode()) == (
+        hub.MAX_STDOUT_BYTES + len(hub.TRUNCATION_MARKER)
+    )
+
+
+def test_run_tool_truncates_stderr_flood(monkeypatch, tmp_path):
+    """Stderr is capped too, and a truncated stderr still classifies normally."""
+    install_sandbox(monkeypatch)
+    install_fake_identity(monkeypatch)
+    health_events = install_fake_health(monkeypatch)
+    monkeypatch.setenv("TOOL_EXECUTION_TIMEOUT", "5")
+
+    flood = b"E" * (512 * 1024)
+    install_fake_subprocess(monkeypatch, [FakeProcess(returncode=1, stderr=flood)])
+
+    async def _scenario():
+        return await asyncio.wait_for(
+            _run_tool_scenario(make_config(), make_tool_dir(tmp_path), {}), timeout=10
+        )
+
+    result = asyncio.run(_scenario())
+
+    assert result["error"].startswith("Tool exited with code 1")
+    assert "output truncated by hub" in result["stderr"]
+    assert len(result["stderr"].encode()) <= (
+        hub.MAX_STDERR_BYTES + len(hub.TRUNCATION_MARKER)
+    )
+    assert any(event["is_success"] is False for event in health_events)
+
+
+def test_run_tool_cleanup_is_offloaded(monkeypatch, tmp_path):
+    """Cleanup runs off the event loop but still happens on every exit path."""
+    from core import sandbox
+
+    install_sandbox(monkeypatch)
+    install_fake_identity(monkeypatch)
+    install_fake_health(monkeypatch)
+    monkeypatch.setenv("TOOL_EXECUTION_TIMEOUT", "0.1")
+
+    run_dirs = []
+    real_prepare = sandbox.prepare_execution
+
+    def _prepare(*args, **kwargs):
+        plan = real_prepare(*args, **kwargs)
+        run_dirs.append(plan.tmpdir)
+        return plan
+
+    monkeypatch.setattr(sandbox, "prepare_execution", _prepare)
+
+    install_fake_subprocess(
+        monkeypatch, [FakeProcess(returncode=0, stdout=b'{"ok": true}')]
+    )
+    result = asyncio.run(_run_tool_scenario(make_config(), make_tool_dir(tmp_path), {}))
+
+    assert result == {"ok": True}
+    assert len(run_dirs) == 1
+    assert not run_dirs[0].exists()
+
+    install_fake_subprocess(monkeypatch, [FakeProcess(hang=True)])
+    result = asyncio.run(_run_tool_scenario(make_config(), make_tool_dir(tmp_path), {}))
+
+    assert "timed out" in result["error"]
+    assert len(run_dirs) == 2
+    assert not run_dirs[1].exists()
 
 
 @pytest.mark.parametrize(

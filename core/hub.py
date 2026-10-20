@@ -38,6 +38,18 @@ health_monitor = HealthMonitor(identity_mgr)
 
 logger = logging.getLogger(__name__)
 
+# Per-stream caps for buffered tool output. The 96k JSON safety net downstream
+# still applies; these caps only stop a flooding tool from exhausting hub memory
+# before it gets there.
+MAX_STDOUT_BYTES = 8 * 1024 * 1024
+MAX_STDERR_BYTES = 256 * 1024
+
+# Appended to captured output that hit a cap so truncation stays visible in the
+# JSONDecodeError path and in the stderr handed back to the caller.
+TRUNCATION_MARKER = b"\n...[output truncated by hub]"
+
+_PIPE_CHUNK_BYTES = 64 * 1024
+
 
 @mcp.custom_route("/healthz", methods=["GET"])
 async def healthz(request):
@@ -124,6 +136,82 @@ def _kill_process_tree(process) -> None:
         process.kill()
     except ProcessLookupError:
         pass
+
+
+async def _collect_stream(stream, limit: int) -> tuple[bytes, bool]:
+    """Read one subprocess pipe to EOF, keeping at most ``limit`` bytes.
+
+    After the cap is reached the pipe is still drained and discarded: an unread
+    pipe fills up and blocks the child forever, which would turn a chatty tool
+    into a timeout instead of a truncated result.
+    """
+    chunks: list[bytes] = []
+    captured = 0
+    truncated = False
+    while True:
+        chunk = await stream.read(_PIPE_CHUNK_BYTES)
+        if not chunk:
+            break
+        if captured >= limit:
+            truncated = True
+            continue
+        room = limit - captured
+        if len(chunk) > room:
+            chunks.append(chunk[:room])
+            captured = limit
+            truncated = True
+            continue
+        chunks.append(chunk)
+        captured += len(chunk)
+
+    data = b"".join(chunks)
+    if truncated:
+        data += TRUNCATION_MARKER
+    return data, truncated
+
+
+async def _write_stdin(process, input_bytes: bytes) -> None:
+    """Send the JSON arguments and close stdin (tolerating a tool that ignores it)."""
+    stdin = process.stdin
+    if stdin is None:
+        return
+    try:
+        stdin.write(input_bytes)
+        await stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    finally:
+        try:
+            stdin.close()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
+async def _communicate_bounded(process, input_bytes: bytes, timeout: float) -> tuple[bytes, bytes]:
+    """``communicate()`` with bounded buffers and unchanged timeout semantics."""
+
+    async def _run() -> tuple[bytes, bytes]:
+        tasks = [
+            asyncio.ensure_future(_write_stdin(process, input_bytes)),
+            asyncio.ensure_future(_collect_stream(process.stdout, MAX_STDOUT_BYTES)),
+            asyncio.ensure_future(_collect_stream(process.stderr, MAX_STDERR_BYTES)),
+        ]
+        try:
+            results = await asyncio.gather(*tasks)
+            stdout, stderr = results[1][0], results[2][0]
+            # communicate() also awaited exit; without this the caller can race
+            # returncode and classify a finished tool as "exited with code None".
+            if process.returncode is None:
+                await process.wait()
+            return stdout, stderr
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    return await asyncio.wait_for(_run(), timeout=timeout)
+
 
 @stamina.retry(on=TransientToolError, attempts=3)
 async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any], user_id: Optional[str]) -> Dict[str, Any]:
@@ -213,7 +301,7 @@ async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[
             )
 
             try:
-                stdout, stderr = await asyncio.wait_for(process.communicate(input=input_json), timeout=timeout)
+                stdout, stderr = await _communicate_bounded(process, input_json, timeout)
             except asyncio.TimeoutError:
                 _kill_process_tree(process)
                 try:
@@ -231,7 +319,9 @@ async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[
                     pass
                 raise
         finally:
-            plan.cleanup()
+            # rmtree is blocking; keep it off the event loop so concurrent tool
+            # calls are not serialized behind cleanup.
+            await asyncio.to_thread(plan.cleanup)
 
         if stderr:
             stderr_text = stderr.decode().strip()
