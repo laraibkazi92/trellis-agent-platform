@@ -477,7 +477,10 @@ jobs:
               apparmor_parser --version
               # -r: replace (idempotent). Include resolution for <abi/3.0> and
               # <abstractions/base> comes from the package's /etc/apparmor.d.
-              apparmor_parser -r /profiles/trellis-hub
+              # -N: load without the policy cache; writing /var/cache/apparmor
+              # is refused in this container (the cache is a host-level
+              # optimization and irrelevant for a one-shot load).
+              apparmor_parser -r -N /profiles/trellis-hub
               aa-status
               cat /sys/kernel/security/apparmor/profiles
               grep -E "^trellis-hub \(enforce\)" /sys/kernel/security/apparmor/profiles
