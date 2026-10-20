@@ -28,7 +28,7 @@ services:
       args:
         PUID: ${TRELLIS_UID:-1000}
         PGID: ${TRELLIS_GID:-1000}
-    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.2.1}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.3.0}
     container_name: egress-mock
     user: "0:0"
     command: ["python", "-m", "http.server", "443"]

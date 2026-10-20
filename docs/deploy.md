@@ -61,7 +61,7 @@ If the host has no access to GHCR, export the images from a connected machine an
 # connected machine
 docker compose pull
 docker save -o trellis-images.tar \
-  ghcr.io/laraibkazi92/trellis-agent-platform:v0.2.0 \
+  ghcr.io/laraibkazi92/trellis-agent-platform:v0.3.0 \
   ghcr.io/vectorize-io/hindsight:0.9.1-slim \
   gcr.io/etcd-development/etcd:v3.6.15 \
   redis:alpine \
@@ -75,7 +75,7 @@ docker load -i trellis-images.tar
 Alternatively push the same images to a private registry mirror and point the stack at it with `TRELLIS_IMAGE` in `.env`:
 
 ```bash
-TRELLIS_IMAGE=registry.internal.example.com/trellis-agent-platform:v0.2.0
+TRELLIS_IMAGE=registry.internal.example.com/trellis-agent-platform:v0.3.0
 ```
 
 ## Install path B: build from source
@@ -97,7 +97,7 @@ TRELLIS_GID=$(id -g)
 
 ```bash
 # 1. Clone the engine at a release tag
-git clone --branch v0.2.0 https://github.com/laraibkazi92/trellis-agent-platform.git
+git clone --branch v0.3.0 https://github.com/laraibkazi92/trellis-agent-platform.git
 cd trellis-agent-platform
 
 # 2. Seed your environment file
@@ -116,7 +116,7 @@ The variables below are the ones you must touch for a first deployment. Everythi
 | `SESSION_SECRET` | Yes | Signs sessions and seeds the Fernet encryption key (`ENCRYPTION_KEY` falls back to it). |
 | `ADMIN_USERS` | Yes | Comma-separated admin identities (e.g. `ops@example.com`). |
 | `TRELLIS_WORKSPACE_DIR` | Recommended | Workspace bind-mount source. Defaults to `./workspace` inside the clone. Point it at your content repo to keep the engine pristine. |
-| `TRELLIS_IMAGE` | Optional | Pins the engine image tag or digest, e.g. `ghcr.io/laraibkazi92/trellis-agent-platform:v0.2.0`. |
+| `TRELLIS_IMAGE` | Optional | Pins the engine image tag or digest, e.g. `ghcr.io/laraibkazi92/trellis-agent-platform:v0.3.0`. |
 | `TRELLIS_UID` / `TRELLIS_GID` | Optional | Container uid:gid for workspace file ownership. Defaults to `1000:1000`. |
 | `DEV_MODE` | No | Keep `false` for anything shared. `true` disables **all** authentication. |
 | `HOST_BIND` | Optional | Host address published ports bind to. Default `0.0.0.0`. |
@@ -352,7 +352,7 @@ docker compose -f docker-compose.yml -f docker-compose.egress.yml up -d
 
 > **The override is not sticky.** Any later plain `docker compose up -d` (with `COMPOSE_FILE` no longer set) silently drops it and puts the hub back on `trellis-network` with full outbound access. Keep `COMPOSE_FILE` in `.env` for as long as you want egress mode, and check `docker inspect tool-hub --format '{{json .NetworkSettings.Networks}}'` after every deploy.
 
-> **Image requirement.** The proxy runs `scripts/egress_proxy.py` from the app image. `TRELLIS_IMAGE` defaults to a release tag that predates it, so either build from this checkout (`docker compose -f … up -d --build`) or pin an image tag that ships the script.
+> **Image requirement.** The proxy runs `scripts/egress_proxy.py` from the app image. `v0.3.0` is the first release that ships it; if you pin an older `TRELLIS_IMAGE` (or build from a pre-`v0.3.0` checkout), add `--build`.
 
 What the override adds:
 

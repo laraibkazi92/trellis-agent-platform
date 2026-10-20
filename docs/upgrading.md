@@ -40,7 +40,7 @@ Run from the engine clone:
 ```bash
 git fetch --tags
 git describe --tags            # note the tag you are on now, for rollback
-git checkout v0.2.0            # target release tag
+git checkout v0.3.0            # target release tag
 docker compose pull            # fetch the multi-arch app image for that tag
 docker compose up -d           # recreate services; nginx-gateway is built from ./gateway
 ```
@@ -66,7 +66,7 @@ Notes:
 ## Rollback
 
 ```bash
-git checkout v0.2.0            # previous tag
+git checkout v0.2.1            # previous tag
 docker compose pull
 docker compose up -d
 ```
@@ -143,38 +143,6 @@ which holds users, API keys, and run history.
 Fix workspace file ownership on the content checkout (outside Docker) with `chown`/`chmod`
 as you would for any other directory. The `hub` service runs as `${TRELLIS_UID:-1000}` like
 the rest of the app containers; this does not affect the other services.
-
-#### Root-owned files in the workspace from the old root-hub posture
-
-The hub and its tools now run as `TRELLIS_UID` with no capabilities (`cap_drop: [ALL]`, no
-`cap_add`). That applies to tool subprocesses too: under bwrap they are no longer uid 0
-inside their namespaces. Deployments that previously ran the hub as root may therefore have
-root-owned files and directories under `/app/workspace` that bwrap tools created as uid 0.
-
-What you see: a tool that used to work now fails with `Permission denied` when writing to
-one of those paths (the tool can read them, since world-readable, but not create or replace
-entries). The failure is DAC, not the sandbox — the same write would fail for any
-non-root user.
-
-Remedy, outside Docker, on the host that holds the bind mount:
-
-```bash
-# whole workspace (simplest)
-sudo chown -R "$TRELLIS_UID:$TRELLIS_GID" ./workspace
-# or only the offending trees, e.g.
-sudo chown -R "$TRELLIS_UID:$TRELLIS_GID" ./workspace/tools/foo/data
-```
-
-Also confirm `SANDBOX_UID`/`SANDBOX_GID` match the hub uid — they default to
-`TRELLIS_UID`/`TRELLIS_GID`, and a non-root hub cannot drop to a different identity, so a
-mismatch means Landlock tools run as an identity that does not own the workspace.
-`SANDBOX_UID` no longer defaults to a separate "tool" identity; on the default deployment it
-is the hub's own uid.
-
-Rollback to the root-hub posture (removing the hub's `user:` line and restoring the old
-capabilities) is only justified when a host cannot run bwrap as a non-root user at all — it
-reintroduces the privilege-separation problem this migration removed. See
-[deploy.md](deploy.md#sandbox-settings-and-rollback).
 
 #### Hindsight embeddings: model, provider, or dimensions
 
@@ -296,6 +264,103 @@ blank inherit it; the value lives only in etcd and is never written into an agen
   `base_url` — neither per-agent, nor the framework default, nor a global store — the SDK may
   still read its own endpoint environment variable (for example `OPENAI_BASE_URL`). Set the
   endpoint explicitly if you do not want that fallback.
+
+### v0.3.0 — 2026-10-20
+
+Changes since `v0.2.1`: tool sandboxing, per-tool network policy, and opt-in egress mode. The
+`TRELLIS_IMAGE` default moves to `v0.3.0`; `docker compose pull && docker compose up -d`
+recreates the hub with the new posture.
+
+#### Tools now run inside a sandbox
+
+The hub probes two backends at startup and picks **bwrap** where it works, otherwise
+**Landlock**. `/healthz` reports the verdict (`backend`, `code`, `remediation`).
+
+- **Filesystem:** `/` is read-only, `/app/workspace` read-write, `/tmp` a private tmpfs
+  (nothing persists), `/var/tmp` and sensitive paths such as `/etc/shadow` denied. A tool that
+  wrote outside the workspace now fails with `Permission denied` — move its data under
+  `/app/workspace` or into the tool directory.
+- **Identity:** the hub and its tools run as `TRELLIS_UID` with no capabilities
+  (`cap_drop: [ALL]`). See the root-owned files section below.
+- **Limits:** 8 MiB stdout / 256 KiB stderr per call, 4 GB address space, 600 s CPU, 64 MB
+  file size, and `pids_limit: 1024` per container.
+- **Docker options:** the hub requires `seccomp=unconfined`, `systempaths=unconfined`, and
+  `apparmor=unconfined` (shipped in `docker-compose.yml`). Removing them breaks bwrap.
+- **Ubuntu 24.04:** `apparmor_restrict_unprivileged_userns=1` refuses user namespaces to
+  unconfined containers, so bwrap is unavailable and the hub falls back to Landlock
+  automatically. To keep bwrap, install `deploy/apparmor/trellis-hub` (requires AppArmor 4.0
+  userspace; validated in CI) or relax the sysctl.
+- **Kernel support:** Landlock needs ABI 3+ (Linux 6.2+). With neither backend available,
+  tool calls fail closed and `/healthz` reports why.
+
+#### Root-owned files in the workspace from the old root-hub posture
+
+The hub and its tools now run as `TRELLIS_UID` with no capabilities (`cap_drop: [ALL]`, no
+`cap_add`). That applies to tool subprocesses too: under bwrap they are no longer uid 0
+inside their namespaces. Deployments that previously ran the hub as root may therefore have
+root-owned files and directories under `/app/workspace` that bwrap tools created as uid 0.
+
+What you see: a tool that used to work now fails with `Permission denied` when writing to
+one of those paths (the tool can read them, since world-readable, but not create or replace
+entries). The failure is DAC, not the sandbox — the same write would fail for any
+non-root user.
+
+Remedy, outside Docker, on the host that holds the bind mount:
+
+```bash
+# whole workspace (simplest)
+sudo chown -R "$TRELLIS_UID:$TRELLIS_GID" ./workspace
+# or only the offending trees, e.g.
+sudo chown -R "$TRELLIS_UID:$TRELLIS_GID" ./workspace/tools/foo/data
+```
+
+Also confirm `SANDBOX_UID`/`SANDBOX_GID` match the hub uid — they default to
+`TRELLIS_UID`/`TRELLIS_GID`, and a non-root hub cannot drop to a different identity, so a
+mismatch means Landlock tools run as an identity that does not own the workspace.
+`SANDBOX_UID` no longer defaults to a separate "tool" identity; on the default deployment it
+is the hub's own uid.
+
+Rollback to the root-hub posture (removing the hub's `user:` line and restoring the old
+capabilities) is only justified when a host cannot run bwrap as a non-root user at all — it
+reintroduces the privilege-separation problem this migration removed. See
+[deploy.md](deploy.md#sandbox-settings-and-rollback).
+
+#### Per-tool network policy
+
+`tool.yaml` gains `network: allow|none` (default **allow**). `none` gives the tool no IP
+network at all: bwrap uses a private network namespace; Landlock denies TCP connect/bind and
+a seccomp rule refuses UDP/raw sockets. Loopback is blocked as well.
+
+- Set `network: none` on every tool that does not call an external API — that is the cheapest
+  exfiltration control available.
+- `SANDBOX_NET_DEFAULT=none` flips the default for tools that do not set the field.
+- `SANDBOX_SECCOMP=off` weakens `none` to TCP-only under Landlock (UDP/raw become reachable);
+  the hub warns at startup. Keep seccomp on.
+
+#### Opt-in egress mode
+
+`docker-compose.egress.yml` moves the hub onto an internal-only network whose only route out
+is a CONNECT proxy that connects to domains declared in `tool.yaml` `egress:`. It is off by
+default. Enable it with `COMPOSE_FILE` in `.env`; see
+[deploy.md](deploy.md#egress-mode-opt-in) for enabling, rollback, and the v1 limits (union
+allowlist, Node clients ignoring proxy variables, etcd still reachable from tools).
+
+#### Probe lifecycle
+
+`/healthz` re-probes and re-selects after a classified sandbox failure (at most once per
+minute), so a host change is picked up without a restart. This is one-directional: a hub that
+started with no working backend still needs one restart after the host is fixed.
+
+#### Upgrade actions
+
+1. `docker compose pull && docker compose up -d` — recreates the hub with the new user,
+   capabilities, limits, and healthcheck.
+2. Check `/healthz`: `ok: true` and the expected `backend`; if not, the payload carries a
+   `code` and `remediation`.
+3. Fix root-owned workspace files if the previous deployment ran the hub as root (section
+   above).
+4. Audit tools: move writes into `/app/workspace`, and add `network: none` where no external
+   API is used.
 
 ---
 
