@@ -1,21 +1,36 @@
 # AppArmor profile for the Trellis tool-hub container.
 #
 # Generated from Docker's docker-default profile
-# (github.com/moby/profiles, apparmor/template.go) with two rule changes:
+# (github.com/moby/profiles, apparmor/template.go) with three rule changes:
 #
-#   1. `deny mount,` is removed. The hub's bwrap backend needs bind mounts
-#      (`/` read-only, `/app/workspace` read-write), a fresh procfs and a tmpfs
-#      on `/tmp`, then calls pivot_root to enter that root. docker-default
-#      denies the first of those mounts, so every tool call fails with
-#      "bwrap: Can't bind mount ...: Permission denied". AppArmor is
-#      independent of seccomp, which is why `seccomp=unconfined` alone does not
-#      help.
-#   2. `userns,` is added. bwrap creates a user namespace (`--unshare-user`);
-#      the hub runs as the operator uid (not root), so that namespace is
-#      unprivileged and maps that uid 1:1. On hosts with
-#      `kernel.apparmor_restrict_unprivileged_userns=1` (Ubuntu 24.04+), a
-#      confined profile without this rule is refused and surfaces as
-#      "bwrap: setting up uid map: Permission denied".
+#   1. docker-default's `deny mount,` is removed. The hub's bwrap backend needs
+#      bind mounts (`/` read-only, `/app/workspace` read-write), a fresh procfs
+#      and a tmpfs on `/tmp`. AppArmor is a whitelist: removing the deny is not
+#      enough, so `mount,` is added below. Without it every tool call fails with
+#      "bwrap: Can't bind mount ...: Permission denied" (AppArmor is independent
+#      of seccomp, which is why `seccomp=unconfined` alone does not help).
+#   2. `pivot_root,` is added. After building the new root, bwrap calls
+#      pivot_root(2), which AppArmor mediates as its own rule class. Kernels
+#      without pivot_root mediation ignore the rule; the parser accepts it on
+#      older userspace too (verified against apparmor_parser 3.0.4).
+#   3. `userns,` is added. bwrap creates an unprivileged user namespace
+#      (`--unshare-user`) that maps the hub's operator uid 1:1. While the
+#      profile pins ABI 3.0 (below) this rule is inert, because ABI 3.0
+#      predates AppArmor's user-namespace mediation; it is kept so the profile
+#      stays correct if the ABI pin is ever raised, at which point hosts with
+#      `kernel.apparmor_restrict_unprivileged_userns=1` (Ubuntu 24.04+) would
+#      otherwise refuse bwrap with "setting up uid map: Permission denied".
+#
+# `mount,` and `pivot_root,` are relaxations, but bounded by the kernel: the
+# hub container has no capabilities (`cap_drop: ALL`), so mount(2) and
+# pivot_root(2) are only honoured inside a user namespace the process created
+# itself — the same permission an unprivileged user has on a bare host.
+#
+# Validated under enforcement by the `apparmor` job in
+# .github/workflows/sandbox-smoke.yml: the profile is loaded on an Ubuntu 24.04
+# runner VM (AppArmor enforcing, Docker's docker-default active) and the full
+# sandbox smoke harness runs with bwrap, then with the Landlock fallback.
+
 #
 # Install this profile on the HOST and load it there -- AppArmor profiles are
 # applied by the host kernel, not from inside the container:
@@ -34,17 +49,20 @@
 # It is not needed, and is never loaded, when the hub runs with
 # `apparmor=unconfined`.
 #
-# `userns,` needs an AppArmor parser with user-namespace mediation (upstream
-# 4.0+, or Ubuntu's 3.0.7+ backport). On older userspace, delete that one rule:
-# those kernels have no AppArmor userns restriction for it to lift.
+# `userns,` needs an AppArmor parser that knows the rule (upstream 4.0+, or
+# Ubuntu's 3.0.7+ backport). On older userspace -- Ubuntu 22.04's 3.0.4 rejects
+# the profile with a syntax error -- delete that one rule: the ABI pin above
+# means the profile behaves identically without it.
 #
-# This profile is NOT a hardening win over docker-default: it only removes the
-# mount denial bwrap needs and lifts the userns restriction. It is the
+# This profile is NOT a hardening win over docker-default: it only replaces the
+# mount denial bwrap needs with an allow and adds pivot_root. It is the
 # policy-compliance alternative for orgs that forbid `apparmor=unconfined`.
 
 # Match docker-default's explicit ABI: at ABI >= 4, `network,` no longer
 # includes unix-domain sockets (moby/profiles pins 3.0 for this reason).
-abi <3.0>,
+# The include path must be `abi/3.0` (under /etc/apparmor.d); a bare `<3.0>`
+# does not resolve and apparmor_parser refuses to load the profile.
+abi <abi/3.0>,
 
 #include <tunables/global>
 
@@ -72,8 +90,15 @@ profile trellis-hub flags=(attach_disconnected,mediate_deleted) {
   capability,
   file,
   umount,
-  # bwrap --unshare-user: required where AppArmor restricts unprivileged
-  # user namespaces (Ubuntu 24.04+).
+  # bwrap's mounts: bind mounts of / and /app/workspace, tmpfs on /tmp and
+  # /dev, and a fresh proc. docker-default denies this with `deny mount,`;
+  # this profile replaces that deny with an allow.
+  mount,
+  # bwrap's final step into the new root; AppArmor mediates pivot_root(2)
+  # separately from mount rules.
+  pivot_root,
+  # bwrap --unshare-user: unprivileged user namespace for the tool. Inert while
+  # the ABI is pinned to 3.0 (see the abi line), kept for a future ABI bump.
   userns,
 
   # Host (privileged) processes may send signals to container processes.

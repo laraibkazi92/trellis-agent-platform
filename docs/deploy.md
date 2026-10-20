@@ -26,8 +26,8 @@ Docker Engine with the Compose v2 plugin is the only host dependency — the pre
 
 | Host | bwrap | Landlock | Support |
 | --- | --- | --- | --- |
-| Rootful Docker, AppArmor relaxed (`apparmor=unconfined`) | ✅ | ✅ | **Primary path**; bwrap itself validated on AppArmor-disabled hosts, the AppArmor fix is the CI fallback case |
-| Rootful Docker + the `deploy/apparmor/trellis-hub` profile | ✅ | ✅ | Profile shipped; **not yet loaded in CI** — validate on a real AppArmor host before relying on it |
+| Rootful Docker, AppArmor relaxed (`apparmor=unconfined`) | ✅ | ✅ | **Primary path**; both backends covered by the `smoke` matrix job on Ubuntu 24.04 |
+| Rootful Docker + the `deploy/apparmor/trellis-hub` profile | ✅ | ✅ | Policy-compliance alternative for orgs that ban unconfined profiles; **validated under enforcement** by the `apparmor` CI job on Ubuntu 24.04 |
 | AppArmor locked, SELinux disabled, rootless Docker / userns-remap | ❌ | ✅ | **Supported, auto-fallback**; covered by the `sandbox-smoke` CI job on Ubuntu 24.04 |
 | SELinux enforcing (RHEL/CentOS/Fedora) | ❌ | ✅ | **Not certified** — needs a real-host validation |
 | Kernel < 5.13, or Landlock blocked by an LSM/seccomp policy | ❌ | ❌ | Unsupported; `/healthz` returns 503 with a diagnosis |
@@ -272,7 +272,7 @@ The clone ships three samples: `workspace/agents/demo-assistant/`, `workspace/to
   - **Landlock limitations.** It restores filesystem blast-radius control and privilege separation, not bwrap's process isolation. `/proc` is shared; the hub and its tools run as one uid, so Yama `kernel.yama.ptrace_scope >= 1` is what keeps another process's environment out, and the hub returns 503 when the scope is 0 or missing. `/tmp` is shared too: each run gets a `0700` directory, but tools share one uid, so **never write secrets there**. `/dev/shm` is not writable, so POSIX shared memory (numpy/torch multiprocessing) fails. `/dev/ptmx` is not granted, so PTY allocation fails (`pexpect`, `node-pty`, `script`). `truncate` on a read-only file is unconfined at Landlock ABI 2 (Debian 12). At ABI >= 6, signal scoping makes `kill -0` on a process outside the sandbox return `EPERM` instead of `ESRCH`. `network: none` denies TCP connect/bind only (Landlock has no UDP/raw-socket control on ABI 4–6); bwrap's `--unshare-net` is the stronger policy because the tool gets no interface at all, including UDP.
   - **Fallback.** If tool execution still fails with bwrap/userns errors on an exotic host, add back only `SYS_ADMIN` to the hub — the sole capability the container may need. Never re-add `SETUID`/`SETGID`/`CHOWN`: on a non-root hub they would grant privilege escalation rather than enable a uid drop. Replacing the hub's `cap_drop`/`security_opt` block with `privileged: true` remains a worse last resort; it removes every container-level control above, so treat it as a temporary host workaround and record why.
 
-The AppArmor profile is `docker-default` with `deny mount,` removed and `userns,` added (plus `abi <3.0>,` to match upstream). It is not a hardening win over `apparmor=unconfined` — it is the policy-compliance option. It has not been loaded in CI yet, so validate it on a real AppArmor host. `userns,` requires an AppArmor parser with user-namespace mediation; on older userspace, delete that one rule (those kernels have no AppArmor userns restriction to lift). It is not used when the hub keeps `apparmor=unconfined`. Install it on the **host** — profiles load on the host kernel, not inside the container — and select it for the hub:
+The AppArmor profile is `docker-default` with its `deny mount,` replaced by `mount,`, `pivot_root,` added (bwrap's final step into its root is mediated separately from mount rules), and `userns,` added, keeping upstream's `abi <abi/3.0>,` pin. It is not a hardening win over `apparmor=unconfined` — it is the policy-compliance option. It is **validated under enforcement** by the `apparmor` job in `.github/workflows/sandbox-smoke.yml`: an Ubuntu 24.04 GitHub-hosted runner VM (AppArmor enabled in the kernel, AppArmor 4.0 userspace, Docker's `docker-default` available) loads the profile host-side with `apparmor_parser -r`, then runs the full stack plus the sandbox smoke harness with `security_opt: apparmor=trellis-hub` — once with `auto` selecting bwrap, once with the Landlock fallback forced. On an AppArmor userspace older than 4.0 (Ubuntu 22.04's parser rejects the rule), delete `userns,`; the ABI pin means the profile behaves identically without it. It is not used when the hub keeps `apparmor=unconfined`. Install it on the **host** — profiles load on the host kernel, not inside the container — and select it for the hub:
 
 ```bash
 sudo install -m 0644 deploy/apparmor/trellis-hub /etc/apparmor.d/trellis-hub
@@ -283,6 +283,15 @@ sudo apparmor_parser -r /etc/apparmor.d/trellis-hub
     security_opt:
       - "apparmor=trellis-hub"
 ```
+
+### CI validation
+
+`.github/workflows/sandbox-smoke.yml` runs two kernel/LSM-facing jobs on `ubuntu-24.04` — an Ubuntu 24.04 GitHub-hosted runner VM, with AppArmor enabled in the kernel and Docker's `docker-default` profile active:
+
+| Job | Proves |
+| --- | --- |
+| `smoke` (`bwrap` + `landlock` matrix legs) | The default path (`auto → bwrap`) works with `apparmor=unconfined`; the fallback works when the container is confined by `docker-default`; the native helper suite passes. |
+| `apparmor` (sandbox changes, `workflow_dispatch`, nightly) | The shipped `deploy/apparmor/trellis-hub` profile loads and confines the hub (`apparmor=trellis-hub`, label asserted at runtime) with no `apparmor=unconfined`, and both bwrap and the forced Landlock fallback pass the full smoke harness. |
 
 ### Sandbox settings and rollback
 

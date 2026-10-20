@@ -15,11 +15,23 @@
 # Both legs also run the native helper suite (tests/test_sandbox_native.py), which
 # previously never ran in CI. Like before, this exercises the smoke harness and the
 # native suite only — not the unit suite (that is ci.yml's job).
+#
+# The separate `apparmor` job validates the shipped deploy/apparmor/trellis-hub
+# profile under real enforcement instead of `apparmor=unconfined`. Ubuntu 24.04
+# GitHub-hosted runners are VMs whose kernel has AppArmor enabled, so the profile
+# can be loaded there (host-side policy) and then proven against the full stack:
+# once with bwrap and once with the Landlock fallback forced. It runs with the
+# other sandbox changes, on dispatch, and nightly.
 
 name: Sandbox smoke
 
 on:
   workflow_dispatch:
+  schedule:
+    # Nightly: the runner image and kernel drift (new Ubuntu point release, new
+    # Docker, AppArmor userspace), and this is the only job that exercises the
+    # profile under enforcement.
+    - cron: "17 4 * * *"
   push:
     paths:
       - "core/sandbox*"
@@ -219,4 +231,228 @@ jobs:
         run: |
           docker compose logs hub || true
           docker compose logs db-sync || true
+          docker compose ps || true
+
+  apparmor:
+    # Validates the policy-compliance path for orgs that forbid
+    # `apparmor=unconfined`. The profile is host-kernel policy, so the job loads
+    # it into the runner VM's kernel first, then runs the whole stack with
+    # security_opt: apparmor=trellis-hub (docker-compose.ci-apparmor.yml).
+    #
+    # Independent of the matrix above on purpose: a profile problem must not
+    # hide a backend verdict.
+    name: apparmor profile (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Every compose command below uses the CI-only override that replaces the
+      # hub's `apparmor=unconfined` with `apparmor=trellis-hub`.
+      COMPOSE_FILE: docker-compose.yml:docker-compose.ci-apparmor.yml
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Record host AppArmor evidence
+        run: |
+          echo "kernel: $(uname -r)"
+          echo "apparmor enabled: $(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || echo absent)"
+          echo "apparmor userns restriction: $(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"
+          echo "securityfs mounted: $(mountpoint -q /sys/kernel/security && echo yes || echo no)"
+          ls -la /sys/kernel/security/ 2>/dev/null || echo "/sys/kernel/security missing"
+          docker --version
+          # `!override` in docker-compose.ci-apparmor.yml needs Compose 2.24.4+.
+          docker compose version
+          docker info --format '{{json .SecurityOptions}}' || true
+
+      - name: Load deploy/apparmor/trellis-hub on the runner kernel
+        # The profile is loaded into the HOST kernel (AppArmor is global, not
+        # namespaced), the same way an operator would install it. A privileged
+        # container is enough: it gets CAP_SYS_ADMIN and an unconfined profile,
+        # which is what writing to /sys/kernel/security/apparmor requires. The
+        # runner needs no apparmor package of its own.
+        #
+        # `apparmor_parser -r` is idempotent, so a re-run replaces the profile.
+        # The explicit `grep ... (enforce)` makes a silent compile/no-load fail
+        # here instead of later as an opaque `docker compose up` error.
+        run: |
+          set -eux
+          test "$(cat /sys/module/apparmor/parameters/enabled)" = "Y" || {
+            echo "AppArmor is not enabled on this runner; cannot validate the profile" >&2
+            exit 1
+          }
+          # securityfs carries /sys/kernel/security/apparmor. systemd normally
+          # mounts it on the runner; mount it here if the image does not.
+          if ! mountpoint -q /sys/kernel/security; then
+            sudo mount -t securityfs none /sys/kernel/security || true
+          fi
+          docker run --rm --privileged \
+            -v /sys/kernel/security:/sys/kernel/security \
+            -v "$PWD/deploy/apparmor:/profiles:ro" \
+            ubuntu:24.04 bash -c '
+              set -eux
+              apt-get update -qq
+              apt-get install -y -qq apparmor
+              # If the host bind mount was an empty directory (no securityfs),
+              # mounting it here reaches the same host kernel interface.
+              if [ ! -e /sys/kernel/security/apparmor/profiles ]; then
+                mount -t securityfs none /sys/kernel/security
+              fi
+              apparmor_parser --version
+              # -r: replace (idempotent). Include resolution for <abi/3.0> and
+              # <abstractions/base> comes from the package's /etc/apparmor.d.
+              apparmor_parser -r /profiles/trellis-hub
+              aa-status
+              cat /sys/kernel/security/apparmor/profiles
+              grep -E "^trellis-hub \(enforce\)" /sys/kernel/security/apparmor/profiles
+            '
+
+      - name: Seed the .env the compose file expects
+        # Same seeding as the matrix job: the hub runs as the runner uid (which
+        # owns the checkout) and DEV_MODE keeps host/ui startable without an IdP.
+        run: |
+          cat > .env <<ENV
+          DEV_MODE=true
+          SESSION_SECRET=sandbox-smoke-ci
+          ADMIN_USERS=dev-user@local.host
+          TRELLIS_UID=$(id -u)
+          TRELLIS_GID=$(id -g)
+          ENV
+
+      - name: Build and start the stack under apparmor=trellis-hub
+        run: docker compose up -d --build
+
+      - name: Assert the hub is confined by the loaded profile
+        # Two proofs: Docker recorded exactly one apparmor entry (the profile,
+        # not `unconfined`), and the running process reports the profile label.
+        run: |
+          set -eux
+          opts=$(docker inspect tool-hub --format '{{range .HostConfig.SecurityOpt}}{{println .}}{{end}}')
+          printf '%s\n' "$opts"
+          test "$(printf '%s\n' "$opts" | grep -c '^apparmor=')" -eq 1
+          printf '%s\n' "$opts" | grep -qx 'apparmor=trellis-hub'
+          label=$(docker compose exec -T hub cat /proc/self/attr/current)
+          echo "hub AppArmor label: $label"
+          case "$label" in
+            *trellis-hub*) ;;
+            *) echo "hub is not confined by trellis-hub" >&2; exit 1 ;;
+          esac
+
+      - name: Wait for /healthz to answer
+        run: |
+          : > healthz.json
+          for attempt in $(seq 1 60); do
+            body=$(docker compose exec -T hub curl -s http://127.0.0.1:8001/healthz 2>/dev/null || true)
+            if printf '%s' "$body" | grep -q '"backend"'; then
+              printf '%s' "$body" > healthz.json
+              break
+            fi
+            sleep 5
+          done
+          if [ ! -s healthz.json ]; then
+            echo "hub /healthz did not answer within 5 minutes" >&2
+            exit 1
+          fi
+          cat healthz.json
+          echo
+
+      - name: Assert auto selected bwrap under the profile
+        # The profile's whole job is to keep the default backend working without
+        # `apparmor=unconfined`: mount, pivot_root, and bwrap's userns must all
+        # be permitted by trellis-hub, not by an unconfined profile.
+        run: |
+          python3 - <<'PY'
+          import json
+          p = json.load(open("healthz.json"))
+          print(json.dumps(p, indent=2, sort_keys=True))
+          assert p.get("requested") == "auto", p
+          assert p.get("backend") == "bwrap", p
+          assert p.get("ok") is True, p
+          assert (p.get("checks") or {}).get("bwrap", {}).get("ok") is True, p
+          assert p["checks"].get("landlock") is None, p
+          print("bwrap selected under trellis-hub; landlock not probed")
+          PY
+
+      - name: Run the sandbox smoke harness (bwrap under trellis-hub)
+        run: |
+          docker compose exec -T hub python scripts/sandbox_smoke.py \
+            --backend auto \
+            --tool text_stats \
+            --check-confinement \
+            --check-privilege \
+            --check-seccomp
+
+      - name: Force the Landlock fallback under the same profile
+        # The profile must not break the fallback either. SANDBOX_BACKEND is
+        # interpolated by docker-compose.yml (`${SANDBOX_BACKEND:-auto}`), so the
+        # environment variable is all that is needed -- no extra override file,
+        # and the committed default stays `auto` for real deployments.
+        run: |
+          SANDBOX_BACKEND=landlock docker compose up -d --force-recreate hub
+          docker compose exec -T hub printenv SANDBOX_BACKEND
+
+      - name: Wait for /healthz after forcing Landlock
+        run: |
+          : > healthz.json
+          for attempt in $(seq 1 60); do
+            body=$(docker compose exec -T hub curl -s http://127.0.0.1:8001/healthz 2>/dev/null || true)
+            if printf '%s' "$body" | grep -q '"backend"'; then
+              printf '%s' "$body" > healthz.json
+              break
+            fi
+            sleep 5
+          done
+          if [ ! -s healthz.json ]; then
+            echo "hub /healthz did not answer within 5 minutes after the forced fallback" >&2
+            exit 1
+          fi
+          cat healthz.json
+          echo
+
+      - name: Assert the forced fallback selected Landlock
+        run: |
+          python3 - <<'PY'
+          import json
+          p = json.load(open("healthz.json"))
+          print(json.dumps(p, indent=2, sort_keys=True))
+          assert p.get("requested") == "landlock", p
+          assert p.get("backend") == "landlock", p
+          assert p.get("ok") is True, p
+          assert (p.get("checks") or {}).get("landlock", {}).get("ok") is True, p
+          # bwrap is not probed when it was not requested.
+          assert p["checks"].get("bwrap") is None, p
+          print("landlock selected under trellis-hub")
+          PY
+
+      - name: Run the sandbox smoke harness (Landlock under trellis-hub)
+        # --backend landlock, not auto: under a working profile `auto` would
+        # select bwrap again, which would not prove the fallback.
+        run: |
+          docker compose exec -T hub python scripts/sandbox_smoke.py \
+            --backend landlock \
+            --tool text_stats \
+            --check-confinement \
+            --check-privilege \
+            --check-seccomp
+
+      - name: Dump AppArmor denials and container logs on failure
+        # AppArmor denials are kernel audit records, not container logs: without
+        # these, every rule gap looks like an opaque tool failure. The profile
+        # is expected to need rule fixes as the hub changes.
+        if: failure()
+        run: |
+          echo "== loaded profiles =="
+          cat /sys/kernel/security/apparmor/profiles || true
+          echo "== aa-status =="
+          sudo aa-status || true
+          echo "== kernel denials (dmesg, last 50) =="
+          sudo dmesg 2>/dev/null | tail -50 || true
+          echo "== journalctl -k (last 50) =="
+          sudo journalctl -k 2>/dev/null | tail -50 || true
+          echo "== hub SecurityOpt =="
+          docker inspect tool-hub --format '{{json .HostConfig.SecurityOpt}}' || true
+          echo "== hub logs =="
+          docker compose logs hub || true
+          echo "== db-sync logs =="
+          docker compose logs db-sync || true
+          echo "== compose ps =="
           docker compose ps || true
