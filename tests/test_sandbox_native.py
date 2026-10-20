@@ -99,22 +99,41 @@ def test_print_plan(tmp_path):
         assert mask & (1 << 15), "IOCTL_DEV missing"
 
     assert plan["deny_net"] is False
+    assert plan["deny_net_error"] is None
     assert plan["handled_access_net"] == "0x0"
 
     if abi >= 4:
-        denied = json.loads(
-            run_helper(
-                [
-                    "--print-plan",
-                    *_granted_args(tmp_path),
-                    "--deny-net",
-                    "--",
-                    "/bin/true",
-                ]
-            ).stdout
+        denied = run_helper(
+            [
+                "--print-plan",
+                *_granted_args(tmp_path),
+                "--deny-net",
+                "--",
+                "/bin/true",
+            ]
         )
-        assert denied["deny_net"] is True
-        assert int(denied["handled_access_net"], 16) == 0x3
+        assert denied.returncode == 0, denied.stderr
+        denied_plan = json.loads(denied.stdout)
+        assert denied_plan["deny_net"] is True
+        assert denied_plan["deny_net_error"] is None
+        assert int(denied_plan["handled_access_net"], 16) == 0x3
+    else:
+        # Below ABI 4 a real run refuses deny_net, so the plan must not read as
+        # enforceable: it carries the error and exits 65 like the real run.
+        denied = run_helper(
+            [
+                "--print-plan",
+                *_granted_args(tmp_path),
+                "--deny-net",
+                "--",
+                "/bin/true",
+            ]
+        )
+        assert denied.returncode == 65
+        denied_plan = json.loads(denied.stdout)
+        assert denied_plan["deny_net"] is True
+        assert denied_plan["deny_net_error"]
+        assert "ABI 4" in denied_plan["deny_net_error"]
 
 
 CONNECT_CODE = (
@@ -464,46 +483,85 @@ UDP_SEND_CODE = (
     "print('SENT')\n"
 )
 
-RAW_SOCKET_CODE = (
-    "import socket\n"
-    "sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)\n"
-    "print('RAW')\n"
+UDP_SOCKET_CODE = (
+    "import socket, sys\n"
+    "family, kind = int(sys.argv[1]), int(sys.argv[2])\n"
+    "try:\n"
+    "    socket.socket(family, kind)\n"
+    "except OSError as exc:\n"
+    "    print(exc.errno)\n"
+    "else:\n"
+    "    print('CREATED')\n"
 )
 
-# EACCES from the seccomp rule; EAFNOSUPPORT/EPERM kept as platform fallbacks.
-NET_DENIED_MARKERS = (
-    "Errno 13",
-    "Permission denied",
-    "Errno 97",
-    "Address family not supported",
-    "Errno 1",
-    "Operation not permitted",
+RAW_SOCKET_CODE = (
+    "import socket\n"
+    "try:\n"
+    "    socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)\n"
+    "except OSError as exc:\n"
+    "    print(exc.errno)\n"
+    "else:\n"
+    "    print('RAW')\n"
+)
+
+AF_NETLINK_CODE = (
+    "import socket\n"
+    "sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0)\n"
+    "print('NETLINK')\n"
 )
 
 
 @requires_deny_net
-def test_deny_net_blocks_udp_sockets(tmp_path):
-    """Landlock covers TCP only; the seccomp rule must close the UDP path."""
-    result = _run_python(tmp_path, UDP_SEND_CODE, extra=["--deny-net"])
+@pytest.mark.parametrize(
+    "family,kind",
+    [
+        pytest.param(socket.AF_INET6, socket.SOCK_DGRAM, id="ipv6-dgram"),
+        pytest.param(
+            socket.AF_INET,
+            socket.SOCK_DGRAM | socket.SOCK_NONBLOCK | socket.SOCK_CLOEXEC,
+            id="ipv4-dgram-with-flags",
+        ),
+    ],
+)
+def test_deny_net_blocks_udp_sockets(tmp_path, family, kind):
+    """Landlock covers TCP only; the seccomp rule must close the UDP path.
 
-    assert result.returncode != 0
-    assert "SENT" not in result.stdout
-    assert any(marker in result.stderr for marker in NET_DENIED_MARKERS), (
-        result.stderr
+    Go (and Python's own flag arguments) fold SOCK_NONBLOCK/SOCK_CLOEXEC into
+    the type argument, so the filter has to mask them off to still see
+    SOCK_DGRAM.
+    """
+    result = run_helper(
+        [
+            *_granted_args(tmp_path),
+            "--deny-net",
+            "--",
+            sys.executable, "-c", UDP_SOCKET_CODE, str(family), str(kind),
+        ]
     )
+
+    assert result.returncode == 0, result.stderr
+    assert "CREATED" not in result.stdout
+    assert result.stdout.strip() == str(errno.EACCES)
 
 
 @requires_deny_net
 def test_deny_net_blocks_raw_sockets(tmp_path):
     result = _run_python(tmp_path, RAW_SOCKET_CODE, extra=["--deny-net"])
 
-    assert result.returncode != 0
+    assert result.returncode == 0, result.stderr
     assert "RAW" not in result.stdout
-    # Seccomp refuses with EACCES before the CAP_NET_RAW check; a host that
-    # already forbids raw sockets reports EPERM, which is just as good.
-    assert any(marker in result.stderr for marker in NET_DENIED_MARKERS), (
-        result.stderr
-    )
+    # EACCES specifically: EPERM would also come from the unprivileged
+    # CAP_NET_RAW check, so it would pass even with no filter at all.
+    assert result.stdout.strip() == str(errno.EACCES)
+
+
+@requires_deny_net
+def test_deny_net_keeps_af_netlink(tmp_path):
+    """The socket rule covers AF_INET/AF_INET6, not every raw socket type."""
+    result = _run_python(tmp_path, AF_NETLINK_CODE, extra=["--deny-net"])
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "NETLINK"
 
 
 def test_allow_udp_send_succeeds(tmp_path):

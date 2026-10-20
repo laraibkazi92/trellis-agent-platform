@@ -14,22 +14,22 @@
 #      without pivot_root mediation ignore the rule; the parser accepts it on
 #      older userspace too (verified against apparmor_parser 3.0.4).
 #   3. `userns,` is added. bwrap creates an unprivileged user namespace
-#      (`--unshare-user`) that maps the hub's operator uid 1:1. While the
-#      profile pins ABI 3.0 (below) this rule is inert, because ABI 3.0
-#      predates AppArmor's user-namespace mediation; it is kept so the profile
-#      stays correct if the ABI pin is ever raised, at which point hosts with
-#      `kernel.apparmor_restrict_unprivileged_userns=1` (Ubuntu 24.04+) would
-#      otherwise refuse bwrap with "setting up uid map: Permission denied".
+#      (`--unshare-user`) that maps the hub's operator uid 1:1. The profile
+#      pins ABI 4.0 (below) so this rule is mediated: on hosts with
+#      `kernel.apparmor_restrict_unprivileged_userns=1` (Ubuntu 24.04+) an
+#      unconfined container is refused, while this profile grants the
+#      permission bwrap needs.
 #
 # `mount,` and `pivot_root,` are relaxations, but bounded by the kernel: the
 # hub container has no capabilities (`cap_drop: ALL`), so mount(2) and
 # pivot_root(2) are only honoured inside a user namespace the process created
 # itself — the same permission an unprivileged user has on a bare host.
 #
-# Validated under enforcement by the `apparmor` job in
-# .github/workflows/sandbox-smoke.yml: the profile is loaded on an Ubuntu 24.04
-# runner VM (AppArmor enforcing, Docker's docker-default active) and the full
-# sandbox smoke harness runs with bwrap, then with the Landlock fallback.
+# The `apparmor` job in .github/workflows/sandbox-smoke.yml is the validation of
+# record: it loads this profile on an Ubuntu 24.04 runner VM (AppArmor enforcing,
+# Docker's docker-default active, `apparmor_restrict_unprivileged_userns=1`) and
+# runs the full sandbox smoke harness with bwrap, then with the Landlock
+# fallback.
 
 #
 # Install this profile on the HOST and load it there -- AppArmor profiles are
@@ -49,20 +49,21 @@
 # It is not needed, and is never loaded, when the hub runs with
 # `apparmor=unconfined`.
 #
-# `userns,` needs an AppArmor parser that knows the rule (upstream 4.0+, or
-# Ubuntu's 3.0.7+ backport). On older userspace -- Ubuntu 22.04's 3.0.4 rejects
-# the profile with a syntax error -- delete that one rule: the ABI pin above
-# means the profile behaves identically without it.
+# `userns,` needs an AppArmor parser that knows the rule and an ABI that
+# mediates it (this profile pins 4.0). On older userspace -- Ubuntu 22.04's
+# 3.0.4 rejects the profile with a syntax error -- this file cannot be used;
+# 22.04 has no unprivileged-userns restriction, so `apparmor=unconfined` is the
+# supported posture there.
 #
 # This profile is NOT a hardening win over docker-default: it only replaces the
 # mount denial bwrap needs with an allow and adds pivot_root. It is the
 # policy-compliance alternative for orgs that forbid `apparmor=unconfined`.
 
-# Match docker-default's explicit ABI: at ABI >= 4, `network,` no longer
-# includes unix-domain sockets (moby/profiles pins 3.0 for this reason).
-# The include path must be `abi/3.0` (under /etc/apparmor.d); a bare `<3.0>`
+# ABI 4.0 adds mediated user namespaces (`userns,` below) and changes `network,`
+# to internet sockets only, so unix-domain sockets need their own rule. The
+# include path must be `abi/4.0` (under /etc/apparmor.d); a bare `<4.0>`
 # does not resolve and apparmor_parser refuses to load the profile.
-abi <abi/3.0>,
+abi <abi/4.0>,
 
 #include <tunables/global>
 
@@ -70,6 +71,8 @@ profile trellis-hub flags=(attach_disconnected,mediate_deleted) {
   #include <abstractions/base>
 
   network,
+  # At ABI >= 4 `network,` no longer covers unix-domain sockets.
+  unix,
   # Disallow obsolete socket families removed from the Linux kernel.
   # AF_DECnet has no AppArmor family name, so it cannot be denied here.
   deny network ax25,
@@ -97,8 +100,9 @@ profile trellis-hub flags=(attach_disconnected,mediate_deleted) {
   # bwrap's final step into the new root; AppArmor mediates pivot_root(2)
   # separately from mount rules.
   pivot_root,
-  # bwrap --unshare-user: unprivileged user namespace for the tool. Inert while
-  # the ABI is pinned to 3.0 (see the abi line), kept for a future ABI bump.
+  # bwrap --unshare-user: unprivileged user namespace for the tool. Mediated at
+  # the pinned ABI 4.0; this is what lifts Ubuntu's unprivileged-userns
+  # restriction for the hub.
   userns,
 
   # Host (privileged) processes may send signals to container processes.

@@ -6,6 +6,9 @@
 import errno
 import logging
 import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -107,6 +110,21 @@ def test_classify_bwrap_stderr_without_evidence():
     assert (
         preflight.classify_bwrap_stderr("bwrap: Can't mount proc: Permission denied")
         == "mount_denied_unknown_lsm"
+    )
+
+
+def test_classify_bwrap_stderr_netns_probe_marks_the_netns_refusal():
+    """The same text means different things before and after the base run."""
+    text = "bwrap: Creating new namespace failed: Operation not permitted"
+
+    assert preflight.classify_bwrap_stderr(text) == "userns_restriction"
+    assert preflight.classify_bwrap_stderr(text, netns=True) == "netns_denied"
+    assert (
+        preflight.classify_bwrap_stderr(
+            "bwrap: setting up network namespace: Operation not permitted",
+            netns=True,
+        )
+        == "netns_denied"
     )
 
 
@@ -229,6 +247,101 @@ def test_probe_bwrap_success(monkeypatch):
     assert result.ok is True
     assert result.backend == "bwrap"
     assert result.code is None
+    assert result.evidence["bwrap_netns"]["ok"] is True
+
+
+def test_probe_bwrap_netns_denial_is_advisory(monkeypatch):
+    """A host that refuses --unshare-net passes bwrap but breaks `network: none`."""
+    monkeypatch.setattr(preflight.shutil, "which", lambda name: "/usr/bin/bwrap")
+    calls = []
+
+    def _run(argv, **kwargs):
+        calls.append(argv)
+        if "--unshare-net" in argv:
+            return subprocess.CompletedProcess(
+                argv,
+                1,
+                "",
+                "bwrap: Creating new namespace failed: Operation not permitted",
+            )
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(preflight.subprocess, "run", _run)
+
+    result = preflight.probe_bwrap()
+
+    assert len(calls) == 2
+    assert result.ok is True
+    assert result.code is None
+    assert result.evidence["bwrap_netns"]["ok"] is False
+    assert result.evidence["bwrap_netns"]["code"] == "netns_denied"
+
+
+def test_probe_bwrap_netns_probe_skipped_when_the_base_run_fails(monkeypatch):
+    monkeypatch.setattr(preflight.shutil, "which", lambda name: "/usr/bin/bwrap")
+    calls = []
+
+    def _run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 1, "", "bwrap: pivot_root: Operation not permitted"
+        )
+
+    monkeypatch.setattr(preflight.subprocess, "run", _run)
+
+    result = preflight.probe_bwrap()
+
+    assert len(calls) == 1
+    assert result.ok is False
+    assert result.code == "seccomp_pivot_root"
+
+
+def test_bwrap_netns_denial_does_not_fail_the_verdict(monkeypatch, caplog):
+    monkeypatch.delenv("SANDBOX_BACKEND", raising=False)
+    monkeypatch.setattr(preflight, "landlock_abi_version", lambda: 5)
+    monkeypatch.setattr(
+        preflight,
+        "_read_text",
+        lambda path: "1\n" if path.endswith("ptrace_scope") else "",
+    )
+    monkeypatch.setattr(
+        preflight,
+        "probe_bwrap",
+        lambda *a, **k: preflight.ProbeResult(
+            backend="bwrap",
+            ok=True,
+            evidence={
+                "bwrap_netns": {
+                    "ok": False,
+                    "code": "netns_denied",
+                    "detail": "no netns here",
+                }
+            },
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=preflight.logger.name):
+        payload = preflight.warmup()
+        preflight.warmup()
+
+    # `allow` tools never pass --unshare-net, so the verdict stays healthy.
+    assert payload["ok"] is True
+    assert payload["backend"] == "bwrap"
+    assert payload["evidence"]["bwrap_netns"] == {
+        "ok": False,
+        "code": "netns_denied",
+        "detail": "no netns here",
+    }
+    assert "netns_denied" in payload["warnings"]
+
+    netns_warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+        and "network namespace" in record.getMessage()
+    ]
+    assert len(netns_warnings) == 1
+    assert preflight.REMEDIATIONS["netns_denied"] in netns_warnings[0]
 
 
 def test_probe_bwrap_classifies_apparmor_mount_denial(monkeypatch):
@@ -589,6 +702,21 @@ def test_unsupported_net_abi_is_advisory_only(monkeypatch):
     assert "landlock_net_unsupported" in payload["warnings"]
 
 
+def test_udp_permitted_at_abi4_skips_the_abi_warning(monkeypatch):
+    """ABI 4+ can express the TCP policy; the UDP gap has its own cause."""
+    payload = _landlock_payload(
+        monkeypatch,
+        preflight.NetProbeResult(
+            False, "seccomp disabled: --deny-net denies TCP only", 6
+        ),
+        abi=6,
+    )
+
+    assert payload["ok"] is True
+    assert payload["evidence"]["net"]["deny_supported"] is False
+    assert "landlock_net_unsupported" not in payload["warnings"]
+
+
 def test_bwrap_only_probe_omits_landlock_net_evidence(monkeypatch):
     monkeypatch.setenv("SANDBOX_BACKEND", "bwrap")
     monkeypatch.setattr(preflight, "landlock_abi_version", lambda: 6)
@@ -631,7 +759,16 @@ def test_probe_landlock_net_argv_and_success(monkeypatch):
 
     def _run(argv, **kwargs):
         seen.append(argv)
-        return subprocess.CompletedProcess(argv, 0, "", "")
+        # A refused UDP socket: the property the probe is looking for. The
+        # helper's benign warning line must not read as a helper refusal.
+        return subprocess.CompletedProcess(
+            argv,
+            1,
+            "",
+            "trellis-sandbox: warning: supplementary groups retained "
+            "(needs CAP_SETGID)\n"
+            "PermissionError: [Errno 13] Permission denied",
+        )
 
     monkeypatch.setattr(preflight, "landlock_abi_version", lambda: 6)
     monkeypatch.setattr(preflight, "_helper_probe_error", lambda *a, **k: None)
@@ -645,8 +782,49 @@ def test_probe_landlock_net_argv_and_success(monkeypatch):
     argv = seen[0]
     assert argv[0] == "/h"
     assert argv[argv.index("--") - 1] == "--deny-net"
-    assert argv[-1] == "/bin/true"
+    assert argv[-2:] == ["-c", argv[-1]]
+    assert "socket.socket(socket.AF_INET, socket.SOCK_DGRAM)" in argv[-1]
     assert "--no-seccomp" not in argv
+
+
+def test_probe_landlock_net_rejects_an_accepting_run(monkeypatch):
+    """Exit 0 means the UDP socket was created, so `none` is not enforceable."""
+    monkeypatch.setattr(preflight, "landlock_abi_version", lambda: 6)
+    monkeypatch.setattr(preflight, "_helper_probe_error", lambda *a, **k: None)
+    monkeypatch.setattr(preflight, "resolve_sandbox_identity", lambda: (1000, 1000))
+    monkeypatch.delenv("SANDBOX_SECCOMP", raising=False)
+    monkeypatch.setattr(
+        preflight.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(argv, 0, "", ""),
+    )
+
+    result = preflight.probe_landlock_net(helper="/h")
+
+    assert result.supported is False
+    assert "UDP still permitted" in result.detail
+
+
+def test_probe_landlock_net_names_seccomp_when_it_is_off(monkeypatch):
+    seen = []
+
+    def _run(argv, **kwargs):
+        seen.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setenv("SANDBOX_SECCOMP", "off")
+    monkeypatch.setattr(preflight, "landlock_abi_version", lambda: 6)
+    monkeypatch.setattr(preflight, "_helper_probe_error", lambda *a, **k: None)
+    monkeypatch.setattr(preflight, "resolve_sandbox_identity", lambda: (1000, 1000))
+    monkeypatch.setattr(preflight.subprocess, "run", _run)
+
+    result = preflight.probe_landlock_net(helper="/h")
+
+    # The probe runs the same argv the hub would (escape hatch included), so the
+    # accepting run is explained by the filter that was skipped.
+    assert "--no-seccomp" in seen[0]
+    assert result.supported is False
+    assert "seccomp disabled" in result.detail
 
 
 def test_probe_landlock_net_reports_helper_failure(monkeypatch):
@@ -944,3 +1122,118 @@ def test_invalidated_healthz_reports_a_newly_broken_backend(monkeypatch):
     assert status == 503
     assert payload["ok"] is False
     assert payload["code"] == "helper_failed"
+
+
+def test_stale_reprobe_is_single_flight(monkeypatch):
+    """Concurrent /healthz requests must not each fork their own probe set."""
+    calls = []
+    started = threading.Event()
+    release = threading.Event()
+
+    _install_stable_host(monkeypatch)
+
+    def _slow_probe(*args, **kwargs):
+        calls.append(1)
+        started.set()
+        assert release.wait(5), "probe was never released"
+        return _probe(True)
+
+    monkeypatch.setattr(preflight, "probe_bwrap", _slow_probe)
+    assert preflight.invalidate("tool failure: helper_failed") is True
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(preflight.build_healthz_payload)
+        assert started.wait(5)
+        second = pool.submit(preflight.build_healthz_payload)
+        # Give the second caller time to reach the gate; without single-flight
+        # it would start a probe of its own and bump `calls` to 2.
+        deadline = time.monotonic() + 1.0
+        while len(calls) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        release.set()
+        results = [first.result(10), second.result(10)]
+
+    assert len(calls) == 1
+    assert [status for status, _ in results] == [200, 200]
+    assert all(payload["ok"] is True for _, payload in results)
+
+
+def test_stale_reprobe_waiter_reports_in_progress_instead_of_probing(monkeypatch):
+    """A caller that cannot get the gate must not start a second probe set."""
+    _install_stable_host(monkeypatch)
+    monkeypatch.setattr(
+        preflight,
+        "probe_bwrap",
+        lambda *a, **k: pytest.fail("a waiting caller must not probe"),
+    )
+    monkeypatch.setattr(preflight, "_REPROBE_WAIT_S", 0.01)
+    assert preflight.invalidate("tool failure: helper_failed") is True
+
+    # Hold the single-flight gate as the "probe in flight".
+    assert preflight._STALE_REPROBE_LOCK.acquire(blocking=False) is True
+    try:
+        status, payload = preflight.build_healthz_payload()
+    finally:
+        preflight._STALE_REPROBE_LOCK.release()
+
+    assert status == 503
+    assert "re-probe is still running" in payload["detail"]
+    assert payload["remediation"]
+
+
+def test_warmup_discards_a_verdict_probed_across_an_invalidation(monkeypatch):
+    """A probe that straddles invalidate() must not republish its older verdict."""
+    calls = []
+    started = threading.Event()
+    release = threading.Event()
+
+    _install_stable_host(monkeypatch)
+
+    def _slow_probe(*args, **kwargs):
+        calls.append(1)
+        started.set()
+        assert release.wait(5), "probe was never released"
+        return _probe(True)
+
+    monkeypatch.setattr(preflight, "probe_bwrap", _slow_probe)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(preflight.warmup)
+        assert started.wait(5)
+        assert preflight.invalidate("tool failure: helper_failed") is True
+        release.set()
+        stale_payload = future.result(10)
+
+    # The caller still receives the verdict its probe produced...
+    assert stale_payload["ok"] is True
+    # ...but it is older than the invalidation, so it is not published.
+    assert preflight.cached_status() == {}
+    assert preflight._STATUS_STALE is True
+
+    # The invalidation survives: the next reader re-probes and publishes.
+    monkeypatch.setattr(preflight, "probe_bwrap", lambda *a, **k: _probe(True))
+    status, payload = preflight.build_healthz_payload()
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert preflight.cached_status()["ok"] is True
+    assert len(calls) == 1
+
+
+def test_seccomp_off_warns_once_about_the_udp_gap(monkeypatch, caplog):
+    _install_stable_host(monkeypatch)
+    monkeypatch.setenv("SANDBOX_SECCOMP", "off")
+    monkeypatch.setattr(preflight, "probe_bwrap", lambda *a, **k: _probe(True))
+
+    with caplog.at_level(logging.WARNING, logger=preflight.logger.name):
+        preflight.warmup()
+        preflight.warmup()
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "UDP" in record.getMessage()
+    ]
+    assert len(messages) == 1
+    assert "network: none" in messages[0]
+    assert "bwrap" in messages[0]

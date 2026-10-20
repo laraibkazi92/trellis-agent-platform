@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import sys
+import threading
 import time
 
 import pytest
@@ -617,6 +618,58 @@ def test_sandbox_classified_failure_invalidates_the_cached_verdict(
     assert invalidations == ["tool failure: landlock_unavailable"]
 
 
+def test_net_policy_refusal_does_not_invalidate_the_cached_verdict(
+    monkeypatch, tmp_path
+):
+    """A per-tool policy this kernel cannot express is not a host regression."""
+    from core import sandbox, sandbox_preflight
+
+    install_sandbox(monkeypatch)
+    install_fake_identity(monkeypatch)
+    install_fake_health(monkeypatch)
+    install_fake_subprocess(
+        monkeypatch,
+        [
+            FakeProcess(
+                returncode=65,
+                stderr=(
+                    b"trellis-sandbox: landlock net access control requires "
+                    b"ABI 4 (have 3)"
+                ),
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        sandbox,
+        "classify_failure",
+        lambda *a, **k: sandbox_preflight.ProbeResult(
+            backend="landlock",
+            ok=False,
+            code="landlock_net_unsupported",
+            detail="requires ABI 4",
+            remediation=sandbox_preflight.REMEDIATIONS["landlock_net_unsupported"],
+        ),
+    )
+    monkeypatch.setattr(sandbox, "log_failure_once", lambda result: None)
+    invalidations = []
+    monkeypatch.setattr(
+        sandbox_preflight,
+        "invalidate",
+        lambda reason: invalidations.append(reason) or True,
+    )
+
+    result = asyncio.run(
+        _run_tool_scenario(
+            make_config(network="none"), make_tool_dir(tmp_path), {}
+        )
+    )
+
+    assert result["sandbox"]["code"] == "landlock_net_unsupported"
+    # Re-probing can only reach the same ABI conclusion, so the cached verdict
+    # (and the selected backend) must survive.
+    assert invalidations == []
+
+
 @pytest.mark.parametrize(
     "returncode,stdout,stderr",
     [
@@ -703,6 +756,40 @@ def test_run_tool_net_default_applies_and_explicit_policy_overrides(
         )
     ) == {"ok": True}
     assert "--unshare-net" not in explicit_spawns[0]["cmd"]
+
+
+def test_run_tool_net_config_dict_overrides_the_env_default(monkeypatch, tmp_path):
+    """A config built from a dict must keep `network: allow` explicit.
+
+    `model_fields_set` is the only signal that separates "the operator chose
+    allow" from "pydantic's default", so the dict path must be pinned too:
+    otherwise SANDBOX_NET_DEFAULT=none would silently win over the config.
+    """
+    install_sandbox(monkeypatch)
+    install_fake_identity(monkeypatch)
+    install_fake_health(monkeypatch)
+    monkeypatch.setenv("SANDBOX_NET_DEFAULT", "none")
+
+    config = ToolConfig.model_validate(
+        {
+            "name": "tmpltool",
+            "description": "d",
+            "runtime": "python",
+            "entrypoint": "main.py",
+            "network": "allow",
+        }
+    )
+    assert "network" in config.model_fields_set
+    # The implicit config has no explicit field, so it inherits the env default.
+    assert "network" not in make_config().model_fields_set
+
+    spawns = install_fake_subprocess(
+        monkeypatch, [FakeProcess(returncode=0, stdout=b'{"ok": true}')]
+    )
+    assert asyncio.run(
+        _run_tool_scenario(config, make_tool_dir(tmp_path), {})
+    ) == {"ok": True}
+    assert "--unshare-net" not in spawns[0]["cmd"]
 
 
 def test_run_tool_reports_sandbox_unavailable(monkeypatch, tmp_path):
@@ -889,6 +976,34 @@ def test_run_tool_truncates_stderr_flood(monkeypatch, tmp_path):
         hub.MAX_STDERR_BYTES + len(hub.TRUNCATION_MARKER)
     )
     assert any(event["is_success"] is False for event in health_events)
+
+
+def test_run_tool_prepare_execution_is_offloaded(monkeypatch, tmp_path):
+    """Backend selection can re-probe; it must not run on the event loop."""
+    from core import sandbox
+
+    install_sandbox(monkeypatch)
+    install_fake_identity(monkeypatch)
+    install_fake_health(monkeypatch)
+
+    threads = []
+    real_prepare = sandbox.prepare_execution
+
+    def _prepare(*args, **kwargs):
+        threads.append(threading.current_thread())
+        return real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(sandbox, "prepare_execution", _prepare)
+    install_fake_subprocess(
+        monkeypatch, [FakeProcess(returncode=0, stdout=b'{"ok": true}')]
+    )
+
+    assert asyncio.run(
+        _run_tool_scenario(make_config(), make_tool_dir(tmp_path), {})
+    ) == {"ok": True}
+
+    assert len(threads) == 1
+    assert threads[0] is not threading.main_thread()
 
 
 def test_run_tool_cleanup_is_offloaded(monkeypatch, tmp_path):

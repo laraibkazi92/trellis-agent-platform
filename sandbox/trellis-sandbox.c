@@ -381,12 +381,28 @@ static void print_plan(const struct opts *o, const struct list *ro,
     putchar(',');
     json_list("rw", rw);
     printf(",\"handled_access_fs\":\"0x%llx\",\"scoped\":%d,\"seccomp\":%s,"
-           "\"deny_net\":%s,\"handled_access_net\":\"0x%llx\"}\n",
+           "\"deny_net\":%s,\"handled_access_net\":\"0x%llx\"",
            (unsigned long long)handled_mask(abi),
            abi >= 6 ? (LL_SCOPE_ABSTRACT_UNIX_SOCKET | LL_SCOPE_SIGNAL) : 0,
            o->no_seccomp ? "false" : "true",
            o->deny_net ? "true" : "false",
            (unsigned long long)net);
+    /* A plan consumer must not read "deny_net":true as enforceable: the real run
+     * refuses --deny-net below ABI 4 (exit 65), so say so in the plan too. */
+    fputs(",\"deny_net_error\":", stdout);
+    if (o->deny_net && abi < 4) {
+        char msg[96];
+
+        if (abi <= 0)
+            snprintf(msg, sizeof(msg), "landlock unavailable (ABI 0)");
+        else
+            snprintf(msg, sizeof(msg),
+                     "landlock net access control requires ABI 4 (have %d)", abi);
+        json_str(msg);
+    } else {
+        fputs("null", stdout);
+    }
+    fputs("}\n", stdout);
 }
 
 static void zero_capabilities(void)
@@ -765,6 +781,14 @@ int main(int argc, char **argv)
     abi = landlock_abi();
     if (o.dry_run || o.print_plan) {
         print_plan(&o, &ro, &rw, tmpdir, abi);
+        /* Mirror the real run: --deny-net below ABI 4 is a refusal, not a plan.
+         * Printing first keeps the plan (with deny_net_error) available. */
+        if (o.deny_net && abi < 4) {
+            if (abi <= 0)
+                die(EXIT_LANDLOCK, "landlock unavailable (ABI 0)");
+            die(EXIT_LANDLOCK,
+                "landlock net access control requires ABI 4 (have %d)", abi);
+        }
         return 0;
     }
     if (abi <= 0)

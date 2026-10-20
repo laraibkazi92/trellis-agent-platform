@@ -1,11 +1,15 @@
 # Copyright (C) 2026 Laraib Kazi
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
+
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Optional, Literal, Dict, Any, Union
 from enum import Enum
 
 from core.llm_providers import ALLOWED_PROVIDERS, provider_requires_base_url
+
+logger = logging.getLogger(__name__)
 
 # 15 selectable LLM providers; the registry lives in core/llm_providers.py.
 # `openai-compatible` targets any OpenAI-compatible endpoint via `base_url`.
@@ -241,5 +245,24 @@ class ToolConfig(BaseModel):
     secret_groups: Optional[List[Dict[str, Any]]] = Field(default_factory=list, description="UI hint for /configuration: renders a set of optional_secrets as a single card with a selector (e.g. an environment dropdown) instead of flat rows. Each group: {label, select_label, options: [{value, label, fields: [{key, label, type}]}]}.")
     timeout_seconds: Optional[int] = Field(default=None, description="Per-tool subprocess execution timeout in seconds. Overrides the TOOL_EXECUTION_TIMEOUT env default (300s) when set. Timeouts are immediately fatal (never retried).")
     retry_on_transient: bool = Field(default=True, description="Allow automatic retry (up to 3 attempts) when the tool fails fast with a transient network error. Set false for tools with non-idempotent side effects (creates/updates/writes) so a transient failure surfaces to the caller instead of re-executing.")
-    network: Literal["allow", "none"] = Field(default="allow", description="Network policy for this tool. 'none' gives the tool no network access (bwrap --unshare-net, or Landlock TCP deny on ABI >= 4). Use for tools that never call external APIs.")
+    network: str = Field(default="allow", description="Network policy for this tool: 'allow' or 'none'. 'none' gives the tool no IP network access (bwrap --unshare-net, or Landlock TCP deny on ABI >= 4). Use for tools that never call external APIs.")
     egress: List[str] = Field(default_factory=list, description="External domains this tool may reach when egress mode is enabled. v1 enforcement is the union across all tools; see docs/deploy.md.")
+
+    @field_validator("network")
+    @classmethod
+    def _normalize_network(cls, value: str) -> str:
+        """Normalize the policy; an unknown value warns instead of dropping the tool.
+
+        As a Literal a typo (`network: deny`) raised ValidationError, and
+        ``load_tool_configs`` drops any tool whose config fails to parse. The
+        safer failure is the default policy plus a visible warning.
+        """
+        normalized = str(value).strip().lower()
+        if normalized in {"allow", "none"}:
+            return normalized
+        logger.warning(
+            "Invalid tool network policy %r; falling back to 'allow'. "
+            "Use 'allow' or 'none'.",
+            value,
+        )
+        return "allow"

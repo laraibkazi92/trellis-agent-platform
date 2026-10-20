@@ -123,6 +123,14 @@ def status_line(url, target, port, timeout=8.0):
 
 
 def direct(host, port, timeout=5.0):
+    # Resolution and connection are reported separately: under toolnet the mock's
+    # name does not resolve at all, which is a different (and expected) fact from
+    # "the name resolved but the connect was refused". A single "blocked" verdict
+    # would make a real routing regression indistinguishable from a DNS miss.
+    try:
+        socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        return "unresolved:" + type(exc).__name__
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return "connected"
@@ -135,13 +143,18 @@ if not url:
     print(json.dumps({"error": "no proxy variable in the sandbox environment"}))
 else:
     # The IP literal is rejected by the proxy before resolution, so any address
-    # proves the SSRF guard; prefer the mock's own IP when CI provides it.
+    # proves the SSRF guard; prefer the mock's own IP when CI provides it. The
+    # source is reported so a run on the public fallback is never mistaken for
+    # a run against the mock.
     literal = (os.environ.get("EGRESS_TEST_IP") or "").strip()
+    literal_source = "env"
     if not literal:
         try:
             literal = socket.gethostbyname(ALLOWED)
+            literal_source = "resolved:" + ALLOWED
         except OSError:
             literal = "1.1.1.1"
+            literal_source = "fallback:1.1.1.1"
     report = {
         "proxy_env": name,
         "proxy": url,
@@ -149,6 +162,7 @@ else:
         "allowed": status_line(url, ALLOWED, 443),
         "denied": status_line(url, DENIED, 443),
         "literal_target": literal,
+        "literal_source": literal_source,
         "literal": status_line(url, literal, 443),
         "no_proxy": os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or "",
     }
@@ -721,6 +735,21 @@ print(json.dumps(info))
 
 HUB_PORT = 8001
 
+# AF_INET/SOCK_DGRAM under `network: none`. The Landlock helper's seccomp
+# filter refuses it (UDP is the one egress channel Landlock's TCP-only network
+# scope cannot close); bwrap closes it with a private netns instead, where the
+# socket() call itself still succeeds. Exit 7 on refusal so the caller can tell
+# a denial from a crash.
+UDP_SNIPPET = """
+import socket, sys
+try:
+    socket.socket(socket.AF_INET, socket.SOCK_DGRAM).close()
+except OSError as exc:
+    print("denied:" + type(exc).__name__)
+    sys.exit(7)
+print("allowed")
+"""
+
 
 def _net_flag(backend):
     """The argv switch that enforces ``network: none`` on this backend."""
@@ -732,10 +761,13 @@ def _net_flag(backend):
 def check_net(backend, timeout, port=HUB_PORT):
     """Prove ``network: none`` changes reality, using ``allow`` as control.
 
-    The hub's own ``/healthz`` listener is the target: tools share the hub's
-    network namespace under ``allow``, so a loopback TCP connect must succeed
-    there and fail under ``none`` (bwrap: private netns with no listener;
-    Landlock: EACCES from the handled net rights).
+    Two legs. TCP: the hub's own ``/healthz`` listener is the target, since
+    tools share the hub's network namespace under ``allow``, so a loopback
+    connect must succeed there and fail under ``none`` (bwrap: private netns
+    with no listener; Landlock: EACCES from the handled net rights). UDP:
+    creating an ``AF_INET/SOCK_DGRAM`` socket must fail under ``none`` on the
+    Landlock backend, whose seccomp filter is the only place that rule lives --
+    this check is its CI coverage -- and still succeed under ``allow``.
     """
     errors = []
     cmd = ["bash", "-c", f"exec 3<>/dev/tcp/127.0.0.1/{port}"]
@@ -745,6 +777,13 @@ def check_net(backend, timeout, port=HUB_PORT):
     allowed = run_in_sandbox(cmd, backend, timeout, network="allow")
     _log(f"net: none -> 127.0.0.1:{port}")
     denied = run_in_sandbox(cmd, backend, timeout, network="none")
+
+    udp_cmd = [sys.executable, "-c", UDP_SNIPPET]
+    _log("net: allow -> AF_INET/SOCK_DGRAM (positive control)")
+    udp_allowed = run_in_sandbox(udp_cmd, backend, timeout, network="allow")
+    _log("net: none -> AF_INET/SOCK_DGRAM")
+    udp_denied = run_in_sandbox(udp_cmd, backend, timeout, network="none")
+    udp_denied_expected = backend is sandbox.Backend.LANDLOCK
 
     if flag not in denied.get("argv", []):
         errors.append(f"{flag} missing from the network: none argv: {denied.get('argv')}")
@@ -763,6 +802,25 @@ def check_net(backend, timeout, port=HUB_PORT):
             f"(exit {denied['returncode']}): {_short(_observed(denied))}"
         )
 
+    if udp_allowed["returncode"] != 0:
+        errors.append(
+            "positive control failed: AF_INET/SOCK_DGRAM must be creatable "
+            f"under network: allow: {_short(_observed(udp_allowed))}"
+        )
+    if udp_denied_expected:
+        if udp_denied["returncode"] in (0, None):
+            errors.append(
+                "network: none still created an AF_INET/SOCK_DGRAM socket on the "
+                "Landlock backend; the seccomp UDP rule is gone, so UDP is an "
+                f"open egress channel: {_short(_observed(udp_denied))}"
+            )
+    elif udp_denied["returncode"] != 0:
+        errors.append(
+            "network: none refused AF_INET/SOCK_DGRAM on the bwrap backend, which "
+            "does not install the UDP seccomp rule (UDP is blocked by its private "
+            f"netns instead); the helper or harness changed: {_short(_observed(udp_denied))}"
+        )
+
     return {
         "ok": not errors,
         "backend": backend.value,
@@ -770,6 +828,11 @@ def check_net(backend, timeout, port=HUB_PORT):
         "port": port,
         "allow": _command_entry(allowed),
         "none": _command_entry(denied),
+        "udp": {
+            "expected_none": "denied" if udp_denied_expected else "allowed-no-route",
+            "allow": _command_entry(udp_allowed),
+            "none": _command_entry(udp_denied),
+        },
     }, errors
 
 
@@ -796,6 +859,11 @@ def check_egress(backend, timeout, live_host=None):
     4. ``CONNECT <ip-literal>:443`` returns 403 (the SSRF guard);
     5. ``NO_PROXY`` covers etcd, redis, host, and hub, so framework traffic
        never goes to the proxy.
+
+    The probes run with ``network="allow"`` explicitly: egress mode is about
+    what the proxy permits, so a deployment with ``SANDBOX_NET_DEFAULT=none``
+    must still get past the sandbox net policy here instead of failing with a
+    misleading "no proxy variable" error.
     """
     name, value = _proxy_env()
     if not value:
@@ -811,7 +879,9 @@ def check_egress(backend, timeout, live_host=None):
 
     snippet = EGRESS_SNIPPET.replace("__LIVE_HOST__", json.dumps(live_host or ""))
     _log(f"egress: proxy {display} ({name}); direct + CONNECT probes")
-    result = run_in_sandbox([sys.executable, "-c", snippet], backend, timeout)
+    result = run_in_sandbox(
+        [sys.executable, "-c", snippet], backend, timeout, network="allow"
+    )
 
     info = None
     lines = (result.get("stdout") or "").strip().splitlines()
@@ -837,8 +907,17 @@ def check_egress(backend, timeout, live_host=None):
             "direct TCP to api.egress-allowed.test:443 succeeded inside the "
             "sandbox; the hub still has a route outside toolnet"
         )
-    elif not direct.startswith("blocked:"):
-        errors.append(f"unexpected direct-connect result: {direct!r}")
+    elif not (direct.startswith("unresolved:") or direct.startswith("blocked:")):
+        errors.append(
+            "direct-egress probe could not resolve or connect to "
+            f"api.egress-allowed.test:443 and returned no socket verdict: {direct!r}"
+        )
+
+    literal_source = str(info.get("literal_source") or "?")
+    _log(
+        f"egress: IP-literal target {info.get('literal_target')} "
+        f"(branch: {literal_source})"
+    )
 
     def _status(field, code, description):
         observed = str(info.get(field) or "")
@@ -874,6 +953,7 @@ def check_egress(backend, timeout, live_host=None):
         "allowed": info.get("allowed"),
         "denied": info.get("denied"),
         "literal_target": info.get("literal_target"),
+        "literal_source": info.get("literal_source"),
         "literal": info.get("literal"),
         "no_proxy": info.get("no_proxy"),
         "live_host": live_host,
@@ -987,7 +1067,8 @@ def build_parser():
         "--check-net",
         action="store_true",
         help=(
-            "Assert network: none blocks a loopback TCP connect while "
+            "Assert network: none blocks a loopback TCP connect and, on the "
+            "Landlock backend, AF_INET/SOCK_DGRAM socket creation, while "
             "network: allow reaches the hub's /healthz listener."
         ),
     )

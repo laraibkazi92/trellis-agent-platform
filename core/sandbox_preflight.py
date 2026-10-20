@@ -12,7 +12,9 @@ can enforce a tool's ``network: none`` policy (Landlock ABI 4+).
 
 A classified tool failure calls ``invalidate()``: the cached verdict goes stale
 so the next health check or backend selection re-probes a host whose LSM policy
-may have changed under the running hub. Invalidation is cooldown-bounded.
+may have changed under the running hub. Invalidation is cooldown-bounded, the
+stale re-probe is single-flight (one probe set at a time), and a probe that
+straddles an invalidation is discarded rather than published.
 """
 
 import copy
@@ -22,7 +24,9 @@ import os
 import pwd
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,6 +42,7 @@ CODES: frozenset[str] = frozenset({
     "landlock_unavailable",
     "landlock_setuid_denied",
     "landlock_net_unsupported",
+    "netns_denied",
     "rlimit_denied",
     "ptrace_scope_unrestricted",
     "mount_denied_unknown_lsm",
@@ -109,6 +114,14 @@ REMEDIATIONS: dict[str, str] = {
         "a kernel with Landlock ABI 4+ (Linux 6.7+). Policies left at the "
         "default `allow` are unaffected."
     ),
+    "netns_denied": (
+        "bwrap can build its namespaces but not a network namespace, so tools "
+        "with `network: none` (`--unshare-net`) fail while `allow` tools keep "
+        "working. Permit network namespace creation for the hub (check "
+        "`unshare -n true` inside the container), or switch to "
+        "`SANDBOX_BACKEND=landlock`, which denies TCP with Landlock instead of "
+        "namespaces."
+    ),
     "ptrace_scope_unrestricted": (
         "ptrace is unrestricted. Set `kernel.yama.ptrace_scope=1` (or higher) on "
         "the host to limit process tracing."
@@ -135,6 +148,9 @@ class ProbeResult:
     code: str | None = None
     detail: str = ""
     remediation: str = ""
+    # Extra payload evidence a probe collected (e.g. the bwrap netns probe),
+    # merged into the cached verdict's ``evidence`` map.
+    evidence: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -155,9 +171,21 @@ _LAST_INVALIDATION: float | None = None
 # A persistently failing sandbox would otherwise fork a probe per failed tool
 # call; at most one invalidation (and therefore one re-probe) per window.
 _REPROBE_COOLDOWN_S = 60.0
+# Single-flight for the stale re-probe: a cold cache must not let every
+# concurrent /healthz request fork its own probe set. A caller that loses the
+# race waits this long for the in-flight verdict, then reports not-ready.
+# Kept well under the hub healthcheck timeout (25 s) while the probing caller's
+# own worst case (bwrap + landlock + privilege + net, 5 s each) is ~20 s.
+_REPROBE_WAIT_S = 10.0
+_STALE_REPROBE_LOCK = threading.Lock()
+# Incremented by invalidate(); warmup() publishes only if it is unchanged, so a
+# probe that straddled an invalidation cannot overwrite the newer verdict.
+_GENERATION = 0
 _WARNED_BACKEND = False
 _WARNED_ROOT_UID = False
 _WARNED_IDENTITY = False
+_WARNED_SECCOMP_OFF = False
+_WARNED_NETNS = False
 
 
 def _monotonic() -> float:
@@ -223,12 +251,26 @@ def landlock_abi_version() -> int:
     return version if isinstance(version, int) and version > 0 else 0
 
 
-def classify_bwrap_stderr(stderr: str, evidence: dict | None = None) -> str | None:
-    """Map bwrap stderr to a stable sandbox failure code."""
+def classify_bwrap_stderr(
+    stderr: str, evidence: dict | None = None, *, netns: bool = False
+) -> str | None:
+    """Map bwrap stderr to a stable sandbox failure code.
+
+    ``netns`` marks a probe that already passed the base run and only added
+    ``--unshare-net``: the same "Creating new namespace failed" text then means
+    the network namespace (not the user namespace) was refused.
+    """
     text = (stderr or "").lower()
     evidence = evidence or {}
     apparmor = evidence.get("apparmor") or {}
     profile = str(apparmor.get("profile") or "").lower()
+
+    if netns and (
+        "netns" in text
+        or "network namespace" in text
+        or "creating new namespace failed" in text
+    ):
+        return "netns_denied"
 
     if any(marker in text for marker in (
         "setting up uid map",
@@ -285,6 +327,53 @@ def probe_yama() -> dict:
     }
 
 
+def _run_bwrap(extra_args: list[str], timeout: float):
+    """Run the pinned bwrap argv plus ``extra_args`` around ``/bin/true``."""
+    return subprocess.run(
+        list(BWRAP_BASE_ARGS) + list(extra_args) + ["/bin/true"],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _probe_bwrap_netns(timeout: float) -> dict:
+    """Can this host create the netns a ``network: none`` bwrap tool needs?
+
+    Advisory: ``allow`` tools never pass ``--unshare-net``, so a denied netns
+    must not fail the overall bwrap verdict -- it only breaks the tools whose
+    policy asks for no network.
+    """
+    try:
+        proc = _run_bwrap(["--unshare-net"], timeout)
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "code": "netns_denied",
+            "detail": _truncate(f"--unshare-net probe timed out after {timeout}s"),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "code": "netns_denied",
+            "detail": _truncate(f"--unshare-net probe failed to start: {exc}"),
+        }
+
+    if proc.returncode == 0:
+        return {"ok": True, "code": None, "detail": ""}
+
+    detail = (
+        _as_text(proc.stderr)
+        or _as_text(proc.stdout)
+        or f"bwrap --unshare-net exited with code {proc.returncode}"
+    ).strip()
+    code = (
+        classify_bwrap_stderr(detail, read_lsm_evidence(), netns=True)
+        or "netns_denied"
+    )
+    return {"ok": False, "code": code, "detail": _truncate(detail)}
+
+
 def probe_bwrap(timeout: float = 5.0) -> ProbeResult:
     """Run a minimal bwrap invocation to verify the backend works."""
     if shutil.which("bwrap") is None:
@@ -297,12 +386,7 @@ def probe_bwrap(timeout: float = 5.0) -> ProbeResult:
         )
 
     try:
-        proc = subprocess.run(
-            list(BWRAP_BASE_ARGS) + ["/bin/true"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        proc = _run_bwrap([], timeout)
     except subprocess.TimeoutExpired as exc:
         return ProbeResult(
             backend="bwrap",
@@ -323,7 +407,14 @@ def probe_bwrap(timeout: float = 5.0) -> ProbeResult:
     stderr = _as_text(proc.stderr)
     stdout = _as_text(proc.stdout)
     if proc.returncode == 0:
-        return ProbeResult(backend="bwrap", ok=True)
+        # The base run proves namespaces work; a host that still refuses a
+        # network namespace would only fail `network: none` tools later, with a
+        # misleading diagnosis, so probe that property here too.
+        return ProbeResult(
+            backend="bwrap",
+            ok=True,
+            evidence={"bwrap_netns": _probe_bwrap_netns(timeout)},
+        )
 
     code = classify_bwrap_stderr(stderr, read_lsm_evidence()) or "unknown"
     detail = (stderr or stdout or f"bwrap exited with code {proc.returncode}").strip()
@@ -355,6 +446,20 @@ def _probe_detail(proc) -> str:
         or _as_text(proc.stdout)
         or f"sandbox helper exited with code {proc.returncode}"
     ).strip()
+
+
+def _helper_refused(text: str) -> bool:
+    """True when the helper itself diagnosed a failure rather than the tool.
+
+    The helper prefixes its fatal messages with ``trellis-sandbox:`` but also
+    emits benign ``trellis-sandbox: warning: ...`` lines on successful runs, so
+    only non-warning lines count as a refusal.
+    """
+    return any(
+        line.startswith("trellis-sandbox:")
+        and not line.startswith("trellis-sandbox: warning:")
+        for line in (text or "").lower().splitlines()
+    )
 
 
 def _classify_helper_result(backend: str, proc) -> ProbeResult:
@@ -594,10 +699,21 @@ def probe_privilege_drop(
     return _run_helper("privilege", helper, ["--ro", "/"], timeout)
 
 
+_NET_PROBE_CODE = (
+    "import socket\n"
+    "socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+)
+
+
 def probe_landlock_net(
     helper: str | None = None, timeout: float = 5.0
 ) -> NetProbeResult:
-    """Check whether the helper can deny TCP with ``--deny-net``.
+    """Check whether the helper can deny UDP/raw as well as TCP under ``--deny-net``.
+
+    Probes the property instead of accepting the flag: Landlock covers TCP only,
+    so a ``--deny-net`` run must refuse a UDP socket with EACCES via the seccomp
+    rule. Accepting the flag but creating the socket still means "deny" is not
+    enforced (``SANDBOX_SECCOMP=off``, or a filter that was never installed).
 
     Advisory only: the default policy is ``allow``, so an unsupported kernel
     must not fail the preflight. Deliberately not routed through
@@ -634,7 +750,7 @@ def probe_landlock_net(
         ["--ro", "/"],
         tmpdir,
         extra_args=["--deny-net"],
-        command=["/bin/true"],
+        command=[sys.executable, "-c", _NET_PROBE_CODE],
     )
     try:
         proc = subprocess.run(
@@ -660,11 +776,20 @@ def probe_landlock_net(
         shutil.rmtree(tmpdir, ignore_errors=True)
 
     if proc.returncode == 0:
-        return NetProbeResult(
-            supported=True, detail=f"--deny-net accepted (ABI {abi})", abi=abi
-        )
+        if seccomp_disabled():
+            cause = "seccomp disabled: --deny-net denies TCP only, UDP still permitted"
+        else:
+            cause = "--deny-net accepted but UDP still permitted"
+        return NetProbeResult(supported=False, detail=cause, abi=abi)
+
+    detail = _probe_detail(proc)
+    if _helper_refused(detail):
+        # The helper refused to start; that says nothing about the net policy.
+        return NetProbeResult(supported=False, detail=_truncate(detail), abi=abi)
     return NetProbeResult(
-        supported=False, detail=_truncate(_probe_detail(proc)), abi=abi
+        supported=True,
+        detail=f"--deny-net refused the UDP socket (ABI {abi})",
+        abi=abi,
     )
 
 
@@ -833,6 +958,24 @@ def _ptrace_failure(requested: str, checks: dict, base: dict | None = None) -> d
     )
 
 
+def _attach_bwrap_evidence(base: dict, result: ProbeResult) -> None:
+    """Merge a bwrap probe's extra evidence (the netns probe) into the payload."""
+    global _WARNED_NETNS
+    netns = (result.evidence or {}).get("bwrap_netns")
+    if netns is None:
+        return
+    base.setdefault("evidence", {})["bwrap_netns"] = netns
+    if not netns.get("ok"):
+        base.setdefault("warnings", []).append("netns_denied")
+        if not _WARNED_NETNS:
+            _WARNED_NETNS = True
+            logger.warning(
+                "bwrap cannot create a network namespace, so tools with "
+                "`network: none` will fail. %s",
+                REMEDIATIONS["netns_denied"],
+            )
+
+
 def _attach_net_evidence(base: dict) -> None:
     """Add the network-policy probe to a payload, advisory only.
 
@@ -849,7 +992,10 @@ def _attach_net_evidence(base: dict) -> None:
         "detail": net.detail,
         "abi": net.abi,
     }
-    if not net.supported:
+    # Only the ABI gate gets the remediation-bearing warning: with ABI 4+ the
+    # TCP policy is enforceable, and an unenforced UDP path (seccomp off, or a
+    # filter that did not install) is already reported in the detail above.
+    if not net.supported and net.abi < 4:
         base.setdefault("warnings", []).append("landlock_net_unsupported")
 
 
@@ -861,6 +1007,7 @@ def _run_probes(requested: str) -> dict:
     if requested == "bwrap":
         result = _safe_probe("bwrap", probe_bwrap)
         checks["bwrap"] = _check(result)
+        _attach_bwrap_evidence(base, result)
         if result.ok:
             return {**base, "ok": True, "backend": "bwrap", "checks": checks}
         return _failure_payload(
@@ -885,6 +1032,7 @@ def _run_probes(requested: str) -> dict:
     # auto: prefer bwrap (zero behavior change), fall back to Landlock.
     bwrap = _safe_probe("bwrap", probe_bwrap)
     checks["bwrap"] = _check(bwrap)
+    _attach_bwrap_evidence(base, bwrap)
     if bwrap.ok:
         return {**base, "ok": True, "backend": "bwrap", "checks": checks}
 
@@ -912,14 +1060,32 @@ def _run_probes(requested: str) -> dict:
     )
 
 
+def _warn_if_seccomp_off() -> None:
+    """Warn once that `network: none` loses its UDP/raw denial when seccomp is off."""
+    global _WARNED_SECCOMP_OFF
+    if _WARNED_SECCOMP_OFF or not seccomp_disabled():
+        return
+    _WARNED_SECCOMP_OFF = True
+    logger.warning(
+        "SANDBOX_SECCOMP=off: under the Landlock backend a `network: none` tool "
+        "now has TCP connect/bind denied only -- UDP and raw IP sockets stay "
+        "usable, so such a tool can still reach the network. Use "
+        "SANDBOX_BACKEND=bwrap (`--unshare-net`) for tools that must have no "
+        "network at all."
+    )
+
+
 def warmup(requested: str | None = None) -> dict:
     """Probe the configured backend once and cache the result.
 
     ``requested`` overrides ``SANDBOX_BACKEND`` when given. Never raises: a
     probe failure is reported in the payload so chat-only agents keep working.
+    A verdict is published only if no ``invalidate()`` landed while it probed.
     """
     global _STATUS_CACHE, _STATUS_STALE
     selected = _normalize_requested(requested)
+    generation = _GENERATION
+    _warn_if_seccomp_off()
     try:
         payload = _run_probes(selected)
     except Exception as exc:
@@ -941,8 +1107,17 @@ def warmup(requested: str | None = None) -> dict:
             payload["landlock_abi"],
         )
 
-    _STATUS_CACHE = payload
-    _STATUS_STALE = False
+    if generation == _GENERATION:
+        _STATUS_CACHE = payload
+        _STATUS_STALE = False
+    else:
+        # invalidate() ran while these probes were in flight: its verdict is
+        # newer than anything this probe set could observe, so keep the cache
+        # stale instead of overwriting it with an older observation.
+        logger.info(
+            "Discarding sandbox verdict probed across an invalidation; "
+            "re-probing on next use."
+        )
     return copy.deepcopy(payload)
 
 
@@ -962,7 +1137,7 @@ def invalidate(reason: str) -> bool:
     re-probes at most once per window instead of forking a probe per failed tool
     call. Returns whether this call actually invalidated the cache.
     """
-    global _STATUS_CACHE, _STATUS_STALE, _LAST_INVALIDATION
+    global _STATUS_CACHE, _STATUS_STALE, _LAST_INVALIDATION, _GENERATION
 
     now = _monotonic()
     if (
@@ -972,6 +1147,7 @@ def invalidate(reason: str) -> bool:
         return False
 
     _LAST_INVALIDATION = now
+    _GENERATION += 1
     _STATUS_STALE = True
     _STATUS_CACHE = {}
     logger.info(
@@ -981,18 +1157,53 @@ def invalidate(reason: str) -> bool:
     return True
 
 
+def _reprobe_stale() -> dict:
+    """Re-probe a stale verdict, one probe set at a time.
+
+    Concurrent ``/healthz`` requests must not each fork their own probe set
+    (up to four helper processes apiece, 5 s each). The first caller probes;
+    the others wait briefly for that verdict and otherwise get ``{}`` so the
+    caller reports not-ready rather than stacking probes.
+    """
+    if not _STALE_REPROBE_LOCK.acquire(blocking=False):
+        # Another thread owns the probe in flight; its published verdict (if it
+        # publishes one) is what these callers should serve.
+        if _STALE_REPROBE_LOCK.acquire(timeout=_REPROBE_WAIT_S):
+            _STALE_REPROBE_LOCK.release()
+        return cached_status()
+
+    try:
+        # A probe may have published between the staleness check and here.
+        payload = cached_status()
+        if payload:
+            return payload
+        return warmup()
+    finally:
+        _STALE_REPROBE_LOCK.release()
+
+
 def build_healthz_payload() -> tuple[int, dict]:
     """Return (200, payload) when ready, else (503, payload).
 
     Cheap in steady state: the probe result is cached by ``warmup()``. A cold
     process (startup, before warmup) reports not-ready instead of probing on the
     request path. An *invalidated* cache is different -- the verdict is known to
-    be stale, so it is re-probed here (the invalidation cooldown bounds how often
-    that can happen) rather than reporting a verdict nobody trusts.
+    be stale, so it is re-probed here (single-flight, and the invalidation
+    cooldown bounds how often that can happen) rather than reporting a verdict
+    nobody trusts.
     """
     payload = cached_status()
     if not payload and _STATUS_STALE:
-        payload = warmup()
+        payload = _reprobe_stale()
+        if not payload:
+            # The probe set is still running in another request. Say so: a bare
+            # timeout would leave the healthcheck with no diagnosis at all.
+            payload = _failure_payload(
+                _requested_backend(),
+                "unknown",
+                "Sandbox preflight re-probe is still running in another request; "
+                f"the verdict was not ready within {_REPROBE_WAIT_S:.0f}s.",
+            )
     if not payload:
         payload = _failure_payload(
             _requested_backend(), "unknown", "Sandbox preflight has not run."
@@ -1001,11 +1212,15 @@ def build_healthz_payload() -> tuple[int, dict]:
 
 
 def reset_for_tests() -> None:
-    global _STATUS_CACHE, _STATUS_STALE, _LAST_INVALIDATION
+    global _STATUS_CACHE, _STATUS_STALE, _LAST_INVALIDATION, _GENERATION
     global _WARNED_BACKEND, _WARNED_ROOT_UID, _WARNED_IDENTITY
+    global _WARNED_SECCOMP_OFF, _WARNED_NETNS
     _STATUS_CACHE = {}
     _STATUS_STALE = False
     _LAST_INVALIDATION = None
+    _GENERATION = 0
     _WARNED_BACKEND = False
     _WARNED_ROOT_UID = False
     _WARNED_IDENTITY = False
+    _WARNED_SECCOMP_OFF = False
+    _WARNED_NETNS = False

@@ -16,7 +16,12 @@
 #     call the hub (host, gateway, taskiq-worker) to `toolnet` as well;
 #   * adds `egress-proxy`, the only container on both networks, running
 #     scripts/egress_proxy.py with an allowlist generated from tool.yaml;
-#   * points the hub -- and therefore every tool it spawns -- at that proxy.
+#   * points the hub -- and therefore every tool it spawns -- at that proxy;
+#   * forwards every documented EGRESS_* knob below, so setting one in .env
+#     actually reaches the proxy instead of silently doing nothing;
+#   * gates the hub on the proxy's healthcheck, so a dead proxy (bad ACL, bind
+#     failure) fails `docker compose up --wait` instead of leaving the stack
+#     "up" with no egress path.
 #
 # CAVEAT: a committed override file is NOT picked up automatically. Any later
 # plain `docker compose up -d` silently drops the override and puts the hub back
@@ -34,11 +39,19 @@ services:
     # The one service that must lose the default network.
     networks: !override
       - toolnet
+    # Merged into the hub's existing depends_on map (etcd, db-sync): the hub
+    # must not start -- and `docker compose up --wait` must not report success
+    # -- while the proxy is dead or its ACL failed to generate.
+    depends_on:
+      egress-proxy:
+        condition: service_healthy
     environment:
-      HTTP_PROXY: http://egress-proxy:3128
-      HTTPS_PROXY: http://egress-proxy:3128
-      http_proxy: http://egress-proxy:3128
-      https_proxy: http://egress-proxy:3128
+      # Every URL uses EGRESS_LISTEN_PORT, the same knob the proxy binds and its
+      # healthcheck probes. Change the port in one place only.
+      HTTP_PROXY: http://egress-proxy:${EGRESS_LISTEN_PORT:-3128}
+      HTTPS_PROXY: http://egress-proxy:${EGRESS_LISTEN_PORT:-3128}
+      http_proxy: http://egress-proxy:${EGRESS_LISTEN_PORT:-3128}
+      https_proxy: http://egress-proxy:${EGRESS_LISTEN_PORT:-3128}
       # Load-bearing: tools call the framework API at http://host:8000 and the
       # hub talks to etcd. Without this, those calls would be sent to the proxy.
       NO_PROXY: etcd,redis,host,hub,gateway,taskiq-worker,localhost,127.0.0.1,::1
@@ -97,7 +110,20 @@ services:
           --out "$${EGRESS_ALLOWLIST_FILE}" &&
         exec python scripts/egress_proxy.py
     environment:
-      EGRESS_ALLOWLIST_FILE: /run/egress/allowlist
+      # Path inside the tmpfs below; the generator writes here and the proxy
+      # reads it (the command expands $${EGRESS_ALLOWLIST_FILE}). Override only
+      # if you also give the container a writable mount at the new path.
+      EGRESS_ALLOWLIST_FILE: ${EGRESS_ALLOWLIST_FILE:-/run/egress/allowlist}
+      # Every documented EGRESS_* knob is forwarded here. Without these lines
+      # compose would hand the proxy only the allowlist path, and an operator
+      # setting them in .env would silently change nothing.
+      EGRESS_LISTEN_PORT: ${EGRESS_LISTEN_PORT:-3128}
+      EGRESS_PORTS: ${EGRESS_PORTS:-443}
+      EGRESS_ALLOW_PRIVATE_DESTINATIONS: ${EGRESS_ALLOW_PRIVATE_DESTINATIONS:-false}
+      EGRESS_CONNECT_TIMEOUT: ${EGRESS_CONNECT_TIMEOUT:-10}
+      EGRESS_IDLE_TIMEOUT: ${EGRESS_IDLE_TIMEOUT:-60}
+      EGRESS_MAX_TUNNEL_S: ${EGRESS_MAX_TUNNEL_S:-600}
+      EGRESS_MAX_CONNECTIONS: ${EGRESS_MAX_CONNECTIONS:-64}
     volumes:
       - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace:ro
     tmpfs:
@@ -111,18 +137,27 @@ services:
       - toolnet
       - default
     healthcheck:
+      # TCP connect to the listener it actually bound (EGRESS_LISTEN_PORT), so
+      # a proxy that crashed, exited on a bad ACL, or never bound is unhealthy
+      # rather than merely "started".
       test:
         - CMD-SHELL
-        - python -c "import socket; socket.create_connection(('127.0.0.1', 3128), 2).close()"
+        - python -c "import socket; socket.create_connection(('127.0.0.1', ${EGRESS_LISTEN_PORT:-3128}), 2).close()"
       interval: 10s
       timeout: 5s
       retries: 3
       start_period: 10s
-    restart: unless-stopped
+    # An ACL/config error exits 2 and would otherwise crash-loop forever. Three
+    # attempts, then Docker leaves the container down; with the hub's
+    # depends_on: service_healthy and this healthcheck, `docker compose
+    # up --wait` then fails instead of reporting a healthy stack with no egress
+    # path. Restarting is still worth it for a transient port bind race.
+    restart: "on-failure:3"
 
 networks:
-  # `internal: true` removes the default route from this network. DNS is not an
-  # exfiltration channel: the embedded resolver forwards from inside each
-  # container's network namespace, which has no route out.
+  # `internal: true` removes the default route from this network. TCP and UDP
+  # therefore cannot leave, but DNS is a residual channel: the embedded resolver
+  # forwards external lookups from the host stack (query names can carry data).
+  # See the egress section of docs/deploy.md.
   toolnet:
     internal: true

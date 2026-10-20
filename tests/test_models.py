@@ -1,8 +1,7 @@
 # Copyright (C) 2026 Laraib Kazi
 # SPDX-License-Identifier: Apache-2.0
 
-import pytest
-from pydantic import ValidationError
+import logging
 
 from core.models import ToolConfig, MCPConfig, is_routable_agent_type
 
@@ -44,9 +43,19 @@ def test_tool_config_network_accepts_none():
     assert config.network == "none"
 
 
-def test_tool_config_network_rejects_invalid_values():
-    with pytest.raises(ValidationError):
-        ToolConfig(**_tool_kwargs(network="deny"))
+def test_tool_config_network_normalizes_case_and_whitespace():
+    assert ToolConfig(**_tool_kwargs(network="  NONE ")).network == "none"
+
+
+def test_tool_config_network_typo_keeps_the_tool(caplog):
+    """A typo must not raise: load_tool_configs drops any config that fails."""
+    with caplog.at_level(logging.WARNING, logger="core.models"):
+        config = ToolConfig(**_tool_kwargs(network="deny"))
+
+    assert config.network == "allow"
+    assert config.name == "opsctl"
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("deny" in message and "allow" in message for message in warnings)
 
 
 def test_tool_config_egress_defaults_to_empty():

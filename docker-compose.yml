@@ -110,12 +110,15 @@ services:
     init: true
     command: python core/hub.py
     restart: unless-stopped
-    # /healthz is cached from the startup probes (no per-request bwrap fork) and
-    # returns 503 when the sandbox cannot execute tools.
+    # /healthz serves the verdict cached by the startup probes (no per-request
+    # bwrap fork) and returns 503 when the sandbox cannot execute tools. After a
+    # classified tool failure the cache is re-probed once (single-flight, one
+    # probe set of up to ~20 s), so the timeout must outlast that probe: a slow
+    # host then answers 503 *with* a diagnosis instead of a bare curl timeout.
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8001/healthz > /dev/null"]
-      interval: 15s
-      timeout: 5s
+      interval: 30s
+      timeout: 25s
       retries: 3
       # Go tools are pre-compiled before uvicorn binds; a cold rebuild can take a
       # while. Do not report a slow-but-healthy hub as a sandbox failure.

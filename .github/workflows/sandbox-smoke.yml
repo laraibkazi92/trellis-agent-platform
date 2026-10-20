@@ -48,8 +48,6 @@ on:
       - "tests/test_egress*.py"
       - "deploy/apparmor/**"
       - ".github/workflows/sandbox-smoke.yml"
-      - "docs/deploy.md"
-      - "docs/tools.md"
   pull_request:
     paths:
       - "core/sandbox*"
@@ -66,8 +64,6 @@ on:
       - "tests/test_egress*.py"
       - "deploy/apparmor/**"
       - ".github/workflows/sandbox-smoke.yml"
-      - "docs/deploy.md"
-      - "docs/tools.md"
 
 permissions:
   contents: read
@@ -79,6 +75,10 @@ concurrency:
 jobs:
   smoke:
     name: ${{ matrix.leg }}
+    # The nightly run exists for AppArmor/kernel drift; the two-leg matrix is
+    # covered by every push and dispatch, so skip it on the schedule to save
+    # runner minutes.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -206,6 +206,7 @@ jobs:
             --tool text_stats \
             --check-confinement \
             --check-privilege \
+            --check-net \
             --check-seccomp
 
       - name: Run the sandbox smoke harness (auto-selected Landlock)
@@ -216,6 +217,7 @@ jobs:
             --tool text_stats \
             --check-confinement \
             --check-privilege \
+            --check-net \
             --check-seccomp
 
       - name: Set up uv (for the native helper tests on the runner)
@@ -334,6 +336,12 @@ jobs:
           docker compose logs egress-proxy || true
           exit 1
 
+      - name: Validate the declared egress domains
+        # Fails on a malformed `egress:` entry instead of discovering it when the
+        # proxy crash-loops in a deployment. Runs inside the image (PyYAML is a
+        # runtime dependency there); the fixture tool above declares one domain.
+        run: docker compose exec -T egress-proxy python scripts/generate_egress_acl.py --check --workspace /app/workspace
+
       - name: Wait for /healthz to answer
         run: |
           : > healthz.json
@@ -397,7 +405,7 @@ jobs:
           egress_ip=$(docker inspect egress-mock --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
           echo "mock IP: $egress_ip"
           docker compose exec -T -e EGRESS_TEST_IP="$egress_ip" hub \
-            python scripts/sandbox_smoke.py --backend auto --check-egress
+            python scripts/sandbox_smoke.py --backend auto --check-net --check-egress
 
       - name: Dump logs on failure
         if: failure()
@@ -441,6 +449,12 @@ jobs:
           docker compose version
           docker info --format '{{json .SecurityOptions}}' || true
 
+      - name: Assert the runner enforces the unprivileged-userns restriction
+        # This job exists to prove the profile lifts Ubuntu's userns restriction.
+        # If the runner default changes, fail loudly instead of silently no
+        # longer exercising that path.
+        run: test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = "1"
+
       - name: Load deploy/apparmor/trellis-hub on the runner kernel
         # The profile is loaded into the HOST kernel (AppArmor is global, not
         # namespaced), the same way an operator would install it. A privileged
@@ -475,12 +489,12 @@ jobs:
                 mount -t securityfs none /sys/kernel/security
               fi
               apparmor_parser --version
-              # -r: replace (idempotent). Include resolution for <abi/3.0> and
+              # -r: replace (idempotent). Include resolution for <abi/4.0> and
               # <abstractions/base> comes from the package's /etc/apparmor.d.
-              # -N: load without the policy cache; writing /var/cache/apparmor
+              # -K: load without the policy cache; writing /var/cache/apparmor
               # is refused in this container (the cache is a host-level
               # optimization and irrelevant for a one-shot load).
-              apparmor_parser -r -N /profiles/trellis-hub
+              apparmor_parser -r -K /profiles/trellis-hub
               aa-status
               cat /sys/kernel/security/apparmor/profiles
               grep -E "^trellis-hub \(enforce\)" /sys/kernel/security/apparmor/profiles
@@ -513,8 +527,8 @@ jobs:
           label=$(docker compose exec -T hub cat /proc/self/attr/current)
           echo "hub AppArmor label: $label"
           case "$label" in
-            *trellis-hub*) ;;
-            *) echo "hub is not confined by trellis-hub" >&2; exit 1 ;;
+            *"trellis-hub (enforce)"*) ;;
+            *) echo "hub is not confined by trellis-hub in enforce mode: $label" >&2; exit 1 ;;
           esac
 
       - name: Wait for /healthz to answer
@@ -559,6 +573,7 @@ jobs:
             --tool text_stats \
             --check-confinement \
             --check-privilege \
+            --check-net \
             --check-seccomp
 
       - name: Force the Landlock fallback under the same profile
@@ -612,6 +627,7 @@ jobs:
             --tool text_stats \
             --check-confinement \
             --check-privilege \
+            --check-net \
             --check-seccomp
 
       - name: Dump AppArmor denials and container logs on failure

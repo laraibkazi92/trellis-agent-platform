@@ -22,6 +22,12 @@ leading ``*.`` is accepted on load and normalized away so a hand-written file
 behaves the same. Blank lines and ``#`` comments are ignored. A missing or empty
 file denies everything (fail closed, never allow-all).
 
+A hand-edited line that is not a valid DNS suffix -- a bare top-level domain
+(``com``, which would match every ``.com``), a leading dot (``.example.com``,
+which never matches), a scheme/path/port, an IP literal, or an illegal label --
+is skipped and logged as ``event=allowlist-invalid-entry``. Skipping is the fail
+-closed direction: the entry grants nothing and the proxy still starts.
+
 Decision matrix (one log line per request)
 ------------------------------------------
 =========================  ======  ==========================================
@@ -31,19 +37,22 @@ Request                    Status  Reason
 method is not CONNECT      405     ``method``
 malformed / bad host       400     ``malformed``
 request head > 8 KiB       413     ``request-too-large``
+head not finished in time  408     ``head-timeout``
 port not in EGRESS_PORTS   403     ``port-not-allowed``
 host not in the allowlist  403     ``not-allowlisted``
 IP-literal target          403     ``ip-literal``
 DNS failure                403     ``resolve-error``
-private/reserved address   403     ``private-destination``
+non-public address         403     ``private-destination``
 all upstream connects fail 502     ``connect-failed``
 EGRESS_MAX_CONNECTIONS hit 503     ``too-many-connections``
 =========================  ======  ==========================================
 
 IP literals are always rejected, before resolution: that is the SSRF guard and
-mirrors Squid's ``dstdomain`` semantics. Any resolved address that is private,
-loopback, link-local, reserved, unspecified, or multicast is also rejected
-unless ``EGRESS_ALLOW_PRIVATE_DESTINATIONS=true`` (CI mock and on-prem APIs).
+mirrors Squid's ``dstdomain`` semantics. Any resolved address that is not
+globally routable -- private, loopback, link-local, reserved, unspecified,
+multicast, or carrier-grade NAT (RFC 6598 ``100.64.0.0/10``, which Python's
+``is_private`` does *not* report) -- is also rejected unless
+``EGRESS_ALLOW_PRIVATE_DESTINATIONS=true`` (CI mock and on-prem APIs).
 
 Not implemented on purpose: TLS termination, MITM, caching, forwarding CONNECT
 to another proxy, per-tool authentication (v2).
@@ -81,6 +90,12 @@ from typing import Callable, Iterable, Sequence
 MAX_REQUEST_HEAD = 8192
 CHUNK = 65536
 DEFAULT_LISTEN_PORT = 3128
+# Absolute budget for a client to finish its request head. Per-recv timeouts
+# alone let a client that dribbles one byte per idle_timeout pin a slot (and a
+# thread) forever; this is measured with time.monotonic() from the first byte.
+HEAD_DEADLINE_SECONDS = 10.0
+MAX_ALLOWLIST_ENTRY = 253
+_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 # CONNECT is the only accepted method. The host may not contain a colon (that
 # would be a port or an IPv6 literal); IPv6 literals are matched separately so
@@ -125,7 +140,12 @@ def host_allowed(host: str, allowlist: Iterable[str]) -> bool:
 
 
 def load_allowlist(path: str | os.PathLike) -> frozenset[str]:
-    """Read the allowlist file; a missing or unreadable file is an empty list."""
+    """Read the allowlist file; a missing or unreadable file is an empty list.
+
+    Invalid lines are skipped (fail closed) and logged individually, so a typo
+    in a hand-edited file denies a host instead of silently allowing a whole
+    top-level domain or blocking the proxy from starting.
+    """
     try:
         text = Path(path).read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -139,24 +159,82 @@ def load_allowlist(path: str | os.PathLike) -> frozenset[str]:
         return frozenset()
 
     entries: set[str] = set()
-    for raw in text.splitlines():
-        line = raw.split("#", 1)[0].strip().lower()
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.split("#", 1)[0].strip()
         if not line:
             continue
-        if line.startswith("*."):
-            line = line[2:]
-        line = normalize_host(line)
-        if line:
-            entries.add(line)
+        entry = parse_allowlist_entry(line)
+        if entry is None:
+            log_line(
+                f"event=allowlist-invalid-entry path={path} line={number} "
+                f"entry={_log_value(line)} decision=skip"
+            )
+            continue
+        entries.add(entry)
     return frozenset(entries)
 
 
+def parse_allowlist_entry(raw: str) -> str | None:
+    """Return the canonical suffix for one allowlist line, or None if invalid.
+
+    Canonical form is a plain lowercase suffix with at least two labels: a bare
+    top-level domain (``com``) is rejected because it would match every host
+    under it, and a leading dot (``.example.com``) is rejected because it can
+    never match a normalized host.
+    """
+    value = raw.split("#", 1)[0].strip().lower()
+    if not value:
+        return None
+    if value.startswith("*."):
+        value = value[2:]
+    if value.startswith(".") or "*" in value:
+        return None
+    value = normalize_host(value)
+    if (
+        not value
+        or value.startswith(".")
+        or len(value) > MAX_ALLOWLIST_ENTRY
+        or "://" in value
+        or any(character in value for character in "/:")
+        or any(character.isspace() for character in value)
+    ):
+        return None
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        pass
+    else:
+        return None
+    labels = value.split(".")
+    if len(labels) < 2:
+        return None
+    if not all(_LABEL_RE.match(label) for label in labels):
+        return None
+    return value
+
+
+def _log_value(value: str, limit: int = 80) -> str:
+    """Sanitize a file line for the audit log (no control chars/newlines)."""
+    return re.sub(r"[^A-Za-z0-9._*:/-]", "?", value)[:limit] or "-"
+
+
 def _blocked_address(address: str) -> bool:
+    """True unless ``address`` is globally routable unicast.
+
+    ``not is_global`` is the load-bearing check: on Python 3.12 ``is_private``
+    is False for ``100.64.0.0/10`` (RFC 6598 carrier-grade NAT, which Tailscale
+    and some clouds hand out), so the named attributes alone would let a CGNAT
+    destination through. The explicit attributes stay because they state the
+    intent and cover the ranges where Python versions disagree; anything they
+    miss is still caught by ``is_global``.
+    """
     try:
         ip = ipaddress.ip_address(address)
     except ValueError:
         return True
-    return any(getattr(ip, attribute) for attribute in _BLOCKED_ATTRIBUTES)
+    if any(getattr(ip, attribute) for attribute in _BLOCKED_ATTRIBUTES):
+        return True
+    return not ip.is_global
 
 
 def system_resolve(host: str, port: int) -> list[str]:
@@ -258,8 +336,10 @@ class EgressProxyServer(socketserver.ThreadingTCPServer):
     """Thread-per-connection CONNECT proxy.
 
     ``config`` is swapped atomically on SIGHUP; each request reads it once. The
-    connection cap is a bounded semaphore taken before the request is parsed, so
-    a flood of idle sockets cannot exhaust threads before it is enforced.
+    connection cap is a bounded semaphore taken in ``process_request`` -- in the
+    accept loop, *before* a thread is spawned -- so a flood of idle sockets
+    cannot create unbounded threads. Over-cap connections get a ``503`` on the
+    accepted socket and are closed without a thread.
     """
 
     allow_reuse_address = True
@@ -280,31 +360,75 @@ class EgressProxyServer(socketserver.ThreadingTCPServer):
         except ValueError:
             pass
 
+    # -- connection admission --------------------------------------------
+
+    def process_request(self, request, client_address) -> None:
+        """Admit the connection before handing it to a thread.
+
+        The cap must bound *threads*, not just parsed requests: acquiring the
+        slot inside the handler thread would still spawn one thread per idle
+        socket. A rejected connection never acquires a slot, so it must not
+        release one either -- ``handle`` owns the release for admitted ones.
+        """
+        if not self.acquire_slot():
+            _reject_connection(self, request, client_address, "too-many-connections")
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            # Thread creation failed: the handler will never run its finally.
+            self.release_slot()
+            raise
+
     def reload(self, allowlist: frozenset[str]) -> None:
         self.config = replace(self.config, allowlist=allowlist)
 
 
+def _reject_connection(server, request, client_address, reason: str) -> None:
+    """Answer ``503`` on an accepted socket and close it, without a thread."""
+    client = f"{client_address[0]}:{client_address[1]}"
+    body = b"503 Service Unavailable\n"
+    try:
+        # The response is tiny (fits in the socket buffer), but a timeout keeps
+        # the accept loop from ever parking on a peer that stopped reading.
+        request.settimeout(1.0)
+        request.sendall(
+            b"HTTP/1.1 503 Service Unavailable\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"Connection: close\r\n\r\n" + body
+        )
+    except OSError:
+        pass
+    finally:
+        # shutdown_request flushes the FIN, then closes -- the same teardown a
+        # handled connection gets.
+        server.shutdown_request(request)
+    server.config.log(
+        f"client={client} method=- host=- port=- decision=deny reason={reason}"
+    )
+
+
 class _Handler(socketserver.BaseRequestHandler):
-    """One CONNECT request per connection; the socket becomes the tunnel."""
+    """One CONNECT request per connection; the socket becomes the tunnel.
+
+    The connection slot was already taken by ``EgressProxyServer.
+    process_request`` before this thread existed, so ``handle`` only has to
+    release it -- on every exit path, including a mid-tunnel error.
+    """
 
     def handle(self) -> None:
         server = self.server
-        assert isinstance(server, EgressProxyServer)
-        client = f"{self.client_address[0]}:{self.client_address[1]}"
-        if not server.acquire_slot():
-            self._respond(503, "Service Unavailable", client, "CONNECT", "-", "-",
-                          "too-many-connections")
-            return
+        client = _client(self)
         try:
-            # A client that never finishes its request head must not hold a
-            # thread forever; the cap alone would still pin all 64 slots.
-            self.request.settimeout(server.config.idle_timeout)
+            assert isinstance(server, EgressProxyServer), server
             self._handle_connect(client)
         except (ConnectionError, OSError):
-            # Client or upstream disappeared mid-tunnel, or the read timed out.
+            # Client or upstream disappeared mid-tunnel, or a recv timed out.
             pass
         finally:
-            server.release_slot()
+            if isinstance(server, EgressProxyServer):
+                server.release_slot()
 
     # -- request handling -------------------------------------------------
 
@@ -398,15 +522,33 @@ class _Handler(socketserver.BaseRequestHandler):
         Returns ``(head, leftover)``. Headers are discarded -- only the request
         line is used -- and any bytes that arrived after the blank line are
         forwarded to the upstream once the tunnel is established.
+
+        The read is bounded by an absolute ``min(idle_timeout, 10s)`` deadline
+        from the first byte, not by a per-recv timeout: otherwise a client that
+        dribbles one byte per idle_timeout keeps a slot (and a thread) forever.
+        A head that misses the deadline gets ``408`` and the socket is closed.
         """
+        config = self.server.config
+        deadline = time.monotonic() + min(config.idle_timeout, HEAD_DEADLINE_SECONDS)
         buffer = b""
         while b"\r\n\r\n" not in buffer:
             if len(buffer) > MAX_REQUEST_HEAD:
                 self._respond(413, "Payload Too Large", _client(self), "-", "-", "-",
                               "request-too-large")
                 return None, b""
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._respond(408, "Request Timeout", _client(self), "-", "-", "-",
+                              "head-timeout")
+                return None, b""
             try:
+                self.request.settimeout(remaining)
                 chunk = self.request.recv(1024)
+            except TimeoutError:
+                # Per-recv timeout: the remaining deadline elapsed mid-read.
+                self._respond(408, "Request Timeout", _client(self), "-", "-", "-",
+                              "head-timeout")
+                return None, b""
             except OSError:
                 return None, b""
             if not chunk:

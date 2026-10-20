@@ -341,8 +341,15 @@ async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[
             if "network" in getattr(config, "model_fields_set", ())
             else None
         )
-        plan = sandbox.prepare_execution(
-            cmd, tool_dir, env=env, network=explicit_net
+        # Backend selection can re-probe on a stale cache (up to the probe
+        # budget); keep that off the event loop so concurrent tool I/O is not
+        # stalled behind a sandbox probe. The plan is plain data.
+        plan = await asyncio.to_thread(
+            sandbox.prepare_execution,
+            cmd,
+            tool_dir,
+            env=env,
+            network=explicit_net,
         )
         try:
             process = await asyncio.create_subprocess_exec(
@@ -395,8 +402,13 @@ async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[
             if failure:
                 sandbox.log_failure_once(failure)
                 # The cached verdict no longer matches reality; let the next
-                # selection and /healthz re-probe (cooldown-bounded).
-                sandbox.invalidate_after_failure(failure.code)
+                # selection and /healthz re-probe (cooldown-bounded). A
+                # `landlock_net_unsupported` refusal is a per-tool policy this
+                # kernel cannot express, not a host-sandbox regression: the
+                # re-probe could only reach the same ABI conclusion, so do not
+                # spend it.
+                if failure.code != "landlock_net_unsupported":
+                    sandbox.invalidate_after_failure(failure.code)
                 error_msg = (
                     f"Tool failed inside the {plan.backend.value} sandbox "
                     f"({failure.code}): {failure.detail}"
