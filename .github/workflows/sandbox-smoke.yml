@@ -1,10 +1,20 @@
 # Copyright (C) 2026 Laraib Kazi
 # SPDX-License-Identifier: Apache-2.0
 #
-# Phase 4 regression test: prove the Landlock fallback works on a host where
-# Docker's stock AppArmor profile is enforcing ("docker-default" denies mount).
-# bwrap cannot mount there, so the hub must select Landlock and every sandbox
-# check must pass. This runs only the smoke harness — not the unit suite.
+# Sandbox backend matrix: prove BOTH backends on a real CI host.
+#
+#   bwrap    - the default backend. docker-compose.yml ships `apparmor=unconfined`
+#              for the hub, which is what lets bwrap perform its bind/proc/tmpfs
+#              mounts under Ubuntu's enforcing docker-default AppArmor profile.
+#              This leg leaves that line untouched and asserts `auto` selects bwrap.
+#   landlock - the fallback (Phase 4 regression test). It strips
+#              `apparmor=unconfined` so docker-default stays enforced (it denies
+#              mount), which is what a hardened runner/org policy looks like; the
+#              hub must select Landlock and every sandbox check must pass.
+#
+# Both legs also run the native helper suite (tests/test_sandbox_native.py), which
+# previously never ran in CI. Like before, this exercises the smoke harness and the
+# native suite only — not the unit suite (that is ci.yml's job).
 
 name: Sandbox smoke
 
@@ -17,11 +27,13 @@ on:
       - "sandbox/**"
       - "Dockerfile"
       - "docker-compose.yml"
+      - "docker-compose.ci-apparmor.yml"
       - "scripts/sandbox_smoke.py"
       - "tests/test_sandbox*.py"
       - "deploy/apparmor/**"
       - ".github/workflows/sandbox-smoke.yml"
       - "docs/deploy.md"
+      - "docs/tools.md"
   pull_request:
     paths:
       - "core/sandbox*"
@@ -29,11 +41,13 @@ on:
       - "sandbox/**"
       - "Dockerfile"
       - "docker-compose.yml"
+      - "docker-compose.ci-apparmor.yml"
       - "scripts/sandbox_smoke.py"
       - "tests/test_sandbox*.py"
       - "deploy/apparmor/**"
       - ".github/workflows/sandbox-smoke.yml"
       - "docs/deploy.md"
+      - "docs/tools.md"
 
 permissions:
   contents: read
@@ -43,22 +57,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  landlock:
-    name: Landlock under AppArmor (ubuntu-24.04)
+  smoke:
+    name: ${{ matrix.leg }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      # Both legs are independent proofs: a bwrap failure must not hide the
+      # fallback's verdict (and vice versa).
+      fail-fast: false
+      matrix:
+        include:
+          - backend: bwrap
+            leg: bwrap (ubuntu-24.04)
+          - backend: landlock
+            leg: landlock fallback (ubuntu-24.04)
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
 
       - name: Record host sandbox evidence
         run: |
+          echo "leg: ${{ matrix.backend }}"
           echo "kernel: $(uname -r)"
           echo "apparmor enabled: $(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || echo absent)"
+          echo "apparmor userns restriction: $(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"
           echo "yama ptrace_scope: $(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo absent)"
           docker info --format '{{json .SecurityOptions}}' || true
 
       - name: Drop apparmor=unconfined so docker-default stays enforced
+        # Landlock leg only: this is the hardened-host simulation that must force
+        # the fallback. The bwrap leg deliberately keeps the line — without it,
+        # docker-default denies mount and bwrap cannot run at all.
+        if: matrix.backend == 'landlock'
         run: sed -i '/apparmor=unconfined/d' docker-compose.yml
 
       - name: Seed the .env the compose file expects
@@ -81,7 +111,7 @@ jobs:
       - name: Build and start the stack (auto backend)
         run: docker compose up -d --build
 
-      - name: Wait for /healthz and assert auto fell back to Landlock
+      - name: Wait for /healthz to answer
         run: |
           : > healthz.json
           for attempt in $(seq 1 60); do
@@ -98,6 +128,34 @@ jobs:
           fi
           cat healthz.json
           echo
+
+      - name: Assert auto selected bwrap
+        # The default deployment path: SANDBOX_BACKEND=auto and AppArmor
+        # unconfined for the hub => bwrap must win without any fallback probing.
+        #
+        # Known risk: Ubuntu 24.04 sets kernel.apparmor_restrict_unprivileged_userns,
+        # so an unconfined *container* is what permits bwrap's --unshare-user.
+        # If this leg fails with a userns EPERM (code "userns_restriction"), pin
+        # ONLY this leg to ubuntu-22.04 and say why here — do not weaken the check.
+        if: matrix.backend == 'bwrap'
+        run: |
+          python3 - <<'PY'
+          import json
+          p = json.load(open("healthz.json"))
+          print(json.dumps(p, indent=2, sort_keys=True))
+          checks = p.get("checks") or {}
+          assert p.get("requested") == "auto", p
+          assert p.get("backend") == "bwrap", p
+          assert p.get("ok") is True, p
+          assert (checks.get("bwrap") or {}).get("ok") is True, p
+          # `auto` short-circuits on a working bwrap: the fallback is never probed.
+          assert checks.get("landlock") is None, p
+          print("bwrap selected; landlock not probed (checks.landlock is null)")
+          PY
+
+      - name: Assert auto fell back to Landlock
+        if: matrix.backend == 'landlock'
+        run: |
           python3 - <<'PY'
           import json
           p = json.load(open("healthz.json"))
@@ -109,7 +167,8 @@ jobs:
           print("bwrap failure code:", (p.get("checks") or {}).get("bwrap", {}).get("code"))
           PY
 
-      - name: Run the sandbox smoke harness (auto-selected Landlock)
+      - name: Run the sandbox smoke harness (bwrap)
+        if: matrix.backend == 'bwrap'
         run: |
           docker compose exec -T hub python scripts/sandbox_smoke.py \
             --backend auto \
@@ -117,6 +176,43 @@ jobs:
             --check-confinement \
             --check-privilege \
             --check-seccomp
+
+      - name: Run the sandbox smoke harness (auto-selected Landlock)
+        if: matrix.backend == 'landlock'
+        run: |
+          docker compose exec -T hub python scripts/sandbox_smoke.py \
+            --backend auto \
+            --tool text_stats \
+            --check-confinement \
+            --check-privilege \
+            --check-seccomp
+
+      - name: Set up uv (for the native helper tests on the runner)
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run the native sandbox helper tests
+        # Native suite for sandbox/trellis-sandbox.c, skipped by ci.yml (it needs a
+        # built helper plus a Landlock kernel) — so it is exercised here instead.
+        #
+        # It runs on the RUNNER, not in the hub image: the image installs
+        # requirements.txt only (no pytest), so `docker compose exec hub pytest`
+        # would fail. The helper is a static binary, so copying it out of the
+        # container and running it against the runner kernel (6.8+, Landlock) is
+        # exactly the environment the suite targets. The root-only test self-skips;
+        # the rest must pass unprivileged.
+        run: |
+          docker compose cp hub:/usr/local/bin/trellis-sandbox ./trellis-sandbox
+          chmod +x ./trellis-sandbox
+          uv run --no-project --with-requirements requirements-dev.txt \
+            python -m pytest tests/test_sandbox_native.py -q \
+            --timeout=120 --timeout-method=thread
+        env:
+          # `python -m pytest` (not bare `pytest`) puts the repo root on sys.path so
+          # the suite can import core.sandbox_preflight.
+          TRELLIS_SANDBOX_INTEGRATION: "1"
+          SANDBOX_HELPER: ${{ github.workspace }}/trellis-sandbox
 
       - name: Dump logs on failure
         if: failure()
