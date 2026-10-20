@@ -180,6 +180,9 @@ except Exception as e:
                                   #   clients via the Gateway's search_tools/use_tool (no agent hop).
   network: allow                  # Optional. allow (default) or none. "none" gives the tool no
                                   #   network at all, loopback included.
+  egress:                         # Optional. Domains this tool reaches when egress mode is on.
+    - api.example.com             #   Plain lowercase DNS suffix: covers the name and *.api.example.com.
+    - "*.vendor.example"          #   A leading '*.' is accepted and normalized to a plain suffix.
   optional_secrets:               # Optional. Injected when present; never required for the tool to run.
     - MY_OPTIONAL_TOKEN
 ```
@@ -202,6 +205,16 @@ variables:
 **`optional_secrets` / `secret_groups`**: `optional_secrets` are injected when the caller has stored them but never count against configuration readiness. `secret_groups` is a UI hint that renders a set of optional secrets as a single card with a selector (e.g. an environment dropdown) on the configuration page; each group is `{label, select_label, options: [{value, label, fields: [{key, label, type}]}]}`.
 
 **`network`**: Set `none` for every tool that does not call an external API — it is the cheapest exfiltration control, since a compromised tool then has nowhere to send the workspace or its injected secrets. `none` also blocks loopback, so a tool that must reach the framework API itself needs `allow`. Under the Landlock backend the policy requires kernel Landlock ABI 4+ (Linux 6.7+); bwrap always supports it with `--unshare-net`. In both backends `none` also refuses UDP and raw IP sockets (the Landlock helper blocks them with a seccomp rule), so the tool has no IP network at all; AF_UNIX sockets still work. Deployments can flip the default for all tools with `SANDBOX_NET_DEFAULT=none`.
+
+**`egress`**: The domains a tool needs when the operator has enabled [egress mode](deploy.md#egress-mode-opt-in). It is a list of plain DNS suffixes — `example.com` covers `example.com` and every `*.example.com` — and the proxy is the only way out. A leading `*.` is accepted and normalized to the same plain suffix, so `"*.example.com"` and `example.com` are the same entry.
+
+Three things to know before using it:
+
+- **v1 is a union.** The proxy generates one allowlist from every tool's `egress:` list, so any tool can reach any declared domain. The field still matters: it is the auditable declaration of what your deployment needs, and per-tool enforcement can build on it later. Keep it as narrow as the vendor's API allows.
+- **Enforcement is opt-in at the deployment level.** Without the compose override nothing reads `egress:` and tools keep their normal outbound access. With it, a domain that is missing from the union is simply unreachable (`ENETUNREACH` or `403`).
+- **Some clients ignore the proxy env.** Python `requests`/`httpx` honour `HTTPS_PROXY`; Node's built-in `fetch`/`undici` do not, and fail closed because there is no direct route. Go tools are compiled in the hub and honour the proxy during that build, so add `proxy.golang.org` (and any module host) to a tool's `egress:` list when it imports third-party packages.
+
+The allowlist is regenerated when the proxy container starts, so after editing `egress:` run `docker compose restart egress-proxy` (or rebuild). Tools that need no network should still use `network: none`: it is stronger than egress mode because there is no route even to the proxy.
 
 ---
 

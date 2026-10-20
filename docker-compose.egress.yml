@@ -1,0 +1,128 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+#
+# Egress mode for the tool hub (opt-in). DO NOT auto-load this file: it is not
+# docker-compose.override.yml, so a plain `docker compose up -d` is unchanged.
+#
+# Enable it by putting this in .env (or the shell):
+#
+#     COMPOSE_FILE=docker-compose.yml:docker-compose.egress.yml
+#
+# WHAT IT DOES
+#   * adds `toolnet`, an `internal: true` network with no external route;
+#   * moves the hub to `toolnet` ONLY, so tools (which share the hub's netns)
+#     have no route off the host except the proxy;
+#   * attaches etcd/redis (already listening on 0.0.0.0) and the services that
+#     call the hub (host, gateway, taskiq-worker) to `toolnet` as well;
+#   * adds `egress-proxy`, the only container on both networks, running
+#     scripts/egress_proxy.py with an allowlist generated from tool.yaml;
+#   * points the hub -- and therefore every tool it spawns -- at that proxy.
+#
+# CAVEAT: a committed override file is NOT picked up automatically. Any later
+# plain `docker compose up -d` silently drops the override and puts the hub back
+# on the default network with unrestricted egress. Keep COMPOSE_FILE in .env, or
+# pass -f docker-compose.yml -f docker-compose.egress.yml every time.
+#
+# `!override` requires Compose 2.24.4+. Compose merges `networks` by key, so
+# declaring `networks: [toolnet]` without it would leave `default` attached and
+# the hub would keep its route to the internet.
+#
+# The proxy needs a writable directory for the generated allowlist; /run/egress
+# is a small tmpfs because the container runs as TRELLIS_UID, not root.
+services:
+  hub:
+    # The one service that must lose the default network.
+    networks: !override
+      - toolnet
+    environment:
+      HTTP_PROXY: http://egress-proxy:3128
+      HTTPS_PROXY: http://egress-proxy:3128
+      http_proxy: http://egress-proxy:3128
+      https_proxy: http://egress-proxy:3128
+      # Load-bearing: tools call the framework API at http://host:8000 and the
+      # hub talks to etcd. Without this, those calls would be sent to the proxy.
+      NO_PROXY: etcd,redis,host,hub,gateway,taskiq-worker,localhost,127.0.0.1,::1
+      no_proxy: etcd,redis,host,hub,gateway,taskiq-worker,localhost,127.0.0.1,::1
+
+  # Everything below already reaches the hub by service name; it needs toolnet
+  # because the hub is no longer on the default network.
+  host:
+    networks:
+      - default
+      - toolnet
+
+  gateway:
+    networks:
+      - default
+      - toolnet
+
+  taskiq-worker:
+    networks:
+      - default
+      - toolnet
+
+  # etcd/redis listen on 0.0.0.0 already. Keep default for ui/nginx/db-sync and
+  # add toolnet so the hub (and its tools) can reach them. This is why egress
+  # mode does not isolate tools from etcd/redis -- see docs/deploy.md.
+  etcd:
+    networks:
+      - default
+      - toolnet
+
+  redis:
+    networks:
+      - default
+      - toolnet
+
+  egress-proxy:
+    build:
+      context: .
+      args:
+        PUID: ${TRELLIS_UID:-1000}
+        PGID: ${TRELLIS_GID:-1000}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.2.1}
+    container_name: egress-proxy
+    user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
+    init: true
+    # Generate the allowlist from the read-only workspace, then become the
+    # proxy. Generation is fail-closed: an invalid `egress:` entry stops the
+    # container (and therefore denies all egress) instead of guessing.
+    command:
+      - bash
+      - -c
+      - |
+        # `$$` is compose's escape for a literal `$`; bash expands the container env.
+        python scripts/generate_egress_acl.py \
+          --workspace /app/workspace \
+          --out "$${EGRESS_ALLOWLIST_FILE}" &&
+        exec python scripts/egress_proxy.py
+    environment:
+      EGRESS_ALLOWLIST_FILE: /run/egress/allowlist
+    volumes:
+      - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace:ro
+    tmpfs:
+      - /run/egress:mode=1777,size=1m
+    cap_drop: [ALL]
+    security_opt:
+      - "no-new-privileges:true"
+    pids_limit: 256
+    # No published ports: only toolnet (and default, for outbound internet).
+    networks:
+      - toolnet
+      - default
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import socket; socket.create_connection(('127.0.0.1', 3128), 2).close()"
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+networks:
+  # `internal: true` removes the default route from this network. DNS is not an
+  # exfiltration channel: the embedded resolver forwards from inside each
+  # container's network namespace, which has no route out.
+  toolnet:
+    internal: true

@@ -49,6 +49,16 @@ def test_tool_config_network_rejects_invalid_values():
         ToolConfig(**_tool_kwargs(network="deny"))
 
 
+def test_tool_config_egress_defaults_to_empty():
+    config = ToolConfig(**_tool_kwargs())
+    assert config.egress == []
+
+
+def test_tool_config_egress_accepts_a_list():
+    config = ToolConfig(**_tool_kwargs(egress=["api.example.com", "*.vendor.test"]))
+    assert config.egress == ["api.example.com", "*.vendor.test"]
+
+
 def test_mcp_config_public_defaults():
     config = MCPConfig(name="example-mcp")
     assert config.public is False

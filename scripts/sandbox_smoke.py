@@ -10,11 +10,12 @@ harness exercises the same argv/env the hub uses for real tools, then reports
 one JSON object on stdout for diffing between backends.
 
 The default run (no check flags) is ``--runtime-matrix`` plus the security
-checks (confinement, privilege, seccomp); ``--check-net`` and ``--tool`` are only
-exercised when named. Tools run without an identity, so prefer read-only tools
-in smoke runs.
+checks (confinement, privilege, seccomp); ``--check-net``, ``--check-egress``
+and ``--tool`` are only exercised when named. Tools run without an identity, so
+prefer read-only tools in smoke runs.
 Exit codes are 0 for a fully green run, 1 for any failed check, and 2 when the
-environment itself is not usable (no backend, no ``/app/workspace``).
+environment itself is not usable (no backend, no ``/app/workspace``, or
+``--check-egress`` without the egress override active).
 """
 
 import argparse
@@ -28,6 +29,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 if str(BASE_DIR) not in sys.path:
@@ -75,6 +77,85 @@ with open(target, "w", encoding="utf-8") as handle:
     handle.write("ok")
 info["written"] = os.path.exists(target)
 print(json.dumps(info))
+"""
+
+# Egress-mode probes, run inside the sandbox. They only use sockets, so they
+# exercise the same path a tool would: the environment (HTTP_PROXY/NO_PROXY)
+# plus the network reachable from the hub's namespace.
+EGRESS_SNIPPET = r"""
+import json, os, socket
+from urllib.parse import urlsplit
+
+LIVE_HOST = __LIVE_HOST__
+ALLOWED = "api.egress-allowed.test"
+DENIED = "api.egress-denied.test"
+
+
+def proxy_url():
+    for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return name, value
+    return None, ""
+
+
+def proxy_address(url):
+    parts = urlsplit(url)
+    return parts.hostname, parts.port or 3128
+
+
+def status_line(url, target, port, timeout=8.0):
+    try:
+        with socket.create_connection(proxy_address(url), timeout=timeout) as sock:
+            request = "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n\r\n".format(
+                target, port, target, port
+            )
+            sock.sendall(request.encode())
+            buffer = b""
+            while b"\r\n" not in buffer:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    break
+                buffer += chunk
+    except OSError as exc:
+        return "error:" + type(exc).__name__
+    return buffer.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+
+
+def direct(host, port, timeout=5.0):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return "connected"
+    except OSError as exc:
+        return "blocked:" + type(exc).__name__
+
+
+name, url = proxy_url()
+if not url:
+    print(json.dumps({"error": "no proxy variable in the sandbox environment"}))
+else:
+    # The IP literal is rejected by the proxy before resolution, so any address
+    # proves the SSRF guard; prefer the mock's own IP when CI provides it.
+    literal = (os.environ.get("EGRESS_TEST_IP") or "").strip()
+    if not literal:
+        try:
+            literal = socket.gethostbyname(ALLOWED)
+        except OSError:
+            literal = "1.1.1.1"
+    report = {
+        "proxy_env": name,
+        "proxy": url,
+        "direct": direct(ALLOWED, 443),
+        "allowed": status_line(url, ALLOWED, 443),
+        "denied": status_line(url, DENIED, 443),
+        "literal_target": literal,
+        "literal": status_line(url, literal, 443),
+        "no_proxy": os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or "",
+    }
+    if LIVE_HOST:
+        report["live_allowed"] = status_line(url, LIVE_HOST, 443)
+        report["live_denied"] = status_line(url, "example.org", 443)
+    print(json.dumps(report))
 """
 
 
@@ -692,6 +773,115 @@ def check_net(backend, timeout, port=HUB_PORT):
     }, errors
 
 
+NO_PROXY_REQUIRED = ("etcd", "redis", "host", "hub")
+
+
+def _proxy_env():
+    for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return name, value
+    return None, None
+
+
+def check_egress(backend, timeout, live_host=None):
+    """Prove the egress override: no direct route, CONNECT allowlist, IP guard.
+
+    Five facts, all from inside the sandbox:
+
+    1. a direct TCP connection to the mock's name fails (topology, not env);
+    2. ``CONNECT api.egress-allowed.test:443`` through the proxy returns 200;
+    3. ``CONNECT api.egress-denied.test:443`` returns 403 -- same IP, different
+       name, so the difference isolates the ACL from reachability;
+    4. ``CONNECT <ip-literal>:443`` returns 403 (the SSRF guard);
+    5. ``NO_PROXY`` covers etcd, redis, host, and hub, so framework traffic
+       never goes to the proxy.
+    """
+    name, value = _proxy_env()
+    if not value:
+        error = (
+            "egress mode is not enabled: HTTP_PROXY/HTTPS_PROXY is unset. "
+            "Start the stack with COMPOSE_FILE=docker-compose.yml:"
+            "docker-compose.egress.yml (see docs/deploy.md)."
+        )
+        return {"ok": False, "error": error}, [error]
+
+    parts = urlsplit(value)
+    display = f"{parts.scheme}://{parts.hostname or '?'}:{parts.port or 3128}"
+
+    snippet = EGRESS_SNIPPET.replace("__LIVE_HOST__", json.dumps(live_host or ""))
+    _log(f"egress: proxy {display} ({name}); direct + CONNECT probes")
+    result = run_in_sandbox([sys.executable, "-c", snippet], backend, timeout)
+
+    info = None
+    lines = (result.get("stdout") or "").strip().splitlines()
+    if lines:
+        try:
+            info = json.loads(lines[-1])
+        except ValueError:
+            info = None
+
+    errors = []
+    if result.get("returncode") != 0:
+        errors.append(f"egress probe failed: {_short(_observed(result))}")
+    if not isinstance(info, dict):
+        errors.append(f"egress probe produced no JSON: {_short(_observed(result))}")
+        return {"ok": False, "error": "no JSON from the egress probe"}, errors
+    if info.get("error"):
+        errors.append(f"egress probe: {info['error']}")
+        return {"ok": False, "error": info["error"]}, errors
+
+    direct = str(info.get("direct") or "")
+    if direct == "connected":
+        errors.append(
+            "direct TCP to api.egress-allowed.test:443 succeeded inside the "
+            "sandbox; the hub still has a route outside toolnet"
+        )
+    elif not direct.startswith("blocked:"):
+        errors.append(f"unexpected direct-connect result: {direct!r}")
+
+    def _status(field, code, description):
+        observed = str(info.get(field) or "")
+        if not observed.startswith(f"HTTP/1.1 {code}"):
+            errors.append(
+                f"{description}: expected HTTP/1.1 {code}, got {observed!r}"
+            )
+
+    _status("allowed", 200, "CONNECT to the allowlisted mock")
+    _status("denied", 403, "CONNECT to the non-allowlisted alias")
+    _status("literal", 403, "CONNECT to an IP literal")
+    if live_host:
+        _status("live_allowed", 200, f"CONNECT to the live host {live_host}")
+        _status("live_denied", 403, "CONNECT to example.org")
+
+    tokens = {
+        token.strip().lower()
+        for token in str(info.get("no_proxy") or "").split(",")
+        if token.strip()
+    }
+    missing = [token for token in NO_PROXY_REQUIRED if token not in tokens]
+    if missing:
+        errors.append(
+            "NO_PROXY does not cover " + ", ".join(missing) + f": {sorted(tokens)}"
+        )
+
+    return {
+        "ok": not errors,
+        "backend": backend.value,
+        "proxy_env": info.get("proxy_env"),
+        "proxy": display,
+        "direct": direct,
+        "allowed": info.get("allowed"),
+        "denied": info.get("denied"),
+        "literal_target": info.get("literal_target"),
+        "literal": info.get("literal"),
+        "no_proxy": info.get("no_proxy"),
+        "live_host": live_host,
+        "live_allowed": info.get("live_allowed"),
+        "live_denied": info.get("live_denied"),
+    }, errors
+
+
 def check_tools(names):
     """Execute registered hub tools through ``hub.run_tool`` (same path as MCP)."""
     errors = []
@@ -802,6 +992,23 @@ def build_parser():
         ),
     )
     parser.add_argument(
+        "--check-egress",
+        action="store_true",
+        help=(
+            "Assert egress mode: no direct route from the sandbox, proxy CONNECT "
+            "allowed/denied/IP-literal verdicts, and NO_PROXY coverage."
+        ),
+    )
+    parser.add_argument(
+        "--egress-live",
+        default=None,
+        metavar="HOST",
+        help=(
+            "With --check-egress, additionally expect CONNECT to this real host "
+            "to return 200 and example.org to return 403 (live deployment)."
+        ),
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=120.0,
@@ -818,6 +1025,7 @@ def _print_report(report):
 def main(argv=None):
     args = build_parser().parse_args(argv)
     timeout = max(1.0, args.timeout)
+    egress_enabled = args.check_egress or bool(args.egress_live)
 
     os.environ["SANDBOX_BACKEND"] = args.backend
     sandbox.reset_for_tests()
@@ -831,6 +1039,7 @@ def main(argv=None):
             "privilege": None,
             "seccomp": None,
             "net": None,
+            "egress": None,
             "tools": None,
         },
         "ok": False,
@@ -872,12 +1081,26 @@ def main(argv=None):
         _print_report(report)
         return 2
 
+    if egress_enabled:
+        proxy_name, proxy_value = _proxy_env()
+        if not proxy_value:
+            report["errors"].append(
+                "egress mode is not enabled: neither HTTP_PROXY nor HTTPS_PROXY is "
+                "set in the environment. Start the stack with "
+                "COMPOSE_FILE=docker-compose.yml:docker-compose.egress.yml "
+                "(see docs/deploy.md)."
+            )
+            _log(report["errors"][-1])
+            _print_report(report)
+            return 2
+
     run_default = not (
         args.runtime_matrix
         or args.check_confinement
         or args.check_privilege
         or args.check_seccomp
         or args.check_net
+        or egress_enabled
         or args.tool
     )
     runners = {
@@ -886,6 +1109,7 @@ def main(argv=None):
         "privilege": lambda: check_privilege(selected, timeout),
         "seccomp": lambda: check_seccomp(selected, timeout),
         "net": lambda: check_net(selected, timeout),
+        "egress": lambda: check_egress(selected, timeout, args.egress_live),
     }
     if args.runtime_matrix or run_default:
         _run_check(report, "runtime_matrix", runners["runtime_matrix"])
@@ -897,6 +1121,8 @@ def main(argv=None):
         _run_check(report, "seccomp", runners["seccomp"])
     if args.check_net:
         _run_check(report, "net", runners["net"])
+    if egress_enabled:
+        _run_check(report, "egress", runners["egress"])
     if args.tool:
         _run_check(report, "tools", lambda: check_tools(args.tool))
 

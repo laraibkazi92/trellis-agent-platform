@@ -291,6 +291,7 @@ sudo apparmor_parser -r /etc/apparmor.d/trellis-hub
 | Job | Proves |
 | --- | --- |
 | `smoke` (`bwrap` + `landlock` matrix legs) | The default path (`auto → bwrap`) works with `apparmor=unconfined`; the fallback works when the container is confined by `docker-default`; the native helper suite passes. |
+| `egress` (egress changes, dispatch, PR) | The opt-in egress override removes the hub's default network, the CONNECT proxy allows an allowlisted name and denies a sibling name and an IP literal, and `NO_PROXY` covers the framework services. |
 | `apparmor` (sandbox changes, `workflow_dispatch`, nightly) | The shipped `deploy/apparmor/trellis-hub` profile loads and confines the hub (`apparmor=trellis-hub`, label asserted at runtime) with no `apparmor=unconfined`, and both bwrap and the forced Landlock fallback pass the full smoke harness. |
 
 ### Sandbox settings and rollback
@@ -331,7 +332,103 @@ The base hub already runs as `${TRELLIS_UID}` with `cap_drop: [ALL]` and an empt
 
 One caveat: `docker compose up --wait` fails when `/healthz` returns 503 — that is the intended signal, not a broken deploy. `host` depends on `hub` with `condition: service_started`, not `service_healthy`, so chat-only agents still start.
 
-## Verifying the deployment
+## Egress mode (opt-in)
+
+By default the hub — and therefore every tool it spawns — has the same unrestricted outbound access as any other container on `trellis-network`. Egress mode removes that: the hub gets a route to **one** CONNECT proxy and nothing else, and that proxy only connects to domains some tool declared in its `tool.yaml`. LLM providers are unaffected: those calls are made by `host`, which keeps its default-network route.
+
+### Enable and disable
+
+Egress mode is a compose override, and a committed override file is **not** auto-loaded. Enable it in `.env`:
+
+```bash
+COMPOSE_FILE=docker-compose.yml:docker-compose.egress.yml
+```
+
+or pass the files explicitly:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.egress.yml up -d
+```
+
+> **The override is not sticky.** Any later plain `docker compose up -d` (with `COMPOSE_FILE` no longer set) silently drops it and puts the hub back on `trellis-network` with full outbound access. Keep `COMPOSE_FILE` in `.env` for as long as you want egress mode, and check `docker inspect tool-hub --format '{{json .NetworkSettings.Networks}}'` after every deploy.
+
+What the override adds:
+
+- `toolnet`, an `internal: true` network with no default route;
+- the hub on `toolnet` **only** (`networks: !override`; Compose otherwise merges and keeps `default`);
+- `host`, `gateway`, `taskiq-worker`, `etcd`, and `redis` on both networks — they still need to reach the hub, or be reached by it, by service name;
+- `egress-proxy`, the only container on both `toolnet` and `default`, running `scripts/egress_proxy.py`;
+- `HTTP_PROXY`/`HTTPS_PROXY` (and lowercase forms) plus `NO_PROXY` on the hub, which tools inherit.
+
+`NO_PROXY` is load-bearing: tools call the framework API at `FRAMEWORK_API_URL=http://host:8000`, and the hub talks to etcd. Those names must bypass the proxy, which is why the override lists `etcd,redis,host,hub,gateway,taskiq-worker,localhost,127.0.0.1,::1`.
+
+### The allowlist
+
+Each tool entry may declare the external domains it needs:
+
+```yaml
+- name: issues_fetch
+  runtime: python
+  entrypoint: fetch_issues.py
+  egress:
+    - api.example.com
+    - "*.vendor.example"
+```
+
+The proxy container generates its allowlist at startup from the **union** of every `workspace/tools/**/tool.yaml`:
+
+```bash
+python scripts/generate_egress_acl.py                 # union on stdout
+python scripts/generate_egress_acl.py --out FILE      # write it
+python scripts/generate_egress_acl.py --check         # CI: validate only
+```
+
+Entries are stored as plain lowercase DNS suffixes; `example.com` covers the name itself and every `*.example.com`. Wildcards are accepted as input and normalized, parents are dropped (`api.example.com` disappears once `example.com` is present), and an invalid entry is fatal — the proxy container does not start, which fails closed. An empty union writes an empty file and prints a warning; the proxy then denies everything. There is no allow-all mode.
+
+Restart the proxy after editing tool manifests: `docker compose restart egress-proxy`. A tool that needs a new domain is a content change plus that restart, not a rebuild.
+
+### Guarantees
+
+- **No direct route.** The hub is attached only to `toolnet` (`internal: true`), so a tool cannot open a TCP connection to the internet. `sandbox_smoke.py --check-egress` asserts this from inside the sandbox.
+- **CONNECT allowlist.** The proxy accepts only `CONNECT host:port`; the port must be in `EGRESS_PORTS` (default `443`) and the host must match the generated suffix list. Anything else is `405`/`403`.
+- **No IP literals, no private destinations.** A CONNECT to `1.2.3.4:443` is rejected before any lookup. Every resolved address is checked, and if any is private, loopback, link-local, reserved, unspecified, or multicast the tunnel is refused. Set `EGRESS_ALLOW_PRIVATE_DESTINATIONS=true` only for a CI mock or an on-prem API that genuinely lives on a private network.
+- **DNS cannot be used to exfiltrate.** The embedded Docker resolver forwards queries from inside the container's network namespace, and that namespace has no route out. Names of containers on `toolnet` still resolve (that is how `egress-proxy` and `etcd` are found); arbitrary external names do not.
+- **Bounded tunnels.** Connect timeout (10 s), idle timeout (60 s), absolute tunnel lifetime (600 s), and a concurrent-tunnel cap (64) are enforced; the cap answers `503`.
+
+### Non-guarantees (v1)
+
+- **The allowlist is a union, not per-tool.** Any tool can reach any domain any tool declared. A compromised tool cannot invent an endpoint, but it can talk to another tool's vendor. Per-tool enforcement needs proxy authentication and is the v2 refinement.
+- **Tools still reach etcd and redis.** The hub shares `toolnet` with them (they must, for the registry and secrets), and tools share the hub's network namespace. `network: none` is the mitigation for tools that need no network at all; treat etcd/redis isolation as a separate platform concern.
+- **Non-HTTP egress is blocked.** SSH, arbitrary TCP, and anything that is not `CONNECT` on an allowlisted port cannot work in egress mode. Raw sockets and UDP have no route either, because the only attached network is `toolnet` and it has no default route. That is intended.
+- **Node `fetch`/`undici` ignore `HTTP_PROXY`** (and fail closed, because there is no direct route). Go tools built in the hub honour the proxy, so `proxy.golang.org` and any module host must be in the union if a tool imports third-party packages at build time. Python `requests`/`httpx` honour the env vars.
+- **No TLS interception.** The proxy tunnels bytes; it cannot inspect or filter HTTP, and it does not cache.
+
+### Rollback
+
+Egress mode is one `-f` away from off, and no data is involved:
+
+```bash
+# 1. Remove COMPOSE_FILE from .env (or omit the -f flags).
+# 2. Recreate the stack on the default network. --remove-orphans also deletes
+#    egress-proxy, which is no longer part of the config and would otherwise
+#    keep toolnet attached (and block step 3).
+docker compose --remove-orphans up -d
+# 3. toolnet has no members now; remove the leftover network by name.
+docker network ls | grep toolnet
+docker network rm <project>_toolnet
+```
+
+Order matters: `docker network rm` fails while the orphaned proxy container is still attached. A full `docker compose down` (without `-v`) also removes both, but stops the stack. Never use `down -v`: it deletes the `etcd-data` volume.
+
+### Troubleshooting
+
+- **`ENETUNREACH` / `EHOSTUNREACH` inside a tool** means it tried a direct connection: either the proxy is down (`docker compose logs egress-proxy`), or the domain is not in the union. The proxy log has one line per decision with `decision=deny reason=...`.
+- **`403` from a client that sets `HTTPS_PROXY`** is the proxy refusing the target: `reason=not-allowlisted`, `port-not-allowed`, `ip-literal`, or `private-destination`. Regenerate the ACL (`docker compose restart egress-proxy`) after adding the domain.
+- **`502`** means the name was allowlisted and public, but the upstream connect failed (timeout, refused).
+- **Everything times out, including the framework API** means `NO_PROXY` was overridden. Compare `docker compose exec hub printenv NO_PROXY` with the value in `docker-compose.egress.yml`.
+- **The hub lost its network after a deploy** means the override was dropped. Re-apply it and re-check the membership above.
+
+
 
 ```bash
 docker compose ps                       # every service up; db-sync exited 0
@@ -339,6 +436,8 @@ curl -sI localhost                      # front door answers through nginx
 docker compose exec host curl -sf http://127.0.0.1:8000/health
 docker compose exec hub curl -s localhost:8001/healthz | python -m json.tool
 docker compose exec hub trellis-sandbox --version
+# Egress mode only: topology, allowlist, IP-literal guard, NO_PROXY.
+docker compose exec hub python scripts/sandbox_smoke.py --check-egress
 docker compose logs db-sync             # sync counts
 docker compose exec host python scripts/trellis logs --limit 5
 ```

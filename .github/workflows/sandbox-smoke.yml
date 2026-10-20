@@ -40,8 +40,12 @@ on:
       - "Dockerfile"
       - "docker-compose.yml"
       - "docker-compose.ci-apparmor.yml"
+      - "docker-compose.egress.yml"
+      - "docker-compose.egress-ci.yml"
       - "scripts/sandbox_smoke.py"
+      - "scripts/egress_*.py"
       - "tests/test_sandbox*.py"
+      - "tests/test_egress*.py"
       - "deploy/apparmor/**"
       - ".github/workflows/sandbox-smoke.yml"
       - "docs/deploy.md"
@@ -54,8 +58,12 @@ on:
       - "Dockerfile"
       - "docker-compose.yml"
       - "docker-compose.ci-apparmor.yml"
+      - "docker-compose.egress.yml"
+      - "docker-compose.egress-ci.yml"
       - "scripts/sandbox_smoke.py"
+      - "scripts/egress_*.py"
       - "tests/test_sandbox*.py"
+      - "tests/test_egress*.py"
       - "deploy/apparmor/**"
       - ".github/workflows/sandbox-smoke.yml"
       - "docs/deploy.md"
@@ -243,6 +251,164 @@ jobs:
           docker compose logs hub || true
           docker compose logs db-sync || true
           docker compose ps || true
+
+  egress:
+    # Opt-in egress mode, end to end: the hub loses the default network and can
+    # only reach the CONNECT allowlist proxy. This proves the topology (no
+    # direct route from a tool), the allowlist (same mock IP, allowed vs denied
+    # name), the IP-literal/SSRF guard, and NO_PROXY coverage.
+    #
+    # Nightly is reserved for the AppArmor drift check; this leg runs on every
+    # push/PR/dispatch that touches one of the workflow's path filters.
+    name: egress proxy (ubuntu-24.04)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # The whole point of the leg: the committed override is not auto-loaded.
+      COMPOSE_FILE: docker-compose.yml:docker-compose.egress.yml:docker-compose.egress-ci.yml
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Record host evidence
+        run: |
+          echo "kernel: $(uname -r)"
+          echo "apparmor userns restriction: $(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"
+          docker compose version
+          docker info --format '{{json .SecurityOptions}}' || true
+
+      - name: Seed the .env the compose file expects
+        # Same seeding as the matrix job. TRELLIS_UID/GID make the proxy run as
+        # the runner uid, which is what owns the read-only workspace mount.
+        run: |
+          cat > .env <<ENV
+          DEV_MODE=true
+          SESSION_SECRET=sandbox-smoke-ci
+          ADMIN_USERS=dev-user@local.host
+          TRELLIS_UID=$(id -u)
+          TRELLIS_GID=$(id -g)
+          ENV
+
+      - name: Allow unprivileged user namespaces (bwrap leg)
+        # Same reason as the bwrap matrix leg: the hub keeps
+        # `apparmor=unconfined`, which Ubuntu 24.04's userns restriction refuses.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Declare the egress fixture tool
+        # The allowlist is generated from tool.yaml, so the stack needs a tool
+        # that declares the mock's name. It is never executed; db-sync registers
+        # it and the harness reads the generated ACL from the proxy.
+        run: |
+          mkdir -p workspace/tools/egress-fixture
+          cat > workspace/tools/egress-fixture/tool.yaml <<'YAML'
+          - name: egress_fixture
+            version: 0.1.0
+            description: "CI fixture: declares the domains the egress smoke exercises."
+            runtime: python
+            entrypoint: main.py
+            network: allow
+            egress:
+              - api.egress-allowed.test
+          YAML
+          cat > workspace/tools/egress-fixture/main.py <<'PY'
+          import json
+          import sys
+
+          json.dump({"ok": True}, sys.stdout)
+          PY
+
+      - name: Build and start the stack in egress mode
+        run: docker compose up -d --build
+
+      - name: Wait for the proxy to report healthy
+        run: |
+          for attempt in $(seq 1 60); do
+            status=$(docker inspect egress-proxy --format '{{.State.Health.Status}}' 2>/dev/null || true)
+            if [ "$status" = "healthy" ]; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "egress-proxy did not become healthy" >&2
+          docker compose logs egress-proxy || true
+          exit 1
+
+      - name: Wait for /healthz to answer
+        run: |
+          : > healthz.json
+          for attempt in $(seq 1 60); do
+            body=$(docker compose exec -T hub curl -s http://127.0.0.1:8001/healthz 2>/dev/null || true)
+            if printf '%s' "$body" | grep -q '"backend"'; then
+              printf '%s' "$body" > healthz.json
+              break
+            fi
+            sleep 5
+          done
+          if [ ! -s healthz.json ]; then
+            echo "hub /healthz did not answer within 5 minutes" >&2
+            exit 1
+          fi
+          cat healthz.json
+          echo
+
+      - name: Assert auto selected bwrap
+        # The sandbox must run tools for the egress probes below to be meaningful.
+        run: |
+          python3 - <<'PY'
+          import json
+          p = json.load(open("healthz.json"))
+          print(json.dumps(p, indent=2, sort_keys=True))
+          assert p.get("requested") == "auto", p
+          assert p.get("backend") == "bwrap", p
+          assert p.get("ok") is True, p
+          assert (p.get("checks") or {}).get("bwrap", {}).get("ok") is True, p
+          PY
+
+      - name: Assert network membership
+        # The hub must have LOST the default network (that is what removes its
+        # route out); the services that call it must have both; the proxy alone
+        # bridges toolnet to the internet.
+        run: |
+          set -eux
+          networks=$(docker inspect tool-hub --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}}{{println}}{{end}}')
+          printf '%s\n' "$networks"
+          test "$(printf '%s\n' "$networks" | grep -c .)" -eq 1
+          printf '%s\n' "$networks" | grep -q 'toolnet$'
+          if printf '%s\n' "$networks" | grep -q 'trellis-network'; then
+            echo "hub is still attached to the default network" >&2
+            exit 1
+          fi
+          for service in agent-host agent-gateway taskiq-worker; do
+            names=$(docker inspect "$service" --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}}{{println}}{{end}}')
+            printf '%s\n' "$names"
+            printf '%s\n' "$names" | grep -q 'trellis-network'
+            printf '%s\n' "$names" | grep -q 'toolnet$'
+          done
+          proxy=$(docker inspect egress-proxy --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}}{{println}}{{end}}')
+          printf '%s\n' "$proxy"
+          printf '%s\n' "$proxy" | grep -q 'trellis-network'
+          printf '%s\n' "$proxy" | grep -q 'toolnet$'
+
+      - name: Run the egress smoke harness
+        # EGRESS_TEST_IP gives the harness the mock's RFC1918 address, so the
+        # IP-literal probe uses the real same-IP target instead of a public IP.
+        run: |
+          egress_ip=$(docker inspect egress-mock --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+          echo "mock IP: $egress_ip"
+          docker compose exec -T -e EGRESS_TEST_IP="$egress_ip" hub \
+            python scripts/sandbox_smoke.py --backend auto --check-egress
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          docker compose logs egress-proxy || true
+          docker compose logs hub || true
+          docker compose logs egress-mock || true
+          docker compose logs db-sync || true
+          docker compose ps || true
+          docker inspect tool-hub --format '{{json .NetworkSettings.Networks}}' || true
+          docker compose exec -T hub printenv HTTP_PROXY HTTPS_PROXY NO_PROXY || true
 
   apparmor:
     # Validates the policy-compliance path for orgs that forbid

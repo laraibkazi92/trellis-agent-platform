@@ -1,0 +1,40 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+#
+# CI-ONLY layer for the egress smoke leg. Never use this in a deployment.
+#
+# The mock upstream lives on the compose default network at a private (RFC1918)
+# address. Production denies every private destination before connecting, so
+# the proxy would reject the mock for the wrong reason and the allow/deny
+# distinction could not be proven. `EGRESS_ALLOW_PRIVATE_DESTINATIONS=true` is
+# the ONE deviation from production behaviour in this file.
+#
+# `api.egress-allowed.test` and `api.egress-denied.test` are two aliases of the
+# SAME container/IP, so a 200-vs-403 difference isolates the allowlist from
+# reachability. The mock is attached to `default` only: the hub lives on
+# toolnet, so a direct connection from a tool has no route to it -- that is the
+# topology check in scripts/sandbox_smoke.py --check-egress.
+services:
+  egress-proxy:
+    environment:
+      EGRESS_ALLOW_PRIVATE_DESTINATIONS: "true"
+
+  egress-mock:
+    # Reuses the stack image (already built/pulled for hub and proxy), so CI
+    # pulls nothing extra. Runs as root only because it binds privileged port
+    # 443, which is what lets the proxy's default EGRESS_PORTS=443 apply.
+    build:
+      context: .
+      args:
+        PUID: ${TRELLIS_UID:-1000}
+        PGID: ${TRELLIS_GID:-1000}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.2.1}
+    container_name: egress-mock
+    user: "0:0"
+    command: ["python", "-m", "http.server", "443"]
+    networks:
+      default:
+        aliases:
+          - api.egress-allowed.test
+          - api.egress-denied.test
+    restart: "no"
