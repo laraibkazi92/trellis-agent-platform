@@ -141,8 +141,8 @@ Do **not** use `docker compose down -v` here. That also deletes the `etcd-data` 
 which holds users, API keys, and run history.
 
 Fix workspace file ownership on the content checkout (outside Docker) with `chown`/`chmod`
-as you would for any other directory. The `hub` service stays root on purpose (it runs the
-bubblewrap sandbox); this does not affect the other services.
+as you would for any other directory. The `hub` service runs as `${TRELLIS_UID:-1000}` like
+the rest of the app containers; this does not affect the other services.
 
 #### Hindsight embeddings: model, provider, or dimensions
 
