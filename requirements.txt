@@ -35,7 +35,7 @@ subagents-pydantic-ai==0.2.20
 pydantic-ai-backend[console]==0.2.26
 pydantic-ai-shields==0.3.4
 pydantic-ai-rlm==0.1.2
-hindsight-client==0.9.1
+hindsight-client==1.0.0
 json-repair==0.63.2
 nh3==0.3.6
 PyJWT==2.13.0
