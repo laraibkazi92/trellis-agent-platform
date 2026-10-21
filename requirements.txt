@@ -17,7 +17,7 @@ python3-saml==1.16.0
 aiofiles==25.1.0
 itsdangerous==2.2.0
 jinja2==3.1.6
-pydantic-settings==2.15.0
+pydantic-settings==2.16.0
 tenacity==9.1.4
 structlog==26.1.0
 python-dotenv==1.2.3
