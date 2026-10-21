@@ -43,7 +43,7 @@ services:
   # SYNC_FORCE_PRUNE=true in .env if the wipe is intended.
   db-sync:
     build: *app-build
-    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.3.0}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.4.0}
     container_name: db-sync
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     environment:
@@ -63,7 +63,7 @@ services:
   # This is the main entry point for the agent fleet.
   host:
     build: *app-build
-    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.3.0}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.4.0}
     container_name: agent-host
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     env_file:
@@ -100,7 +100,7 @@ services:
   # Executes local polyglot tools and exposes them to the Host via SSE
   hub:
     build: *app-build
-    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.3.0}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.4.0}
     container_name: tool-hub
     # Runs as the operator uid -- the same identity that owns the bind-mounted
     # workspace, so tools run as the workspace owner and no capabilities are
@@ -237,7 +237,7 @@ services:
   # published to the host: nginx fronts it at /edge (gateway/entrypoint.sh).
   edge-relay:
     build: *app-build
-    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.3.0}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.4.0}
     container_name: edge-relay
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     # Exactly ONE worker, on purpose: the site -> live connection map is in-process
@@ -283,7 +283,7 @@ services:
   # Bridges external MCP clients to the internal agent fleet via the Host's HTTP API.
   gateway:
     build: *app-build
-    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.3.0}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.4.0}
     container_name: agent-gateway
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     environment:
@@ -329,7 +329,7 @@ services:
 
   taskiq-worker:
     build: *app-build
-    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.3.0}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.4.0}
     container_name: taskiq-worker
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     # NOTE: no `env_file: .env` here on purpose. The worker copies os.environ into
@@ -361,7 +361,7 @@ services:
 
   taskiq-scheduler:
     build: *app-build
-    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.3.0}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.4.0}
     container_name: taskiq-scheduler
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     # NOTE: no `env_file: .env`. The scheduler only enqueues jobs (the worker runs
@@ -429,7 +429,7 @@ services:
 
   ui:
     build: *app-build
-    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.3.0}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.4.0}
     container_name: agent-ui
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     env_file:

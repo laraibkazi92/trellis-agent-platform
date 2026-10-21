@@ -40,7 +40,7 @@ Run from the engine clone:
 ```bash
 git fetch --tags
 git describe --tags            # note the tag you are on now, for rollback
-git checkout v0.3.0            # target release tag
+git checkout v0.4.0            # target release tag
 docker compose pull            # fetch the multi-arch app image for that tag
 docker compose up -d           # recreate services; nginx-gateway is built from ./gateway
 ```
@@ -361,6 +361,68 @@ started with no working backend still needs one restart after the host is fixed.
    above).
 4. Audit tools: move writes into `/app/workspace`, and add `network: none` where no external
    API is used.
+
+---
+
+### v0.4.0 — 2026-10-21
+
+Changes since `v0.3.0`: edge nodes (`trellis-proxy`), so tools can run on a host that only
+dials out. The `TRELLIS_IMAGE` default moves to `v0.4.0`. The central side (`edge-relay`
+service plus the `/edge` route) ships in the same compose file, and **edges themselves are
+opt-in** — an install that never enrolls one keeps behaving exactly as it did on `v0.3.0`.
+
+#### What an edge is
+
+A `trellis-proxy` node runs this same image on the host where the tools live and opens an
+**outbound-only** tunnel to the central install. No inbound port and no VPN. The hub treats
+the edge's tools as ordinary tools: they appear in the registry as `<site>__<tool>`, run
+under the same sandbox policy *on the edge*, and their files stay on the edge host.
+
+- New service: `edge-relay` (central side, internal port 8100) — nginx routes `/edge` to it.
+- New admin page: **Admin → Edges** — site enrollment, live connections, revocation.
+- Enrollment: create a site in the UI, copy its token to the edge host. Authoring and the
+  protocol are in [proxy.md](proxy.md); the edge-side compose file is `deploy/proxy/`.
+- Edge tools are written into etcd by the relay and marked `managed_by: edge-relay`. The
+  registry sync (`scripts/sync_to_db.py`) **preserves** those entries — they never exist on
+  central disk, so without that carve-out every `db-sync` would delete every remote tool.
+  An undecodable edge config fails closed rather than being pruned.
+- TLS for the tunnel (either terminating on the main nginx or in a dedicated `/edge`
+  terminator): [proxy-tls.md](proxy-tls.md). Note the fail-loud caveat there — a wrong
+  `EDGE_MTLS_CA` path stops nginx, taking the UI and API down with `/edge`, not just `/edge`.
+
+#### New `.env` keys (all optional, defaults shown)
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `EDGE_RELAY_URL` | compose service name | hub → relay address, for a split-host install |
+| `EDGE_TOOL_RECONCILE_SECONDS` | `10` | how often the hub re-reads relay-published tools (`0` disables) |
+| `EDGE_AUDIT_LOG` | `/app/data/edge-audit.log` | relay audit trail (inside `health-data`, 10 MB × 5) |
+| `EDGE_RATE_LIMIT_PER_MIN` / `_RPS` / `_BURST` | `120` / `30` / `20` | per-site call budget; a site record can override the per-minute value |
+| `EDGE_MTLS_CA` | unset | CA bundle for edge client certs; requires `SSL_ENABLED=true` |
+| `TRELLIS_VERSION` | build value | reported in the edge hello frame and **Admin → Edges** |
+| `EDGE_DEV_SITE` / `EDGE_DEV_TOKEN` | unset | **DEV ONLY**, ignored unless `DEV_MODE=true`; plaintext, no rotation, no audit |
+
+#### Upgrade actions
+
+1. `docker compose pull && docker compose up -d` — pulls `v0.4.0` and starts `edge-relay`.
+2. **Rebuild the edge proxy:** `docker compose up -d --build nginx-gateway`. The `/edge`
+   routes live in `gateway/entrypoint.sh`, which is built locally rather than pulled, so
+   `pull` alone leaves the old entrypoint in place and `/edge` returns 404.
+3. Confirm `/healthz` is still `ok: true` with the backend you expect, and that
+   **Admin → Edges** renders.
+4. Only if you want edges: deploy `deploy/proxy/` on the edge host and enroll a site
+   (step-by-step in [proxy.md](proxy.md#enrollment)).
+
+Changes to declare:
+
+- **Compose services:** added `edge-relay`; `nginx-gateway` gained `/edge` routes (rebuild
+  required, see step 2). No ports added on the host.
+- **`.env` keys:** added, all optional and defaulted (table above).
+- **Registry sync:** preserves `managed_by: edge-relay` tools; ignores undecodable edge
+  configs instead of pruning them.
+- **Tool protocol / `workspace/` layout:** none.
+- **Data migrations:** none. etcd gains `<site>__<tool>` entries only when a site enrolls.
+- **Image pins:** unchanged (etcd, Redis, Hindsight).
 
 ---
 
