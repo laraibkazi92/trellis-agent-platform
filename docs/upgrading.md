@@ -399,15 +399,23 @@ under the same sandbox policy *on the edge*, and their files stay on the edge ho
 | `EDGE_AUDIT_LOG` | `/app/data/edge-audit.log` | relay audit trail (inside `health-data`, 10 MB × 5) |
 | `EDGE_RATE_LIMIT_PER_MIN` / `_RPS` / `_BURST` | `120` / `30` / `20` | per-site call budget; a site record can override the per-minute value |
 | `EDGE_MTLS_CA` | unset | CA bundle for edge client certs; requires `SSL_ENABLED=true` |
-| `TRELLIS_VERSION` | build value | reported in the edge hello frame and **Admin → Edges** |
+| `TRELLIS_VERSION` | the release tag on a pulled image; `dev` on a local build | reported in the edge hello frame and **Admin → Edges** |
 | `EDGE_DEV_SITE` / `EDGE_DEV_TOKEN` | unset | **DEV ONLY**, ignored unless `DEV_MODE=true`; plaintext, no rotation, no audit |
 
 #### Upgrade actions
 
 1. `docker compose pull && docker compose up -d` — pulls `v0.4.0` and starts `edge-relay`.
-2. **Rebuild the edge proxy:** `docker compose up -d --build nginx-gateway`. The `/edge`
-   routes live in `gateway/entrypoint.sh`, which is built locally rather than pulled, so
-   `pull` alone leaves the old entrypoint in place and `/edge` returns 404.
+2. **Rebuild the edge proxy:**
+   ```bash
+   docker compose build nginx-gateway
+   docker compose up -d --no-build --no-deps nginx-gateway
+   ```
+   The `/edge` routes live in `gateway/entrypoint.sh`, which is built locally rather than
+   pulled, so `pull` alone leaves the old entrypoint in place and `/edge` returns 404.
+   **Do not** use `docker compose up -d --build nginx-gateway`: `--build` on `up` also
+   builds every service with a `build:` section in that service's dependency graph, so it
+   replaces the image you just pulled with a local build — verified on a live host, the app
+   image then reports `TRELLIS_VERSION=dev` and carries no attestation.
 3. Confirm `/healthz` is still `ok: true` with the backend you expect, and that
    **Admin → Edges** renders.
 4. Only if you want edges: deploy `deploy/proxy/` on the edge host and enroll a site

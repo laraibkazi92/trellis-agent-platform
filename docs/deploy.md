@@ -62,11 +62,14 @@ gh attestation verify oci://ghcr.io/laraibkazi92/trellis-agent-platform:v0.4.0 \
 
 Images published before that change carry no attestation, and the check fails for them — that is expected, not a broken release.
 
-One service is not published: `nginx-gateway` is built from `./gateway` in the clone, so it compiles locally on first `up` (a small nginx image). After changing anything under `gateway/`, rebuild just that service:
+One service is not published: `nginx-gateway` is built from `./gateway` in the clone, so it compiles locally on first `up` (a small nginx image). After changing anything under `gateway/`, rebuild **only** that service:
 
 ```bash
-docker compose up -d --build nginx-gateway
+docker compose build nginx-gateway
+docker compose up -d --no-build --no-deps nginx-gateway
 ```
+
+Do not use `docker compose up -d --build nginx-gateway` for this: `--build` on `up` also builds every service with a `build:` section in that service's dependency graph, which replaces the app image you pulled from GHCR with a local build that reports `TRELLIS_VERSION=dev` and carries no attestation.
 
 `hindsight` (agent memory) is the upstream `ghcr.io/vectorize-io/hindsight` image and is pulled the same way.
 
@@ -268,7 +271,7 @@ docker compose up -d
 
 `db-sync` re-syncs your workspace into etcd on the way up, so newly added content in your content repo is picked up at the same time. If you build from source instead, use `docker compose up -d --build`.
 
-If the new release changed anything under `gateway/` (nginx), rebuild that service too: `docker compose up -d --build nginx-gateway`.
+If the new release changed anything under `gateway/` (nginx), rebuild that service too: `docker compose build nginx-gateway && docker compose up -d --no-build --no-deps nginx-gateway`. Use that two-step form rather than `up -d --build nginx-gateway`, which also rebuilds the app services in the dependency graph.
 
 Rollback is the reverse: `git checkout <previous-tag>`, `docker compose pull`, `docker compose up -d`. etcd schema migrations note — the bundled etcd is `v3.6.15`; an in-place upgrade of a 3.5 data directory is supported but one-way, so rolling back the etcd image afterwards requires a snapshot/restore. Keep `etcd-data` backed up before upgrading, and see [Upgrading](upgrading.md) for the volume and data caveats referenced from `docker-compose.yml`.
 
