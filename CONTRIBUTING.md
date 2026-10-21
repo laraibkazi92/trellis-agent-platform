@@ -121,7 +121,9 @@ each `docs/*.md` guide — please read the one matching your change.
    guard, and the version always comes from the git ref, never from an input.
    The run also refuses to build unless **every workflow that ran for the tagged
    commit succeeded** — tag only a commit whose CI is green, otherwise the job fails
-   at the first step.
+   at the first step. Note the gate is defined *in* this workflow file, and a tag push
+   runs the workflow **as it exists at the tagged commit**: never tag a commit older
+   than the gate itself, or the gate will not exist for that run.
 4. The run's summary carries the image **digest**, and the image is attested by
    GitHub's keyless signer. Paste the digest into the GitHub Release and confirm the
    attestation verifies before announcing:
