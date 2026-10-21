@@ -18,6 +18,10 @@ Feature overview, topology, and failure semantics: [docs/proxy.md](../../docs/pr
   language runtimes are needed on the VM.
 - An enrollment token from an admin (`edge_<site>_<random>`, shown once when the site is
   created in **Admin → Edges**) and the **site id** it belongs to.
+- **TLS on the central listener** (`wss://`). The tunnel carries the permanent token and
+  every tool payload, so it is not optional outside a single trusted segment. Runbook,
+  including an internal CA and the `/edge`-only terminator:
+  [docs/proxy-tls.md](../../docs/proxy-tls.md).
 - Optional: egress to whatever the exported tools call (vendor APIs), and `HTTPS_PROXY` /
   `NO_PROXY` in `.env` if this network only permits egress through a proxy. The proxy
   honours both for the tunnel itself.
@@ -83,6 +87,7 @@ exported tools is the end-to-end proof.
 | Tunnel closes with **4409** (`site superseded`) | A newer connection for the same site exists — typically an old container still running on a second host | Stop the duplicate (`docker compose down` there); 4409 is also what a redeploy sees for a moment, so confirm it repeats before acting |
 | **Nothing published** / no tools in Admin → Edges | `exports` is empty (or names do not match `tool.yaml` `name:` fields, or `tools_dir` does not exist in the container) | `exports` is an allowlist and an empty list publishes nothing. List the tools explicitly, then SIGHUP. Publishing an empty catalog keeps the site's existing central tools and flags a warning, so a typo cannot wipe the inventory |
 | **`503 edge_offline`** on a tool call | The site is not connected: tunnel down, wrong token, or relay restarted | `docker compose logs -f trellis-proxy` for the reconnect reason; edges retry with jittered backoff (1 s → 60 s) |
+| `CERTIFICATE_VERIFY_FAILED` / `certificate is not valid for '<name>'` | The edge does not trust the relay's CA, or the URL does not match the cert SAN | [docs/proxy-tls.md](../../docs/proxy-tls.md) §5–6 |
 | **No outbound connection at all** | Egress firewall, or a proxy that needs `HTTPS_PROXY`/`NO_PROXY` | Test from inside the container: `docker compose exec trellis-proxy curl -sI https://trellis.example.com/`. `wss://` needs 443 and, if a proxy is enforced, `HTTPS_PROXY` set in `.env` |
 | **`token_file … is empty`** on restart | The token file was a writable copy, and the proxy removed it after the first read (it logs `token file … was removed after reading`) | Re-provision `edge-token`, or use the sample compose secret (mounted read-only, so it survives restarts) |
 | Tool calls fail with a sandbox error | `sandbox: auto` picked a backend this kernel cannot run (no user namespaces, restrictive AppArmor) | Check the mentioned backend in the log, then pin `sandbox: landlock`; for bwrap, enable the shared-sandbox block in `docker-compose.yml` |

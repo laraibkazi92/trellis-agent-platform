@@ -118,6 +118,9 @@ in-flight calls fail rather than being replayed).
 - The relay itself never decrypts tool secrets (only the provider key for embeddings).
 - Outbound-free posture unchanged: the relay never dials an edge, so no central firewall
   rule is needed for edges beyond accepting 443 from them.
+- **TLS.** The tunnel carries the site's permanent token and every tool payload, so an edge
+  that crosses an untrusted network must dial `wss://`. Setup (internal CA, cert SANs, both
+  termination options): [proxy-tls.md](proxy-tls.md).
 
 ## Security notes
 
@@ -178,6 +181,10 @@ limit is a token bucket with capacity equal to the rate, so a short burst is all
 sustained traffic is capped.
 
 ### Optional mutual TLS
+
+TLS for the tunnel itself is a prerequisite and is covered in [proxy-tls.md](proxy-tls.md).
+Everything in this section is an *additional* client-certificate check on top of it.
+
 
 Set `EDGE_MTLS_CA` to a CA bundle **inside the nginx container** and uncomment the SSL
 volume in `docker-compose.yml`, for example:

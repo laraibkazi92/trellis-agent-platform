@@ -263,6 +263,9 @@ The clone ships three samples: `workspace/agents/demo-assistant/`, `workspace/to
 
 ## TLS and hardening
 
+- **Edge tunnels.** Edges must dial `wss://`; see [proxy-tls.md](proxy-tls.md) for an
+  internal CA, the certificate SANs, and an `/edge`-only terminator if `:80` must keep
+  serving plain HTTP.
 - **Front door.** `nginx-gateway` publishes ports 80 and 443 and is the single entry point for the stack. Set `SSL_ENABLED=True` and `SSL_DNS_NAME=<your-domain>` in `.env` to serve HTTPS; certificates are read from `SSL_CERT_DIR` (default `./gateway/ssl`, expecting `cert.pem` and `key.pem`). The cert-directory volume mount is commented out in `docker-compose.yml` — enable it by uncommenting that block, or via a local `docker-compose.override.yml`, which keeps the engine clone pristine.
 - **Bind address.** `HOST_BIND` defaults to `0.0.0.0`, so published ports are reachable from anywhere. Set `HOST_BIND=127.0.0.1` to keep them loopback-only — this also covers the Hindsight ports (8888 API, 9999 Control Plane UI). etcd and Redis are never published regardless.
 - **Authentication.** Keep `DEV_MODE=false` for anything shared: `true` disables API-key auth, UI login, and MCP auth across `host`, `hub`, `gateway`, and `ui`, and only logs a startup warning — it does not restrict the bind host. Optional SSO is configured with `GITHUB_CLIENT_ID`/`GITHUB_CLIENT_SECRET` or the `OIDC_*` variables, plus `ALLOWED_DOMAINS` to restrict by email domain.

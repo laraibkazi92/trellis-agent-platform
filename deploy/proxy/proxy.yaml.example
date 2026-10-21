@@ -21,6 +21,11 @@ site: plant-floor
 
 # Central Trellis host, WebSocket endpoint. Use wss:// in production: the tunnel carries
 # the bearer token and internal tool arguments. The path is fixed.
+#
+# The proxy verifies the relay's certificate and has no switch to disable that. For an
+# internal CA point tls_ca_file at the CA (see docs/proxy-tls.md):
+#   server_url: wss://trellis.internal/edge/v1/connect
+#   tls_ca_file: /etc/trellis/tls/ca.pem
 server_url: wss://trellis.example.com/edge/v1/connect
 
 # Where the enrollment token (edge_<site>_<random>) is read from. The file form is
