@@ -21,7 +21,7 @@ pydantic-settings==2.15.0
 tenacity==9.1.4
 structlog==26.1.0
 python-dotenv==1.2.3
-markdown==3.10.3
+markdown==3.11.1
 stamina==26.1.0
 granian==2.8.1
 taskiq==0.12.4
