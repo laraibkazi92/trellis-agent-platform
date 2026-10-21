@@ -20,10 +20,13 @@ services:
     # Same non-root posture as the central services: tools run as this uid.
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     command: python core/proxy.py --config /etc/trellis/proxy.yaml
-    # Holds TRELLIS_EDGE_TOKEN plus whatever credentials the exported tools need. Keep it
-    # mode 0600 and never commit it: every credential this edge uses lives here and none
-    # of it is ever sent to the central host.
+    # Credentials the exported tools need (API keys, service accounts). Keep it mode 0600
+    # and never commit it: none of it is ever sent to the central host. The tunnel token
+    # is deliberately NOT here -- Docker injects secrets as a mounted file, which keeps
+    # the token out of the process environment (and out of /proc/<pid>/environ).
     env_file: .env
+    secrets:
+      - edge_token
     volumes:
       # The sandbox grants tools exactly one writable path, /app/workspace (override
       # with SANDBOX_RW_PATH). It must exist, and it must be writable if any exported
@@ -58,3 +61,11 @@ services:
     #
     # Orgs that forbid unconfined profiles can install deploy/apparmor/trellis-hub on the
     # host and select it with `apparmor=trellis-hub` instead of `apparmor=unconfined`.
+
+secrets:
+  # `edge-token` is the plaintext enrollment token, written here once:
+  #   umask 077 && printf '%s' 'edge_<site>_<secret>' > edge-token
+  # It appears at /run/secrets/edge_token in the container and is referenced by
+  # `token_file:` in proxy.yaml. Never commit it; rotate it from Admin -> Edges if it leaks.
+  edge_token:
+    file: ./edge-token

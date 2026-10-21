@@ -21,7 +21,7 @@
         </p>
     </div>
 
-    {% if new_token %}
+    {% for new_token in new_tokens %}
     <div class="border border-amber-500/40 bg-amber-50 dark:bg-amber-950/20 p-5 mb-6 space-y-3">
         <div class="flex items-start gap-3">
             <span class="text-amber-600 dark:text-amber-400 shrink-0"><i data-lucide="key-round" class="w-5 h-5"></i></span>
@@ -34,19 +34,22 @@
             </div>
         </div>
         <div class="group flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
-            <code id="newEdgeToken" class="flex-1 break-all bg-white dark:bg-neutral-950 border border-amber-500/40 px-3 py-2 font-mono text-sm text-neutral-900 dark:text-neutral-100">{{ new_token.token }}</code>
-            <button type="button" onclick="copyToClipboard(this, '#newEdgeToken')"
+            <code id="newEdgeToken{{ loop.index }}" class="flex-1 break-all bg-white dark:bg-neutral-950 border border-amber-500/40 px-3 py-2 font-mono text-sm text-neutral-900 dark:text-neutral-100">{{ new_token.token }}</code>
+            <button type="button" onclick="copyToClipboard(this, '#newEdgeToken{{ loop.index }}')"
                     class="border border-amber-500/60 text-amber-700 dark:text-amber-300 hover:bg-amber-500 hover:text-white font-mono font-bold text-xs uppercase tracking-widest px-4 py-2 transition-colors shrink-0">
                 COPY
             </button>
         </div>
         <p class="font-mono text-[11px] text-neutral-600 dark:text-neutral-400">
-            Set it as the edge's <code class="bg-neutral-200 dark:bg-neutral-800 px-1 py-0.5 rounded-sm">TRELLIS_EDGE_TOKEN</code>
-            environment variable (never inline it in <code class="bg-neutral-200 dark:bg-neutral-800 px-1 py-0.5 rounded-sm">proxy.yaml</code>),
-            then start the edge. Full steps: <a href="/docs/proxy" class="underline hover:text-accent dark:hover:text-accent-dark">docs/proxy.md</a>.
+            Save it to the edge's token file and point
+            <code class="bg-neutral-200 dark:bg-neutral-800 px-1 py-0.5 rounded-sm">token_file:</code> at it (a docker secret is
+            the safest mount), or set it as
+            <code class="bg-neutral-200 dark:bg-neutral-800 px-1 py-0.5 rounded-sm">TRELLIS_EDGE_TOKEN</code> &mdash; never inline
+            it in <code class="bg-neutral-200 dark:bg-neutral-800 px-1 py-0.5 rounded-sm">proxy.yaml</code>, then start the edge.
+            Full steps: <a href="/docs/proxy" class="underline hover:text-accent dark:hover:text-accent-dark">docs/proxy.md</a>.
         </p>
     </div>
-    {% endif %}
+    {% endfor %}
 
     <!-- Add edge -->
     <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm mb-6">

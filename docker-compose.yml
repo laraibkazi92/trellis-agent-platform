@@ -23,6 +23,9 @@ x-app-build: &app-build
   args:
     PUID: ${TRELLIS_UID:-1000}
     PGID: ${TRELLIS_GID:-1000}
+    # Shown in Admin -> Edges so an operator can spot a stale proxy. `docker compose
+    # build` cannot know the release tag; the publish workflow passes the real one.
+    TRELLIS_VERSION: ${TRELLIS_VERSION:-dev}
 
 # Workspace bind mounts: every app service mounts the workspace at the SAME
 # container path (/app/workspace), from ${TRELLIS_WORKSPACE_DIR:-./workspace}. Point
@@ -256,6 +259,11 @@ services:
       # The audit line carries site/tool/call id/user/outcome/bytes -- never payloads.
       EDGE_RATE_LIMIT_PER_MIN: ${EDGE_RATE_LIMIT_PER_MIN:-120}
       EDGE_AUDIT_LOG: /app/data/edge-audit.log
+      # Needed to decrypt LLM provider keys for the embeddings of `public` edge tools.
+      # Without them (and with DEV_MODE=false) every index call fails and the tool
+      # still works but ranks last in tool search. Same values as host/hub.
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
     volumes:
       # Health events for remote tool calls. Deliberately no workspace mount: the relay
       # has no local tools and must not be able to read the content repo.

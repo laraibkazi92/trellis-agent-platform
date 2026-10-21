@@ -18,7 +18,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from core.health import HealthMonitor
 from core.tool_index import delete_tool, index_tool
@@ -123,12 +123,22 @@ def _tool_config(site: str, tool: EdgeTool, site_config: Dict[str, Any]) -> Dict
 
 
 def publish_catalog(
-    identity_mgr: Any, site: str, tools: List[EdgeTool], edge_version: str
+    identity_mgr: Any,
+    site: str,
+    tools: List[EdgeTool],
+    edge_version: str,
+    *,
+    allow_empty: bool = False,
 ) -> List[str]:
     """Write a site's published catalog to the registry and refresh its status.
 
     Raises ``ValueError`` when the site is gone or disabled: the handshake validated
     the token, but a site can be deleted or revoked between the upgrade and this write.
+
+    ``allow_empty`` guards the destructive case: a handshake that publishes nothing
+    (a mistyped ``tools_dir``, a workspace volume that was not mounted) would otherwise
+    prune the site's entire central inventory. An admin narrowing ``exports`` to nothing
+    is an explicit intent and passes ``allow_empty=True``.
     """
     site_config = effective_site_config(identity_mgr, site)
     if site_config and not identity_mgr.get_edge_config(site):
@@ -170,8 +180,41 @@ def publish_catalog(
             # Also re-index on a visibility *promotion*: a tool that was private on
             # the first publish has no vector, and search would rank it last forever.
             if not current or current.get("public") is not True or _embedding_changed(current, config):
-                index_tool(identity_mgr, name, tool.description, tool.inputs)
+                if not index_tool(identity_mgr, name, tool.description, tool.inputs):
+                    # Usually a decryptable LLM key is missing (ENCRYPTION_KEY on the
+                    # relay). The tool still works; it just cannot be found by search.
+                    logger.warning(
+                        "could not index tool '%s' for search (embeddings unavailable); "
+                        "it will rank last in tool search",
+                        name,
+                    )
         published.append(name)
+
+    owned = {
+        name for name, config in existing.items() if config.get("managed_by") == MANAGED_BY
+    }
+    if not published and owned and not allow_empty:
+        logger.error(
+            "edge '%s' published an empty catalog; keeping %d existing tool(s) instead of "
+            "pruning them. Check exports/tools_dir on the edge (an admin export change "
+            "still prunes).",
+            site,
+            len(owned),
+        )
+        identity_mgr.save_edge_status(
+            site,
+            {
+                "connected": True,
+                "connected_at": _now_iso(),
+                "edge_version": edge_version,
+                "tools": sorted(owned),
+                "last_error": (
+                    "the edge published an empty catalog; existing tools were kept. "
+                    "Check exports/tools_dir on the site."
+                ),
+            },
+        )
+        return sorted(owned)
 
     for name, config in existing.items():
         if name in published:

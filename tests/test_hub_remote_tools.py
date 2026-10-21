@@ -670,3 +670,19 @@ def test_an_unreadable_tool_config_is_protected_from_the_prune(monkeypatch):
 
     assert hub.register_tools() == 0
     assert REGISTRY_NAME in fake_mcp.handlers
+
+
+def test_an_oversized_remote_result_is_truncated_like_a_local_tool(monkeypatch):
+    """The edge is semi-trusted: the hub enforces the 96k context cap itself."""
+    config = make_remote_config()
+    install_fake_health(monkeypatch)
+    install_transport(
+        monkeypatch,
+        json_response(200, {"tool": TOOL, "result": {"blob": "x" * 100_000}}),
+    )
+
+    result = run_remote(config, {}, user_id="user-1")
+
+    assert "Global Safety Net" in result["error"]
+    assert result["partial_data_preview"].endswith("[TRUNCATED DUE TO SAFETY LIMITS]")
+    assert len(result["partial_data_preview"]) < 100_000

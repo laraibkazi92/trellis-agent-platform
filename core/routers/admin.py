@@ -7,8 +7,8 @@ import json
 import yaml
 import time
 import asyncio
-import secrets
 import httpx
+from typing import Optional
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import templates, CSRFRoute
@@ -934,33 +934,33 @@ _EDGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _EDGE_RESERVED_NAMES = frozenset({"mcp"})
 
 # An enrollment token is handed to the operator exactly once. The POST handlers redirect
-# (303, the admin-UI convention), so the plaintext rides in this process for the next
-# /admin/edges render only -- never in the session (a client-readable cookie) and never in
-# etcd. Entries are popped on read and expire, so a missed render cannot leak one later.
+# (303, the admin-UI convention) and the plaintext rides in this process until the next
+# /admin/edges render -- never in the session (a client-readable cookie), never in etcd,
+# and never in a URL (nginx/uvicorn access logs would record it). Entries are popped on
+# read and expire, so a missed render cannot leak one later.
 _EDGE_TOKEN_TTL_SECONDS = 300.0
-_pending_edge_tokens: dict[str, tuple[float, str, str]] = {}
+_pending_edge_tokens: dict[str, tuple[float, str]] = {}
 
 
-def _stash_edge_token(site: str, token: str) -> str:
-    key = secrets.token_urlsafe(16)
-    _pending_edge_tokens[key] = (time.monotonic(), site, token)
-    return key
+def _stash_edge_token(site: str, token: str) -> None:
+    _pending_edge_tokens[site] = (time.monotonic(), token)
 
 
-def _pop_edge_token(key: str | None) -> dict | None:
+def _pop_edge_tokens() -> list[dict]:
+    """Hand every pending token to the next page render, then forget them."""
     now = time.monotonic()
     expired = [
-        k for k, (created, _, _) in _pending_edge_tokens.items()
+        site for site, (created, _) in _pending_edge_tokens.items()
         if now - created > _EDGE_TOKEN_TTL_SECONDS
     ]
     for stale in expired:
         _pending_edge_tokens.pop(stale, None)
-    if not key:
-        return None
-    entry = _pending_edge_tokens.pop(key, None)
-    if not entry:
-        return None
-    return {"site": entry[1], "token": entry[2]}
+    entries = [
+        {"site": site, "token": token}
+        for site, (_, token) in sorted(_pending_edge_tokens.items())
+    ]
+    _pending_edge_tokens.clear()
+    return entries
 
 
 def _edge_name_error(name: str) -> str | None:
@@ -1036,7 +1036,7 @@ async def admin_edges_page(request: Request):
             "user": user,
             "edges": edges,
             "flash_msg": request.session.pop("flash_msg", None),
-            "new_token": _pop_edge_token(request.query_params.get("token")),
+            "new_tokens": _pop_edge_tokens(),
             "rate_limit_default": os.getenv("EDGE_RATE_LIMIT_PER_MIN", "120"),
         },
     )
@@ -1069,9 +1069,8 @@ async def create_edge(request: Request):
         f"Edge '{name}' created. Its enrollment token is shown once on this page -- copy "
         f"it now, it cannot be retrieved again."
     )
-    return RedirectResponse(
-        url=f'/admin/edges?token={_stash_edge_token(name, token)}', status_code=303
-    )
+    _stash_edge_token(name, token)
+    return RedirectResponse(url='/admin/edges', status_code=303)
 
 
 @router.post("/admin/edges/update")
@@ -1162,9 +1161,8 @@ async def rotate_edge(request: Request):
         f"Token for edge '{name}' rotated. The previous token no longer works; the new "
         f"enrollment token is shown once on this page -- copy it now."
     )
-    return RedirectResponse(
-        url=f'/admin/edges?token={_stash_edge_token(name, token)}', status_code=303
-    )
+    _stash_edge_token(name, token)
+    return RedirectResponse(url='/admin/edges', status_code=303)
 
 
 @router.post("/admin/edges/revoke")

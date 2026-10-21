@@ -1169,7 +1169,9 @@ def test_heartbeat_republishes_after_an_admin_changes_the_exports(monkeypatch):
     monkeypatch.setattr(
         app_module.registry,
         "publish_catalog",
-        lambda mgr, site, tools, version: published.append((site, len(tools), version)) or [],
+        lambda mgr, site, tools, version, **kwargs: published.append(
+            (site, len(tools), version)
+        ) or [],
     )
     monkeypatch.setattr(app_module, "HEARTBEAT_S", 0.01)
 
@@ -1204,7 +1206,7 @@ def test_heartbeat_does_not_republish_without_an_admin_change(monkeypatch):
 
     monkeypatch.setattr(app_module, "_identity_manager", lambda: _Mgr())
     monkeypatch.setattr(
-        app_module.registry, "publish_catalog", lambda *args: published.append(args)
+        app_module.registry, "publish_catalog", lambda *args, **kwargs: published.append(args)
     )
     monkeypatch.setattr(app_module, "HEARTBEAT_S", 0.01)
 
@@ -1218,3 +1220,38 @@ def test_heartbeat_does_not_republish_without_an_admin_change(monkeypatch):
     asyncio.run(run())
 
     assert published == []
+
+
+def test_an_admin_export_change_is_allowed_to_empty_the_catalog(monkeypatch):
+    """An explicit admin narrowing is intent, unlike a handshake that sent nothing."""
+    conn = _install_conn(site="plant-floor")
+    conn.published_signature = (("echo",), False, (), None)
+    seen = {}
+
+    class _Mgr:
+        def get_edge_config(self, site):
+            return {"name": site, "enabled": True, "exports": [], "public": False,
+                    "public_tools": [], "rate_limit_per_min": None}
+
+    monkeypatch.setattr(app_module, "_identity_manager", lambda: _Mgr())
+    monkeypatch.setattr(
+        app_module.registry,
+        "publish_catalog",
+        lambda *args, **kwargs: seen.update(kwargs) or [],
+    )
+    monkeypatch.setattr(app_module, "HEARTBEAT_S", 0.01)
+
+    async def run():
+        task = asyncio.create_task(app_module._heartbeat(conn))
+        await _wait_for_frames(conn.ws, count=1)
+        for _ in range(200):
+            if seen:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+
+    assert seen.get("allow_empty") is True

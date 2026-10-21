@@ -52,8 +52,9 @@ attributable to an operator action.
 1. **Admin → Edges → create site.** Choose the site id (e.g. `plant-floor`) and a display
    name. The enrollment token is shown **once**; the registry stores only its SHA256.
 2. **Install the edge.** Copy [`deploy/proxy/`](../deploy/proxy/), fill in `proxy.yaml`,
-   put the token in `.env` as `TRELLIS_EDGE_TOKEN`, then `docker compose up -d`. Full
-   runbook: [deploy/proxy/README.md](../deploy/proxy/README.md).
+   write the token to `edge-token` (mounted as the `edge_token` docker secret and read via
+   `token_file:`), then `docker compose up -d`. Full runbook:
+   [deploy/proxy/README.md](../deploy/proxy/README.md).
 3. **Connect.** The proxy dials `wss://<central-host>/edge/v1/connect` with subprotocol
    `trellis.edge.v1` and its token. The relay derives the site from the token hash —
    never from a client-supplied name — and publishes the tools listed in `exports` as
@@ -101,13 +102,20 @@ in-flight calls fail rather than being replayed).
 | Invalid catalog entry | That tool is rejected and logged; the site's other tools still register |
 | Name collision with a local tool | Registration is refused for the colliding tool only, and logged |
 | Duplicate connection for a site | The older connection is closed with `4409` |
+| Edge publishes an empty catalog | Existing tools are **kept** (a mistyped `tools_dir` or missing volume must not wipe the central inventory); the site's status carries a warning. Narrowing `exports` in Admin still prunes |
 
 ## Central requirements
 
 - The `edge-relay` service (added by `docker-compose.yml`; one worker, internal port
-  8100) and the `/edge` location in `gateway/entrypoint.sh`.
-The relay reads and writes plain registry records (no secret decryption), so it does not
-need `ENCRYPTION_KEY` or `SESSION_SECRET`.
+  8100) and the `/edge` location in `gateway/entrypoint.sh`. **Rebuild nginx and the app
+  image when you deploy this**: an edge pointed at an older nginx gets `404` on `/edge`,
+  and an older app image has no `services/`, so `edge-relay` crash-loops with
+  `ModuleNotFoundError`. Use `docker compose up -d --build`, or pin a published tag that
+  contains the feature. Plain `docker compose up -d` reuses the on-disk `v0.3.0` image.
+- `ENCRYPTION_KEY` (or `SESSION_SECRET`) is passed to `edge-relay` so it can decrypt the
+  LLM provider key it needs to embed `public: true` edge tools for tool search. Without
+  it the tools still publish and run, but they are never indexed and log a warning.
+- The relay itself never decrypts tool secrets (only the provider key for embeddings).
 - Outbound-free posture unchanged: the relay never dials an edge, so no central firewall
   rule is needed for edges beyond accepting 443 from them.
 
@@ -120,6 +128,15 @@ need `ENCRYPTION_KEY` or `SESSION_SECRET`.
   encryption is not part of this release.
 - Site compromise is bounded to that site's catalogs. Central/relay compromise is bounded
   to the union of exported tools — not the customer's network.
+- **Exported tools are trusted code on that VM.** They run unsandboxed from the proxy's
+  point of view in the sense that they share its uid: they can read the workspace, the
+  edge's `env_file` credentials, and (if they are malicious) the token file or the proxy's
+  memory. The token cannot cross to another site — it is site-scoped and the relay
+  derives identity from its hash — but a malicious *tool author* on a trusted edge can
+  impersonate that edge. Review tool code the way you review a service account.
+  The token is read from a file and the file is unlinked, so it is not inherited through
+  the process environment; a read-only secret mount cannot be unlinked, which is a
+  residual (same-uid) exposure.
 - Edge payloads are capped (10 MB frame, 1 MB arguments, 200 tools per site, 16 in flight)
   and the relay logs site, tool, call id, duration, and outcome — never arguments or
   results. The user id travels in the call frame for attribution and is not logged with
@@ -156,7 +173,7 @@ Two independent limits:
 | relay | site record `rate_limit_per_min` | inherits the default | per site override, editable in Admin → Edges |
 
 An over-limit call never reaches the edge: the relay answers `429 rate_limited` and the
-hub surfaces "Edge '<site>' is rate-limiting tool calls; '<tool>' was not sent." The
+hub surfaces "Edge '<site>' is rate-limiting tool calls; '<site>__<tool>' was not sent." The
 limit is a token bucket with capacity equal to the rate, so a short burst is allowed and
 sustained traffic is capped.
 
@@ -197,6 +214,11 @@ prompted for a certificate — the dashboard and `/v1` do not require one.
 
 mTLS is defence in depth on top of the enrollment token, not a replacement: the relay
 still resolves the bearer token to a site.
+
+**A misconfigured `EDGE_MTLS_CA` stops nginx, not just `/edge`.** If the variable is set
+without `SSL_ENABLED=true`, or the CA file is not inside the container, the entrypoint
+refuses to start (that is deliberate: silently ignoring mTLS would be a worse failure).
+The dashboard, `/v1`, and `/mcp` share that nginx, so remove the variable to recover.
 
 ### Filesystem
 

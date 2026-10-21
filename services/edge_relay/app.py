@@ -43,6 +43,24 @@ from services.edge_relay.tokens import hash_token, resolve_token
 
 logger = logging.getLogger(__name__)
 
+
+def _configure_logging() -> None:
+    """Make this module's INFO lines visible under uvicorn.
+
+    uvicorn only configures the ``uvicorn*`` loggers, so without a root handler every
+    connect/call line an operator greps for falls through to lastResort (WARNING).
+    Under pytest a handler already exists, so this is a no-op there.
+    """
+    if logging.getLogger().handlers:
+        return
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+
+_configure_logging()
+
 RATE_LIMIT_PER_MIN = normalise_rate(os.getenv("EDGE_RATE_LIMIT_PER_MIN", "120"))
 limiter = SiteLimiter(RATE_LIMIT_PER_MIN)
 
@@ -265,6 +283,7 @@ async def _apply_admin_changes(conn: EdgeConn, config: Dict[str, Any]) -> None:
             conn.site,
             list(conn.tools.values()),
             conn.edge_version,
+            allow_empty=True,
         )
     except Exception:
         logger.exception("could not refresh the catalog for site=%s", conn.site)

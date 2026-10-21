@@ -8,8 +8,10 @@
 # environment or secret store by the tool processes themselves -- they are never sent to
 # the central install, never stored in etcd, and never leave this VM.
 #
-# Apply changes with `docker compose restart trellis-proxy`; send SIGHUP to re-publish the
-# tool catalog (the proxy reconnects; in-flight calls fail rather than being replayed).
+# Apply exports/tools_dir changes with SIGHUP (`docker kill -s HUP trellis-proxy`), which
+# reloads this file and re-publishes the catalog (the proxy reconnects; in-flight calls
+# fail rather than being replayed). site/server_url/token/tls/sandbox changes need a
+# restart, and the proxy logs a warning for each one you try to apply with SIGHUP.
 
 # Site id, pre-registered by an admin in Admin -> Edges. It must match the site the token
 # was issued for. The central relay derives identity from the token hash and never trusts
@@ -21,9 +23,17 @@ site: plant-floor
 # the bearer token and internal tool arguments. The path is fixed.
 server_url: wss://trellis.example.com/edge/v1/connect
 
-# Env var holding the enrollment token (edge_<site>_<random>). Never inline the token:
-# this file is read-only inside the container but still copied by backups.
-token_env: TRELLIS_EDGE_TOKEN
+# Where the enrollment token (edge_<site>_<random>) is read from. The file form is
+# preferred: it is not part of the process environment, so it never lands in
+# /proc/<pid>/environ where a tool could read it. The sample compose mounts it as a docker
+# secret. The proxy reads the file once and unlinks it when the mount allows that.
+# Env equivalent: TRELLIS_EDGE_TOKEN_FILE.
+token_file: /run/secrets/edge_token
+
+# Fallback for installs that cannot mount a file: name of the env var holding the token.
+# Only used when token_file is empty. Never inline the token itself: this file is
+# read-only inside the container but still copied by backups.
+# token_env: TRELLIS_EDGE_TOKEN
 
 # Directory holding this edge's tool.yaml directories. Same schema as the central
 # workspace (workspace/tools/<tool>/tool.yaml). The sample compose mounts the workspace

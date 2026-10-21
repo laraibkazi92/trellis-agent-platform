@@ -108,6 +108,10 @@ class ProxyConfig:
     site: str
     server_url: str
     token_env: str = "TRELLIS_EDGE_TOKEN"
+    # Preferred over ``token_env``: a file is not part of the exec environment, so it
+    # never shows up in /proc/<pid>/environ where a tool running as the same uid can
+    # read it. Read once, then unlinked when the mount allows it.
+    token_file: Optional[str] = None
     tools_dir: Path = Path("workspace/tools")
     exports: List[str] = field(default_factory=list)
     sandbox: str = "auto"
@@ -197,6 +201,8 @@ def load_config(path: str | Path | None = None) -> ProxyConfig:
         )
 
     token_env = str(raw.get("token_env") or "TRELLIS_EDGE_TOKEN").strip() or "TRELLIS_EDGE_TOKEN"
+    token_file = os.getenv("TRELLIS_EDGE_TOKEN_FILE") or raw.get("token_file")
+    token_file = str(token_file).strip() if token_file else None
 
     tls_ca_file = os.getenv("TRELLIS_EDGE_TLS_CA") or raw.get("tls_ca_file")
     tls_cert_file = os.getenv("TRELLIS_EDGE_TLS_CERT") or raw.get("tls_cert_file")
@@ -226,6 +232,7 @@ def load_config(path: str | Path | None = None) -> ProxyConfig:
         site=site,
         server_url=server_url,
         token_env=token_env,
+        token_file=token_file or None,
         tools_dir=Path(tools_dir).expanduser() if tools_dir else Path("workspace/tools"),
         exports=exports,
         sandbox=sandbox,
@@ -501,6 +508,9 @@ class _Session:
         self.tools: Dict[str, Tuple[ToolConfig, Path]] = {}
         self.reconnect = asyncio.Event()
         self.connection: Any = None
+        # Set once the relay answered our hello with a welcome: ``--once`` uses it to
+        # tell "connected, then the relay hung up" from "never accepted".
+        self.accepted = False
         # Set by a ``drain`` frame: a pause the relay asked for, honoured by the
         # reconnect wait in run(). Sleeping here would block in-flight results
         # from being sent while the socket is still open.
@@ -528,18 +538,19 @@ class _Session:
             self.tools = load_tools(self.config.tools_dir, self.config.exports)
             return
 
-        for field in (
+        for name in (
             "site",
             "server_url",
             "token_env",
+            "token_file",
             "sandbox",
             "tls_ca_file",
             "tls_cert_file",
             "tls_key_file",
         ):
-            if getattr(fresh, field) != getattr(self.config, field):
+            if getattr(fresh, name) != getattr(self.config, name):
                 logger.warning(
-                    "SIGHUP: %s changes need a restart; keeping the current value", field
+                    "SIGHUP: %s changes need a restart; keeping the current value", name
                 )
 
         # Build the catalog first: if it raises, handle_sighup keeps the old one and
@@ -634,11 +645,45 @@ def _resolve_and_forget_token(config: ProxyConfig) -> str:
     return token
 
 
+def _consume_token_file(path: Path) -> None:
+    """Remove the token file once the handshake owns its value.
+
+    A docker secret or a copy in a writable tmpfs can be unlinked, which is the point:
+    a tool running as the proxy's uid can read ``/proc/<pid>/environ`` but not the
+    heap of a process it may not ptrace. A bind-mounted file cannot be unlinked --
+    warn rather than fail the handshake.
+    """
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning(
+            "token file %s could not be removed after reading (%s); a tool running as "
+            "the same uid may still read it -- mount it as a docker secret",
+            path,
+            exc,
+        )
+
+
 def _resolve_token(config: ProxyConfig) -> str:
+    path_value = (os.getenv("TRELLIS_EDGE_TOKEN_FILE") or config.token_file or "").strip()
+    if path_value:
+        path = Path(path_value).expanduser()
+        try:
+            token = path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ValueError(f"proxy config: cannot read token_file {path}: {exc}") from exc
+        if not token:
+            raise ValueError(f"proxy config: token_file {path} is empty")
+        _consume_token_file(path)
+        return token
+
     token = os.getenv(config.token_env, "").strip()
     if not token:
         raise ValueError(
-            f"proxy config: edge token is not set (environment variable {config.token_env!r} is required)"
+            "proxy config: edge token is not set (set token_file: / a TRELLIS_EDGE_TOKEN_FILE, "
+            f"or the {config.token_env!r} environment variable)"
         )
     return token
 
@@ -735,6 +780,7 @@ async def _serve(session: _Session, ws) -> None:
             welcome_site,
             session.config.site,
         )
+    session.accepted = True
     logger.info(
         "Welcome from relay: site=%s heartbeat=%ss inflight=%s",
         welcome_site,
@@ -906,6 +952,11 @@ async def run(
                 session.connection = None
 
             if once:
+                if not session.accepted:
+                    raise RuntimeError(
+                        "edge session ended before the relay accepted the catalog "
+                        f"(close code {close_code}); see the log above"
+                    )
                 return
 
             # A stable session was a success, not a failure streak: start the
@@ -955,6 +1006,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    # The websockets client logs every request header, Authorization included, at
+    # DEBUG. A troubleshooting session must not write the site credential to the logs.
+    logging.getLogger("websockets").setLevel(
+        max(logging.INFO, logging.getLogger().level)
     )
 
     config = load_config(args.config)

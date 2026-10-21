@@ -38,6 +38,7 @@ MAX_STDERR_BYTES = 256 * 1024
 
 # Appended to captured output that hit a cap so truncation stays visible in the
 # JSONDecodeError path and in the stderr handed back to the caller.
+MAX_RESULT_CHARS = 96_000
 TRUNCATION_MARKER = b"\n...[output truncated by hub]"
 
 _PIPE_CHUNK_BYTES = 64 * 1024
@@ -212,11 +213,13 @@ async def execute_tool(
             return
         await asyncio.to_thread(on_health, is_success, error_message)
 
+    tool_dir = Path(tool_dir).resolve()
     entrypoint_path = (tool_dir / config.entrypoint).resolve()
-    if not str(entrypoint_path).startswith(str(tool_dir)):
-        return {"error": f"Entrypoint resolves outside tool directory"}
+    # is_relative_to, not a string prefix: "tools/foo" must not accept "tools/foo-evil".
+    if not entrypoint_path.is_relative_to(tool_dir):
+        return {"error": "Entrypoint resolves outside tool directory"}
     if not entrypoint_path.is_file():
-        return {"error": f"Entrypoint does not exist or is not a file"}
+        return {"error": "Entrypoint does not exist or is not a file"}
 
     cmd = []
     if config.runtime == "python":
@@ -353,8 +356,8 @@ async def execute_tool(
             result = json.loads(stdout.decode("utf-8", errors="replace"))
             # Global Safety Net: Safely truncate tool outputs exceeding 24k tokens (96,000 characters)
             stringified = json.dumps(result)
-            if len(stringified) > 96000:
-                logger.warning(f"Warning: Tool {config.name} output size ({len(stringified)} chars) exceeded safety limit of 96000 chars. Truncating...")
+            if len(stringified) > MAX_RESULT_CHARS:
+                logger.warning(f"Warning: Tool {config.name} output size ({len(stringified)} chars) exceeded safety limit of {MAX_RESULT_CHARS} chars. Truncating...")
                 result = {
                     "error": f"Global Safety Net: The tool '{config.name}' output exceeded the 24k token limit (96,000 characters). Output was safely truncated to prevent model context crashes.",
                     "partial_data_preview": stringified[:90000] + "... [TRUNCATED DUE TO SAFETY LIMITS]"

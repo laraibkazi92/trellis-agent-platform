@@ -570,3 +570,26 @@ def test_a_whitelisted_tool_is_public_even_when_the_site_is_not(mgr):
     published = _config(mgr, REGISTRY_NAME)
     assert published["public"] is True
     assert _embedding(mgr, REGISTRY_NAME) is not None
+
+
+def test_an_empty_catalog_keeps_the_existing_inventory(mgr):
+    """A mistyped tools_dir must not wipe the site's central tools."""
+    mgr.create_edge(SITE, "Plant floor", "admin@example.com")
+    _publish(mgr, [_tool()])
+
+    published = _publish(mgr, [])
+
+    assert published == [REGISTRY_NAME]
+    assert _config(mgr, REGISTRY_NAME) is not None
+    assert "empty catalog" in (mgr.get_edge_status(SITE) or {}).get("last_error", "")
+
+
+def test_an_admin_driven_empty_catalog_still_prunes(mgr):
+    """Narrowing exports to nothing is explicit intent, not a misconfiguration."""
+    mgr.create_edge(SITE, "Plant floor", "admin@example.com")
+    _publish(mgr, [_tool()])
+
+    published = registry.publish_catalog(mgr, SITE, [], "0.3.0", allow_empty=True)
+
+    assert published == []
+    assert _config(mgr, REGISTRY_NAME) is None

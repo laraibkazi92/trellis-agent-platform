@@ -837,3 +837,96 @@ def test_reload_keeps_the_old_state_when_the_new_config_is_invalid(tmp_path):
 
     assert session.config == before[0]
     assert session.tools == before[1]
+
+
+# --- token file ---------------------------------------------------------------------
+
+
+def _token_config(tmp_path, token_file):
+    return proxy.ProxyConfig(
+        site="plant-floor",
+        server_url="ws://relay.local/edge/v1/connect",
+        token_file=str(token_file) if token_file is not None else None,
+    )
+
+
+def test_the_token_is_read_from_a_file_and_the_file_is_removed(monkeypatch, tmp_path):
+    monkeypatch.delenv("TRELLIS_EDGE_TOKEN_FILE", raising=False)
+    token_path = tmp_path / "edge-token"
+    token_path.write_text("edge_plant-floor_secret\n")
+
+    token = proxy._resolve_token(_token_config(tmp_path, token_path))
+
+    assert token == "edge_plant-floor_secret"
+    # No copy left on disk for a tool running as the same uid to read.
+    assert not token_path.exists()
+
+
+def test_the_token_file_wins_over_the_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRELLIS_EDGE_TOKEN", "edge_from_env")
+    monkeypatch.delenv("TRELLIS_EDGE_TOKEN_FILE", raising=False)
+    token_path = tmp_path / "edge-token"
+    token_path.write_text("edge_from_file")
+
+    assert proxy._resolve_token(_token_config(tmp_path, token_path)) == "edge_from_file"
+
+
+def test_a_missing_token_file_fails_with_an_actionable_message(tmp_path):
+    with pytest.raises(ValueError, match="cannot read token_file"):
+        proxy._resolve_token(_token_config(tmp_path, tmp_path / "nope"))
+
+
+def test_an_empty_token_file_is_rejected(tmp_path):
+    token_path = tmp_path / "edge-token"
+    token_path.write_text("   \n")
+
+    with pytest.raises(ValueError, match="is empty"):
+        proxy._resolve_token(_token_config(tmp_path, token_path))
+
+
+def test_token_file_is_loaded_from_proxy_yaml(tmp_path):
+    tools = tmp_path / "tools"
+    _write_tool(tools, "alpha")
+    config_path = tmp_path / "proxy.yaml"
+    _write_config(config_path, tools, ["alpha"])
+    config_path.write_text(
+        config_path.read_text() + f"token_file: {tmp_path / 'edge-token'}\n"
+    )
+
+    config = proxy.load_config(config_path)
+
+    assert config.token_file == str(tmp_path / "edge-token")
+
+
+def test_once_fails_when_the_relay_hangs_up_before_welcome(monkeypatch):
+    """A clean close before the catalog is accepted must not look like success."""
+    from types import SimpleNamespace
+
+    config = proxy.ProxyConfig(site="plant-floor", server_url="ws://relay.local/edge/v1/connect")
+    monkeypatch.setenv("TRELLIS_EDGE_TOKEN", "edge_plant-floor_secret")
+    monkeypatch.setattr(proxy, "_SECRET_ENV_NAMES", set())
+
+    async def _noop_serve(session, ws):
+        return None
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    class _FakeConnect:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return SimpleNamespace(close_code=1011, send=_noop, close=_noop)
+
+        async def __aexit__(self, *exc):
+            return False
+
+    def _fake_connect(url, additional_headers=None, **kwargs):
+        return _FakeConnect()
+
+    monkeypatch.setattr(proxy, "_serve", _noop_serve)
+    monkeypatch.setattr(proxy, "_connect_factory", lambda: _fake_connect)
+
+    with pytest.raises(RuntimeError, match="before the relay accepted"):
+        asyncio.run(proxy.run(config, once=True))

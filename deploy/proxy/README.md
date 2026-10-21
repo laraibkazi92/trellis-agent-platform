@@ -6,8 +6,9 @@ publishes the tools listed in its `exports` allowlist, and runs them locally.
 
 Feature overview, topology, and failure semantics: [docs/proxy.md](../../docs/proxy.md).
 
-> **Status:** enrollment is live — create the site in **Admin → Edges**, then paste the
-> one-time token into this host's `.env` as `TRELLIS_EDGE_TOKEN`.
+> **Status:** enrollment is live — create the site in **Admin → Edges**, then write the
+> one-time token to `edge-token` on this host (mounted as a docker secret and read through
+> `token_file:` in `proxy.yaml`).
 
 ## Prerequisites
 
@@ -35,14 +36,15 @@ cp -a /path/to/your/tools/. workspace/tools/
 cp proxy.yaml.example proxy.yaml
 $EDITOR proxy.yaml          # site, server_url, tools_dir, exports, sandbox
 
-# 4. Provide the enrollment token (0600, never committed). Compose reads .env for both
-#    interpolation and env_file.
-install -m 0600 /dev/null .env
-cat >> .env <<'EOF'
-TRELLIS_EDGE_TOKEN=edge_plant-floor_...
-EOF
+# 4. Provide the enrollment token. It is mounted as a docker secret (never an env var,
+#    which a tool could read from /proc/<pid>/environ) and referenced by token_file:.
+umask 077
+printf '%s' 'edge_plant-floor_...' > edge-token
 
-# 5. Start it.
+# 5. Put the tool credentials the exported tools need in .env (never the tunnel token).
+install -m 0600 /dev/null .env
+
+# 6. Start it.
 docker compose up -d
 ```
 
@@ -56,12 +58,13 @@ or a restart. No manual file copy is needed after editing `tool.yaml`.
 ## Verify
 
 ```bash
-docker compose ps                     # trellis-proxy Up, restarting only if the tunnel fails
 docker compose logs -f trellis-proxy  # one line per connection state change, never bodies
 ```
 
-The one-line check that matters is on the **central** side: the relay behind nginx reports
-the site as connected.
+`docker compose ps` only proves the process is alive: the proxy never exits on a tunnel
+failure, it reconnects in a loop, so the container shows `Up` either way. Watch the log or
+the central view. The one-line check that matters is on the **central** side: the relay
+behind nginx reports the site as connected.
 
 ```bash
 # on the central host (the relay is not published; go through its own container network)
@@ -76,9 +79,9 @@ exported tools is the end-to-end proof.
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| Tunnel closes with **4403** (`token rejected`) | Token unknown, revoked, or disabled; or it belongs to a different site than `proxy.yaml` says | Re-check `TRELLIS_EDGE_TOKEN` in `.env`; if revoked, have an admin rotate it and paste the new value |
+| Handshake fails with **HTTP 401** / close **4403** | Token unknown, revoked, or disabled; or it belongs to a different site than `proxy.yaml` says | Re-check the token in `edge-token` (or `token_file:`); if revoked, have an admin rotate it and write the new value |
 | Tunnel closes with **4409** (`site superseded`) | A newer connection for the same site exists — typically an old container still running on a second host | Stop the duplicate (`docker compose down` there); 4409 is also what a redeploy sees for a moment, so confirm it repeats before acting |
-| **Nothing published** / no tools in Admin → Edges | `exports` is empty (or names do not match `tool.yaml` `name:` fields) | `exports` is an allowlist and an empty list publishes nothing. List the tools explicitly, then restart |
+| **Nothing published** / no tools in Admin → Edges | `exports` is empty (or names do not match `tool.yaml` `name:` fields, or `tools_dir` does not exist in the container) | `exports` is an allowlist and an empty list publishes nothing. List the tools explicitly, then SIGHUP. Publishing an empty catalog keeps the site's existing central tools and flags a warning, so a typo cannot wipe the inventory |
 | **`503 edge_offline`** on a tool call | The site is not connected: tunnel down, wrong token, or relay restarted | `docker compose logs -f trellis-proxy` for the reconnect reason; edges retry with jittered backoff (1 s → 60 s) |
 | **No outbound connection at all** | Egress firewall, or a proxy that needs `HTTPS_PROXY`/`NO_PROXY` | Test from inside the container: `docker compose exec trellis-proxy curl -sI https://trellis.example.com/`. `wss://` needs 443 and, if a proxy is enforced, `HTTPS_PROXY` set in `.env` |
 | Tool calls fail with a sandbox error | `sandbox: auto` picked a backend this kernel cannot run (no user namespaces, restrictive AppArmor) | Check the mentioned backend in the log, then pin `sandbox: landlock`; for bwrap, enable the shared-sandbox block in `docker-compose.yml` |
@@ -94,6 +97,10 @@ exported tools is the end-to-end proof.
 - **Credentials stay local.** Tool secrets live in this host's `.env` / secret store and
   are injected into local tool processes. They never transit the tunnel and are never
   stored in the central etcd.
+- **Tool code is trusted.** Tools share the proxy's uid, so they can read what it can read.
+  Review exported tool code like a service account. The enrollment token is file-mounted
+  (not inherited through the environment) and the file is unlinked after reading; a
+  read-only secret mount cannot be unlinked, which is the documented residual.
 - **No user-scoped secrets.** Remote tools run as an edge-level service account, not as
   the requesting Trellis user — a consequence of keeping credentials on this side. See the
   feature doc for the residual risk.

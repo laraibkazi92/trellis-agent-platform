@@ -145,13 +145,6 @@ def _edge_config(name="plant-floor", **overrides):
     return config
 
 
-def _token_key(location):
-    """Pull the one-shot handoff key out of a redirect Location."""
-    assert "?" in location, location
-    query = location.split("?", 1)[1]
-    return {k: v for k, v in (pair.split("=", 1) for pair in query.split("&"))}["token"]
-
-
 # --- GET /admin/edges ----------------------------------------------------------
 
 def test_non_admin_is_redirected_away(monkeypatch):
@@ -267,9 +260,10 @@ def test_create_valid_edge_shows_token_once(monkeypatch):
     }]
     assert "shown once" in session["flash_msg"]
 
-    # The token is not in the redirect URL: the follow-up render claims it by key.
-    key = _token_key(response.headers["location"])
-    follow_up = FakeRequest(session=_admin_session(), query={"token": key})
+    # The token is never in the redirect URL (access logs would record it): the
+    # follow-up render claims whatever this process is holding.
+    assert response.headers["location"] == "/admin/edges"
+    follow_up = FakeRequest(session=_admin_session())
     captured = {}
     real = admin.templates.TemplateResponse
 
@@ -280,15 +274,15 @@ def test_create_valid_edge_shows_token_once(monkeypatch):
     monkeypatch.setattr(admin.templates, "TemplateResponse", capturing)
     rendered = asyncio.run(admin.admin_edges_page(follow_up))
 
-    assert captured["context"]["new_token"] == {"site": "plant-floor", "token": TOKEN}
+    assert captured["context"]["new_tokens"] == [{"site": "plant-floor", "token": TOKEN}]
     html = rendered.body.decode()
-    assert f'<code id="newEdgeToken"' in html
+    assert '<code id="newEdgeToken1"' in html
     assert TOKEN in html
     assert "shown once" in html.lower()
 
     # Second render: the one-shot value is gone, so it cannot leak later.
     monkeypatch.setattr(admin.templates, "TemplateResponse", real)
-    second = asyncio.run(admin.admin_edges_page(FakeRequest(query={"token": key})))
+    second = asyncio.run(admin.admin_edges_page(FakeRequest()))
     assert TOKEN not in second.body.decode()
 
 
@@ -403,9 +397,9 @@ def test_rotate_issues_a_new_one_time_token(monkeypatch):
     assert fake.rotated == [{"name": "plant-floor", "rotated_by": ADMIN_EMAIL}]
     assert "shown once" in session["flash_msg"]
 
-    key = _token_key(response.headers["location"])
+    assert response.headers["location"] == "/admin/edges"
     rendered = asyncio.run(
-        admin.admin_edges_page(FakeRequest(session=_admin_session(), query={"token": key}))
+        admin.admin_edges_page(FakeRequest(session=_admin_session()))
     )
     assert "edge_plant-floor_rotatedtoken" in rendered.body.decode()
 

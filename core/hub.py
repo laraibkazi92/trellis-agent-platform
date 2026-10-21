@@ -24,6 +24,7 @@ from core import sandbox_preflight
 # (core.proxy) can run tools identically without importing this module's
 # etcd-backed identity manager. Re-exported here for existing callers.
 from core.tool_runtime import (  # noqa: F401
+    MAX_RESULT_CHARS,
     MAX_STDERR_BYTES,
     MAX_STDOUT_BYTES,
     RESTRICTED_ENV_VARS,
@@ -269,6 +270,36 @@ def _edge_error_field(body: Dict[str, Any], field: str, default: str = "") -> st
 
 
 @stamina.retry(on=TransientToolError, attempts=3)
+def _cap_remote_result(name: str, result: Any) -> Any:
+    """Apply the local 96k safety net to a remote result.
+
+    ``core.tool_runtime`` enforces this on the edge, but the edge is semi-trusted: a
+    modified or malicious proxy can simply not truncate, and an oversized result would
+    land in the model's context (and the provider bill). The hub is the trust boundary,
+    so it caps what it accepts.
+    """
+    try:
+        stringified = json.dumps(result)
+    except (TypeError, ValueError):
+        return result
+    if len(stringified) <= MAX_RESULT_CHARS:
+        return result
+    logger.warning(
+        "Remote tool %s returned %d chars; truncating to the %d-char safety limit",
+        name,
+        len(stringified),
+        MAX_RESULT_CHARS,
+    )
+    return {
+        "error": (
+            f"Global Safety Net: The tool '{name}' output exceeded the 24k token limit "
+            f"({MAX_RESULT_CHARS:,} characters). Output was safely truncated to prevent "
+            "model context crashes."
+        ),
+        "partial_data_preview": stringified[:90_000] + "... [TRUNCATED DUE TO SAFETY LIMITS]",
+    }
+
+
 async def _run_remote(config: ToolConfig, arguments: Dict[str, Any], user_id: Optional[str]) -> Dict[str, Any]:
     """Dispatches a remote (edge-hosted) tool through the edge relay's internal API.
 
@@ -364,7 +395,8 @@ async def _run_remote(config: ToolConfig, arguments: Dict[str, Any], user_id: Op
         await record_health(True)
         # A well-formed tool result is a JSON object; anything else is wrapped so
         # callers keep a dict contract.
-        return result if isinstance(result, dict) else {"result": result}
+        result = result if isinstance(result, dict) else {"result": result}
+        return _cap_remote_result(config.name, result)
 
     if status == 400:
         # Schema rejection: permanent by construction, never retried.
@@ -626,7 +658,13 @@ if __name__ == "__main__":
     register_tools()
     # Edge catalogs are published at runtime, so the tool table has to follow etcd
     # instead of being read once at boot. 0 disables the watcher (tests/CI).
-    reconcile_seconds = float(os.getenv("EDGE_TOOL_RECONCILE_SECONDS", "10"))
+    try:
+        reconcile_seconds = float(os.getenv("EDGE_TOOL_RECONCILE_SECONDS", "10"))
+    except ValueError:
+        # A typo here must not take every tool call in the instance down at boot; the
+        # nginx entrypoint fails loud for the same class of mistake.
+        logger.warning("EDGE_TOOL_RECONCILE_SECONDS is not a number; using 10s")
+        reconcile_seconds = 10.0
     if reconcile_seconds > 0:
         threading.Thread(
             target=_reconcile_loop,
