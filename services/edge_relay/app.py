@@ -86,6 +86,9 @@ class EdgeConn:
         self.rate_limit_per_min: Optional[int] = None
         # Digest of the token presented at handshake; a rotation changes it.
         self.token_hash: str = ""
+        # Catalog-relevant admin fields as last published (None = never published).
+        self.published_signature: Optional[tuple] = None
+        self.edge_version: str = ""
 
     async def send(self, frame: Dict[str, Any]) -> None:
         if self.closed:
@@ -244,6 +247,36 @@ async def _lifespan(_app: FastAPI):
             pass
 
 
+async def _apply_admin_changes(conn: EdgeConn, config: Dict[str, Any]) -> None:
+    """Republish when an admin edited exports/public/public_tools/rate limit.
+
+    Those fields are read at handshake, so without this a removed tool stayed callable
+    (and a new one invisible) until the edge happened to reconnect. The heartbeat
+    already re-reads the record; acting on a change is one extra registry write.
+    """
+    signature = _catalog_signature(config)
+    conn.rate_limit_per_min = config.get("rate_limit_per_min")
+    if conn.published_signature is None or signature == conn.published_signature:
+        return
+    try:
+        published = await asyncio.to_thread(
+            registry.publish_catalog,
+            _identity_manager(),
+            conn.site,
+            list(conn.tools.values()),
+            conn.edge_version,
+        )
+    except Exception:
+        logger.exception("could not refresh the catalog for site=%s", conn.site)
+        return
+    conn.published_signature = signature
+    logger.info(
+        "edge catalog refreshed from admin changes site=%s tools=%d",
+        conn.site,
+        len(published),
+    )
+
+
 def _mark_all_disconnected(reason: str) -> None:
     mgr = _identity_manager()
     for site in mgr.list_edges():
@@ -278,6 +311,16 @@ class CallBody(BaseModel):
     # Strict: pydantic would otherwise accept ``true`` as ``1``.
     deadline_ms: Annotated[int, Field(strict=True)] = DEFAULT_DEADLINE_MS
     user: Optional[str] = None
+
+
+def _catalog_signature(config: Dict[str, Any]) -> tuple:
+    """The admin-editable fields that change what a site publishes or how fast."""
+    return (
+        tuple(config.get("exports") or []),
+        bool(config.get("public")),
+        tuple(config.get("public_tools") or []),
+        config.get("rate_limit_per_min"),
+    )
 
 
 def _error(status: int, code: str, message: str) -> JSONResponse:
@@ -322,6 +365,9 @@ async def _heartbeat(conn: EdgeConn) -> None:
                 and bool(conn.token_hash)
                 and config["token_hash"] != conn.token_hash
             )
+            if not revoked and not rotated:
+                await _apply_admin_changes(conn, config)
+
             if revoked or rotated:
                 # `enabled` stays true across a rotation, so the hash compare is what
                 # makes "rotate" cut off a leaked tunnel instead of waiting for a drop.
@@ -453,6 +499,8 @@ async def edge_connect(ws: WebSocket) -> None:
         relay.unregister(site, conn)
         return
 
+    conn.published_signature = _catalog_signature(config)
+    conn.edge_version = edge_version
     await relay.register(site, conn)
     logger.info("edge connected site=%s version=%s tools=%d", site, edge_version, len(tools))
     audit.record("connect", site=site, outcome="ok")

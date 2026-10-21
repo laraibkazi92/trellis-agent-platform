@@ -30,6 +30,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,33 @@ CODES: frozenset[str] = frozenset({
     "helper_failed",
     "unknown",
 })
+
+def writable_root() -> Path:
+    """The one path a sandboxed tool may write, overridable on a standalone install.
+
+    Rejects ``/`` (which would remove write confinement) and non-absolute values, so a
+    typo falls back to the framework default instead of silently widening the sandbox.
+    """
+    raw = (os.getenv("SANDBOX_RW_PATH") or "/app/workspace").strip()
+    candidate = Path(raw)
+    if not candidate.is_absolute() or candidate == Path("/"):
+        if raw != "/app/workspace":
+            logger.warning(
+                "Ignoring SANDBOX_RW_PATH=%r (must be an absolute path other than '/'); "
+                "using /app/workspace",
+                raw,
+            )
+        return Path("/app/workspace")
+    return candidate
+
+
+def bwrap_base_args() -> tuple[str, ...]:
+    """The pinned bwrap argv with the configured writable root substituted in."""
+    root = str(writable_root())
+    if root == "/app/workspace":
+        return BWRAP_BASE_ARGS
+    return tuple(arg.replace("/app/workspace", root) for arg in BWRAP_BASE_ARGS)
+
 
 BWRAP_BASE_ARGS: tuple[str, ...] = (
     "bwrap",
@@ -511,7 +539,8 @@ def _classify_helper_result(backend: str, proc) -> ProbeResult:
 
     # A missing bind source is a deployment problem, not a Landlock refusal.
     # Phase 1 made the same call for bwrap; do not mislabel it ``bwrap_missing``.
-    if "/app/workspace" in text and any(
+    writable = str(writable_root())
+    if (writable in text or "/app/workspace" in text) and any(
         marker in text
         for marker in ("no such file", "not found", "does not exist", "missing")
     ):
@@ -673,7 +702,7 @@ def probe_landlock(
         return missing
 
     return _run_helper(
-        "landlock", helper, ["--ro", "/", "--rw", "/app/workspace"], timeout
+        "landlock", helper, ["--ro", "/", "--rw", str(writable_root())], timeout
     )
 
 

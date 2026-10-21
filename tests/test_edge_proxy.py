@@ -10,6 +10,7 @@ schema, and one failing tool never takes the receive loop down.
 """
 
 import asyncio
+import os
 import json
 import logging
 import time
@@ -785,3 +786,44 @@ def test_edge_mode_stops_the_tunable_etcd_refresh(monkeypatch):
 
     assert tunables.resolve("tool_execution_timeout") == 300.0
     assert calls == []
+
+
+def test_the_enrollment_token_is_removed_before_tools_run(monkeypatch, tmp_path):
+    """The tunnel credential must not be inherited by tool subprocesses."""
+    monkeypatch.setenv("TRELLIS_EDGE_TOKEN", "edge_site_supersecret")
+    config = proxy.ProxyConfig(site="plant-floor", server_url="ws://relay.local/edge/v1/connect")
+
+    token = proxy._resolve_and_forget_token(config)
+
+    assert token == "edge_site_supersecret"
+    assert "TRELLIS_EDGE_TOKEN" not in os.environ
+    assert "TRELLIS_EDGE_TOKEN" not in proxy.build_env(tmp_path)
+
+
+def test_build_env_drops_a_reintroduced_token(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRELLIS_EDGE_TOKEN", "edge_site_supersecret")
+    proxy._SECRET_ENV_NAMES.add("TRELLIS_EDGE_TOKEN")
+
+    env = proxy.build_env(tmp_path)
+
+    assert "TRELLIS_EDGE_TOKEN" not in env
+
+
+def test_reload_keeps_the_old_state_when_the_new_config_is_invalid(tmp_path):
+    tools = tmp_path / "tools"
+    _write_tool(tools, "alpha")
+    config_path = tmp_path / "proxy.yaml"
+    _write_config(config_path, tools, ["alpha"])
+
+    session = proxy._Session(proxy.load_config(config_path), config_path)
+    session.reload()
+    before = (session.config, dict(session.tools))
+
+    config_path.write_text("site: [unclosed\n")
+
+    # An unreadable/invalid config is logged and ignored: the previous allowlist keeps
+    # serving rather than dropping every tool because of a typo.
+    session.reload()
+
+    assert session.config == before[0]
+    assert session.tools == before[1]

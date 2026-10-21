@@ -1145,3 +1145,71 @@ def test_unchanged_token_hash_keeps_the_tunnel(monkeypatch):
     asyncio.run(run())
 
     assert conn.ws.closed_codes == []
+
+
+def test_heartbeat_republishes_after_an_admin_changes_the_exports(monkeypatch):
+    """An un-exported tool must stop being callable without waiting for a reconnect."""
+    conn = _install_conn(site="plant-floor")
+    conn.published_signature = (("echo",), False, (), None)
+    conn.edge_version = "0.3.0"
+    published = []
+
+    class _Mgr:
+        def get_edge_config(self, site):
+            return {
+                "name": site,
+                "enabled": True,
+                "exports": ["echo", "new_tool"],
+                "public": True,
+                "public_tools": [],
+                "rate_limit_per_min": 30,
+            }
+
+    monkeypatch.setattr(app_module, "_identity_manager", lambda: _Mgr())
+    monkeypatch.setattr(
+        app_module.registry,
+        "publish_catalog",
+        lambda mgr, site, tools, version: published.append((site, len(tools), version)) or [],
+    )
+    monkeypatch.setattr(app_module, "HEARTBEAT_S", 0.01)
+
+    async def run():
+        task = asyncio.create_task(app_module._heartbeat(conn))
+        await _wait_for_frames(conn.ws, count=1)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+
+    assert published == [("plant-floor", 1, "0.3.0")]
+    assert conn.rate_limit_per_min == 30
+    assert conn.published_signature == (("echo", "new_tool"), True, (), 30)
+
+
+def test_heartbeat_does_not_republish_without_an_admin_change(monkeypatch):
+    conn = _install_conn(site="plant-floor")
+    conn.published_signature = ((), False, (), None)
+    published = []
+
+    class _Mgr:
+        def get_edge_config(self, site):
+            return {"name": site, "enabled": True, "exports": [], "public": False,
+                    "public_tools": [], "rate_limit_per_min": None}
+
+    monkeypatch.setattr(app_module, "_identity_manager", lambda: _Mgr())
+    monkeypatch.setattr(
+        app_module.registry, "publish_catalog", lambda *args: published.append(args)
+    )
+    monkeypatch.setattr(app_module, "HEARTBEAT_S", 0.01)
+
+    async def run():
+        task = asyncio.create_task(app_module._heartbeat(conn))
+        await _wait_for_frames(conn.ws, count=1)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+
+    assert published == []

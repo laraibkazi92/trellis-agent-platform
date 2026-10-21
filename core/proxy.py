@@ -45,7 +45,7 @@ MAX_INFLIGHT = protocol.MAX_INFLIGHT
 # Runtimes this edge can actually spawn. ``remote`` is a central-side pointer to
 # another edge, never something an edge executes itself. ``go`` is absent on
 # purpose: the hub precompiles Go tools into ``tool_dir/.bin``, and an edge has
-# no compile step while the workspace is mounted read-only, so a published go
+# no compile step, so a published go
 # tool would fail every call with FileNotFoundError.
 EDGE_RUNTIMES = frozenset({"python", "ts", "bash"})
 
@@ -63,11 +63,15 @@ _VALID_SANDBOX_BACKENDS = frozenset({"auto", "bwrap", "landlock"})
 
 
 def _installed_version() -> str:
-    """The installed distribution's version, or "0.0.0" for a bare checkout.
+    """The version reported in ``hello``, for protocol diagnostics.
 
-    The deployed repo is a source tree with no pyproject/egg-info, so the
-    fallback is the normal path there -- not an error worth surfacing.
+    The image installs requirements only (no project metadata), so the normal path is
+    ``TRELLIS_VERSION`` from the deployment, then "0.0.0" -- not an error worth
+    surfacing. Central operators use the Admin -> Edges column to spot a stale proxy.
     """
+    from_env = os.getenv("TRELLIS_VERSION", "").strip()
+    if from_env:
+        return from_env
     try:
         from importlib.metadata import version
 
@@ -326,12 +330,22 @@ def load_tools(tools_dir: Path, exports: List[str]) -> Dict[str, Tuple[ToolConfi
 # ---------------------------------------------------------------- execution
 
 
+# Names stripped from every tool's environment. The tunnel credential authenticates
+# this *site*; a tool that read it could dial the relay, supersede the real edge, and
+# answer forwarded calls with forged results.
+_SECRET_ENV_NAMES: set[str] = set()
+
+
 def build_env(tool_dir: Path) -> Dict[str, str]:
     """Sanitized environment with this tool's own ``bin/`` prepended to PATH.
 
     Built per call, like the hub, so each tool only sees its own helper binaries.
+    The proxy's own credentials are removed even if something re-adds them to the
+    process environment.
     """
     env = sanitized_env()
+    for secret in _SECRET_ENV_NAMES:
+        env.pop(secret, None)
     tool_bin = str((Path(tool_dir) / "bin").resolve())
     env["PATH"] = f"{tool_bin}{os.pathsep}{env.get('PATH', '')}"
     return env
@@ -496,11 +510,12 @@ class _Session:
         """Re-read proxy.yaml (exports/tools_dir) and rebuild the catalog.
 
         Re-reading is what makes ``SIGHUP`` useful after editing ``exports``: a
-        tool file alone would be filtered out by the in-memory allowlist. Identity
-        and destination are deliberately *not* reloadable -- changing the site or
-        the relay URL mid-session would silently move a live tunnel.
+        tool file alone would be filtered out by the in-memory allowlist. Fields that
+        cannot be applied to a live tunnel (identity, destination, credentials, the
+        sandbox backend) are reported rather than half-applied.
         """
-        if self.config_path is not None:
+        fresh: Optional[ProxyConfig] = None
+        if self.config_path is not None and self.config_path.exists():
             try:
                 fresh = load_config(self.config_path)
             except Exception:
@@ -508,23 +523,33 @@ class _Session:
                     "SIGHUP: could not re-read %s; using the current allowlist",
                     self.config_path,
                 )
-            else:
-                if (fresh.site, fresh.server_url) != (
-                    self.config.site,
-                    self.config.server_url,
-                ):
-                    logger.warning(
-                        "SIGHUP: site/server_url changes need a restart; keeping %s -> %s",
-                        self.config.site,
-                        self.config.server_url,
-                    )
-                self.config = replace(
-                    self.config,
-                    exports=fresh.exports,
-                    tools_dir=fresh.tools_dir,
-                    sandbox=fresh.sandbox,
+
+        if fresh is None:
+            self.tools = load_tools(self.config.tools_dir, self.config.exports)
+            return
+
+        for field in (
+            "site",
+            "server_url",
+            "token_env",
+            "sandbox",
+            "tls_ca_file",
+            "tls_cert_file",
+            "tls_key_file",
+        ):
+            if getattr(fresh, field) != getattr(self.config, field):
+                logger.warning(
+                    "SIGHUP: %s changes need a restart; keeping the current value", field
                 )
-        self.tools = load_tools(self.config.tools_dir, self.config.exports)
+
+        # Build the catalog first: if it raises, handle_sighup keeps the old one and
+        # the config must still describe what is actually published.
+        candidate = replace(
+            self.config, exports=fresh.exports, tools_dir=fresh.tools_dir
+        )
+        new_tools = load_tools(candidate.tools_dir, candidate.exports)
+        self.config = candidate
+        self.tools = new_tools
 
     def request_reconnect(self, reason: str = "") -> None:
         """Republish by reconnecting: closing the socket makes the loop redial."""
@@ -595,6 +620,18 @@ def _header_kwarg(connect) -> str:
     if "extra_headers" in parameters:
         return "extra_headers"
     return ""
+
+
+def _resolve_and_forget_token(config: ProxyConfig) -> str:
+    """Read the enrollment token, then take it out of the process environment.
+
+    Tools inherit ``os.environ`` through ``sanitized_env``; the token has no business
+    there once the handshake owns it.
+    """
+    token = _resolve_token(config)
+    _SECRET_ENV_NAMES.add(config.token_env)
+    os.environ.pop(config.token_env, None)
+    return token
 
 
 def _resolve_token(config: ProxyConfig) -> str:
@@ -793,7 +830,7 @@ async def run(
     if config.sandbox != "auto":
         os.environ.setdefault("SANDBOX_BACKEND", config.sandbox)
 
-    token = _resolve_token(config)
+    token = _resolve_and_forget_token(config)
     connect = _connect_factory()
 
     # Tells shared core modules (core/tunables) not to look for etcd: an edge is a
@@ -923,7 +960,15 @@ def main(argv: Optional[List[str]] = None) -> None:
     config = load_config(args.config)
     _install_signal_handlers()
     resolved = _config_path(args.config)
-    asyncio.run(run(config, once=args.once, config_path=resolved[0] if resolved[1] else None))
+    # Pass the path whenever it exists, not only when it was spelled out: the implicit
+    # ./proxy.yaml must be just as reloadable as an explicit --config.
+    asyncio.run(
+        run(
+            config,
+            once=args.once,
+            config_path=resolved[0] if resolved[0].exists() else None,
+        )
+    )
 
 
 if __name__ == "__main__":

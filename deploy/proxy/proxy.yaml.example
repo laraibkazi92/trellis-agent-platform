@@ -26,8 +26,9 @@ server_url: wss://trellis.example.com/edge/v1/connect
 token_env: TRELLIS_EDGE_TOKEN
 
 # Directory holding this edge's tool.yaml directories. Same schema as the central
-# workspace (workspace/tools/<tool>/tool.yaml). Mounted read-only at /app/workspace by the
-# compose file, so tools may read their own assets but the proxy never writes to the tree.
+# workspace (workspace/tools/<tool>/tool.yaml). The sample compose mounts the workspace
+# read-write at /app/workspace because the sandbox grants tools exactly that one writable
+# path (override with SANDBOX_RW_PATH); mount :ro only for read-only tools.
 tools_dir: ./workspace/tools
 
 # Allowlist of tools this node publishes to the central install, e.g.

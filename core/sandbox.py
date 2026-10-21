@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 # Single source of truth shared with the preflight probe.
 BWRAP_ARGS = sandbox_preflight.BWRAP_BASE_ARGS
+writable_root = sandbox_preflight.writable_root
 
 _VALID_BACKENDS = frozenset({"auto", "bwrap", "landlock"})
 _VALID_NET_POLICIES = frozenset({"allow", "none"})
@@ -266,16 +267,6 @@ def invalidate_after_failure(code: str) -> bool:
     return True
 
 
-def writable_root() -> Path:
-    """The one writable path the landlock helper grants a tool.
-
-    Defaults to the framework's workspace. Overridable so a standalone install
-    (the edge proxy, embedders) can point it at its own writable directory instead
-    of inheriting a path that may not exist in that container.
-    """
-    return Path(os.getenv("SANDBOX_RW_PATH") or "/app/workspace")
-
-
 def _seccomp_disabled() -> bool:
     return sandbox_preflight.seccomp_disabled()
 
@@ -293,7 +284,7 @@ def build_cmd(
     backend = Backend(backend)
     deny_net = _normalize_net(network) == "none"
     if backend is Backend.BWRAP:
-        args = list(BWRAP_ARGS)
+        args = list(sandbox_preflight.bwrap_base_args())
         if deny_net:
             # A private network namespace with no interfaces: loopback included.
             args.append("--unshare-net")

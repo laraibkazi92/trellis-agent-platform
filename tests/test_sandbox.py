@@ -702,3 +702,50 @@ def test_invalidate_after_failure_keeps_the_selection_within_cooldown(monkeypatc
 
     # Nothing new to select from: the memoized backend is still valid.
     assert len(calls) == 1
+
+
+# --- writable root -------------------------------------------------------------------
+
+
+def test_writable_root_defaults_to_the_workspace(monkeypatch):
+    monkeypatch.delenv("SANDBOX_RW_PATH", raising=False)
+    assert sandbox.writable_root() == Path("/app/workspace")
+
+
+def test_writable_root_is_applied_to_the_landlock_argv(monkeypatch, tmp_path):
+    monkeypatch.setenv("SANDBOX_RW_PATH", str(tmp_path))
+
+    argv = sandbox.build_cmd(
+        sandbox.Backend.LANDLOCK,
+        ["bash", "x"],
+        tmp_path / "tool",
+        tmp_path / "tmp",
+        1000,
+        1000,
+    )
+
+    assert argv[argv.index("--rw") + 1] == str(tmp_path)
+
+
+def test_writable_root_is_applied_to_the_bwrap_argv(monkeypatch, tmp_path):
+    monkeypatch.setenv("SANDBOX_RW_PATH", str(tmp_path))
+
+    argv = sandbox.build_cmd(
+        sandbox.Backend.BWRAP,
+        ["bash", "x"],
+        tmp_path / "tool",
+        tmp_path / "tmp",
+        1000,
+        1000,
+    )
+
+    binds = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--bind"]
+    assert str(tmp_path) in binds
+    assert "/app/workspace" not in binds
+
+
+@pytest.mark.parametrize("value", ["/", "", "   ", "relative/path"])
+def test_writable_root_refuses_a_dangerous_or_relative_value(monkeypatch, value):
+    monkeypatch.setenv("SANDBOX_RW_PATH", value)
+
+    assert sandbox.writable_root() == Path("/app/workspace")
