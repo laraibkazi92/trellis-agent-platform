@@ -40,7 +40,7 @@ Run from the engine clone:
 ```bash
 git fetch --tags
 git describe --tags            # note the tag you are on now, for rollback
-git checkout v0.4.0            # target release tag
+git checkout v0.4.1            # target release tag
 docker compose pull            # fetch the multi-arch app image for that tag
 docker compose up -d           # recreate services; nginx-gateway is built from ./gateway
 ```
@@ -399,15 +399,23 @@ under the same sandbox policy *on the edge*, and their files stay on the edge ho
 | `EDGE_AUDIT_LOG` | `/app/data/edge-audit.log` | relay audit trail (inside `health-data`, 10 MB × 5) |
 | `EDGE_RATE_LIMIT_PER_MIN` / `_RPS` / `_BURST` | `120` / `30` / `20` | per-site call budget; a site record can override the per-minute value |
 | `EDGE_MTLS_CA` | unset | CA bundle for edge client certs; requires `SSL_ENABLED=true` |
-| `TRELLIS_VERSION` | build value | reported in the edge hello frame and **Admin → Edges** |
+| `TRELLIS_VERSION` | the release tag on a pulled image; `dev` on a local build | reported in the edge hello frame and **Admin → Edges** |
 | `EDGE_DEV_SITE` / `EDGE_DEV_TOKEN` | unset | **DEV ONLY**, ignored unless `DEV_MODE=true`; plaintext, no rotation, no audit |
 
 #### Upgrade actions
 
 1. `docker compose pull && docker compose up -d` — pulls `v0.4.0` and starts `edge-relay`.
-2. **Rebuild the edge proxy:** `docker compose up -d --build nginx-gateway`. The `/edge`
-   routes live in `gateway/entrypoint.sh`, which is built locally rather than pulled, so
-   `pull` alone leaves the old entrypoint in place and `/edge` returns 404.
+2. **Rebuild the edge proxy:**
+   ```bash
+   docker compose build nginx-gateway
+   docker compose up -d --no-build --no-deps nginx-gateway
+   ```
+   The `/edge` routes live in `gateway/entrypoint.sh`, which is built locally rather than
+   pulled, so `pull` alone leaves the old entrypoint in place and `/edge` returns 404.
+   **Do not** use `docker compose up -d --build nginx-gateway`: `--build` on `up` also
+   builds every service with a `build:` section in that service's dependency graph, so it
+   replaces the image you just pulled with a local build — verified on a live host, the app
+   image then reports `TRELLIS_VERSION=dev` and carries no attestation.
 3. Confirm `/healthz` is still `ok: true` with the backend you expect, and that
    **Admin → Edges** renders.
 4. Only if you want edges: deploy `deploy/proxy/` on the edge host and enroll a site
@@ -426,6 +434,49 @@ Changes to declare:
 
 ---
 
+### v0.4.1 — 2026-10-21
+
+Documentation-only release. No code, image content, compose service, `.env` key, or registry
+behavior changed since `v0.4.0`; the only functional difference is the `TRELLIS_IMAGE` default,
+which moves to `v0.4.1`.
+
+It exists because the `v0.4.0` **tag** shipped upgrade instructions telling you to run
+`docker compose up -d --build nginx-gateway`. That command builds every service with a
+`build:` section in that service's dependency graph, so it does not just rebuild the edge
+proxy — it replaces the app image pulled from GHCR with a local build that reports
+`TRELLIS_VERSION=dev` and carries no attestation. The fix landed on `main` right after
+`v0.4.0`; this tag re-ships it so the instructions you read from the tag are correct.
+
+**If you already upgraded to `v0.4.0`:** nothing is broken. Check what your app image is:
+
+```bash
+docker image inspect "${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.4.0}" \
+  --format '{{index .RepoDigests 0}}'
+```
+
+- `@sha256:fc37e6c8…` (or any digest that is not the image ID itself) — you are on the released
+  image. No action.
+- An empty `RepoDigests` or a digest equal to the image ID — that is a local build. Restore
+  the released artifact with `docker compose pull && docker compose up -d`, and rebuild the
+  proxy with the two-step form:
+
+  ```bash
+  docker compose build nginx-gateway
+  docker compose up -d --no-build --no-deps nginx-gateway
+  ```
+
+**Upgrade from `v0.4.0`:** `docker compose pull && docker compose up -d`, then the two-step
+proxy rebuild above if you have not already done it. The `v0.4.0` notes otherwise apply
+unchanged.
+
+- **Compose services:** none changed.
+- **`.env` keys:** none added or removed.
+- **Registry sync / tool protocol / data migrations:** none.
+- **Image pins:** `TRELLIS_IMAGE` default → `v0.4.1` (identical image content to `v0.4.0`,
+  different build, so it has its own digest and attestation).
+
+---
+
 ## Release checklist (maintainer template)
 
 Copy this into the release PR/notes and fill it in per release.
@@ -437,6 +488,9 @@ Copy this into the release PR/notes and fill it in per release.
 - [ ] CI published multi-arch images to GHCR
       (`ghcr.io/laraibkazi92/trellis-agent-platform:vX.Y.Z`).
 - [ ] `TRELLIS_IMAGE` default in docker-compose.yml updated to the new tag.
+- [ ] Upgrade instructions re-read **from the tag**, not from `main`
+      (`git show vX.Y.Z:docs/upgrading.md`) — a doc fix that lands after tagging does not
+      reach anyone who checks out the tag.
 - [ ] Fresh-clone smoke test: `cp .env.example .env && docker compose up -d`, agent call over
       REST and `/mcp` both succeed, `db-sync` completes.
 - [ ] Upgrade smoke test: previous tag → this tag via `docker compose pull && up -d`.

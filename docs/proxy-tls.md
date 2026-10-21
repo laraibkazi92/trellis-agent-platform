@@ -283,7 +283,7 @@ in Admin → Edges, and fix the transport before reconnecting.
 | `CERTIFICATE_VERIFY_FAILED … unable to get local issuer certificate` | trusting the leaf instead of the CA, or the server is not sending its intermediate | trust `ca.pem`; serve leaf + intermediate in `cert.pem` |
 | `… certificate is not valid for 'trellis.internal'` / `IP address mismatch` | SAN missing or does not match the URL | reissue with the exact `DNS:`/`IP:` entry |
 | `[SSL: WRONG_VERSION_NUMBER]` | dialing TLS at a plain-HTTP port (nginx fell back, or wrong port) | check the listener log line from step 3 |
-| `HTTP 404` on `/edge` | nginx image predates the feature | `docker compose up -d --build nginx-gateway` |
+| `HTTP 404` on `/edge` | nginx image predates the feature | `docker compose build nginx-gateway && docker compose up -d --no-build --no-deps nginx-gateway` (not `up --build`, which also rebuilds the app image) |
 | Certificate warning in the admin's browser | internal CA is not in the OS/browser trust store | install `ca.pem` there, or use your existing PKI |
 
 ## Operational notes
