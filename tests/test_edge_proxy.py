@@ -719,3 +719,55 @@ def test_missing_header_kwarg_is_an_error_not_a_silent_unauthorized(monkeypatch)
 
     with pytest.raises(ValueError, match="websockets"):
         proxy._connect_kwargs(config, "tok", connect=legacy_connect)
+
+
+# --- SIGHUP reload ---------------------------------------------------------------
+
+
+def _write_tool(root, name):
+    directory = root / name
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "tool.yaml").write_text(
+        f"name: {name}\ndescription: {name}\nruntime: python\nentrypoint: {name}.py\n"
+    )
+
+
+def _write_config(path, tools_dir, exports, site="plant-floor", url="ws://relay.local/edge/v1/connect"):
+    path.write_text(
+        f"site: {site}\nserver_url: {url}\ntools_dir: {tools_dir}\n"
+        f"exports: [{', '.join(exports)}]\n"
+    )
+
+
+def test_reload_applies_a_changed_exports_allowlist(tmp_path):
+    """SIGHUP after editing proxy.yaml must publish a newly allowed tool."""
+    tools = tmp_path / "tools"
+    _write_tool(tools, "alpha")
+    _write_tool(tools, "beta")
+    config_path = tmp_path / "proxy.yaml"
+    _write_config(config_path, tools, ["alpha"])
+
+    session = proxy._Session(proxy.load_config(config_path), config_path)
+    session.reload()
+    assert set(session.tools) == {"alpha"}
+
+    _write_config(config_path, tools, ["alpha", "beta"])
+    session.reload()
+
+    assert set(session.tools) == {"alpha", "beta"}
+
+
+def test_reload_refuses_to_move_a_live_tunnel_to_another_site(tmp_path):
+    tools = tmp_path / "tools"
+    _write_tool(tools, "alpha")
+    config_path = tmp_path / "proxy.yaml"
+    _write_config(config_path, tools, ["alpha"])
+
+    session = proxy._Session(proxy.load_config(config_path), config_path)
+    session.reload()
+
+    _write_config(config_path, tools, ["alpha"], site="other-site")
+    session.reload()
+
+    assert session.config.site == "plant-floor"
+    assert set(session.tools) == {"alpha"}

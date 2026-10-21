@@ -25,7 +25,7 @@ import random
 import signal
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -481,8 +481,9 @@ async def _call_with_deadline(
 class _Session:
     """Catalog plus connection state shared by the serve loop and SIGHUP."""
 
-    def __init__(self, config: ProxyConfig) -> None:
+    def __init__(self, config: ProxyConfig, config_path: Optional[Path] = None) -> None:
         self.config = config
+        self.config_path = config_path
         self.tools: Dict[str, Tuple[ToolConfig, Path]] = {}
         self.reconnect = asyncio.Event()
         self.connection: Any = None
@@ -492,6 +493,37 @@ class _Session:
         self.reconnect_delay: float = 0.0
 
     def reload(self) -> None:
+        """Re-read proxy.yaml (exports/tools_dir) and rebuild the catalog.
+
+        Re-reading is what makes ``SIGHUP`` useful after editing ``exports``: a
+        tool file alone would be filtered out by the in-memory allowlist. Identity
+        and destination are deliberately *not* reloadable -- changing the site or
+        the relay URL mid-session would silently move a live tunnel.
+        """
+        if self.config_path is not None:
+            try:
+                fresh = load_config(self.config_path)
+            except Exception:
+                logger.exception(
+                    "SIGHUP: could not re-read %s; using the current allowlist",
+                    self.config_path,
+                )
+            else:
+                if (fresh.site, fresh.server_url) != (
+                    self.config.site,
+                    self.config.server_url,
+                ):
+                    logger.warning(
+                        "SIGHUP: site/server_url changes need a restart; keeping %s -> %s",
+                        self.config.site,
+                        self.config.server_url,
+                    )
+                self.config = replace(
+                    self.config,
+                    exports=fresh.exports,
+                    tools_dir=fresh.tools_dir,
+                    sandbox=fresh.sandbox,
+                )
         self.tools = load_tools(self.config.tools_dir, self.config.exports)
 
     def request_reconnect(self, reason: str = "") -> None:
@@ -748,7 +780,9 @@ async def _serve(session: _Session, ws) -> None:
             await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def run(config: ProxyConfig, *, once: bool = False) -> None:
+async def run(
+    config: ProxyConfig, *, once: bool = False, config_path: Optional[Path] = None
+) -> None:
     """Connect, serve, and reconnect with jittered exponential backoff.
 
     ``once`` performs a single attempt and re-raises its failure, which is what
@@ -762,7 +796,7 @@ async def run(config: ProxyConfig, *, once: bool = False) -> None:
     token = _resolve_token(config)
     connect = _connect_factory()
 
-    session = _Session(config)
+    session = _Session(config, config_path)
     session.reload()
     _active_session = session
     _active_loop = asyncio.get_running_loop()
@@ -874,7 +908,8 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     config = load_config(args.config)
     _install_signal_handlers()
-    asyncio.run(run(config, once=args.once))
+    resolved = _config_path(args.config)
+    asyncio.run(run(config, once=args.once, config_path=resolved[0] if resolved[1] else None))
 
 
 if __name__ == "__main__":
