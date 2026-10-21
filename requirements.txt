@@ -28,7 +28,7 @@ taskiq==0.12.4
 taskiq-redis==1.2.3
 taskiq-fastapi==0.5.0
 asyncache==0.3.1
-cachetools==5.5.2
+cachetools==7.2.3
 pycron==3.2.0
 cryptography==50.0.0
 subagents-pydantic-ai==0.2.20
