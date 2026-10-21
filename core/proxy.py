@@ -796,6 +796,10 @@ async def run(
     token = _resolve_token(config)
     connect = _connect_factory()
 
+    # Tells shared core modules (core/tunables) not to look for etcd: an edge is a
+    # standalone install and the failed refresh would log forever.
+    os.environ.setdefault("TRELLIS_EDGE_MODE", "1")
+
     writable = sandbox.writable_root()
     if not writable.exists():
         # Every landlock-sandboxed call binds this path. A tools-only mount (or a

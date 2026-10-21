@@ -771,3 +771,17 @@ def test_reload_refuses_to_move_a_live_tunnel_to_another_site(tmp_path):
 
     assert session.config.site == "plant-floor"
     assert set(session.tools) == {"alpha"}
+
+
+def test_edge_mode_stops_the_tunable_etcd_refresh(monkeypatch):
+    """An edge has no etcd; the shared tunables cache must not keep probing for one."""
+    from core import tunables
+
+    monkeypatch.setenv("TRELLIS_EDGE_MODE", "1")
+    monkeypatch.setattr(tunables, "_overrides_checked_at", 0.0)
+    monkeypatch.setattr(tunables, "_refresh_in_flight", False)
+    calls = []
+    monkeypatch.setattr(tunables, "_refresh_overrides_sync", lambda: calls.append(1))
+
+    assert tunables.resolve("tool_execution_timeout") == 300.0
+    assert calls == []

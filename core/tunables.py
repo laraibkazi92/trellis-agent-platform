@@ -124,6 +124,11 @@ def _refresh_overrides_sync() -> None:
 
 def _kick_refresh() -> None:
     global _refresh_in_flight
+    # An edge node has no etcd by design (it is a standalone install). Attempting the
+    # refresh there only logs a permanent warning every TTL; env/defaults are the whole
+    # story on that side.
+    if os.getenv("TRELLIS_EDGE_MODE"):
+        return
     if (time.monotonic() - _overrides_checked_at) < _CACHE_TTL_SECONDS:
         return
     if _refresh_in_flight:
