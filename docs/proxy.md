@@ -205,6 +205,13 @@ Tools run inside the same sandbox as the hub's, which grants exactly one writabl
 container. Mount it writable if any exported tool writes files; a read-only mount is fine
 only for read-only tools. The proxy logs a warning at startup when the path is missing.
 
+### Relay shutdown
+
+On a graceful relay stop the edge redials within about a second (the backoff floor),
+whether or not the `drain` frame reaches it — uvicorn can close the socket during
+shutdown before the relay's drain loop runs. In-flight calls at that moment fail; they
+are never replayed.
+
 ### Revocation latency
 
 Revoking a token closes the **next handshake** immediately and the **live** tunnel at the

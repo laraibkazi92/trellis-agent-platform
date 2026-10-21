@@ -48,8 +48,8 @@ DEFAULT_DEADLINE_MS = 330_000
 HEARTBEAT_S = 20
 
 EDGE_FRAMES = frozenset({"hello", "result", "ping"})
-# `drain` is sent on relay shutdown so edges reconnect promptly instead of waiting
-# out their backoff. `catalog` is RESERVED (force a republish without reconnecting):
+# `drain` is sent on relay shutdown (best effort: uvicorn may close first) so edges
+# reconnect promptly instead of waiting out their backoff. `catalog` is RESERVED (force a republish without reconnecting):
 # accepted and handled, but no sender emits it yet -- do not build runbooks on it.
 RELAY_FRAMES = frozenset({"welcome", "call", "ping", "catalog", "drain"})
 

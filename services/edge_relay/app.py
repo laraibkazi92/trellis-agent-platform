@@ -232,8 +232,10 @@ async def _lifespan(_app: FastAPI):
         logger.warning("could not reset edge status at startup: %s", exc)
     yield
 
-    # Drain instead of dropping: each edge reconnects immediately rather than after
-    # its backoff, which keeps a redeploy from looking like an outage.
+    # Best-effort drain: uvicorn may already have closed the sockets with 1012 by the
+    # time this runs, in which case the send fails and the edge redials on its normal
+    # 1 s floor anyway. Kept because a shutdown path that *does* reach here still saves
+    # the edge a full backoff.
     for conn in list(relay.sites.values()):
         try:
             await conn.send({"t": "drain", "reconnect_after_s": 1})
