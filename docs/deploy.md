@@ -45,6 +45,23 @@ docker compose up -d
 
 > If a pull ever asks for credentials, the GHCR package has not been made public: either set its visibility to public in the repo's package settings, or `docker login ghcr.io` with a token that has `read:packages`.
 
+### Pinning and verifying a release
+
+`TRELLIS_IMAGE` in `.env` pins a **tag** (`:v0.4.0`) because a tag stays readable in a diff. Tags are mutable, so if you need the image to be byte-identical forever, pin the **digest** published in that release's workflow summary instead:
+
+```bash
+TRELLIS_IMAGE=ghcr.io/laraibkazi92/trellis-agent-platform@sha256:<digest>
+```
+
+Every release published after provenance was wired up is attested by GitHub's keyless signer, which proves the image was built by `.github/workflows/publish-images.yml` from the commit its tag points at. Verify a pulled image with the GitHub CLI (no signing key, no registry login — the attestation is stored next to the image):
+
+```bash
+gh attestation verify oci://ghcr.io/laraibkazi92/trellis-agent-platform:v0.4.0 \
+  -R laraibkazi92/trellis-agent-platform
+```
+
+Images published before that change carry no attestation, and the check fails for them — that is expected, not a broken release.
+
 One service is not published: `nginx-gateway` is built from `./gateway` in the clone, so it compiles locally on first `up` (a small nginx image). After changing anything under `gateway/`, rebuild just that service:
 
 ```bash
@@ -61,7 +78,7 @@ If the host has no access to GHCR, export the images from a connected machine an
 # connected machine
 docker compose pull
 docker save -o trellis-images.tar \
-  ghcr.io/laraibkazi92/trellis-agent-platform:v0.3.0 \
+  ghcr.io/laraibkazi92/trellis-agent-platform:v0.4.0 \
   ghcr.io/vectorize-io/hindsight:0.9.1-slim \
   gcr.io/etcd-development/etcd:v3.6.15 \
   redis:alpine \
@@ -75,7 +92,7 @@ docker load -i trellis-images.tar
 Alternatively push the same images to a private registry mirror and point the stack at it with `TRELLIS_IMAGE` in `.env`:
 
 ```bash
-TRELLIS_IMAGE=registry.internal.example.com/trellis-agent-platform:v0.3.0
+TRELLIS_IMAGE=registry.internal.example.com/trellis-agent-platform:v0.4.0
 ```
 
 ## Install path B: build from source
@@ -97,7 +114,7 @@ TRELLIS_GID=$(id -g)
 
 ```bash
 # 1. Clone the engine at a release tag
-git clone --branch v0.3.0 https://github.com/laraibkazi92/trellis-agent-platform.git
+git clone --branch v0.4.0 https://github.com/laraibkazi92/trellis-agent-platform.git
 cd trellis-agent-platform
 
 # 2. Seed your environment file
@@ -116,7 +133,7 @@ The variables below are the ones you must touch for a first deployment. Everythi
 | `SESSION_SECRET` | Yes | Signs sessions and seeds the Fernet encryption key (`ENCRYPTION_KEY` falls back to it). |
 | `ADMIN_USERS` | Yes | Comma-separated admin identities (e.g. `ops@example.com`). |
 | `TRELLIS_WORKSPACE_DIR` | Recommended | Workspace bind-mount source. Defaults to `./workspace` inside the clone. Point it at your content repo to keep the engine pristine. |
-| `TRELLIS_IMAGE` | Optional | Pins the engine image tag or digest, e.g. `ghcr.io/laraibkazi92/trellis-agent-platform:v0.3.0`. |
+| `TRELLIS_IMAGE` | Optional | Pins the engine image tag or digest, e.g. `ghcr.io/laraibkazi92/trellis-agent-platform:v0.4.0`. |
 | `TRELLIS_UID` / `TRELLIS_GID` | Optional | Container uid:gid for workspace file ownership. Defaults to `1000:1000`. |
 | `DEV_MODE` | No | Keep `false` for anything shared. `true` disables **all** authentication. |
 | `HOST_BIND` | Optional | Host address published ports bind to. Default `0.0.0.0`. |

@@ -2,8 +2,13 @@
 # Copyright (C) 2026 Laraib Kazi
 # SPDX-License-Identifier: Apache-2.0
 #
-# Manually build and push the Trellis container images (publishing is manual
-# by decision — there is no CI pipeline for this repo).
+# Build and push the Trellis container images to a registry you control.
+#
+# This is NOT the path that publishes the official public image: that is
+# .github/workflows/publish-images.yml, triggered by a v* tag, which also attests
+# build provenance (this script cannot). Use this script to push the app and
+# gateway images to your own registry — what the Helm chart under charts/trellis
+# consumes, and what air-gapped installs mirror.
 #
 # Usage:
 #   REGISTRY=ghcr.io/your-org [TAG=sha] [PLATFORMS=linux/amd64] ./scripts/publish_images.sh

@@ -1,0 +1,23 @@
+# Keeps the SHA-pinned actions in .github/workflows/ and the pinned base images in
+# the Dockerfile current. Dependabot understands the `# vX.Y.Z` comment after each
+# pin and rewrites both the SHA and the comment.
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly

@@ -111,12 +111,24 @@ each `docs/*.md` guide — please read the one matching your change.
 2. Update the default `TRELLIS_IMAGE` pin (`docker-compose.yml`, `.env.example`) to
    the new tag.
 3. Push the tag. CI ([`.github/workflows/publish-images.yml`](.github/workflows/publish-images.yml))
-   builds and pushes the multi-arch images (linux/amd64 + linux/arm64) to GHCR as
+   blocks on the `release` environment until you approve the run, then builds and
+   pushes the multi-arch images (linux/amd64 + linux/arm64) to GHCR as
    `ghcr.io/laraibkazi92/trellis-agent-platform:vX.Y.Z` and `:latest`. No secrets to
    configure — **but after the very first push, set the GHCR package visibility to
    public** (package settings → Change visibility); GHCR packages default to private,
    and a private package would force every org to authenticate before `docker compose pull`.
-4. Add a [docs/upgrading.md](docs/upgrading.md) entry for the release, listing any
+   Only a tag ref can publish: a `workflow_dispatch` against a branch fails the ref
+   guard, and the version always comes from the git ref, never from an input.
+4. The run's summary carries the image **digest**, and the image is attested by
+   GitHub's keyless signer. Paste the digest into the GitHub Release and confirm the
+   attestation verifies before announcing:
+   ```bash
+   gh attestation verify oci://ghcr.io/laraibkazi92/trellis-agent-platform:vX.Y.Z \
+     -R laraibkazi92/trellis-agent-platform
+   ```
+   Attestations are per-build — images published before v0.4.0 have none, so this
+   check only applies to releases made after provenance was wired up.
+5. Add a [docs/upgrading.md](docs/upgrading.md) entry for the release, listing any
    changes to `docker-compose.yml`, `.env` variables, the registry sync
    (`scripts/sync_to_db.py`), or the tool protocol.
 

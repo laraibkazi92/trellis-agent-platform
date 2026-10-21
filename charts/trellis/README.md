@@ -30,6 +30,9 @@ script via ConfigMap instead of requiring a custom image build.
    ```
 
    Then set `image.repository`/`image.tag` and `gatewayImage.*` accordingly.
+   (The public `ghcr.io/laraibkazi92/trellis-agent-platform` image is app-only, so
+   `gatewayImage` keeps its plain `nginx:alpine` default; pointing
+   `image.repository` at GHCR is enough if you want the published engine.)
 
 2. **Provide workspace content.** The app image does *not* bake `workspace/`
    in (docker-compose bind-mounts it). Point `workspace.persistentVolumeClaim`

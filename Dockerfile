@@ -1,6 +1,13 @@
+# Base images are pinned by digest (the manifest-list digest, so linux/amd64 and
+# linux/arm64 still both resolve) because this Dockerfile produces the published
+# release image: a mutable tag lets the toolchain change under a tag that is
+# supposed to be reproducible. Dependabot bumps the digest weekly
+# (.github/dependabot.yml); re-check the arm64 leg after a manual bump.
+ARG PYTHON_BASE=python:3.12-slim@sha256:cb33f7f771ecec2ef1225cf39b159591a040391bd73e4c01f00fdfc4c47611d2
+
 # Static Landlock sandbox helper (core/sandbox.py). Built on the same base image
 # as the runtime stage so the static binary matches its architecture.
-FROM python:3.12-slim AS sandbox-build
+FROM ${PYTHON_BASE} AS sandbox-build
 COPY sandbox/trellis-sandbox.c /src/trellis-sandbox.c
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
     && mkdir -p /out \
@@ -8,8 +15,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Use Python 3.12 slim as the base image
-FROM python:3.12-slim
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+FROM ${PYTHON_BASE}
+# Pinned like the base: `latest` would change the dependency resolver under a
+# release tag. Verified to resolve both published architectures.
+COPY --from=ghcr.io/astral-sh/uv:0.13.4@sha256:9f130421e930bfbdc563c00740466603f8723158e90297d07957c2294640262b /uv /uvx /bin/
 
 # Install system dependencies for Node.js and Go.
 # TARGETARCH is provided by BuildKit's predefined platform args (amd64/arm64/...); it
@@ -19,7 +28,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 # linux-amd64 tarball produced a broken Go toolchain on arm64 hosts. Note: Go publishes
 # its 32-bit ARM tarball as linux-armv6l, so TARGETARCH=arm would 404 -- only amd64/arm64
 # are published by CI; add an explicit case mapping if linux/arm/v7 is ever needed. A bad
-# arch fails loudly (curl -f and tar both error), never silently.
+# arch fails loudly (explicit case below, then curl -f), never silently.
 ARG TARGETARCH
 RUN apt-get update && apt-get install -y \
     curl \
@@ -29,9 +38,24 @@ RUN apt-get update && apt-get install -y \
     && update-ca-certificates \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
-    && curl -fsSL "https://golang.org/dl/go1.22.2.linux-${TARGETARCH:-amd64}.tar.gz" | tar -C /usr/local -xzf - \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# Go toolchain, checksum-verified. The URL is fixed by version, but a download over
+# TLS is still the one image input nobody signs for us, so the published sha256 is
+# checked before unpacking. Only the architectures CI publishes are mapped: an
+# unmapped TARGETARCH fails here instead of producing a broken toolchain.
+ARG GO_VERSION=1.22.2
+RUN set -eu; \
+    case "${TARGETARCH:-amd64}" in \
+        amd64) go_sha256=5901c52b7a78002aeff14a21f93e0f064f74ce1360fce51c6ee68cd471216a17 ;; \
+        arm64) go_sha256=36e720b2d564980c162a48c7e97da2e407dfcc4239e1e58d98082dfa2486a0c1 ;; \
+        *) echo "no pinned checksum for TARGETARCH=${TARGETARCH:-amd64}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/go.tar.gz "https://golang.org/dl/go${GO_VERSION}.linux-${TARGETARCH:-amd64}.tar.gz"; \
+    echo "${go_sha256}  /tmp/go.tar.gz" | sha256sum -c -; \
+    tar -C /usr/local -xzf /tmp/go.tar.gz; \
+    rm /tmp/go.tar.gz
 
 # Add Go to PATH
 ENV PATH=$PATH:/usr/local/go/bin

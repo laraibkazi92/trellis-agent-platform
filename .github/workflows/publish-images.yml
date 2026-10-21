@@ -1,13 +1,27 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+#
 # Publishes the Trellis engine image to GHCR as a multi-arch (linux/amd64 + linux/arm64)
 # image, so orgs can `docker compose pull` instead of building the whole toolchain
 # (Python + Node + Go) themselves. See docs/deploy.md.
 #
 # Triggers:
-#   - push of a v* tag (the normal release path): publishes
-#     ghcr.io/<owner>/<repo>:<tag>, plus :latest for stable tags (no "-" suffix;
-#     pre-releases like v0.2.0-rc1 do not move :latest)
-#   - workflow_dispatch with an explicit tag (for re-publishing / testing the workflow
-#     before the first real release)
+#   - push of a v* tag (the normal release path)
+#   - workflow_dispatch against a TAG ref, to re-publish an existing release. A
+#     dispatch against a branch fails the ref guard below and publishes nothing.
+#   The version always comes from the git ref, never from a workflow input, so a
+#   published image cannot disagree with the commit its tag points at.
+#
+# Tags: `<version>` always, plus `:latest` for stable versions (anything without a
+# "-" suffix, so v0.2.0-rc1 does not move :latest).
+#
+# Provenance: the image is attested by GitHub's keyless signer, bound to this repo,
+# this workflow file, and the tag ref. Verify a pulled image with
+#   gh attestation verify oci://ghcr.io/<owner>/<repo>:<tag> -R <owner>/<repo>
+#
+# Publishing is gated by the `release` environment (repo settings -> Environments),
+# whose required reviewers must approve before any step runs -- so the
+# packages:write and id-token:write tokens are not minted until a human approves.
 #
 # No secrets to configure: GITHUB_TOKEN with packages:write is sufficient. NOTE: GHCR
 # packages default to PRIVATE even for a public repo -- set the package visibility to
@@ -19,31 +33,50 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Version tag to publish (e.g. v0.2.0)"
-        required: true
 
 permissions:
   contents: read
   packages: write
+  attestations: write
+  id-token: write
 
 env:
   REGISTRY: ghcr.io
 
+# The tag is the unit of deployment: a re-run against a tag that is still
+# publishing must not interleave with the run already in flight.
+concurrency:
+  group: publish-images-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
+    environment: release
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Full history so the annotated tag object is present for the guard below.
+          fetch-depth: 0
+
+      - name: "Guard: only a tag ref may publish"
+        run: |
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+            echo "publishing requires a tag ref; got ${GITHUB_REF_TYPE} ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+          head_sha="$(git rev-parse HEAD)"
+          tag_sha="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")"
+          if [[ "$head_sha" != "$tag_sha" ]]; then
+            echo "${GITHUB_REF_NAME} points at ${tag_sha}, but ${head_sha} is checked out" >&2
+            exit 1
+          fi
 
       - name: Resolve image name and tags
         id: meta
-        env:
-          DISPATCH_TAG: ${{ inputs.tag }}
         run: |
-          # `${VAR:-default}` picks the dispatch input when present, else the pushed tag.
-          version="${DISPATCH_TAG:-$GITHUB_REF_NAME}"
+          version="${GITHUB_REF_NAME}"
           # GHCR requires a lowercase repository path.
           image="${REGISTRY}/${GITHUB_REPOSITORY,,}"
           {
@@ -60,24 +93,52 @@ jobs:
           echo "Publishing ${image}:${version}"
 
       # QEMU lets buildx build the non-native architecture on the amd64 runner.
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+          # The attestation step below is the signed provenance statement; buildx's
+          # own (unsigned) one would duplicate it.
+          provenance: false
           build-args: |
             TRELLIS_VERSION=${{ steps.meta.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.meta.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          # Store the attestation next to the image so verification needs no
+          # GitHub API call beyond `gh`'s own auth.
+          push-to-registry: true
+
+      - name: Record the published digest
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### Published ${IMAGE}:${GITHUB_REF_NAME}"
+            echo
+            echo '```'
+            echo "${IMAGE}@${DIGEST}"
+            echo '```'
+            echo
+            echo "Verify: \`gh attestation verify oci://${IMAGE}:${GITHUB_REF_NAME} -R ${GITHUB_REPOSITORY}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

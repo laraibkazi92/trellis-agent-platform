@@ -1,0 +1,6 @@
+# CI/CD defines what the published images are, so a workflow change is a release
+# decision rather than a routine edit.
+/.github/ @laraibkazi92
+/Dockerfile @laraibkazi92
+
+* @laraibkazi92
