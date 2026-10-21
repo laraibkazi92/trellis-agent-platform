@@ -686,3 +686,23 @@ def test_an_oversized_remote_result_is_truncated_like_a_local_tool(monkeypatch):
     assert "Global Safety Net" in result["error"]
     assert result["partial_data_preview"].endswith("[TRUNCATED DUE TO SAFETY LIMITS]")
     assert len(result["partial_data_preview"]) < 100_000
+
+
+def test_run_remote_actually_retries_a_transient_failure(monkeypatch):
+    """The retry decorator belongs on _run_remote, not on a helper it replaced."""
+    config = make_remote_config(retry_on_transient=True)
+    install_fake_health(monkeypatch)
+    attempts = []
+
+    def flaky(_request):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise httpx.ConnectError("relay hop refused")
+        return httpx.Response(200, json={"tool": TOOL, "result": {"temp": 21}})
+
+    install_transport(monkeypatch, flaky)
+
+    result = run_remote(config, {})
+
+    assert result == {"temp": 21}
+    assert len(attempts) == 3

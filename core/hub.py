@@ -269,7 +269,6 @@ def _edge_error_field(body: Dict[str, Any], field: str, default: str = "") -> st
     return default
 
 
-@stamina.retry(on=TransientToolError, attempts=3)
 def _cap_remote_result(name: str, result: Any) -> Any:
     """Apply the local 96k safety net to a remote result.
 
@@ -300,6 +299,7 @@ def _cap_remote_result(name: str, result: Any) -> Any:
     }
 
 
+@stamina.retry(on=TransientToolError, attempts=3)
 async def _run_remote(config: ToolConfig, arguments: Dict[str, Any], user_id: Optional[str]) -> Dict[str, Any]:
     """Dispatches a remote (edge-hosted) tool through the edge relay's internal API.
 

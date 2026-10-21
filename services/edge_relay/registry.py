@@ -193,6 +193,7 @@ def publish_catalog(
     owned = {
         name for name, config in existing.items() if config.get("managed_by") == MANAGED_BY
     }
+    empty_catalog_warning = None
     if not published and owned and not allow_empty:
         logger.error(
             "edge '%s' published an empty catalog; keeping %d existing tool(s) instead of "
@@ -201,28 +202,19 @@ def publish_catalog(
             site,
             len(owned),
         )
-        identity_mgr.save_edge_status(
-            site,
-            {
-                "connected": True,
-                "connected_at": _now_iso(),
-                "edge_version": edge_version,
-                "tools": sorted(owned),
-                "last_error": (
-                    "the edge published an empty catalog; existing tools were kept. "
-                    "Check exports/tools_dir on the site."
-                ),
-            },
+        published = sorted(owned)
+        empty_catalog_warning = (
+            "the edge published an empty catalog; existing tools were kept. "
+            "Check exports/tools_dir on the site."
         )
-        return sorted(owned)
-
-    for name, config in existing.items():
-        if name in published:
-            continue
-        if config.get("managed_by") != MANAGED_BY:
-            continue
-        delete_tool(identity_mgr, name)
-        logger.info("edge '%s' pruned tool '%s' (no longer in its catalog)", site, name)
+    else:
+        for name, config in existing.items():
+            if name in published:
+                continue
+            if config.get("managed_by") != MANAGED_BY:
+                continue
+            delete_tool(identity_mgr, name)
+            logger.info("edge '%s' pruned tool '%s' (no longer in its catalog)", site, name)
 
     identity_mgr.save_edge_status(
         site,
@@ -231,7 +223,7 @@ def publish_catalog(
             "connected_at": _now_iso(),
             "edge_version": edge_version,
             "tools": published,
-            "last_error": None,
+            "last_error": empty_catalog_warning,
         },
     )
     # Connectivity is back: clear the Offline state a disconnect (or a failed call
