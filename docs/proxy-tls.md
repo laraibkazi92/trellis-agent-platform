@@ -75,6 +75,11 @@ openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
 | `ca.pem` | **every edge** (`tls_ca_file`) | the only thing an edge trusts |
 | `ca.key` | offline | signs renewals; losing it means re-trusting every edge |
 
+nginx loads the certificate once, at start. After regenerating it, reload the listener —
+`docker compose exec nginx-gateway nginx -s reload` (3A) or `docker compose restart edge-tls`
+(3B). A plain `up -d` will not recreate a container whose mounts and environment did not
+change, so it would keep serving the old certificate.
+
 ## 3A. Terminate on the main nginx
 
 The certificate directory is mounted by the existing (commented) volume.
