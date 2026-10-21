@@ -93,7 +93,7 @@ jobs:
             leg: landlock fallback (ubuntu-24.04)
     steps:
       - name: Check out the repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Record host sandbox evidence
         run: |
@@ -221,7 +221,7 @@ jobs:
             --check-seccomp
 
       - name: Set up uv (for the native helper tests on the runner)
-        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.1
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v5.4.1
         with:
           python-version: "3.12"
 
@@ -271,7 +271,7 @@ jobs:
       COMPOSE_FILE: docker-compose.yml:docker-compose.egress.yml:docker-compose.egress-ci.yml
     steps:
       - name: Check out the repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Record host evidence
         run: |
@@ -435,7 +435,7 @@ jobs:
       COMPOSE_FILE: docker-compose.yml:docker-compose.ci-apparmor.yml
     steps:
       - name: Check out the repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Record host AppArmor evidence
         run: |
