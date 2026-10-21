@@ -204,6 +204,8 @@ docker compose exec host python scripts/trellis sync
 docker compose exec host python scripts/trellis logs [AGENT] --limit 20
 ```
 
+**Tools on a network you cannot reach.** If a tool's API lives behind a network the central host cannot dial, publish it with an edge node instead of opening a path in: `trellis-proxy` dials out over WSS and the tools appear centrally as native tools. See [Edge nodes (trellis-proxy)](proxy.md).
+
 ## Content authoring workflow
 
 The workspace files are the source of truth on every rebuild. The `db-sync` init container runs once at startup (`python scripts/sync_to_db.py`) and pushes `workspace/agents`, `workspace/tools`, `workspace/workflows`, and `workspace/mcps` into the etcd registry. Agent and tool edits made in the UI are **dual-written** back to the matching workspace file, so a UI change surfaces as a diff in your content repo — commit it there.

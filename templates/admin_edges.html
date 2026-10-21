@@ -1,0 +1,229 @@
+<!--
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+-->
+
+{% extends "base.html" %}
+
+{% block title %}Edge Nodes{% endblock %}
+
+{% block content %}
+<div class="max-w-5xl mx-auto">
+    <a href="/admin" class="font-mono text-xs uppercase tracking-widest text-neutral-500 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark transition-colors mb-6 inline-flex items-center gap-2">
+        <i data-lucide="arrow-left" class="w-4 h-4"></i> BACK TO ADMIN DASHBOARD
+    </a>
+
+    <div class="mb-8">
+        <h1 class="text-3xl font-bold tracking-tight uppercase mb-2">Edge Nodes</h1>
+        <p class="text-neutral-500 dark:text-neutral-400 font-mono text-sm">
+            Edge nodes run tools on internal networks the central host cannot reach &mdash; the edge dials out to
+            the relay, and its exported tools are called like any local tool.
+        </p>
+    </div>
+
+    {% if new_token %}
+    <div class="border border-amber-500/40 bg-amber-50 dark:bg-amber-950/20 p-5 mb-6 space-y-3">
+        <div class="flex items-start gap-3">
+            <span class="text-amber-600 dark:text-amber-400 shrink-0"><i data-lucide="key-round" class="w-5 h-5"></i></span>
+            <div>
+                <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Enrollment token for &ldquo;{{ new_token.site }}&rdquo;</h2>
+                <p class="font-mono text-xs text-amber-700 dark:text-amber-300 mt-1">
+                    Shown once. Copy it now &mdash; it is not stored in retrievable form and cannot be displayed again.
+                    If it is lost, rotate the token below to mint a new one.
+                </p>
+            </div>
+        </div>
+        <div class="group flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+            <code id="newEdgeToken" class="flex-1 break-all bg-white dark:bg-neutral-950 border border-amber-500/40 px-3 py-2 font-mono text-sm text-neutral-900 dark:text-neutral-100">{{ new_token.token }}</code>
+            <button type="button" onclick="copyToClipboard(this, '#newEdgeToken')"
+                    class="border border-amber-500/60 text-amber-700 dark:text-amber-300 hover:bg-amber-500 hover:text-white font-mono font-bold text-xs uppercase tracking-widest px-4 py-2 transition-colors shrink-0">
+                COPY
+            </button>
+        </div>
+        <p class="font-mono text-[11px] text-neutral-600 dark:text-neutral-400">
+            Set it as the edge's <code class="bg-neutral-200 dark:bg-neutral-800 px-1 py-0.5 rounded-sm">TRELLIS_EDGE_TOKEN</code>
+            environment variable (never inline it in <code class="bg-neutral-200 dark:bg-neutral-800 px-1 py-0.5 rounded-sm">proxy.yaml</code>),
+            then start the edge. Full steps: <a href="/docs/proxy" class="underline hover:text-accent dark:hover:text-accent-dark">docs/proxy.md</a>.
+        </p>
+    </div>
+    {% endif %}
+
+    <!-- Add edge -->
+    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm mb-6">
+        <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Add edge</h2>
+        <p class="font-mono text-xs text-neutral-500 dark:text-neutral-400 mt-1 mb-4">
+            Registering a site mints its enrollment token. Nothing connects until the edge is started with that token.
+        </p>
+        <form action="/admin/edges/create" method="POST" class="space-y-4">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="grid gap-4 md:grid-cols-3">
+                <div class="space-y-1">
+                    <label for="edgeName" class="font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Site name</label>
+                    <input type="text" name="name" id="edgeName" required maxlength="64" placeholder="plant-floor"
+                           pattern="[A-Za-z0-9][A-Za-z0-9_\-]{0,63}"
+                           class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
+                    <p class="font-mono text-[10px] text-neutral-500 dark:text-neutral-400">Letters, digits, &lsquo;-&rsquo; and &lsquo;_&rsquo;. Used as the prefix of every tool it publishes (<code>site__tool</code>).</p>
+                </div>
+                <div class="space-y-1">
+                    <label for="edgeDisplayName" class="font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Display name</label>
+                    <input type="text" name="display_name" id="edgeDisplayName" placeholder="Plant floor"
+                           class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
+                    <p class="font-mono text-[10px] text-neutral-500 dark:text-neutral-400">Optional label for this page. Defaults to the site name.</p>
+                </div>
+                <div class="space-y-1">
+                    <label for="edgeExports" class="font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Exports allowlist</label>
+                    <input type="text" name="exports" id="edgeExports" placeholder="boiler_status, plant_readings"
+                           class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
+                    <p class="font-mono text-[10px] text-neutral-500 dark:text-neutral-400">Optional, comma-separated. A central allowlist of tool names; empty means no central restriction. The edge's own <code>proxy.yaml</code> exports list is always enforced, whatever is set here.</p>
+                </div>
+            </div>
+            <div class="flex justify-end">
+                <button type="submit" class="bg-accent hover:bg-accent-dark text-white font-mono font-bold text-sm uppercase py-2.5 px-6 transition-colors rounded">
+                    Create edge &amp; token
+                </button>
+            </div>
+        </form>
+    </div>
+
+    {% if not edges %}
+    <div class="border border-dashed border-neutral-300 dark:border-neutral-700 bg-white dark:bg-neutral-900 p-10 text-center rounded">
+        <p class="font-mono text-sm font-bold uppercase tracking-widest text-neutral-700 dark:text-neutral-300">No edge nodes yet</p>
+        <p class="font-mono text-xs text-neutral-500 dark:text-neutral-400 mt-2">
+            Register a site above, then run <code class="bg-neutral-200 dark:bg-neutral-800 px-1 py-0.5 rounded-sm">trellis-proxy</code>
+            on the internal host with the token it mints. Setup and troubleshooting live in
+            <a href="/docs/proxy" class="underline hover:text-accent dark:hover:text-accent-dark">docs/proxy.md</a>.
+        </p>
+    </div>
+    {% else %}
+    <div class="space-y-4">
+        {% for edge in edges %}
+        <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded shadow-sm">
+            <div class="flex flex-wrap items-center gap-x-4 gap-y-2 p-5 border-b border-neutral-200 dark:border-neutral-800">
+                <span class="inline-flex items-center gap-2 font-mono text-[10px] font-bold uppercase tracking-widest {% if edge.connected %}text-emerald-600 dark:text-emerald-400{% else %}text-neutral-500 dark:text-neutral-400{% endif %}">
+                    <span class="inline-block w-2.5 h-2.5 rounded-full {% if edge.connected %}bg-emerald-500{% else %}bg-neutral-400 dark:bg-neutral-600{% endif %}"></span>
+                    {% if edge.connected %}Connected{% else %}Offline{% endif %}
+                </span>
+                <h2 class="text-lg font-bold tracking-tight">{{ edge.display_name }}</h2>
+                <span class="font-mono text-[10px] font-bold border border-neutral-200 dark:border-neutral-700 text-neutral-500 dark:text-neutral-400 px-1.5 py-0.5 uppercase tracking-widest">{{ edge.name }}</span>
+                {% if edge.enabled %}
+                <span class="font-mono text-[10px] font-bold border border-emerald-300 text-emerald-600 dark:border-emerald-800/30 dark:text-emerald-400 px-1.5 py-0.5 uppercase tracking-widest bg-emerald-50 dark:bg-emerald-900/10">Enabled</span>
+                {% else %}
+                <span class="font-mono text-[10px] font-bold border border-neutral-300 text-neutral-500 dark:border-neutral-700 dark:text-neutral-400 px-1.5 py-0.5 uppercase tracking-widest">Disabled</span>
+                {% endif %}
+                {% if edge.public %}
+                <span class="font-mono text-[10px] font-bold border border-emerald-300 text-emerald-600 dark:border-emerald-800/30 dark:text-emerald-400 px-1.5 py-0.5 uppercase tracking-widest bg-emerald-50 dark:bg-emerald-900/10">Public</span>
+                {% endif %}
+                {% if edge.edge_version %}
+                <span class="font-mono text-[10px] font-bold bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400 px-2 py-0.5 rounded border border-neutral-200 dark:border-neutral-700 uppercase">v{{ edge.edge_version }}</span>
+                {% endif %}
+            </div>
+
+            <div class="p-5 space-y-4">
+                <dl class="grid grid-cols-2 md:grid-cols-4 gap-4 font-mono text-xs">
+                    <div>
+                        <dt class="text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Tools</dt>
+                        <dd class="mt-1 text-neutral-900 dark:text-neutral-100 font-bold">{{ edge.tools | length }}</dd>
+                    </div>
+                    <div>
+                        <dt class="text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Token</dt>
+                        <dd class="mt-1 text-neutral-700 dark:text-neutral-300 break-all">{{ edge.token_preview or '—' }}</dd>
+                    </div>
+                    <div>
+                        <dt class="text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Created</dt>
+                        <dd class="mt-1 text-neutral-700 dark:text-neutral-300">{{ edge.created_at or '—' }}</dd>
+                    </div>
+                    <div>
+                        <dt class="text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Last seen</dt>
+                        <dd class="mt-1 text-neutral-700 dark:text-neutral-300">{{ edge.last_seen or '—' }}</dd>
+                    </div>
+                </dl>
+
+                {% if edge.tools %}
+                <div class="flex flex-wrap items-center gap-1.5">
+                    {% for tool in edge.tools %}
+                    <span class="font-mono text-[10px] bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-300 px-2 py-0.5 rounded border border-neutral-200 dark:border-neutral-700">{{ tool }}</span>
+                    {% endfor %}
+                </div>
+                {% endif %}
+
+                {% if edge.last_error %}
+                <div class="flex items-start gap-2 border border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-900/10 px-3 py-2">
+                    <span class="text-red-600 dark:text-red-400 shrink-0"><i data-lucide="triangle-alert" class="w-4 h-4"></i></span>
+                    <p class="font-mono text-xs text-red-700 dark:text-red-300 break-all">{{ edge.last_error }}</p>
+                </div>
+                {% endif %}
+
+                <form action="/admin/edges/update" method="POST" class="grid gap-3 md:grid-cols-[1fr_2fr_1fr_6rem_auto] md:items-end border-t border-neutral-200 dark:border-neutral-800 pt-4">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="hidden" name="name" value="{{ edge.name }}">
+                    <div class="space-y-1">
+                        <label for="display-{{ edge.name }}" class="font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Display name</label>
+                        <input type="text" name="display_name" id="display-{{ edge.name }}" value="{{ edge.display_name }}"
+                               class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-2.5 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
+                    </div>
+                    <div class="space-y-1">
+                        <label for="exports-{{ edge.name }}" class="font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Exports allowlist</label>
+                        <input type="text" name="exports" id="exports-{{ edge.name }}" value="{{ edge.exports | join(', ') }}" placeholder="Empty = no central restriction"
+                               class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-2.5 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
+                    </div>
+                    <div class="space-y-1">
+                        <label for="public-tools-{{ edge.name }}" class="font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Public tools</label>
+                        <input type="text" name="public_tools" id="public-tools-{{ edge.name }}" value="{{ edge.public_tools | join(', ') }}" placeholder="Empty = none individually"
+                               class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-2.5 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
+                    </div>
+                    <div class="space-y-1">
+                        <label for="rate-{{ edge.name }}" class="font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Calls / min</label>
+                        <input type="number" min="1" max="6000" name="rate_limit_per_min" id="rate-{{ edge.name }}" value="{{ edge.rate_limit_per_min if edge.rate_limit_per_min is not none else '' }}" placeholder="{{ rate_limit_default }}"
+                               class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-2.5 font-mono text-sm focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded">
+                    </div>
+                    <div class="flex flex-col gap-2">
+                        <label class="inline-flex items-center gap-2 font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400 cursor-pointer select-none">
+                            <input type="checkbox" name="public" value="true" class="h-4 w-4 text-accent border-neutral-300 dark:border-neutral-600 bg-white dark:bg-neutral-900 rounded-none focus:ring-accent focus:ring-offset-0 dark:focus:ring-offset-neutral-900" {% if edge.public %}checked{% endif %}>
+                            Public tools
+                        </label>
+                        <button type="submit" class="bg-neutral-800 dark:bg-neutral-100 text-white dark:text-neutral-900 font-mono font-bold text-xs uppercase tracking-widest py-2.5 px-5 hover:bg-neutral-900 dark:hover:bg-neutral-200 transition-colors rounded">
+                            Save
+                        </button>
+                    </div>
+                </form>
+
+                <div class="flex flex-wrap items-center gap-3 border-t border-neutral-200 dark:border-neutral-800 pt-4">
+                    <form action="/admin/edges/test" method="POST">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <input type="hidden" name="name" value="{{ edge.name }}">
+                        <button type="submit" class="border border-neutral-300 dark:border-neutral-700 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 font-mono font-bold text-xs uppercase tracking-widest px-4 py-2 transition-colors">
+                            Check tunnel
+                        </button>
+                    </form>
+                    <form action="/admin/edges/rotate" method="POST"
+                          onsubmit="return confirm('Rotate the token for \'{{ edge.name }}\'? The current token stops working immediately and the edge must be reconfigured with the new one.');">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <input type="hidden" name="name" value="{{ edge.name }}">
+                        <button type="submit" class="border border-neutral-300 dark:border-neutral-700 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 font-mono font-bold text-xs uppercase tracking-widest px-4 py-2 transition-colors">
+                            Rotate token
+                        </button>
+                    </form>
+                    <form action="/admin/edges/revoke" method="POST"
+                          onsubmit="return confirm('Revoke the token for \'{{ edge.name }}\'? The live tunnel is refused at its next handshake and the current socket closes.');">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <input type="hidden" name="name" value="{{ edge.name }}">
+                        <button type="submit" class="border border-amber-400 text-amber-700 dark:border-amber-700 dark:text-amber-400 hover:bg-amber-500 hover:text-white dark:hover:bg-amber-600/20 font-mono font-bold text-xs uppercase tracking-widest px-4 py-2 transition-colors">
+                            Revoke token
+                        </button>
+                    </form>
+                    <form action="/admin/edges/delete" method="POST" class="ml-auto"
+                          onsubmit="return confirm('Delete edge \'{{ edge.name }}\'? Its tools are removed from the registry and the edge must be re-registered to reconnect.');">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <input type="hidden" name="name" value="{{ edge.name }}">
+                        <button type="submit" class="border border-red-400 text-red-600 dark:border-red-800 dark:text-red-400 hover:bg-red-600 hover:text-white font-mono font-bold text-xs uppercase tracking-widest px-4 py-2 transition-colors">
+                            Delete edge
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

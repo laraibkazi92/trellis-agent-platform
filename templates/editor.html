@@ -247,6 +247,20 @@
                 </div>
 
             {% elif type == 'tool' %}
+                {% if edge_managed %}
+                <div class="flex items-start gap-3 border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 p-4 mb-8">
+                    <i data-lucide="lock" class="w-5 h-5 shrink-0 text-amber-600 dark:text-amber-400"></i>
+                    <div class="font-mono text-xs text-amber-800 dark:text-amber-300 space-y-1">
+                        <p class="font-bold uppercase tracking-widest">Read-only &mdash; managed by the edge relay</p>
+                        <p class="whitespace-normal">
+                            This tool runs on edge &lsquo;{{ edge_site }}&rsquo; and is managed by the edge relay.
+                            Its schema comes from the edge; edit the tool there and reconnect.
+                            <a href="/admin/edges" class="underline hover:text-amber-900 dark:hover:text-amber-200">Manage edge nodes</a>.
+                        </p>
+                    </div>
+                </div>
+                {% endif %}
+                <fieldset {% if edge_managed %}disabled{% endif %} class="min-w-0">
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-8">
                     <div>
                         <label class="form-label">Runtime Engine</label>
@@ -271,13 +285,16 @@
                     <input type="text" name="entrypoint" value="{{ config.entrypoint }}" class="form-input font-mono text-accent dark:text-accent-dark">
                 </div>
                 <input type="hidden" name="rel_path" value="{{ config.rel_path }}">
+                </fieldset>
             {% endif %}
             
+            {% if not edge_managed %}
             <div class="flex justify-end pt-6 border-t border-neutral-200 dark:border-neutral-800 mt-8">
                 <button type="submit" class="border border-neutral-900 dark:border-neutral-100 bg-neutral-900 dark:bg-neutral-100 text-white dark:text-neutral-900 px-8 py-3 font-bold text-sm hover:bg-neutral-800 dark:hover:bg-neutral-200 transition-colors uppercase tracking-widest font-mono">
                     Commit Changes
                 </button>
             </div>
+            {% endif %}
         </form>
     </div>
 

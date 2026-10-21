@@ -229,13 +229,24 @@ class MCPConfig(BaseModel):
     variables: Optional[Union[List[str], Dict[str, List[str]]]] = Field(default_factory=list, description="List of non-sensitive configuration variables required by this MCP.")
     tools: Optional[List[MCPToolDefinition]] = Field(default_factory=list, description="Optional statically defined tools to bypass dynamic discovery.")
 
+class RemoteToolSpec(BaseModel):
+    """Where a remote (edge-hosted) tool actually executes.
+
+    ``site`` is both the edge id and the routing key; it is written by the edge
+    relay from the catalog the edge published, never by a caller.
+    """
+    site: str = Field(..., pattern="^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    tool: str = Field(..., pattern="^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
 class ToolConfig(BaseModel):
     """Configuration for a Tool, parsed from tool.yaml."""
     name: str
     version: str = "0.1.0"
     description: str
-    runtime: str = Field(..., pattern="^(python|go|ts|bash)$")
-    entrypoint: str
+    runtime: str = Field(..., pattern="^(python|go|ts|bash|remote)$")
+    entrypoint: str = ""
+    remote: Optional[RemoteToolSpec] = Field(default=None, description="Set for edge-hosted tools: the site and the tool name inside that site's catalog. Remote tools have no local entrypoint and no central secrets.")
     public: bool = Field(default=False, description="Expose this tool directly to external MCP clients and gateway search.")
     inputs: Optional[Dict[str, Any]] = None
     outputs: Optional[Dict[str, Any]] = None
@@ -266,3 +277,22 @@ class ToolConfig(BaseModel):
             value,
         )
         return "allow"
+
+    @model_validator(mode="after")
+    def _validate_remote(self) -> "ToolConfig":
+        """A tool is either local (entrypoint required) or remote (pointer only).
+
+        ``rel_path`` is not part of the model; ``load_tool_configs`` keeps it out of
+        the parsed config and resolves the directory separately. Remote configs have
+        no directory at all, so the runtime tag is what tells the hub which branch of
+        ``run_tool`` to take.
+        """
+        if self.remote is not None:
+            if self.runtime != "remote":
+                raise ValueError("a tool with `remote` set must use runtime: remote")
+            self.entrypoint = ""
+        elif self.runtime == "remote":
+            raise ValueError("runtime: remote requires a `remote: {site, tool}` block")
+        elif not self.entrypoint:
+            raise ValueError("entrypoint is required for a non-remote tool")
+        return self

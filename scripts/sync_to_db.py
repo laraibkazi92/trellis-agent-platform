@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.auth import IdentityManager
 from core.embeddings import embed_text
 from core.models import coerce_bool_flag, AgentRule, GlobalRule, RoutingRulesConfig
+from core.tool_index import delete_tool, index_tool
 
 BASE_DIR = Path(__file__).parent.parent
 WORKSPACE_DIR = BASE_DIR / "workspace"
@@ -300,7 +301,12 @@ def main(argv=None):
     
     # 1. Fetch current items from etcd
     existing_agents = set(identity_mgr._get_all_configs_by_prefix("/registry/agents/").keys())
-    existing_tools = set(identity_mgr._get_all_configs_by_prefix("/registry/tools/").keys())
+    # Tool configs (not just names): the prune needs `managed_by` to tell a
+    # workspace tool from an edge-registered one. A config that fails to decode is
+    # absent from this dict and therefore never enters the delete loop at all --
+    # fail-closed, exactly like an unreadable edge config should be.
+    existing_tool_configs = identity_mgr._get_all_configs_by_prefix("/registry/tools/")
+    existing_tools = set(existing_tool_configs)
     existing_mcps = set(identity_mgr._get_all_configs_by_prefix("/registry/mcps/").keys())
     
     seen_agents = set()
@@ -356,15 +362,12 @@ def main(argv=None):
 
                 # Index the embedding only for tools exposed publicly via the gateway.
                 if config.get("public"):
-                    inputs = config.get("inputs") or {}
-                    input_keys = ", ".join(
-                        f"{key}:{spec.get('type', 'any')}" if isinstance(spec, dict) else str(key)
-                        for key, spec in inputs.items()
-                    )
-                    parts = [name, config.get("description", ""), input_keys]
-                    vector = embed_text("\n".join(p for p in parts if p), task_type="retrieval_document")
-                    if vector:
-                        identity_mgr.save_tool_embedding(name, vector)
+                    if index_tool(
+                        identity_mgr,
+                        name,
+                        config.get("description", ""),
+                        config.get("inputs") or {},
+                    ):
                         print(f"  Indexed embedding for tool: {name}")
                     else:
                         print(f"  Skipped embedding for tool: {name} (embeddings unavailable)")
@@ -443,17 +446,32 @@ def main(argv=None):
         return 1
 
     print("\nPruning obsolete entries from etcd...")
-    
+
+    # Ownership: the edge relay is the sole writer of `<site>__<tool>` entries and
+    # marks them `managed_by: edge-relay`. They never exist on the central disk, so
+    # without this carve-out every rebuild would delete every remote tool. The
+    # carve-out deliberately ignores --force-prune: that flag bypasses the
+    # wiped-workspace guard, never ownership.
+    protected_tools = {
+        tool
+        for tool, config in existing_tool_configs.items()
+        if config.get("managed_by") == "edge-relay"
+    }
+    if protected_tools:
+        print(
+            f"  Keeping {len(protected_tools)} edge-managed tool(s): "
+            f"{', '.join(sorted(protected_tools))}"
+        )
+
     for agent in existing_agents - seen_agents:
         print(f"  Deleting obsolete agent: {agent}")
         identity_mgr.client.delete(f"/registry/agents/{agent}/config")
         identity_mgr.client.delete(f"/registry/agents/{agent}/skills")
         identity_mgr.client.delete(f"/registry/agents/{agent}/embedding")
-        
-    for tool in existing_tools - seen_tools:
+
+    for tool in existing_tools - seen_tools - protected_tools:
         print(f"  Deleting obsolete tool: {tool}")
-        identity_mgr.client.delete(f"/registry/tools/{tool}/config")
-        identity_mgr.client.delete(f"/registry/tools/{tool}/embedding")
+        delete_tool(identity_mgr, tool)
 
     prune_obsolete_mcps(identity_mgr, existing_mcps, seen_mcps)
 

@@ -35,6 +35,16 @@ from core import hub
 from core.models import ToolConfig
 
 
+@pytest.fixture(autouse=True)
+def _reset_registered_tools():
+    """register_tools() reconciles against process-global state; reset it per test."""
+    hub._registered_tools.clear()
+    hub._unreadable_tool_names.clear()
+    yield
+    hub._registered_tools.clear()
+    hub._unreadable_tool_names.clear()
+
+
 ENTRYPOINT_SOURCE = "import json, sys\nprint(json.dumps({}))\n"
 
 

@@ -12,7 +12,8 @@ import asyncio
 import hashlib
 import jwt
 import os
-from typing import Dict, List, Optional, Any, Union
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any, Tuple, Union
 from functools import wraps
 
 from core.models import Identity, IdentityType
@@ -33,6 +34,51 @@ user_id_var = contextvars.ContextVar("user_id", default=None)
 # "Bearer " header makes it skip its own DEV_MODE bypass, validate the sentinel as a
 # key, and reject the call with 401.
 DEV_MODE_AUTH_TOKEN = "dev-token"
+
+# Edge (trellis-proxy) registry layout. `/registry/edges/<site>/config` is the site
+# record, `/status` is written by the relay, and `/edge_tokens/<sha256> -> site` is a
+# token index so the relay's pre-upgrade handshake is one get instead of a scan of
+# every site. Only the hash is ever persisted; the plaintext is returned once.
+EDGES_PREFIX = "/registry/edges/"
+EDGE_TOKENS_PREFIX = "/edge_tokens/"
+EDGE_TOOLS_PREFIX = "/registry/tools/"
+EDGE_MANAGED_BY = "edge-relay"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _edge_token_preview(site: str, token: str) -> str:
+    return f"edge_{site}_...{token[-4:]}"
+
+
+def _mint_edge_token(site: str) -> Tuple[str, str]:
+    """Mint an enrollment token and its storage hash (the plaintext is shown once)."""
+    token = f"edge_{site}_{secrets.token_urlsafe(32)}"
+    return token, hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+_EDGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def _validated_edge_name(name: Any) -> str:
+    """Validate a site id, raising ``ValueError`` (the admin UI's error channel).
+
+    Mirrors ``services/edge_relay/protocol.py``'s ``validate_site_name`` deliberately:
+    ``core`` must not import ``services``. The rule has to match exactly, because a
+    name the registry accepts must never be rejected later by the relay's handshake.
+    """
+    if not isinstance(name, str) or not _EDGE_NAME_RE.match(name):
+        raise ValueError(f"Invalid edge name: {name!r}")
+    if "__" in name:
+        # `<site>__<tool>` is the registry key: a separator inside either half makes
+        # two different (site, tool) pairs collide.
+        raise ValueError(f"Edge name may not contain '__': {name!r}")
+    if name.lower() == "mcp":
+        # `mcp__` is already a meaningful prefix for MCP tools in core/tool_search.py.
+        raise ValueError("'mcp' is reserved for MCP tool names")
+    return name
 
 
 class EtcdContentionError(RuntimeError):
@@ -735,6 +781,29 @@ class IdentityManager:
             return json.loads(value.decode('utf-8'))
         return None
 
+    def get_tool_config_safe(self, name: str) -> Tuple[bool, Optional[Dict]]:
+        """Read one tool config for the hub's reconcile pass: ``(read_ok, config)``.
+
+        Deliberately undecorated. ``get_tool_config`` is wrapped in ``retry_etcd``,
+        which retries *any* exception -- a single malformed JSON value would cost the
+        caller ~18 s of backoff and make the whole reconcile look like a registry
+        outage. Here a decode failure is reported as ``read_ok=False`` immediately, and
+        the caller protects that tool from the prune instead of deleting it.
+        """
+        try:
+            value, _ = self.client.get(f"/registry/tools/{name}/config")
+        except Exception as exc:
+            logger.warning(f"Could not read tool config '{name}': {exc}")
+            return False, None
+        if not value:
+            return True, None
+        try:
+            decoded = json.loads(value.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            logger.error(f"Tool config '{name}' is not valid JSON; leaving it untouched.")
+            return False, None
+        return True, decoded if isinstance(decoded, dict) else None
+
     @retry_etcd()
     def list_tools(self) -> List[str]:
         """List all tool names in the registry."""
@@ -806,6 +875,243 @@ class IdentityManager:
         -- so an MCP pruned from the registry must also clear that key range, or its
         embeddings outlive the config and keep ranking in tool search as ghosts."""
         self.client.delete_prefix(f"/registry/tools/mcp__{mcp_name}__/embedding")
+
+    # --- Edges (trellis-proxy) -------------------------------------------------
+    #
+    # A site is /registry/edges/<site>/{config,status}; the relay is the only writer
+    # of its `<site>__<tool>` tool configs, so nothing here touches those beyond
+    # deleting them when the site itself is removed. Tokens are minted once, stored
+    # as a SHA-256 hash, and indexed at /edge_tokens/<sha256> -> site. No method here
+    # logs a token or its hash.
+
+    def _read_edge_record(self, path: str) -> Optional[Dict]:
+        """Read one edge record without a retry loop of its own.
+
+        Public readers wrap this in ``@retry_etcd()``; mutators call it directly so a
+        failing etcd is retried once rather than multiplied by nesting. A corrupt
+        value reads as missing: re-running a JSON parse ten times helps nobody, and
+        the edge auth path must fail closed.
+        """
+        value, _ = self.client.get(path)
+        if not value:
+            return None
+        try:
+            parsed = json.loads(value.decode('utf-8'))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            logger.error(f"Edge record at {path} is not valid JSON; treating it as missing.")
+            return None
+        if not isinstance(parsed, dict):
+            logger.error(f"Edge record at {path} is not a JSON object; treating it as missing.")
+            return None
+        return parsed
+
+    @retry_etcd()
+    def save_edge_config(self, name: str, config: Dict) -> None:
+        """Persist an edge (site) record. Operator-editable fields are the admin UI's."""
+        self.client.put(f"{EDGES_PREFIX}{name}/config", json.dumps(config))
+
+    @retry_etcd()
+    def get_edge_config(self, name: str) -> Optional[Dict]:
+        return self._read_edge_record(f"{EDGES_PREFIX}{name}/config")
+
+    @retry_etcd()
+    def list_edges(self) -> List[str]:
+        """List all registered edge (site) names."""
+        return self._list_names_by_prefix(EDGES_PREFIX)
+
+    @retry_etcd()
+    def get_all_edge_configs(self) -> Dict[str, Dict]:
+        """Get all edge configs in a single fetch."""
+        return self._get_all_configs_by_prefix(EDGES_PREFIX)
+
+    @retry_etcd()
+    def save_edge_status(self, name: str, status: Dict) -> None:
+        """Persist the relay-owned connection status for a site."""
+        self.client.put(f"{EDGES_PREFIX}{name}/status", json.dumps(status))
+
+    @retry_etcd()
+    def get_edge_status(self, name: str) -> Optional[Dict]:
+        return self._read_edge_record(f"{EDGES_PREFIX}{name}/status")
+
+    def create_edge(
+        self,
+        name: str,
+        display_name: str,
+        created_by: str,
+        exports: Optional[List[str]] = None,
+    ) -> str:
+        """Register a site and return its enrollment token (the only time it exists).
+
+        Distinct from ``create_key``: user API keys have their own lifecycle and
+        owner, and an edge token authenticates one tunnel, not a person.
+
+        Validation and the duplicate check sit outside the retried body on purpose:
+        ``retry_etcd`` retries *any* exception, so a ``ValueError`` raised inside it
+        would take ten backoff cycles to reach the admin.
+        """
+        site = _validated_edge_name(name)
+        if self.get_edge_config(site):
+            raise ValueError(f"Edge '{site}' already exists.")
+        return self._create_edge(site, display_name, created_by, exports)
+
+    @retry_etcd()
+    def _create_edge(
+        self,
+        site: str,
+        display_name: str,
+        created_by: str,
+        exports: Optional[List[str]],
+    ) -> str:
+        token, token_hash = _mint_edge_token(site)
+        config = {
+            "name": site,
+            "display_name": display_name or site,
+            "token_hash": token_hash,
+            "token_preview": _edge_token_preview(site, token),
+            "version": "v1",
+            "created_by": created_by,
+            "created_at": _now_iso(),
+            "enabled": True,
+            "exports": list(exports or []),
+            "public": False,
+            "public_tools": [],
+        }
+        self.client.put(f"{EDGES_PREFIX}{site}/config", json.dumps(config))
+        self.client.put(f"{EDGE_TOKENS_PREFIX}{token_hash}", json.dumps(site))
+        logger.info(f"Edge '{site}' registered by {created_by}.")
+        return token
+
+    def rotate_edge_token(self, name: str, rotated_by: str) -> str:
+        """Replace a site's enrollment token; everything else on the record survives.
+
+        The config is written before the old index key is deleted: ``resolve_edge_token``
+        also compares the stored hash, so the old token stops working at the config
+        write, and a crash between the two leaves an inert index entry, not a live one.
+        """
+        config = self.get_edge_config(name)
+        if not config:
+            raise ValueError(f"Edge '{name}' not found.")
+        return self._rotate_edge_token(name, config, rotated_by)
+
+    @retry_etcd()
+    def _rotate_edge_token(self, name: str, config: Dict, rotated_by: str) -> str:
+        old_hash = config.get("token_hash")
+        token, token_hash = _mint_edge_token(name)
+        config.update({
+            "token_hash": token_hash,
+            "token_preview": _edge_token_preview(name, token),
+            "version": "v1",
+            # An explicit rotation is a re-enrollment, so a previously revoked site
+            # becomes reachable again; otherwise there is no way back from revoke.
+            "enabled": True,
+            "rotated_by": rotated_by,
+            "rotated_at": _now_iso(),
+        })
+        self.client.put(f"{EDGES_PREFIX}{name}/config", json.dumps(config))
+        self.client.put(f"{EDGE_TOKENS_PREFIX}{token_hash}", json.dumps(name))
+        if isinstance(old_hash, str) and old_hash:
+            self.client.delete(f"{EDGE_TOKENS_PREFIX}{old_hash}")
+        logger.info(f"Edge '{name}' token rotated by {rotated_by}.")
+        return token
+
+    @retry_etcd()
+    def revoke_edge_token(self, name: str) -> None:
+        """Disable a site by dropping its index key and clearing ``enabled``.
+
+        ``token_hash`` is kept for audit, but a revoked site whose index entry somehow
+        survives still fails to resolve: resolution requires ``enabled`` to be truthy.
+        """
+        config = self._read_edge_record(f"{EDGES_PREFIX}{name}/config")
+        if not config:
+            logger.warning(f"Edge '{name}' not found; nothing to revoke.")
+            return
+
+        token_hash = config.get("token_hash")
+        config["enabled"] = False
+        config["revoked_at"] = _now_iso()
+        self.client.put(f"{EDGES_PREFIX}{name}/config", json.dumps(config))
+        if isinstance(token_hash, str) and token_hash:
+            self.client.delete(f"{EDGE_TOKENS_PREFIX}{token_hash}")
+        logger.info(f"Edge '{name}' token revoked.")
+
+    @retry_etcd()
+    def resolve_edge_token(self, token: str) -> Optional[str]:
+        """Resolve a bearer token to its site name, or ``None``.
+
+        One indexed get on the hot path. Both the index entry and a truthy ``enabled``
+        are required, and the stored hash must still match, so a stale index entry
+        (rotation or revoke interrupted halfway) fails closed.
+        """
+        if not token:
+            return None
+
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        value, _ = self.client.get(f"{EDGE_TOKENS_PREFIX}{digest}")
+        if not value:
+            return None
+        try:
+            site = json.loads(value.decode('utf-8'))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            logger.error("An edge token index entry is not valid JSON; ignoring it.")
+            return None
+        if not isinstance(site, str) or not site:
+            return None
+
+        config = self._read_edge_record(f"{EDGES_PREFIX}{site}/config")
+        if not config or not config.get("enabled", True):
+            return None
+        # Both sides are SHA-256 digests of a value the caller must already know, so a
+        # constant-time compare adds nothing an attacker could measure.
+        if config.get("token_hash") != digest:
+            logger.warning(f"Edge '{site}' token index entry is stale; refusing it.")
+            return None
+        return site
+
+    @retry_etcd()
+    def delete_edge(self, name: str) -> None:
+        """Remove a site: index entry, config, status, and its `<site>__*` tools.
+
+        The token index key is deleted first. If the tool pass then fails, the retry
+        re-reads an already-deleted config and would no longer know the hash to
+        remove -- leaving an index entry pointing at a site that no longer exists.
+        """
+        config = self._read_edge_record(f"{EDGES_PREFIX}{name}/config") or {}
+        token_hash = config.get("token_hash")
+        if isinstance(token_hash, str) and token_hash:
+            self.client.delete(f"{EDGE_TOKENS_PREFIX}{token_hash}")
+        self.client.delete(f"{EDGES_PREFIX}{name}/config")
+        self.client.delete(f"{EDGES_PREFIX}{name}/status")
+        removed = self._delete_edge_tools(name)
+        logger.info(f"Edge '{name}' deleted along with {removed} published tool(s).")
+
+    @retry_etcd()
+    def delete_edge_tools(self, name: str) -> int:
+        """Delete the tool configs and embeddings the relay published for a site."""
+        return self._delete_edge_tools(name)
+
+    def _delete_edge_tools(self, name: str) -> int:
+        """Count and remove `<site>__*` tools, refusing anything the relay does not own."""
+        from core.tool_index import delete_tool
+
+        prefix = f"{EDGE_TOOLS_PREFIX}{name}__"
+        removed = 0
+        for value, metadata in self.client.get_prefix(prefix):
+            key = metadata.key.decode('utf-8')
+            if not key.startswith(prefix) or not key.endswith("/config"):
+                continue
+            tool_name = key[len(EDGE_TOOLS_PREFIX):-len("/config")]
+            try:
+                config = json.loads(value.decode('utf-8')) if value else {}
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                config = None
+            if not isinstance(config, dict) or config.get("managed_by") != EDGE_MANAGED_BY:
+                # Never delete a tool we did not write: `<site>__` is a name prefix, not
+                # proof of ownership (a local tool or an older scheme may hold it).
+                logger.warning(f"Refusing to delete tool '{tool_name}': not managed by the edge relay.")
+                continue
+            delete_tool(self, tool_name)
+            removed += 1
+        return removed
 
     @retry_etcd()
     def save_routing_rules(self, rules_data: Dict[str, Any]) -> None:

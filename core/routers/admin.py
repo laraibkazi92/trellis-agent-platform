@@ -5,7 +5,10 @@ import os
 import re
 import json
 import yaml
+import time
 import asyncio
+import secrets
+import httpx
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import templates, CSRFRoute
@@ -919,6 +922,289 @@ async def delete_llm_provider_key(request: Request, key_name: str = Form(...)):
 
     return RedirectResponse(url='/admin/llm-providers', status_code=303)
 
+# --- Edge nodes (trellis-proxy) ------------------------------------------------
+#
+# The central host cannot dial a site, so an edge registers itself and its tools are
+# published into /registry/tools/<site>__<tool> by the relay. These routes own the site
+# lifecycle (enrollment token, exports allowlist, delete); tool configs are the relay's.
+
+# Site names become the `<site>__<tool>` registry prefix, so they must be a safe etcd key
+# segment and must not collide with the separator or a reserved prefix.
+_EDGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_EDGE_RESERVED_NAMES = frozenset({"mcp"})
+
+# An enrollment token is handed to the operator exactly once. The POST handlers redirect
+# (303, the admin-UI convention), so the plaintext rides in this process for the next
+# /admin/edges render only -- never in the session (a client-readable cookie) and never in
+# etcd. Entries are popped on read and expire, so a missed render cannot leak one later.
+_EDGE_TOKEN_TTL_SECONDS = 300.0
+_pending_edge_tokens: dict[str, tuple[float, str, str]] = {}
+
+
+def _stash_edge_token(site: str, token: str) -> str:
+    key = secrets.token_urlsafe(16)
+    _pending_edge_tokens[key] = (time.monotonic(), site, token)
+    return key
+
+
+def _pop_edge_token(key: str | None) -> dict | None:
+    now = time.monotonic()
+    expired = [
+        k for k, (created, _, _) in _pending_edge_tokens.items()
+        if now - created > _EDGE_TOKEN_TTL_SECONDS
+    ]
+    for stale in expired:
+        _pending_edge_tokens.pop(stale, None)
+    if not key:
+        return None
+    entry = _pending_edge_tokens.pop(key, None)
+    if not entry:
+        return None
+    return {"site": entry[1], "token": entry[2]}
+
+
+def _edge_name_error(name: str) -> str | None:
+    if not name:
+        return "Edge name is required."
+    if "__" in name:
+        return "Invalid edge name: '__' is reserved as the tool-name separator."
+    if name.lower() in _EDGE_RESERVED_NAMES:
+        return f"Invalid edge name: '{name}' is reserved."
+    if not _EDGE_NAME_RE.match(name):
+        return (
+            "Invalid edge name: use letters, digits, '-' or '_', start with a letter or "
+            "digit, and keep it to 64 characters."
+        )
+    return None
+
+
+def _parse_edge_exports(raw: str) -> list[str]:
+    return [item.strip() for item in (raw or "").split(",") if item.strip()]
+
+
+def _parse_edge_rate(raw: str | None) -> int | None:
+    """Operator override for the relay's per-site call budget; blank = default."""
+    if raw in (None, ""):
+        return None
+    try:
+        rate = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return max(1, min(rate, 6000))
+
+
+@router.get("/admin/edges", response_class=HTMLResponse)
+async def admin_edges_page(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    user = request.session.get('user')
+    names = await asyncio.to_thread(identity_mgr.list_edges)
+
+    edges = []
+    for name in sorted(names):
+        config = await asyncio.to_thread(identity_mgr.get_edge_config, name) or {}
+        status = await asyncio.to_thread(identity_mgr.get_edge_status, name) or {}
+        # The relay publishes the catalog as names, but tolerate {name: ...} dicts so a
+        # status written by a newer relay never breaks this page.
+        raw_tools = status.get("tools") or []
+        tools = [t.get("name", "") if isinstance(t, dict) else str(t) for t in raw_tools]
+        edges.append({
+            "name": name,
+            "display_name": config.get("display_name") or name,
+            "enabled": config.get("enabled", True) is not False,
+            "connected": status.get("connected") is True,
+            "edge_version": status.get("edge_version") or config.get("edge_version") or "",
+            "tools": tools,
+            "exports": config.get("exports") or [],
+            "public": config.get("public") is True,
+            "public_tools": config.get("public_tools") or [],
+            "token_preview": config.get("token_preview") or "",
+            "created_at": config.get("created_at") or "",
+            "last_error": status.get("last_error") or "",
+            "last_seen": (
+                status.get("connected_at") or status.get("disconnected_at")
+                or config.get("last_seen") or ""
+            ),
+            "rate_limit_per_min": config.get("rate_limit_per_min"),
+        })
+
+    return templates.TemplateResponse(
+        request=request,
+        name="admin_edges.html",
+        context={
+            "user": user,
+            "edges": edges,
+            "flash_msg": request.session.pop("flash_msg", None),
+            "new_token": _pop_edge_token(request.query_params.get("token")),
+            "rate_limit_default": os.getenv("EDGE_RATE_LIMIT_PER_MIN", "120"),
+        },
+    )
+
+
+@router.post("/admin/edges/create")
+async def create_edge(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    form = await request.form()
+    name = (form.get("name") or "").strip()
+    display_name = (form.get("display_name") or "").strip() or name
+    exports = _parse_edge_exports(form.get("exports") or "")
+
+    if error := _edge_name_error(name):
+        request.session["flash_msg"] = error
+        return RedirectResponse(url='/admin/edges', status_code=303)
+
+    created_by = (request.session.get("user") or {}).get("email") or "unknown"
+    try:
+        token = await asyncio.to_thread(
+            identity_mgr.create_edge, name, display_name, created_by, exports
+        )
+    except ValueError as exc:
+        request.session["flash_msg"] = str(exc)
+        return RedirectResponse(url='/admin/edges', status_code=303)
+
+    request.session["flash_msg"] = (
+        f"Edge '{name}' created. Its enrollment token is shown once on this page -- copy "
+        f"it now, it cannot be retrieved again."
+    )
+    return RedirectResponse(
+        url=f'/admin/edges?token={_stash_edge_token(name, token)}', status_code=303
+    )
+
+
+@router.post("/admin/edges/update")
+async def update_edge(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    form = await request.form()
+    name = (form.get("name") or "").strip()
+
+    config = await asyncio.to_thread(identity_mgr.get_edge_config, name)
+    if not config:
+        request.session["flash_msg"] = f"Edge '{name}' not found."
+        return RedirectResponse(url='/admin/edges', status_code=303)
+
+    # Only these three fields are operator-editable. The token hash, ownership and status
+    # deliberately stay exactly as the registry has them -- never round-tripped via a form.
+    config["display_name"] = (form.get("display_name") or "").strip() or name
+    config["exports"] = _parse_edge_exports(form.get("exports") or "")
+    config["public"] = form.get("public") == "true"
+    # Per-tool whitelist: names here are public even when the site is not.
+    config["public_tools"] = _parse_edge_exports(form.get("public_tools") or "")
+    # Blank clears the override, so the site follows EDGE_RATE_LIMIT_PER_MIN.
+    rate = _parse_edge_rate(form.get("rate_limit_per_min"))
+    if rate is None:
+        config.pop("rate_limit_per_min", None)
+    else:
+        config["rate_limit_per_min"] = rate
+    await asyncio.to_thread(identity_mgr.save_edge_config, name, config)
+
+    request.session["flash_msg"] = f"Edge '{name}' updated."
+    return RedirectResponse(url='/admin/edges', status_code=303)
+
+
+@router.post("/admin/edges/test")
+async def test_edge(request: Request):
+    """Report whether the relay currently holds a live tunnel for this site.
+
+    A real tool call needs a tool and its arguments, so this is a connectivity probe:
+    it answers "is the tunnel up, and what does it publish" without side effects.
+    """
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    form = await request.form()
+    name = (form.get("name") or "").strip()
+    base = os.getenv("EDGE_RELAY_URL", "http://edge-relay:8100").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            response = await client.get(f"{base}/healthz")
+            response.raise_for_status()
+            sites = (response.json() or {}).get("sites") or {}
+    except Exception as exc:
+        request.session["flash_msg"] = (
+            f"Could not reach the edge relay ({type(exc).__name__}); check the edge-relay service."
+        )
+        return RedirectResponse(url='/admin/edges', status_code=303)
+
+    info = sites.get(name)
+    if not info:
+        request.session["flash_msg"] = (
+            f"Edge '{name}' is offline: the relay has no live tunnel for it."
+        )
+    else:
+        request.session["flash_msg"] = (
+            f"Edge '{name}' is connected: {info.get('tools', 0)} tool(s) published, "
+            f"{info.get('inflight', 0)} call(s) in flight."
+        )
+    return RedirectResponse(url='/admin/edges', status_code=303)
+
+
+@router.post("/admin/edges/rotate")
+async def rotate_edge(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    form = await request.form()
+    name = (form.get("name") or "").strip()
+    rotated_by = (request.session.get("user") or {}).get("email") or "unknown"
+
+    try:
+        token = await asyncio.to_thread(identity_mgr.rotate_edge_token, name, rotated_by)
+    except ValueError as exc:
+        request.session["flash_msg"] = str(exc)
+        return RedirectResponse(url='/admin/edges', status_code=303)
+
+    request.session["flash_msg"] = (
+        f"Token for edge '{name}' rotated. The previous token no longer works; the new "
+        f"enrollment token is shown once on this page -- copy it now."
+    )
+    return RedirectResponse(
+        url=f'/admin/edges?token={_stash_edge_token(name, token)}', status_code=303
+    )
+
+
+@router.post("/admin/edges/revoke")
+async def revoke_edge(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    form = await request.form()
+    name = (form.get("name") or "").strip()
+    await asyncio.to_thread(identity_mgr.revoke_edge_token, name)
+
+    request.session["flash_msg"] = (
+        f"Token for edge '{name}' revoked. The live tunnel is refused at its next "
+        f"handshake and the current socket closes."
+    )
+    return RedirectResponse(url='/admin/edges', status_code=303)
+
+
+@router.post("/admin/edges/delete")
+async def delete_edge(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    form = await request.form()
+    name = (form.get("name") or "").strip()
+
+    config = await asyncio.to_thread(identity_mgr.get_edge_config, name)
+    if not config:
+        request.session["flash_msg"] = f"Edge '{name}' not found."
+        return RedirectResponse(url='/admin/edges', status_code=303)
+
+    # Deleting the site also removes its catalogued tools, configs and embeddings.
+    await asyncio.to_thread(identity_mgr.delete_edge, name)
+
+    request.session["flash_msg"] = (
+        f"Edge '{name}' deleted, along with the tools it published. The edge must be "
+        f"re-registered with a new token to reconnect."
+    )
+    return RedirectResponse(url='/admin/edges', status_code=303)
+
 @router.get("/editor/{type}/{name}", response_class=HTMLResponse)
 async def editor_page(request: Request, type: str, name: str):
     fallback_url = '/agents' if type == 'agent' else '/tools'
@@ -1016,6 +1302,12 @@ async def editor_page(request: Request, type: str, name: str):
         if not config:
             request.session["flash_msg"] = "Tool not found."
             return RedirectResponse(url='/tools', status_code=303)
+        # Remote tools are published by the edge relay from the edge's own catalog, so
+        # their schema cannot be edited here: the editor renders read-only and names the
+        # owning site.
+        edge_site = (config.get("remote") or {}).get("site") or (
+            safe_name.split("__", 1)[0] if "__" in safe_name else ""
+        )
         return templates.TemplateResponse(
             request=request,
             name="editor.html", 
@@ -1024,7 +1316,9 @@ async def editor_page(request: Request, type: str, name: str):
                 "type": type,
                 "name": safe_name,
                 "config": config,
-                "error": flash_msg
+                "error": flash_msg,
+                "edge_managed": config.get("managed_by") == "edge-relay",
+                "edge_site": edge_site,
             }
         )
     elif type == "mcp":
@@ -1263,7 +1557,25 @@ async def save_tool(request: Request, name: str):
     
     # 1. Update etcd immediately
     config = await asyncio.to_thread(identity_mgr.get_tool_config, safe_name) or {"name": safe_name}
+    # Defence in depth: the editor renders read-only for edge tools, but a stale form
+    # (opened before the tool moved to an edge, or before the upgrade) can still POST.
+    # The relay owns these configs; a save here would be overwritten on the next catalog
+    # publish and could poison the schema in between.
+    if config.get("managed_by") == "edge-relay":
+        request.session["flash_msg"] = (
+            f"Tool '{safe_name}' is managed by the edge relay and cannot be edited here. "
+            f"Change it on the edge and reconnect."
+        )
+        return RedirectResponse(url='/tools', status_code=303)
     config["runtime"] = form.get("runtime")
+    # `remote` is a registry pointer, not a runtime an operator can pick. A local tool
+    # marked remote has no `remote` block, fails ToolConfig validation, and silently
+    # disappears from the hub at the next reconcile.
+    if config.get("runtime") == "remote":
+        request.session["flash_msg"] = (
+            "Runtime 'remote' is assigned by the edge relay and cannot be selected here."
+        )
+        return RedirectResponse(url=f'/editor/tool/{safe_name}', status_code=303)
     config["version"] = form.get("version")
     config["description"] = form.get("description")
     config["entrypoint"] = form.get("entrypoint")

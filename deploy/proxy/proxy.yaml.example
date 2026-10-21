@@ -1,0 +1,51 @@
+# trellis-proxy configuration -- one file per edge node.
+#
+# Copy to proxy.yaml next to this file's docker-compose.yml and edit. It is mounted
+# read-only at /etc/trellis/proxy.yaml.
+#
+# SECRETS: the enrollment token is never written here, only the name of the env var that
+# holds it. Tool credentials (API keys, service accounts) are read from THIS host's
+# environment or secret store by the tool processes themselves -- they are never sent to
+# the central install, never stored in etcd, and never leave this VM.
+#
+# Apply changes with `docker compose restart trellis-proxy`; send SIGHUP to re-publish the
+# tool catalog (the proxy reconnects; in-flight calls fail rather than being replayed).
+
+# Site id, pre-registered by an admin in Admin -> Edges. It must match the site the token
+# was issued for. The central relay derives identity from the token hash and never trusts
+# this value, so a wrong site cannot impersonate another edge -- the proxy logs a warning
+# when the relay reports a different site than the one configured here.
+site: plant-floor
+
+# Central Trellis host, WebSocket endpoint. Use wss:// in production: the tunnel carries
+# the bearer token and internal tool arguments. The path is fixed.
+server_url: wss://trellis.example.com/edge/v1/connect
+
+# Env var holding the enrollment token (edge_<site>_<random>). Never inline the token:
+# this file is read-only inside the container but still copied by backups.
+token_env: TRELLIS_EDGE_TOKEN
+
+# Directory holding this edge's tool.yaml directories. Same schema as the central
+# workspace (workspace/tools/<tool>/tool.yaml). Mounted read-only at /app/workspace by the
+# compose file, so tools may read their own assets but the proxy never writes to the tree.
+tools_dir: ./workspace/tools
+
+# Allowlist of tools this node publishes to the central install, e.g.
+#   exports: [boiler_status, plant_readings]
+# Empty list publishes NOTHING -- this is an allowlist, not a denylist. A tool that is not
+# listed is never advertised in the catalog, and the proxy refuses it locally even if the
+# central side asks for it, so a compromised relay cannot invoke an unexported tool.
+exports: []
+
+# Optional mutual TLS. Only needed when the central relay is configured with
+# EDGE_MTLS_CA. Mount the files read-only into this container; the proxy presents the
+# certificate on the WebSocket handshake and verifies the relay against tls_ca_file.
+# Env equivalents: TRELLIS_EDGE_TLS_CA / _CERT / _KEY.
+# tls_ca_file: /etc/trellis/tls/ca.pem
+# tls_cert_file: /etc/trellis/tls/edge.pem
+# tls_key_file: /etc/trellis/tls/edge-key.pem
+
+# Sandbox backend for tool processes: auto | bwrap | landlock. Same semantics as the
+# central hub's SANDBOX_BACKEND: `auto` prefers bwrap and falls back to Landlock when
+# bwrap cannot run (no user namespaces, restrictive AppArmor). See deploy/proxy/README.md.
+sandbox: auto

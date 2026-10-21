@@ -1,0 +1,57 @@
+# trellis-proxy -- standalone edge install.
+#
+# Runs on an INTERNAL VM that has outbound 443 to the central Trellis host and no
+# inbound reachability. It dials out over WSS, and executes only the tools listed in
+# proxy.yaml's `exports` allowlist, locally, with the same tool.yaml schema and the same
+# sandbox as the central hub.
+#
+# Deliberately standalone: no etcd, no redis, no shared network with the central stack,
+# and no service from the engine's docker-compose.yml. See docs/proxy.md.
+services:
+  trellis-proxy:
+    # The SAME published image as the central install, with a different entrypoint. Pin
+    # the tag (or a digest) to the version the central host runs: the edge wire protocol
+    # is versioned and an older proxy may be refused at the handshake.
+    # Must be a build that includes core/proxy.py (anything published after this
+    # feature landed). Pin the exact tag the central host runs: the tunnel protocol is
+    # versioned and a mismatch is refused at the handshake.
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:latest}
+    container_name: trellis-proxy
+    # Same non-root posture as the central services: tools run as this uid.
+    user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
+    command: python core/proxy.py --config /etc/trellis/proxy.yaml
+    # Holds TRELLIS_EDGE_TOKEN plus whatever credentials the exported tools need. Keep it
+    # mode 0600 and never commit it: every credential this edge uses lives here and none
+    # of it is ever sent to the central host.
+    env_file: .env
+    volumes:
+      # Read-only: the proxy runs the tools declared in the workspace, it never edits it.
+      - ./workspace:/app/workspace:ro
+      - ./proxy.yaml:/etc/trellis/proxy.yaml:ro
+    # PID 1 must reap tool children, same reason as the central hub: a tool that
+    # daemonizes would otherwise leave zombies under a long-lived proxy.
+    init: true
+    restart: unless-stopped
+    security_opt:
+      - "no-new-privileges:true"
+    # No `ports:` -- nothing here accepts inbound traffic. Egress is 443 to the central
+    # host plus whatever the exported tools themselves call; that outbound path is the
+    # whole point of the edge install.
+
+    # --- Shared sandbox (optional) -------------------------------------------------
+    # The default posture is the Landlock helper, which only ADDS restrictions and runs
+    # unprivileged, so `no-new-privileges` above is sufficient. If you want the *shared*
+    # sandbox -- bubblewrap, as the central hub uses it -- replace the security_opt list
+    # above with the block below. bwrap needs these container-level exceptions to build
+    # its root (mount + pivot_root); the rationale for each line, and why cap_add stays
+    # empty, is documented on the `hub` service in this project's docker-compose.yml.
+    #
+    # cap_drop: [ALL]
+    # security_opt:
+    #   - "no-new-privileges:true"
+    #   - "systempaths=unconfined"
+    #   - "seccomp=unconfined"
+    #   - "apparmor=unconfined"
+    #
+    # Orgs that forbid unconfined profiles can install deploy/apparmor/trellis-hub on the
+    # host and select it with `apparmor=trellis-hub` instead of `apparmor=unconfined`.

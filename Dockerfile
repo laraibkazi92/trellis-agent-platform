@@ -61,6 +61,9 @@ RUN cp $(python -c "import certifi; print(certifi.where())") /usr/local/share/ca
 
 # Copy the rest of the application code
 COPY core/ core/
+# services/ holds the edge relay (`uvicorn services.edge_relay.app:app`, compose service
+# `edge-relay`). It is not part of the hub's tool path, but it ships in the same image.
+COPY services/ services/
 COPY templates/ templates/
 COPY scripts/ scripts/
 COPY docs/ docs/

@@ -548,6 +548,32 @@ async def discover_agents(
     agents.sort(key=lambda x: x["name"].lower())
     return agents
 
+async def _remote_tool_configuration_status(site: str) -> Dict:
+    """Readiness of an edge-hosted tool: connected edge or nothing.
+
+    Mirrors :func:`is_tool_configured`'s return shape exactly. There are no central
+    secrets to check (they live on the edge), so an offline edge is reported as the
+    missing requirement — labelled so the caller gets an actionable message instead
+    of a blank "not configured".
+
+    Fails **open** on a registry read error: an etcd hiccup must not make every
+    remote tool look broken.
+    """
+    try:
+        status = await asyncio.to_thread(identity_mgr.get_edge_status, site)
+    except Exception as e:
+        logger.warning(f"Could not read edge status for '{site}': {e}")
+        status = {"connected": True}
+    if isinstance(status, dict) and status.get("connected") is True:
+        return {"configured": True, "missing_secrets": [], "missing_variables": [], "optional_missing_secrets": []}
+    return {
+        "configured": False,
+        "missing_secrets": [],
+        "missing_variables": [f"edge '{site}' is not connected"],
+        "optional_missing_secrets": [],
+    }
+
+
 async def is_tool_configured(tool_name: str, user_id: Optional[str] = None) -> Dict:
     """Check if a specific tool (local or MCP, e.g. ``mcp__{server}__{name}``) is
     configured for a user.
@@ -585,6 +611,14 @@ async def is_tool_configured(tool_name: str, user_id: Optional[str] = None) -> D
 
     if not config:
         return not_configured
+
+    # Edge-hosted tools have no central secrets or variables at all: their only
+    # requirement is that the owning edge is currently connected. A remote spec
+    # short-circuits before the secret resolution below (which would otherwise
+    # report every remote tool as configured and hide an offline edge).
+    remote = config.get("remote")
+    if isinstance(remote, dict) and remote.get("site"):
+        return await _remote_tool_configuration_status(str(remote["site"]))
 
     required_secrets = _resolve_requirements(config.get("secrets"), False)
     required_variables = _resolve_requirements(config.get("variables"), False)
@@ -727,10 +761,11 @@ async def discover_tools() -> List[Dict]:
 
     for name, config in tool_configs.items():
         health = tool_health.get(name)
-        tools.append({
+        remote_spec = config.get("remote") if isinstance(config.get("remote"), dict) else None
+        entry = {
             "name": config.get("name", name),
             "description": config.get("description", ""),
-            "runtime": config.get("runtime", "unknown"),
+            "runtime": config.get("runtime") or ("remote" if remote_spec else "unknown"),
             "entrypoint": config.get("entrypoint", ""),
             "rel_path": config.get("rel_path", ""),
             "inputs": config.get("inputs", {}),
@@ -739,7 +774,12 @@ async def discover_tools() -> List[Dict]:
             "health": health or {"status": "Online"},
             "is_mcp": False,
             "public": config.get("public") is True
-        })
+        }
+        if remote_spec:
+            # Edge-hosted tools render their owning site; the payload shape for
+            # every other tool is unchanged.
+            entry["site"] = remote_spec.get("site")
+        tools.append(entry)
 
     for mcp_name, mcp_config in mcp_configs.items():
         mcp_public = mcp_config.get("public") is True

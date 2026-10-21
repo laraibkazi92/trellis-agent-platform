@@ -22,6 +22,7 @@ DOC_MAP = {
     "tools": ("docs/tools.md", "Tool Developer Guide"),
     "mcp": ("docs/mcp.md", "MCP Server Guide"),
     "workflows": ("docs/workflows.md", "Background Workflows Guide"),
+    "proxy": ("docs/proxy.md", "Edge Proxy Guide"),
 }
 
 @router.get("/{doc_type}", response_class=HTMLResponse)

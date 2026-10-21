@@ -134,6 +134,11 @@
                     {{ tool.runtime }}
                 </span>
                 {% endif %}
+                {% if tool.runtime == 'remote' %}
+                <span class="font-mono text-[9px] font-bold border border-violet-300 text-violet-600 dark:border-violet-800/30 dark:text-violet-400 px-1.5 py-0.5 uppercase tracking-widest bg-violet-50 dark:bg-violet-900/10 flex items-center gap-1">
+                    <i data-lucide="waypoints" class="w-3 h-3"></i> edge: {{ tool.get('edge_site') or tool.get('site') or tool.name.split('__')[0] }}
+                </span>
+                {% endif %}
                 {% if tool.public %}
                 <span class="font-mono text-[9px] font-bold border border-emerald-300 text-emerald-600 dark:border-emerald-800/30 dark:text-emerald-400 px-1.5 py-0.5 uppercase tracking-widest bg-emerald-50 dark:bg-emerald-900/10 flex items-center gap-1">
                     <i data-lucide="zap" class="w-3 h-3"></i> Public

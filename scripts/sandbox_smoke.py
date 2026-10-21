@@ -980,6 +980,8 @@ def check_tools(names):
         return {"ok": False, "results": {}}, [
             f"could not load tool configs: {type(exc).__name__}: {exc}"
         ]
+    if configs is None:
+        return {"ok": False, "results": {}}, ["could not read the tool registry (etcd unavailable)"]
 
     for name in names:
         _log(f"tool: {name}")

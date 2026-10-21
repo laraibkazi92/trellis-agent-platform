@@ -1,13 +1,14 @@
 # Copyright (C) 2026 Laraib Kazi
 # SPDX-License-Identifier: Apache-2.0
 
-import sys
-import json
 import os
-import signal
+import json
 import subprocess
 import asyncio
 import logging
+import threading
+import time
+import httpx
 import stamina
 from pathlib import Path
 import typing
@@ -18,8 +19,20 @@ from core.models import ToolConfig
 from core.auth import get_identity_manager
 from core.env_sanitize import sanitized_env
 from core.devmode import enforce_dev_mode_safety
-from core.tunables import resolve as resolve_tunable
-from core import sandbox, sandbox_preflight
+from core import sandbox_preflight
+# The execution core lives in core.tool_runtime so the edge proxy
+# (core.proxy) can run tools identically without importing this module's
+# etcd-backed identity manager. Re-exported here for existing callers.
+from core.tool_runtime import (  # noqa: F401
+    MAX_STDERR_BYTES,
+    MAX_STDOUT_BYTES,
+    RESTRICTED_ENV_VARS,
+    TRUNCATION_MARKER,
+    TransientToolError,
+    _communicate_bounded,
+    _kill_process_tree,
+    execute_tool,
+)
 from core.background.tasks import (
     background_tasks as _background_tasks,
     drain_background_tasks as _drain_background_tasks,
@@ -38,17 +51,10 @@ health_monitor = HealthMonitor(identity_mgr)
 
 logger = logging.getLogger(__name__)
 
-# Per-stream caps for buffered tool output. The 96k JSON safety net downstream
-# still applies; these caps only stop a flooding tool from exhausting hub memory
-# before it gets there.
-MAX_STDOUT_BYTES = 8 * 1024 * 1024
-MAX_STDERR_BYTES = 256 * 1024
-
-# Appended to captured output that hit a cap so truncation stays visible in the
-# JSONDecodeError path and in the stderr handed back to the caller.
-TRUNCATION_MARKER = b"\n...[output truncated by hub]"
-
-_PIPE_CHUNK_BYTES = 64 * 1024
+# Fingerprint per registered FastMCP tool, so a reconcile pass only touches what
+# changed. Guarded because the reconcile thread and startup both call register_tools().
+_registered_tools: Dict[str, str] = {}
+_registration_lock = threading.Lock()
 
 
 @mcp.custom_route("/healthz", methods=["GET"])
@@ -93,411 +99,338 @@ class _LifespanDrainWrapper:
 
         await self._app(scope, receive_and_drain, send)
 
-RESTRICTED_ENV_VARS = {"PATH", "PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "BASH_ENV", "ENV", "HOSTALIASES"}
 
-def load_tool_configs() -> Dict[str, tuple[ToolConfig, Path]]:
-    """Fetches tool configurations from etcd."""
-    configs = {}
+# Names whose config could not be read or parsed during the last load. The reconcile
+# pass must not treat those as deleted: one corrupt key would otherwise unregister a
+# working tool, and a full read failure would empty the table.
+_unreadable_tool_names: set[str] = set()
+
+
+def load_tool_configs() -> Optional[Dict[str, tuple[ToolConfig, Optional[Path]]]]:
+    """Fetch tool configurations from etcd.
+
+    Returns ``None`` when the registry itself could not be listed (nothing can be
+    trusted, and the caller must keep its current table). Per-tool failures do not
+    abort the pass: the name is recorded in ``_unreadable_tool_names`` so the caller
+    protects it from the prune and reconciles everything else.
+
+    Remote (edge-hosted) tools carry no ``rel_path``: their ``remote`` block is the
+    entire execution target, so they are returned with ``tool_dir=None``. Local tools
+    keep the existing BASE_DIR containment check.
+    """
+    global _unreadable_tool_names
+
+    configs: Dict[str, tuple[ToolConfig, Optional[Path]]] = {}
+    unreadable: set[str] = set()
     try:
         tool_names = identity_mgr.list_tools()
-        for name in tool_names:
-            data = identity_mgr.get_tool_config(name)
-            if data and "rel_path" in data:
-                try:
-                    rel_path = data.pop("rel_path")
-                    config = ToolConfig(**data)
-                    tool_dir = (BASE_DIR / rel_path).resolve()
-                    if not str(tool_dir).startswith(str(BASE_DIR.resolve())):
-                        logger.error(f"Error: Tool directory {tool_dir} is outside BASE_DIR {BASE_DIR}")
-                        continue
-                    configs[config.name] = (config, tool_dir)
-                except Exception as e:
-                    logger.error(f"Error loading tool {name}: {e}")
     except Exception as e:
         logger.error(f"Error loading tools from etcd: {e}")
+        return None
+
+    for name in tool_names:
+        ok, data = identity_mgr.get_tool_config_safe(name)
+        if not ok:
+            unreadable.add(name)
+            continue
+        if not data:
+            continue
+        try:
+            rel_path = data.pop("rel_path", None)
+            config = ToolConfig(**data)
+            if config.remote is not None:
+                # The edge relay writes this config; there is no directory on
+                # this side and no rel_path to resolve.
+                configs[config.name] = (config, None)
+                continue
+            if not rel_path:
+                logger.error(f"Error loading tool {name}: missing rel_path")
+                unreadable.add(name)
+                continue
+            tool_dir = (BASE_DIR / rel_path).resolve()
+            if not str(tool_dir).startswith(str(BASE_DIR.resolve())):
+                logger.error(f"Error: Tool directory {tool_dir} is outside BASE_DIR {BASE_DIR}")
+                unreadable.add(name)
+                continue
+            configs[config.name] = (config, tool_dir)
+        except Exception as e:
+            logger.error(f"Error loading tool {name}: {e}")
+            unreadable.add(name)
+
+    _unreadable_tool_names = unreadable
     return configs
-
-class TransientToolError(Exception):
-    pass
-
-
-def _kill_process_tree(process) -> None:
-    """Kill the child's whole session, not just the direct child.
-
-    bwrap tears its PID namespace down with the parent, but the Landlock backend
-    runs the tool directly, so its own children are only killed by this signal.
-    Compose runs the hub with ``init: true``: tini is PID 1 and reaps whatever
-    survives, but reaping a live grandchild is not enough -- kill the session so
-    it does not keep running after the timeout.
-    """
-    pid = getattr(process, "pid", None)
-    if pid:
-        try:
-            os.killpg(pid, signal.SIGKILL)
-            return
-        except ProcessLookupError:
-            return
-        except OSError:
-            pass
-    try:
-        process.kill()
-    except ProcessLookupError:
-        pass
-
-
-async def _collect_stream(stream, limit: int) -> tuple[bytes, bool]:
-    """Read one subprocess pipe to EOF, keeping at most ``limit`` bytes.
-
-    After the cap is reached the pipe is still drained and discarded: an unread
-    pipe fills up and blocks the child forever, which would turn a chatty tool
-    into a timeout instead of a truncated result.
-    """
-    chunks: list[bytes] = []
-    captured = 0
-    truncated = False
-    while True:
-        chunk = await stream.read(_PIPE_CHUNK_BYTES)
-        if not chunk:
-            break
-        if captured >= limit:
-            truncated = True
-            continue
-        room = limit - captured
-        if len(chunk) > room:
-            chunks.append(chunk[:room])
-            captured = limit
-            truncated = True
-            continue
-        chunks.append(chunk)
-        captured += len(chunk)
-
-    data = b"".join(chunks)
-    if truncated:
-        data += TRUNCATION_MARKER
-    return data, truncated
-
-
-async def _write_stdin(process, input_bytes: bytes) -> None:
-    """Send the JSON arguments and close stdin (tolerating a tool that ignores it)."""
-    stdin = process.stdin
-    if stdin is None:
-        return
-    try:
-        stdin.write(input_bytes)
-        await stdin.drain()
-    except (BrokenPipeError, ConnectionResetError):
-        pass
-    finally:
-        try:
-            stdin.close()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-
-
-async def _wait_bounded(process, timeout: float = 5.0) -> None:
-    """Await exit, but never let a wedged pipe pin the request.
-
-    A killed child normally resolves in milliseconds; this is the backstop for
-    the pathological case where even asyncio's exit waiter never fires.
-    """
-    try:
-        await asyncio.wait_for(process.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
-        logger.warning("Tool process did not exit within %.0fs after kill", timeout)
-    except ProcessLookupError:
-        pass
-
-
-async def _communicate_bounded(
-    process, input_bytes: bytes, timeout: float
-) -> tuple[bytes, bool, bytes, bool]:
-    """``communicate()`` with bounded buffers and unchanged timeout semantics.
-
-    Returns ``(stdout, stdout_truncated, stderr, stderr_truncated)``. Timeout
-    semantics match ``asyncio.subprocess.Process.communicate()`` for the caller;
-    the only addition is a bounded post-kill wait, so a pathological pipe state
-    cannot pin a request indefinitely.
-    """
-
-    async def _run() -> tuple[bytes, bool, bytes, bool]:
-        tasks = [
-            asyncio.ensure_future(_write_stdin(process, input_bytes)),
-            asyncio.ensure_future(_collect_stream(process.stdout, MAX_STDOUT_BYTES)),
-            asyncio.ensure_future(_collect_stream(process.stderr, MAX_STDERR_BYTES)),
-        ]
-        try:
-            results = await asyncio.gather(*tasks)
-            stdout, stdout_truncated = results[1]
-            stderr, stderr_truncated = results[2]
-            # communicate() also awaited exit; without this the caller can race
-            # returncode and classify a finished tool as "exited with code None".
-            if process.returncode is None:
-                await _wait_bounded(process)
-            return stdout, stdout_truncated, stderr, stderr_truncated
-        finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            # Cancelling a reader that asyncio paused on a full pipe leaves the
-            # transport open: EOF is never observed, connection_lost() never
-            # runs and the exit waiter a timeout handler awaits can stay pending
-            # forever. Closing the pipes forces that callback. `_transport` is
-            # private, but it is the only handle asyncio exposes on a
-            # StreamReader's pipe.
-            for stream in (process.stdout, process.stderr):
-                transport = getattr(stream, "_transport", None)
-                if transport is None:
-                    continue
-                try:
-                    if not transport.is_closing():
-                        transport.close()
-                except Exception:
-                    logger.debug("Failed to close tool pipe transport", exc_info=True)
-
-    return await asyncio.wait_for(_run(), timeout=timeout)
 
 
 @stamina.retry(on=TransientToolError, attempts=3)
 async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any], user_id: Optional[str]) -> Dict[str, Any]:
-    """Executes a tool as a subprocess and handles JSON stdin/stdout."""
-    entrypoint_path = (tool_dir / config.entrypoint).resolve()
-    if not str(entrypoint_path).startswith(str(tool_dir)):
-        return {"error": f"Entrypoint resolves outside tool directory"}
-    if not entrypoint_path.is_file():
-        return {"error": f"Entrypoint does not exist or is not a file"}
-
-    cmd = []
-    if config.runtime == "python":
-        cmd = [sys.executable, str(entrypoint_path)]
-    elif config.runtime == "go":
-        bin_path = tool_dir / ".bin" / config.name
-        cmd = [str(bin_path)]
-    elif config.runtime == "ts":
-        cmd = ["npx", "tsx", str(entrypoint_path)]
-    elif config.runtime == "bash":
-        cmd = ["bash", str(entrypoint_path)]
-    else:
-        return {"error": f"Unsupported runtime: {config.runtime}"}
+    """Builds the tool's environment, then delegates execution to core.tool_runtime."""
+    # Constructed per call (not at import) so tests and callers that swap
+    # hub.health_monitor keep working.
+    def on_health(ok: bool, err: Optional[str]) -> Any:
+        return health_monitor.record_event("tool", config.name, ok, err)
 
     try:
-        env = sanitized_env()
-
-        # A CLI binary dropped into this tool's own bin/ on the host becomes
-        # available to it automatically — workspace/ is already bind-mounted
-        # into this container, so this needs no docker-compose volume mount
-        # and no image rebuild. Scoped per-tool (rather than one shared
-        # directory) so different tools' binaries can't collide by name.
-        tool_bin = str((tool_dir / "bin").resolve())
-        env["PATH"] = f"{tool_bin}{os.pathsep}{env.get('PATH', '')}"
-
-        if user_id:
-            from core.discovery import _resolve_requirements
-            is_background = user_id.startswith("svc_agent_")
-            
-            # Scoped Secret Injection
-            secret_keys = _resolve_requirements(config.secrets, is_background)
-            if secret_keys:
-                secrets = await asyncio.to_thread(identity_mgr.get_resolved_config, user_id, "secrets", keys=secret_keys)
-                safe_secrets = {str(k): str(v) for k, v in secrets.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
-                env.update(safe_secrets)
-
-            # Scoped Optional Secret Injection (absence does not block tool execution)
-            optional_secret_keys = _resolve_requirements(getattr(config, "optional_secrets", None), is_background)
-            if optional_secret_keys:
-                optional_secrets = await asyncio.to_thread(identity_mgr.get_resolved_config, user_id, "secrets", keys=optional_secret_keys)
-                safe_optional_secrets = {str(k): str(v) for k, v in optional_secrets.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
-                env.update(safe_optional_secrets)
-
-            # Scoped Variable Injection
-            variable_keys = _resolve_requirements(config.variables, is_background)
-            if variable_keys:
-                variables = await asyncio.to_thread(identity_mgr.get_resolved_config, user_id, "variables", keys=variable_keys)
-                safe_vars = {str(k): str(v) for k, v in variables.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
-                env.update(safe_vars)
-
-            # Auto-inject framework loopback capabilities
-            env["FRAMEWORK_EXECUTION_TOKEN"] = await asyncio.to_thread(identity_mgr.generate_execution_token, user_id)
-            framework_url = await asyncio.to_thread(identity_mgr.get_config, "HOST_URL", os.getenv("HOST_URL", "http://localhost:8000"))
-            env["FRAMEWORK_API_URL"] = framework_url
-
-            # Auto-inject user identity (email)
-            if os.getenv("DEV_MODE", "false").lower() == "true":
-                env["TRELLIS_USER_EMAIL"] = os.getenv("DEV_USER_EMAIL", "dev-user@local.host")
-            else:
-                user_profile = await asyncio.to_thread(identity_mgr.get_user, user_id)
-                if user_profile and user_profile.get("email"):
-                    env["TRELLIS_USER_EMAIL"] = user_profile["email"]
-
-        input_json = json.dumps(arguments).encode()
-        default_timeout = resolve_tunable("tool_execution_timeout")
-        timeout = config.timeout_seconds if getattr(config, "timeout_seconds", None) else default_timeout
-
-        # Only an explicitly configured policy may override the deployment
-        # default; pydantic's "allow" default would otherwise mask
-        # SANDBOX_NET_DEFAULT=none for every tool that never set the field.
-        explicit_net = (
-            config.network
-            if "network" in getattr(config, "model_fields_set", ())
-            else None
-        )
-        # Backend selection can re-probe on a stale cache (up to the probe
-        # budget); keep that off the event loop so concurrent tool I/O is not
-        # stalled behind a sandbox probe. The plan is plain data.
-        plan = await asyncio.to_thread(
-            sandbox.prepare_execution,
-            cmd,
-            tool_dir,
-            env=env,
-            network=explicit_net,
-        )
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *plan.argv,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=str(tool_dir),
-                env=plan.env,
-                start_new_session=True,
-            )
-
-            try:
-                stdout, stdout_truncated, stderr, _stderr_truncated = await _communicate_bounded(process, input_json, timeout)
-            except asyncio.TimeoutError:
-                _kill_process_tree(process)
-                await _wait_bounded(process)
-                error_msg = f"Tool execution timed out after {timeout:.0f}s."
-                await asyncio.to_thread(health_monitor.record_event, "tool", config.name, False, error_msg)
-                return {"error": error_msg}
-            except asyncio.CancelledError:
-                _kill_process_tree(process)
-                await _wait_bounded(process)
-                raise
-        finally:
-            # rmtree is blocking; keep it off the event loop so concurrent tool
-            # calls are not serialized behind cleanup.
-            await asyncio.to_thread(plan.cleanup)
-
-        # The sandbox helper emits a benign "supplementary groups retained"
-        # warning on successful runs. It is not tool output, so keep it out of
-        # the hub log (raw stderr still feeds error classification below).
-        stderr_text = stderr.decode("utf-8", errors="replace").strip()
-        loggable_stderr = "\n".join(
-            line
-            for line in stderr_text.splitlines()
-            if not line.startswith("trellis-sandbox: warning:")
-        ).strip()
-        if loggable_stderr:
-            if len(loggable_stderr) > 2048:
-                logger.warning(f"Tool {config.name} stderr ({len(loggable_stderr)} chars): {loggable_stderr[:2048]}... [truncated]")
-            else:
-                logger.warning(f"Tool {config.name} stderr: {loggable_stderr}")
-
-        if process.returncode != 0:
-            stderr_str = stderr.decode("utf-8", errors="replace").strip()
-            failure = sandbox.classify_failure(
-                stderr_str, plan.backend, process.returncode
-            )
-            if failure:
-                sandbox.log_failure_once(failure)
-                # The cached verdict no longer matches reality; let the next
-                # selection and /healthz re-probe (cooldown-bounded). A
-                # `landlock_net_unsupported` refusal is a per-tool policy this
-                # kernel cannot express, not a host-sandbox regression: the
-                # re-probe could only reach the same ABI conclusion, so do not
-                # spend it.
-                if failure.code != "landlock_net_unsupported":
-                    sandbox.invalidate_after_failure(failure.code)
-                error_msg = (
-                    f"Tool failed inside the {plan.backend.value} sandbox "
-                    f"({failure.code}): {failure.detail}"
-                )
-                await asyncio.to_thread(health_monitor.record_event, "tool", config.name, False, error_msg)
-                # A sandbox denial can never succeed on retry: skip the
-                # TransientToolError path even if stderr happens to contain a
-                # transient keyword.
-                return {
-                    "error": error_msg,
-                    "stderr": stderr_str,
-                    "sandbox": {
-                        "backend": plan.backend.value,
-                        "code": failure.code,
-                        "remediation": failure.remediation,
-                    },
-                }
-
-            error_msg = f"Tool exited with code {process.returncode}: {stderr_str}"
-            await asyncio.to_thread(health_monitor.record_event, "tool", config.name, False, error_msg)
-            config_retry = getattr(config, "retry_on_transient", True)
-            
-            # Identify common transient network errors in stderr
-            transient_keywords = ["timeout", "connection refused", "econnrefused", "eof", "network is unreachable", "temporary failure"]
-            if config_retry and any(keyword in stderr_str.lower() for keyword in transient_keywords):
-                raise TransientToolError(error_msg)
-                
-            return {
-                "error": error_msg,
-                "stderr": stderr_str
-            }
-
-        try:
-            result = json.loads(stdout.decode("utf-8", errors="replace"))
-            # Global Safety Net: Safely truncate tool outputs exceeding 24k tokens (96,000 characters)
-            stringified = json.dumps(result)
-            if len(stringified) > 96000:
-                logger.warning(f"Warning: Tool {config.name} output size ({len(stringified)} chars) exceeded safety limit of 96000 chars. Truncating...")
-                result = {
-                    "error": f"Global Safety Net: The tool '{config.name}' output exceeded the 24k token limit (96,000 characters). Output was safely truncated to prevent model context crashes.",
-                    "partial_data_preview": stringified[:90000] + "... [TRUNCATED DUE TO SAFETY LIMITS]"
-                }
-            # A valid JSON payload cannot hit the stdout cap: truncation appends
-            # a marker and breaks the parse, so the flag is only meaningful on
-            # the JSONDecodeError path below.
-            # A valid JSON output with an 'error' key is considered a User-Scoped Failure,
-            # which does NOT trip the global circuit breaker. We count it as a success for global health.
-            await asyncio.to_thread(health_monitor.record_event, "tool", config.name, True)
-            return result
-        except json.JSONDecodeError:
-            # stdout is capped at MAX_STDOUT_BYTES, which is far above the 96k
-            # JSON safety net: returning it whole (plus the same text in the
-            # warning) would flood the model context, so bound both.
-            decoded = stdout.decode("utf-8", errors="replace").strip()
-            preview = decoded[:90000]
-            truncated = stdout_truncated
-            if len(decoded) > len(preview):
-                preview += TRUNCATION_MARKER.decode()
-                truncated = True
-            error_msg = f"Output was not valid JSON: {decoded[:2048]}"
-            await asyncio.to_thread(health_monitor.record_event, "tool", config.name, False, error_msg)
-            return {"output": preview, "warning": error_msg, "truncated": truncated}
-
-    except sandbox.SandboxUnavailable as e:
-        error_msg = f"Sandbox unavailable ({e.code}): {e.detail or e.remediation}"
-        await asyncio.to_thread(health_monitor.record_event, "tool", config.name, False, error_msg)
-        return {
-            "error": error_msg,
-            "sandbox": {
-                "backend": e.backend,
-                "code": e.code,
-                "remediation": e.remediation,
-            },
-        }
-    except TransientToolError:
-        raise
+        env = await _build_tool_env(config, tool_dir, user_id)
     except Exception as e:
         error_msg = f"Failed to execute tool: {str(e)}"
-        await asyncio.to_thread(health_monitor.record_event, "tool", config.name, False, error_msg)
+        await asyncio.to_thread(on_health, False, error_msg)
         return {"error": error_msg}
 
-async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """Executes a tool as a subprocess and handles JSON stdin/stdout."""
+    return await execute_tool(config, tool_dir, arguments, env=env, on_health=on_health)
+
+
+async def _build_tool_env(config: ToolConfig, tool_dir: Path, user_id: Optional[str]) -> Dict[str, str]:
+    """Sanitized env, per-tool bin dir, and identity-scoped secrets/variables."""
+    env = sanitized_env()
+
+    # A CLI binary dropped into this tool's own bin/ on the host becomes
+    # available to it automatically — workspace/ is already bind-mounted
+    # into this container, so this needs no docker-compose volume mount
+    # and no image rebuild. Scoped per-tool (rather than one shared
+    # directory) so different tools' binaries can't collide by name.
+    tool_bin = str((tool_dir / "bin").resolve())
+    env["PATH"] = f"{tool_bin}{os.pathsep}{env.get('PATH', '')}"
+
+    if user_id:
+        from core.discovery import _resolve_requirements
+        is_background = user_id.startswith("svc_agent_")
+
+        # Scoped Secret Injection
+        secret_keys = _resolve_requirements(config.secrets, is_background)
+        if secret_keys:
+            secrets = await asyncio.to_thread(identity_mgr.get_resolved_config, user_id, "secrets", keys=secret_keys)
+            safe_secrets = {str(k): str(v) for k, v in secrets.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
+            env.update(safe_secrets)
+
+        # Scoped Optional Secret Injection (absence does not block tool execution)
+        optional_secret_keys = _resolve_requirements(getattr(config, "optional_secrets", None), is_background)
+        if optional_secret_keys:
+            optional_secrets = await asyncio.to_thread(identity_mgr.get_resolved_config, user_id, "secrets", keys=optional_secret_keys)
+            safe_optional_secrets = {str(k): str(v) for k, v in optional_secrets.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
+            env.update(safe_optional_secrets)
+
+        # Scoped Variable Injection
+        variable_keys = _resolve_requirements(config.variables, is_background)
+        if variable_keys:
+            variables = await asyncio.to_thread(identity_mgr.get_resolved_config, user_id, "variables", keys=variable_keys)
+            safe_vars = {str(k): str(v) for k, v in variables.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
+            env.update(safe_vars)
+
+        # Auto-inject framework loopback capabilities
+        env["FRAMEWORK_EXECUTION_TOKEN"] = await asyncio.to_thread(identity_mgr.generate_execution_token, user_id)
+        framework_url = await asyncio.to_thread(identity_mgr.get_config, "HOST_URL", os.getenv("HOST_URL", "http://localhost:8000"))
+        env["FRAMEWORK_API_URL"] = framework_url
+
+        # Auto-inject user identity (email)
+        if os.getenv("DEV_MODE", "false").lower() == "true":
+            env["TRELLIS_USER_EMAIL"] = os.getenv("DEV_USER_EMAIL", "dev-user@local.host")
+        else:
+            user_profile = await asyncio.to_thread(identity_mgr.get_user, user_id)
+            if user_profile and user_profile.get("email"):
+                env["TRELLIS_USER_EMAIL"] = user_profile["email"]
+
+    return env
+
+
+def _relay_url() -> str:
+    """Base URL of the in-cluster edge relay (compose service name by default)."""
+    return os.getenv("EDGE_RELAY_URL", "http://edge-relay:8100").rstrip("/")
+
+
+# Mirrors services/edge_relay/protocol.MAX_DEADLINE_MS. Duplicated on purpose:
+# core must never import services/ (the relay is a separate process tree, and the
+# import would drag FastAPI/WS deps into the hub's module graph). The relay clamps
+# the value again on its side, so this is only an upper bound on the wire.
+_MAX_DEADLINE_MS = 3_600_000
+
+
+def _remote_client(timeout_seconds: float) -> httpx.AsyncClient:
+    """Client factory seam for remote dispatch.
+
+    One client per call: the hub has no shared client, and a remote call's edge
+    round trip dwarfs the connection setup. Tests monkeypatch this seam to inject
+    an ``httpx.MockTransport``, which keeps the request/response mapping under
+    test without touching the network.
+    """
+    return httpx.AsyncClient(timeout=timeout_seconds)
+
+
+def _edge_error_field(body: Dict[str, Any], field: str, default: str = "") -> str:
+    """Reads ``error.<field>`` (or the string form of ``error``) from a call body."""
+    error = body.get("error")
+    if isinstance(error, dict):
+        value = error.get(field)
+        if isinstance(value, str) and value:
+            return value
+        return default
+    if field == "message" and isinstance(error, str) and error:
+        return error
+    return default
+
+
+@stamina.retry(on=TransientToolError, attempts=3)
+async def _run_remote(config: ToolConfig, arguments: Dict[str, Any], user_id: Optional[str]) -> Dict[str, Any]:
+    """Dispatches a remote (edge-hosted) tool through the edge relay's internal API.
+
+    The relay owns the tunnel; this side only maps its HTTP contract onto the same
+    result-dict shape a local tool returns. Arguments, results, and response bodies
+    are never logged: they carry the customer's internal data.
+
+    Decorated like ``_run_tool_attempt`` so ``retry_on_transient`` keeps the same
+    meaning it has for local tools. Remote tools default to False (an in-flight edge
+    call is never replayed), so a retry here is always an explicit operator choice.
+    """
+    remote = config.remote
+    site = remote.site
+    tool = remote.tool
+
+    # Imported here (not at module scope) so a cold hub start does not pull the
+    # tunables cache — mirrors core.tool_runtime's identical lookup.
+    from core.tunables import resolve as resolve_tunable
+
+    timeout_seconds = config.timeout_seconds or resolve_tunable("tool_execution_timeout")
+    # The HTTP read timeout leads deadline_ms by 5 s so the edge's structured
+    # timeout (or the relay's 504) wins the race and the caller sees a reason,
+    # not a bare client-side read timeout.
+    deadline_ms = int(min((timeout_seconds + 30) * 1000, _MAX_DEADLINE_MS))
+
+    async def record_health(ok: bool, error: Optional[str] = None) -> None:
+        # Health writes are etcd I/O: keep them off the event loop, and never let
+        # a registry hiccup turn a completed call into an exception.
+        try:
+            await asyncio.to_thread(health_monitor.record_event, "tool", config.name, ok, error)
+        except Exception as exc:
+            logger.warning(f"Failed to record health for remote tool {config.name}: {exc}")
+
+    try:
+        async with _remote_client(timeout_seconds + 35) as client:
+            response = await client.post(
+                f"{_relay_url()}/v1/sites/{site}/call",
+                json={
+                    "tool": tool,
+                    "args": arguments,
+                    "deadline_ms": deadline_ms,
+                    "user": user_id,
+                },
+            )
+    except httpx.TimeoutException as exc:
+        # The hub's own read timeout fired, which means the relay did not answer in
+        # time and the call may already have run on the edge. Never retried — the
+        # same "timeouts are immediately fatal" rule local tools follow.
+        message = (
+            f"Tool '{config.name}' did not respond on edge '{site}' before the hub's "
+            f"own deadline ({type(exc).__name__}). The call may still have run on the edge."
+        )
+        await record_health(False, message)
+        return {"error": message}
+    except httpx.ConnectError as exc:
+        # Nothing was sent: the TCP connect itself failed, so a retry cannot
+        # duplicate a call. Every other TransportError (ReadError, WriteError,
+        # RemoteProtocolError) happens *after* the request left this process --
+        # the relay may have forwarded it and the edge may have run it -- so those
+        # take the never-retry path below.
+        message = (
+            f"Tool '{config.name}' is unreachable (the edge relay hop to edge "
+            f"'{site}' failed: {type(exc).__name__})."
+        )
+        if config.retry_on_transient:
+            raise TransientToolError(message)
+        await record_health(False, message)
+        return {"error": message}
+    except httpx.TransportError as exc:
+        message = (
+            f"Tool '{config.name}' lost its connection to edge '{site}' mid-call "
+            f"({type(exc).__name__}). It may already have run on the edge."
+        )
+        await record_health(False, message)
+        return {"error": message}
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    status = response.status_code
+
+    if status == 200:
+        if "error" in body:
+            message = _edge_error_field(body, "message", "the edge did not report a reason")
+            error = f"Tool '{config.name}' failed on edge '{site}': {message}"
+            await record_health(False, error)
+            return {"error": error}
+        result = body.get("result")
+        await record_health(True)
+        # A well-formed tool result is a JSON object; anything else is wrapped so
+        # callers keep a dict contract.
+        return result if isinstance(result, dict) else {"result": result}
+
+    if status == 400:
+        # Schema rejection: permanent by construction, never retried.
+        error = (
+            f"Tool '{config.name}' rejected the arguments: "
+            f"{_edge_error_field(body, 'message', 'the relay rejected the call')}"
+        )
+        await record_health(False, error)
+        return {"error": error}
+
+    if status == 404:
+        error = (
+            f"Edge '{site}' no longer exports tool '{config.name}'. The registration "
+            "is stale; the edge's catalog changed since it was published."
+        )
+        await record_health(False, error)
+        return {"error": error}
+
+    if status == 503:
+        code = _edge_error_field(body, "code")
+        if code == "edge_overloaded":
+            message = f"Edge '{site}' is busy and cannot accept tool '{config.name}' right now."
+            if config.retry_on_transient:
+                raise TransientToolError(message)
+            await record_health(False, message)
+            return {"error": message}
+        if code in ("edge_offline", "edge_disconnected"):
+            # Expected operational state, not a hub bug: surface it, never raise.
+            error = f"Tool '{config.name}' is offline (edge '{site}' is not connected)."
+            await record_health(False, error)
+            return {"error": error}
+
+    if status == 429:
+        # Per-site rate limit at the relay. Retryable, but only explicitly: the
+        # call was rejected before dispatch, so a retry cannot duplicate it.
+        message = f"Edge '{site}' is rate-limiting tool calls; '{config.name}' was not sent."
+        if config.retry_on_transient:
+            raise TransientToolError(message)
+        await record_health(False, message)
+        return {"error": message}
+
+    if status == 504:
+        error = f"Tool '{config.name}' timed out on edge '{site}' (no result before the deadline)."
+        await record_health(False, error)
+        return {"error": error}
+
+    # Unknown status: include the code, and at most a short body preview.
+    preview = (response.text or "")[:200]
+    error = f"Tool '{config.name}' failed on edge '{site}' (relay returned HTTP {status}: {preview})"
+    await record_health(False, error)
+    return {"error": error}
+
+
+async def run_tool(config: ToolConfig, tool_dir: Optional[Path], arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Executes a tool locally (subprocess) or remotely (edge relay)."""
     # stamina re-invokes with the same dict — never mutate the caller's arguments.
     arguments = dict(arguments)
     user_id = arguments.pop("__user_id", None)
-    if user_id and user_id.startswith("svc_agent_"):
+    is_background = bool(user_id) and user_id.startswith("svc_agent_")
+    # The hub's local tools get the agent name as a stdin field; the edge has no
+    # agent-identity semantics, so a remote call carries the user id only.
+    if is_background and config.remote is None:
         arguments["__agent_name"] = user_id[len("svc_agent_"):]
     try:
+        if config.remote is not None:
+            return await _run_remote(config, arguments, user_id)
         return await _run_tool_attempt(config, tool_dir, arguments, user_id)
     finally:
         # Usage is recorded once per invocation, not once per stamina retry attempt.
@@ -507,100 +440,181 @@ async def run_tool(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any]
                 f"record_tool_usage:{config.name}",
             )
 
-def register_tools():
-    """Dynamically registers tools with the FastMCP server and pre-compiles Go tools."""
-    configs = load_tool_configs()
-    
-    for name, (config, tool_dir) in configs.items():
-        if config.runtime == "go":
-            entrypoint_path = (tool_dir / config.entrypoint).resolve()
-            if not str(entrypoint_path).startswith(str(tool_dir)) or not entrypoint_path.is_file():
-                logger.error(f"Skipping compilation of Go tool {name}: invalid entrypoint {config.entrypoint}")
-                continue
-            
-            logger.info(f"Pre-compiling Go tool: {name}")
-            bin_dir = tool_dir / ".bin"
-            bin_dir.mkdir(exist_ok=True)
-            bin_path = bin_dir / config.name
-            try:
-                subprocess.run(["go", "build", "-o", str(bin_path), config.entrypoint], cwd=str(tool_dir), check=True, env=sanitized_env())
-            except subprocess.CalledProcessError as e:
-                logger.error(f"Failed to compile Go tool {name}: {e}")
-                continue
+def _tool_fingerprint(config: ToolConfig, tool_dir: Optional[Path]) -> str:
+    """Stable identity for a registered tool: config + the directory it runs from.
 
-        # Use a closure to capture the current config and tool_dir
-        def create_handler(c, d):
-            import inspect
-            
-            sig_parts = []
-            annotations = {}
-            params = []
-            
-            if c.inputs:
-                for input_name, input_def in c.inputs.items():
-                    input_type = input_def.get("type", "string")
-                    py_type = str
-                    if input_type == "string":
-                        # Historical: 'string' maps to Any (not str) so the handler's str()-coercion
-                        # below is the single place stringification happens; unknown types also
-                        # fall through to the str default.
-                        py_type = Any
-                    elif input_type == "integer": py_type = int
-                    elif input_type == "boolean": py_type = bool
-                    elif input_type == "array": py_type = list
-                    elif input_type == "object": py_type = dict
-                    
-                    is_req = input_def.get("required", False)
-                    default = inspect.Parameter.empty if is_req else None
-                    
-                    params.append(
-                        inspect.Parameter(
-                            input_name, 
-                            inspect.Parameter.POSITIONAL_OR_KEYWORD, 
-                            annotation=py_type, 
-                            default=default
-                        )
-                    )
-                    annotations[input_name] = py_type
+    The reconcile loop re-registers only when this changes, so a 10 s tick does not
+    rebuild Go binaries or churn the FastMCP tool table.
+    """
+    payload = config.model_dump(mode="json")
+    return f"{json.dumps(payload, sort_keys=True, default=str)}|{tool_dir or ''}"
 
-            # Add __user_id
+
+def _remove_registered_tool(name: str) -> None:
+    """Drop one tool from the live FastMCP table (best effort across versions)."""
+    provider = getattr(mcp, "local_provider", None)
+    remove = getattr(provider, "remove_tool", None)
+    if remove is None:
+        logger.debug("FastMCP build has no remove_tool; '%s' stays registered until restart", name)
+        return
+    try:
+        remove(name)
+    except Exception:
+        logger.debug("Could not remove tool '%s' from FastMCP", name, exc_info=True)
+
+
+
+def _create_tool_handler(c: ToolConfig, d: Optional[Path]) -> Any:
+    import inspect
+
+    sig_parts = []
+    annotations = {}
+    params = []
+
+    if c.inputs:
+        for input_name, input_def in c.inputs.items():
+            input_type = input_def.get("type", "string")
+            py_type = str
+            if input_type == "string":
+                # Historical: 'string' maps to Any (not str) so the handler's str()-coercion
+                # below is the single place stringification happens; unknown types also
+                # fall through to the str default.
+                py_type = Any
+            elif input_type == "integer": py_type = int
+            elif input_type == "boolean": py_type = bool
+            elif input_type == "array": py_type = list
+            elif input_type == "object": py_type = dict
+
+            is_req = input_def.get("required", False)
+            default = inspect.Parameter.empty if is_req else None
+
             params.append(
                 inspect.Parameter(
-                    "__user_id",
+                    input_name,
                     inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                    annotation=typing.Optional[str],
-                    default=None
+                    annotation=py_type,
+                    default=default
                 )
             )
-            annotations["__user_id"] = typing.Optional[str]
-            
-            async def handler(**kwargs):
-                filtered_kwargs = {}
-                for k, v in kwargs.items():
-                    if v is not None:
-                        # Ensure we stringify string inputs properly 
-                        if c.inputs and k in c.inputs:
-                            if c.inputs[k].get("type", "string") == "string" and not isinstance(v, str):
-                                filtered_kwargs[k] = str(v)
-                            else:
-                                filtered_kwargs[k] = v
-                        else:
-                            filtered_kwargs[k] = v
-                            
-                try:
-                    return await run_tool(c, d, filtered_kwargs)
-                except TransientToolError as e:
-                    return {"error": f"Tool failed after retries: {str(e)}"}
-            
-            handler.__signature__ = inspect.Signature(params)
-            handler.__annotations__ = annotations
-            handler.__name__ = c.name.replace('-', '_')
-            handler.__doc__ = c.description
-            
-            return handler
+            annotations[input_name] = py_type
 
-        mcp.tool(name=name, description=config.description)(create_handler(config, tool_dir))
-        logger.info(f"Registered tool: {name}")
+    # Add __user_id
+    params.append(
+        inspect.Parameter(
+            "__user_id",
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            annotation=typing.Optional[str],
+            default=None
+        )
+    )
+    annotations["__user_id"] = typing.Optional[str]
+
+    async def handler(**kwargs):
+        filtered_kwargs = {}
+        for k, v in kwargs.items():
+            if v is not None:
+                # Ensure we stringify string inputs properly
+                if c.inputs and k in c.inputs:
+                    if c.inputs[k].get("type", "string") == "string" and not isinstance(v, str):
+                        filtered_kwargs[k] = str(v)
+                    else:
+                        filtered_kwargs[k] = v
+                else:
+                    filtered_kwargs[k] = v
+
+        try:
+            return await run_tool(c, d, filtered_kwargs)
+        except TransientToolError as e:
+            return {"error": f"Tool failed after retries: {str(e)}"}
+
+    handler.__signature__ = inspect.Signature(params)
+    handler.__annotations__ = annotations
+    handler.__name__ = c.name.replace('-', '_')
+    handler.__doc__ = c.description
+
+    return handler
+
+def register_tools() -> int:
+    """Reconcile FastMCP's tool table with the registry; returns the change count.
+
+    Called once at startup and then from ``_reconcile_loop``. Reconciling (rather
+    than registering once) is what makes a newly connected edge's tools executable
+    without restarting the hub, and what makes a removed tool stop being callable.
+    """
+    configs = load_tool_configs()
+    if configs is None:
+        # A failed read is not an empty registry: keep serving what is registered.
+        logger.warning("Tool registry read failed; keeping the current tool table")
+        return 0
+    changed = 0
+
+    with _registration_lock:
+        for name, (config, tool_dir) in configs.items():
+            if config.remote is not None:
+                # Defense in depth: the relay derives the registry name from the
+                # catalogue it published, so a mismatch means the entry was corrupted
+                # (or hand-edited) and the tool would dispatch to the wrong site.
+                expected_site = config.name.split("__", 1)[0]
+                if config.remote.site != expected_site:
+                    logger.error(
+                        f"Skipping remote tool {name}: remote.site '{config.remote.site}' does not "
+                        f"match the registry prefix '{expected_site}__'"
+                    )
+                    continue
+
+            fingerprint = _tool_fingerprint(config, tool_dir)
+            if _registered_tools.get(name) == fingerprint:
+                continue
+
+            if config.remote is None and config.runtime == "go":
+                entrypoint_path = (tool_dir / config.entrypoint).resolve()
+                if not str(entrypoint_path).startswith(str(tool_dir)) or not entrypoint_path.is_file():
+                    logger.error(f"Skipping compilation of Go tool {name}: invalid entrypoint {config.entrypoint}")
+                    continue
+
+                logger.info(f"Pre-compiling Go tool: {name}")
+                bin_dir = tool_dir / ".bin"
+                bin_dir.mkdir(exist_ok=True)
+                bin_path = bin_dir / config.name
+                try:
+                    subprocess.run(["go", "build", "-o", str(bin_path), config.entrypoint], cwd=str(tool_dir), check=True, env=sanitized_env())
+                except subprocess.CalledProcessError as e:
+                    logger.error(f"Failed to compile Go tool {name}: {e}")
+                    continue
+
+            if name in _registered_tools:
+                # The schema or entrypoint changed: replace the handler so the MCP
+                # signature matches the catalog the agent is told about.
+                _remove_registered_tool(name)
+            mcp.tool(name=name, description=config.description)(_create_tool_handler(config, tool_dir))
+            _registered_tools[name] = fingerprint
+            changed += 1
+            logger.info(f"Registered tool: {name}")
+
+        # A tool whose config vanished is no longer callable. Its embedding and
+        # usage history are separate concerns and are left to the registry owners.
+        # Unreadable configs are protected: a corrupt or unreachable entry must not
+        # unregister a tool that may be perfectly healthy.
+        for stale in sorted(set(_registered_tools) - set(configs) - _unreadable_tool_names):
+            _remove_registered_tool(stale)
+            _registered_tools.pop(stale, None)
+            changed += 1
+            logger.info(f"Unregistered tool: {stale}")
+
+    return changed
+
+
+def _reconcile_loop(interval: float) -> None:
+    """Keep the tool table in step with etcd (edge catalogs publish at runtime)."""
+    while True:
+        time.sleep(interval)
+        try:
+            if register_tools():
+                logger.info("Tool registry reconciled (interval %.0fs)", interval)
+        except Exception:
+            # Keep serving the current tool set: a transient etcd error must not
+            # empty the hub's tool table.
+            logger.exception("Tool registry reconcile failed; keeping the current tools")
 
 if __name__ == "__main__":
     # Startup gate: refuse to serve an unauthenticated DEV_MODE instance on a
@@ -610,6 +624,16 @@ if __name__ == "__main__":
     # the hub from starting, it only flips the health payload to 503.
     sandbox_preflight.warmup()
     register_tools()
+    # Edge catalogs are published at runtime, so the tool table has to follow etcd
+    # instead of being read once at boot. 0 disables the watcher (tests/CI).
+    reconcile_seconds = float(os.getenv("EDGE_TOOL_RECONCILE_SECONDS", "10"))
+    if reconcile_seconds > 0:
+        threading.Thread(
+            target=_reconcile_loop,
+            args=(reconcile_seconds,),
+            daemon=True,
+            name="tool-registry-reconcile",
+        ).start()
     import uvicorn
     app = _LifespanDrainWrapper(mcp.http_app(host_origin_protection=False))
     uvicorn.run(app, host=os.getenv("BIND_HOST", "0.0.0.0"), port=8001)

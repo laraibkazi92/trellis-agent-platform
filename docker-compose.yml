@@ -208,6 +208,9 @@ services:
       SANDBOX_RLIMIT_CPU_S: ${SANDBOX_RLIMIT_CPU_S:-}
       SANDBOX_RLIMIT_NPROC: ${SANDBOX_RLIMIT_NPROC:-}
       SANDBOX_RLIMIT_FSIZE_MB: ${SANDBOX_RLIMIT_FSIZE_MB:-}
+      # How often the hub re-reads the tool registry so a newly connected edge's tools
+      # become executable without a restart. 0 disables the watcher.
+      EDGE_TOOL_RECONCILE_SECONDS: ${EDGE_TOOL_RECONCILE_SECONDS:-10}
     # Per-container backstop against fork bombs: RLIMIT_NPROC counts the whole
     # host uid, while pids.max counts only this container's processes/threads.
     pids_limit: 1024
@@ -222,6 +225,51 @@ services:
     volumes:
       - health-data:/app/data
       - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace
+
+  # Edge Relay (trellis-proxy tunnel terminator)
+  # Terminates outbound-initiated WSS tunnels from edge nodes -- internal VMs that can
+  # reach this host on 443 but accept no inbound connections (see docs/proxy.md and
+  # deploy/proxy/). Each site dials out to /edge/v1/connect; the relay keeps that live
+  # socket in process memory and forwards the tool calls it is handed. It is never
+  # published to the host: nginx fronts it at /edge (gateway/entrypoint.sh).
+  edge-relay:
+    build: *app-build
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.3.0}
+    container_name: edge-relay
+    user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
+    # Exactly ONE worker, on purpose: the site -> live connection map is in-process
+    # memory, so a second worker would answer 503 edge_offline for every site whose
+    # socket happens to be held by the other worker.
+    command: uvicorn services.edge_relay.app:app --host 0.0.0.0 --port 8100 --workers 1
+    # NOTE: no `env_file: .env` here on purpose, same reasoning as the hub. The relay
+    # resolves edge token hashes from etcd and never decrypts tool secrets, so handing
+    # it the whole .env would only widen the blast radius of a relay compromise. Only
+    # the variables it actually needs are passed explicitly below.
+    environment:
+      <<: *common-env
+      DEV_MODE: ${DEV_MODE:-false}
+      # Dev-only tunnel credential for an edge running on this host. Ignored unless
+      # DEV_MODE=true; see the trellis-proxy section of .env.example.
+      EDGE_DEV_SITE: ${EDGE_DEV_SITE:-}
+      EDGE_DEV_TOKEN: ${EDGE_DEV_TOKEN:-}
+      # Per-site call budget (the site record can override it) and the audit trail.
+      # The audit line carries site/tool/call id/user/outcome/bytes -- never payloads.
+      EDGE_RATE_LIMIT_PER_MIN: ${EDGE_RATE_LIMIT_PER_MIN:-120}
+      EDGE_AUDIT_LOG: /app/data/edge-audit.log
+    volumes:
+      # Health events for remote tool calls. Deliberately no workspace mount: the relay
+      # has no local tools and must not be able to read the content repo.
+      - health-data:/app/data
+    depends_on:
+      etcd:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8100/healthz > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
 
   # External Gateway MCP Server
   # Bridges external MCP clients to the internal agent fleet via the Host's HTTP API.
@@ -383,6 +431,8 @@ services:
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
       ADMIN_USERS: ${ADMIN_USERS}
       REDIS_URL: redis://redis:6379/0
+      # Admin -> Edges "check tunnel" reads the relay's health endpoint.
+      EDGE_RELAY_URL: ${EDGE_RELAY_URL:-http://edge-relay:8100}
     volumes:
       - health-data:/app/data
       - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace
@@ -404,6 +454,12 @@ services:
       # Set SSL_ENABLED=True in your .env to enable HTTPS
       - SSL_ENABLED=${SSL_ENABLED:-False}
       - SSL_DNS_NAME=${SSL_DNS_NAME:-localhost}
+      # /edge connection-level flood protection (per-site call rates are the relay's).
+      - EDGE_RATE_LIMIT_RPS=${EDGE_RATE_LIMIT_RPS:-30}
+      - EDGE_RATE_LIMIT_BURST=${EDGE_RATE_LIMIT_BURST:-20}
+      # Optional mutual TLS for edge nodes: path to a CA bundle inside the container.
+      # Requires SSL_ENABLED=true and the volume below uncommented.
+      - EDGE_MTLS_CA=${EDGE_MTLS_CA:-}
     # volumes:
     #   # Map host certificates directory via .env variables:
     #   # Place your cert.pem and key.pem in a directory and map it here

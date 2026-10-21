@@ -5,6 +5,10 @@ pydantic-ai[huggingface]==2.57.0
 google-genai==2.31.0
 mcp==2.0.0
 fastmcp==4.0.3
+# Direct dependency of the edge tunnel (core/proxy.py client, relay server under
+# uvicorn). Previously present only transitively via google-genai, so a dependency
+# bump there could silently remove the edge's transport.
+websockets==16.1.1
 uvicorn==0.52.3
 httpx==0.28.1
 etcd-sdk-python==0.0.7
