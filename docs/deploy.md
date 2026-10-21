@@ -62,6 +62,14 @@ gh attestation verify oci://ghcr.io/laraibkazi92/trellis-agent-platform:v0.4.0 \
 
 Images published before that change carry no attestation, and the check fails for them — that is expected, not a broken release.
 
+If the check fails with *"the provided token was denied access to the requested resource"*, the problem is `gh`'s credentials, not the release: `gh` resolves the image digest through GitHub rather than anonymously, and a default `gh auth login` does not include the `read:packages` scope. Grant it once and retry:
+
+```bash
+gh auth refresh -s read:packages
+```
+
+The registry itself needs nothing extra — anonymous pulls of the public package work, and `docker pull`/`docker compose pull` are unaffected by this.
+
 One service is not published: `nginx-gateway` is built from `./gateway` in the clone, so it compiles locally on first `up` (a small nginx image). After changing anything under `gateway/`, rebuild **only** that service:
 
 ```bash
