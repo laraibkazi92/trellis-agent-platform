@@ -119,6 +119,9 @@ each `docs/*.md` guide — please read the one matching your change.
    and a private package would force every org to authenticate before `docker compose pull`.
    Only a tag ref can publish: a `workflow_dispatch` against a branch fails the ref
    guard, and the version always comes from the git ref, never from an input.
+   The run also refuses to build unless **every workflow that ran for the tagged
+   commit succeeded** — tag only a commit whose CI is green, otherwise the job fails
+   at the first step.
 4. The run's summary carries the image **digest**, and the image is attested by
    GitHub's keyless signer. Paste the digest into the GitHub Release and confirm the
    attestation verifies before announcing:

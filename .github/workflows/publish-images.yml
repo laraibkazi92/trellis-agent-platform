@@ -22,6 +22,8 @@
 # Publishing is gated by the `release` environment (repo settings -> Environments),
 # whose required reviewers must approve before any step runs -- so the
 # packages:write and id-token:write tokens are not minted until a human approves.
+# It is also gated on CI: every workflow that ran for the tagged commit must have
+# succeeded, so a tag cannot ship code whose tests failed.
 #
 # No secrets to configure: GITHUB_TOKEN with packages:write is sufficient. NOTE: GHCR
 # packages default to PRIVATE even for a public repo -- set the package visibility to
@@ -36,6 +38,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
   packages: write
   attestations: write
   id-token: write
@@ -72,6 +75,58 @@ jobs:
             echo "${GITHUB_REF_NAME} points at ${tag_sha}, but ${head_sha} is checked out" >&2
             exit 1
           fi
+
+      # A tag push reaches this workflow directly, bypassing CI -- v0.3.0 and v0.4.0
+      # both published images from commits whose test suite was failing. Refuse to
+      # build unless every workflow that ran for this commit succeeded.
+      - name: Require green CI for the tagged commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+          TIMEOUT_SECONDS: "900"
+        run: |
+          deadline=$(( SECONDS + TIMEOUT_SECONDS ))
+          saw_any=false
+          while :; do
+            runs=$(gh run list --commit "$SHA" --limit 50 --json workflowName,status,conclusion)
+            if [[ "$runs" != "[]" ]]; then
+              saw_any=true
+            fi
+
+            # Path-filtered and schedule-only workflows show up as skipped/neutral.
+            failed=$(jq -r '[.[] | select(.status == "completed")
+                              | select(.conclusion != "success"
+                                       and .conclusion != "skipped"
+                                       and .conclusion != "neutral")]
+                             | unique_by(.workflowName)
+                             | .[] | "\(.workflowName): \(.conclusion)"' <<<"$runs")
+            if [[ -n "$failed" ]]; then
+              echo "::error::CI is not green for ${SHA}; refusing to publish"
+              printf '  %s\n' "$failed"
+              exit 1
+            fi
+
+            # Require a completed, successful CI run: a commit that never ran the
+            # test suite is not a releasable commit.
+            ci_ok=$(jq '[.[] | select(.workflowName == "CI" and .status == "completed"
+                                       and .conclusion == "success")] | length' <<<"$runs")
+            pending=$(jq '[.[] | select(.status != "completed")] | length' <<<"$runs")
+            if [[ "$ci_ok" -gt 0 && "$pending" -eq 0 ]]; then
+              echo "CI green for ${SHA}; publishing"
+              exit 0
+            fi
+
+            if [[ "$SECONDS" -gt "$deadline" ]]; then
+              if [[ "$saw_any" == false ]]; then
+                echo "::error::no CI run found for ${SHA}; tag only a commit that ran CI on main"
+              else
+                echo "::error::timed out waiting for CI on ${SHA} (${pending} run(s) still in progress)"
+              fi
+              exit 1
+            fi
+            echo "waiting for CI on ${SHA} (${pending} run(s) in progress)"
+            sleep 20
+          done
 
       - name: Resolve image name and tags
         id: meta
