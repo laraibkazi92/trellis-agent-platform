@@ -656,13 +656,19 @@ def _consume_token_file(path: Path) -> None:
     try:
         path.unlink()
     except FileNotFoundError:
-        pass
+        return
     except OSError as exc:
         logger.warning(
             "token file %s could not be removed after reading (%s); a tool running as "
             "the same uid may still read it -- mount it as a docker secret",
             path,
             exc,
+        )
+    else:
+        logger.info(
+            "token file %s was removed after reading; re-provision it before restarting "
+            "the proxy (a read-only secret mount is left in place instead)",
+            path,
         )
 
 
