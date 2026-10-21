@@ -350,6 +350,8 @@ async def _heartbeat(conn: EdgeConn) -> None:
     while not conn.closed:
         await asyncio.sleep(HEARTBEAT_S)
 
+        revoked = rotated = False
+        config: Optional[Dict[str, Any]] = None
         try:
             config = await asyncio.to_thread(
                 registry.effective_site_config, _identity_manager(), conn.site
@@ -365,9 +367,6 @@ async def _heartbeat(conn: EdgeConn) -> None:
                 and bool(conn.token_hash)
                 and config["token_hash"] != conn.token_hash
             )
-            if not revoked and not rotated:
-                await _apply_admin_changes(conn, config)
-
             if revoked or rotated:
                 # `enabled` stays true across a rotation, so the hash compare is what
                 # makes "rotate" cut off a leaked tunnel instead of waiting for a drop.
@@ -384,6 +383,11 @@ async def _heartbeat(conn: EdgeConn) -> None:
             await conn.send({"t": "ping"})
         except EdgeDisconnected:
             return
+
+        # After the keepalive: a republish can re-index embeddings, and delaying the
+        # ping risks an intermediary's read timeout mid-maintenance.
+        if config is not None and not revoked and not rotated:
+            await _apply_admin_changes(conn, config)
 
 
 async def _receive_frame(ws: Any) -> Optional[Dict[str, Any]]:

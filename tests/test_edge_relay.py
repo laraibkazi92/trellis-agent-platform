@@ -1175,7 +1175,12 @@ def test_heartbeat_republishes_after_an_admin_changes_the_exports(monkeypatch):
 
     async def run():
         task = asyncio.create_task(app_module._heartbeat(conn))
+        # The keepalive is sent first; the republish follows it on the same beat.
         await _wait_for_frames(conn.ws, count=1)
+        for _ in range(200):
+            if published:
+                break
+            await asyncio.sleep(0.01)
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task

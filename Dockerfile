@@ -80,6 +80,10 @@ COPY --chmod=0755 --from=sandbox-build /out/trellis-sandbox /usr/local/bin/trell
 # so on the default non-root hub tools run at this same uid, which is the workspace owner.
 ARG PUID=1000
 ARG PGID=1000
+# Reported in the edge hello frame / Admin -> Edges so an operator can spot a proxy
+# running an older build than the central install. Supplied by the release workflow.
+ARG TRELLIS_VERSION=0.0.0
+ENV TRELLIS_VERSION=${TRELLIS_VERSION}
 RUN groupadd -g ${PGID} trellis \
     && useradd -u ${PUID} -g ${PGID} -m -s /usr/sbin/nologin trellis \
     && mkdir -p /app/data \

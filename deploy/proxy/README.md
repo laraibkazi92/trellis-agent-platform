@@ -49,10 +49,9 @@ docker compose up -d
 `proxy.yaml` is mounted read-only at `/etc/trellis/proxy.yaml`. The workspace is mounted
 at `/app/workspace` read-write by default, because the sandbox grants tools exactly that
 one writable path; mount it `:ro` only when every exported tool is read-only (writes then
-fail with a sandbox error). Tool edits are a content change plus a `SIGHUP` or restart
-(`docker compose restart trellis-proxy`) or `SIGHUP` to re-publish the catalog (the proxy
-reconnects, so an in-flight call fails rather than being replayed). No manual file copy
-is needed after editing `tool.yaml`.
+fail with a sandbox error). Tool edits are a content change plus a `SIGHUP` to re-publish
+the catalog (the proxy reconnects, so an in-flight call fails rather than being replayed),
+or a restart. No manual file copy is needed after editing `tool.yaml`.
 
 ## Verify
 

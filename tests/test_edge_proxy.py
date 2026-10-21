@@ -788,7 +788,17 @@ def test_edge_mode_stops_the_tunable_etcd_refresh(monkeypatch):
     assert calls == []
 
 
-def test_the_enrollment_token_is_removed_before_tools_run(monkeypatch, tmp_path):
+@pytest.fixture
+def _clean_secret_env_names():
+    import core.proxy as proxy_module
+
+    before = set(proxy_module._SECRET_ENV_NAMES)
+    yield
+    proxy_module._SECRET_ENV_NAMES.clear()
+    proxy_module._SECRET_ENV_NAMES.update(before)
+
+
+def test_the_enrollment_token_is_removed_before_tools_run(monkeypatch, tmp_path, _clean_secret_env_names):
     """The tunnel credential must not be inherited by tool subprocesses."""
     monkeypatch.setenv("TRELLIS_EDGE_TOKEN", "edge_site_supersecret")
     config = proxy.ProxyConfig(site="plant-floor", server_url="ws://relay.local/edge/v1/connect")
@@ -800,7 +810,7 @@ def test_the_enrollment_token_is_removed_before_tools_run(monkeypatch, tmp_path)
     assert "TRELLIS_EDGE_TOKEN" not in proxy.build_env(tmp_path)
 
 
-def test_build_env_drops_a_reintroduced_token(monkeypatch, tmp_path):
+def test_build_env_drops_a_reintroduced_token(monkeypatch, tmp_path, _clean_secret_env_names):
     monkeypatch.setenv("TRELLIS_EDGE_TOKEN", "edge_site_supersecret")
     proxy._SECRET_ENV_NAMES.add("TRELLIS_EDGE_TOKEN")
 

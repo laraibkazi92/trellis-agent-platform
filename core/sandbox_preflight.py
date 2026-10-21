@@ -51,6 +51,9 @@ CODES: frozenset[str] = frozenset({
     "unknown",
 })
 
+_warned_invalid_rw_path = False
+
+
 def writable_root() -> Path:
     """The one path a sandboxed tool may write, overridable on a standalone install.
 
@@ -60,7 +63,10 @@ def writable_root() -> Path:
     raw = (os.getenv("SANDBOX_RW_PATH") or "/app/workspace").strip()
     candidate = Path(raw)
     if not candidate.is_absolute() or candidate == Path("/"):
-        if raw != "/app/workspace":
+        global _warned_invalid_rw_path
+        if raw != "/app/workspace" and not _warned_invalid_rw_path:
+            # Called on every execution; one warning is enough to fix a typo.
+            _warned_invalid_rw_path = True
             logger.warning(
                 "Ignoring SANDBOX_RW_PATH=%r (must be an absolute path other than '/'); "
                 "using /app/workspace",
