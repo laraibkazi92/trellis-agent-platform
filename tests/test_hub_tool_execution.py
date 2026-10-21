@@ -25,6 +25,7 @@ Pins the contracts introduced by the Hub hardening plan:
 import asyncio
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -950,6 +951,11 @@ def test_sandbox_warning_only_stderr_is_not_logged(monkeypatch, tmp_path, caplog
     install_sandbox(monkeypatch)
     install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
+    # The preflight warns when SANDBOX_UID differs from this process's uid. Pin both
+    # to the current identity so this test is about the helper's stderr, not about
+    # the uid of whoever runs it (GitHub runners are 1001, images are 1000).
+    monkeypatch.setenv("SANDBOX_UID", str(os.geteuid()))
+    monkeypatch.setenv("SANDBOX_GID", str(os.getegid()))
 
     warning = b"trellis-sandbox: warning: supplementary groups retained (needs CAP_SETGID)\n"
     install_fake_subprocess(
