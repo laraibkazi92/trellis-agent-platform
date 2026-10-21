@@ -266,6 +266,16 @@ def invalidate_after_failure(code: str) -> bool:
     return True
 
 
+def writable_root() -> Path:
+    """The one writable path the landlock helper grants a tool.
+
+    Defaults to the framework's workspace. Overridable so a standalone install
+    (the edge proxy, embedders) can point it at its own writable directory instead
+    of inheriting a path that may not exist in that container.
+    """
+    return Path(os.getenv("SANDBOX_RW_PATH") or "/app/workspace")
+
+
 def _seccomp_disabled() -> bool:
     return sandbox_preflight.seccomp_disabled()
 
@@ -292,7 +302,7 @@ def build_cmd(
     argv = [
         sandbox_preflight.helper_path(),
         "--ro", "/",
-        "--rw", "/app/workspace",
+        "--rw", str(writable_root()),
         "--tmpdir", str(tmpdir),
         "--uid", str(uid),
         "--gid", str(gid),

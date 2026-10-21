@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import yaml
 
-from core import tool_runtime
+from core import sandbox, tool_runtime
 from core.env_sanitize import sanitized_env
 from core.models import ToolConfig
 from services.edge_relay import protocol
@@ -795,6 +795,16 @@ async def run(
 
     token = _resolve_token(config)
     connect = _connect_factory()
+
+    writable = sandbox.writable_root()
+    if not writable.exists():
+        # Every landlock-sandboxed call binds this path. A tools-only mount (or a
+        # read-only workspace) otherwise fails with an opaque "Sandbox unavailable".
+        logger.warning(
+            "sandbox writable root %s does not exist; mount the workspace at that path "
+            "(see deploy/proxy/docker-compose.yml)",
+            writable,
+        )
 
     session = _Session(config, config_path)
     session.reload()

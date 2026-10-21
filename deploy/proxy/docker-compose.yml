@@ -25,8 +25,11 @@ services:
     # of it is ever sent to the central host.
     env_file: .env
     volumes:
-      # Read-only: the proxy runs the tools declared in the workspace, it never edits it.
-      - ./workspace:/app/workspace:ro
+      # The sandbox grants tools exactly one writable path, /app/workspace (override
+      # with SANDBOX_RW_PATH). It must exist, and it must be writable if any exported
+      # tool writes files -- a read-only mount fails at write time with an opaque
+      # sandbox error. Mount it `:ro` only when every tool is read-only.
+      - ./workspace:/app/workspace
       - ./proxy.yaml:/etc/trellis/proxy.yaml:ro
     # PID 1 must reap tool children, same reason as the central hub: a tool that
     # daemonizes would otherwise leave zombies under a long-lived proxy.

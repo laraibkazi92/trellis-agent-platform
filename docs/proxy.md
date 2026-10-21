@@ -198,6 +198,13 @@ prompted for a certificate — the dashboard and `/v1` do not require one.
 mTLS is defence in depth on top of the enrollment token, not a replacement: the relay
 still resolves the bearer token to a site.
 
+### Filesystem
+
+Tools run inside the same sandbox as the hub's, which grants exactly one writable path:
+`/app/workspace` (override with `SANDBOX_RW_PATH`). The directory must exist in the proxy
+container. Mount it writable if any exported tool writes files; a read-only mount is fine
+only for read-only tools. The proxy logs a warning at startup when the path is missing.
+
 ### Revocation latency
 
 Revoking a token closes the **next handshake** immediately and the **live** tunnel at the
