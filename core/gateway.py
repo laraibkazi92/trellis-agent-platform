@@ -20,6 +20,7 @@ from core.discovery import discover_agents, is_agent_configured, is_tool_configu
 from core.agent_search import search_agents as _search_agents_ranked
 from core.tool_search import search_tools as _search_tools_ranked, execute_whitelisted_tool
 from core.agent_factory import get_hub_client, get_external_mcp_client
+from core.remote_mcp import call_edge_mcp
 from core.models import is_agent_external, is_routable_agent_type
 from core.health import compute_agent_operational_status
 
@@ -532,8 +533,9 @@ async def use_tool(ctx: Context, tool_name: str, arguments: Dict[str, Any]) -> A
     that it is configured — do not guess.
 
     Args:
-        tool_name: Exact name of the tool (e.g. 'opsctl', 'netctl', or an MCP tool's
-            'mcp__{server}__{name}' form as returned by `search_tools`).
+        tool_name: Exact name of the tool (e.g. 'opsctl', 'netctl', a central MCP
+            tool's 'mcp__{server}__{name}', or an edge MCP tool's
+            'mcp__{site}__{mcp}__{name}' form as returned by `search_tools`).
         arguments: Dictionary of arguments matching the tool's input schema.
     """
     user_id = user_id_var.get()
@@ -549,6 +551,7 @@ async def use_tool(ctx: Context, tool_name: str, arguments: Dict[str, Any]) -> A
         is_configured=is_tool_configured,
         get_hub_client_fn=get_hub_client,
         get_external_mcp_client_fn=get_external_mcp_client,
+        call_edge_mcp_fn=call_edge_mcp,
     )
     if not (isinstance(output, str) and output.startswith("SYSTEM:")):
         await ctx.report_progress(3, 3, message=f"Tool '{tool_name}' execution complete.")

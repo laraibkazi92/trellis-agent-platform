@@ -4,7 +4,7 @@
 import os
 import asyncio
 import logging
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 from core.auth import get_identity_manager
 from core.models import BACKGROUND_AGENT_TYPES, Identity, IdentityType
 
@@ -157,6 +157,49 @@ async def get_agent_required_variables(config: Dict, strict: bool = False) -> Li
     tool_configs, mcp_configs = await _fetch_agent_tool_mcp_configs(config, strict=strict)
     return sorted(_resolve_agent_requirements(config, tool_configs, mcp_configs)["required_variables"])
 
+def _mcp_key_for_tool_name(tool_name: str, mcp_configs: Dict[str, Dict]) -> Optional[str]:
+    """Registry key of the MCP server owning an ``mcp__...`` tool name.
+
+    Resolution is against the configs at hand, never the name's shape alone: a 4+-part
+    name is an edge server (``<site>__<mcp>``) only when that config exists, otherwise it
+    is a central server whose *tool* name contains ``__`` (``mcp__srv__do__thing`` ->
+    ``srv``). Without the 4-vs-3 branch, a 4-part edge name would look up the site name
+    as a central MCP and absorb that unrelated server's secrets.
+    """
+    parts = tool_name.split("__")
+    if len(parts) < 3:
+        return None
+    if len(parts) >= 4:
+        edge_key = f"{parts[1]}__{parts[2]}"
+        if edge_key in mcp_configs:
+            return edge_key
+    return parts[1]
+
+
+async def resolve_edge_mcp_target(
+    tool_name: str, identity_manager: Optional[Any] = None
+) -> Optional[tuple[str, str, str]]:
+    """``(site, mcp, tool)`` when ``tool_name`` names an edge-exported MCP tool.
+
+    Registry-backed, never shape-based: an ``mcp__`` name is an edge target only when
+    ``<parts[1]>__<parts[2]>`` is a registered MCP config **carrying a ``remote`` block**.
+    Everything else -- including a central server whose own tool name contains ``__``
+    (``mcp__srv__do__thing``) -- reads as central and returns ``None``. The tool half is
+    re-joined so an edge tool name may itself contain ``__``.
+    """
+    if not tool_name.startswith("mcp__"):
+        return None
+    parts = tool_name.split("__")
+    if len(parts) < 4 or not parts[1] or not parts[2]:
+        return None
+    mgr = identity_manager or identity_mgr
+    config = await asyncio.to_thread(mgr.get_mcp_config, f"{parts[1]}__{parts[2]}")
+    remote = (config or {}).get("remote")
+    if not isinstance(remote, dict) or not remote.get("site") or not remote.get("mcp"):
+        return None
+    return str(remote["site"]), str(remote["mcp"]), "__".join(parts[3:])
+
+
 def _resolve_agent_requirements(
     config: Dict,
     tool_configs: Dict[str, Dict],
@@ -198,9 +241,9 @@ def _resolve_agent_requirements(
         if tool_config:
             _absorb(tool_config)
         elif tool_name.startswith("mcp__"):
-            parts = tool_name.split("__")
-            if len(parts) >= 3:
-                mcp_config = mcp_configs.get(parts[1])
+            mcp_key = _mcp_key_for_tool_name(tool_name, mcp_configs)
+            if mcp_key:
+                mcp_config = mcp_configs.get(mcp_key)
                 if mcp_config:
                     _absorb(mcp_config)
 
@@ -278,9 +321,25 @@ async def _fetch_agent_tool_mcp_configs(config: Dict, strict: bool = False) -> "
 
     for tool_name in config.get("allowed_tools", []):
         if tool_name.startswith("mcp__"):
-            parts = tool_name.split("__")
-            if len(parts) >= 3:
-                mcp_names.add(parts[1])
+            # Same registry-backed branch the aggregation uses: a 4-part name is an
+            # edge server only if that server is actually registered, so a central
+            # MCP never gets looked up under an edge site's name.
+            try:
+                target = await resolve_edge_mcp_target(tool_name)
+            except Exception as exc:
+                # Fail soft like the config gathers below: a registry hiccup must not
+                # turn into an exception out of is_agent_configured when the caller did
+                # not ask for strict mode.
+                if strict:
+                    raise
+                logger.warning("Could not resolve edge MCP target for %r: %s", tool_name, exc)
+                target = None
+            if target:
+                mcp_names.add(f"{target[0]}__{target[1]}")
+            else:
+                parts = tool_name.split("__", 2)
+                if len(parts) >= 3 and parts[1]:
+                    mcp_names.add(parts[1])
             continue
         direct_tools.append(tool_name)
 
@@ -578,6 +637,11 @@ async def is_tool_configured(tool_name: str, user_id: Optional[str] = None) -> D
     """Check if a specific tool (local or MCP, e.g. ``mcp__{server}__{name}``) is
     configured for a user.
 
+    An edge-hosted MCP tool (``mcp__{site}__{mcp}__{name}``) resolves to its
+    ``<site>__<mcp>`` registry entry and, being a remote entry, is gated on edge
+    connectivity instead of central secrets. Which reading applies is decided by
+    :func:`resolve_edge_mcp_target` (registry-backed), never by the name's shape.
+
     Reuses the same secret/variable resolution primitives as :func:`is_agent_configured`
     (``_resolve_requirements``, ``flatten_secret_group_keys``) but resolves requirements
     from the tool's/MCP's own config rather than an agent's ``allowed_tools``/``allowed_mcps``
@@ -602,20 +666,28 @@ async def is_tool_configured(tool_name: str, user_id: Optional[str] = None) -> D
     not_configured = {"configured": False, "missing_secrets": [], "missing_variables": [], "optional_missing_secrets": []}
 
     if tool_name.startswith("mcp__"):
-        parts = tool_name.split("__")
-        if len(parts) < 3:
-            return not_configured
-        config = await asyncio.to_thread(identity_mgr.get_mcp_config, parts[1])
+        target = await resolve_edge_mcp_target(tool_name)
+        if target:
+            # Edge-exported MCP server: the registry key is <site>__<mcp>.
+            server_name = f"{target[0]}__{target[1]}"
+        else:
+            # Central reading: the tail after `mcp__<server>__` is the tool name, even
+            # when it contains "__" itself.
+            parts = tool_name.split("__", 2)
+            if len(parts) < 3 or not parts[1]:
+                return not_configured
+            server_name = parts[1]
+        config = await asyncio.to_thread(identity_mgr.get_mcp_config, server_name)
     else:
         config = await asyncio.to_thread(identity_mgr.get_tool_config, tool_name)
 
     if not config:
         return not_configured
 
-    # Edge-hosted tools have no central secrets or variables at all: their only
-    # requirement is that the owning edge is currently connected. A remote spec
-    # short-circuits before the secret resolution below (which would otherwise
-    # report every remote tool as configured and hide an offline edge).
+    # Edge-hosted tools and MCP servers have no central secrets or variables at
+    # all: their only requirement is that the owning edge is currently connected.
+    # A remote spec short-circuits before the secret resolution below (which would
+    # otherwise report every remote entry as configured and hide an offline edge).
     remote = config.get("remote")
     if isinstance(remote, dict) and remote.get("site"):
         return await _remote_tool_configuration_status(str(remote["site"]))

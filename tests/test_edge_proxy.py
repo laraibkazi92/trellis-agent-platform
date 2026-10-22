@@ -30,6 +30,8 @@ ENV_VARS = (
     "TRELLIS_SERVER_URL",
     "TRELLIS_EDGE_TOOLS_DIR",
     "TRELLIS_EDGE_TOKEN",
+    "TRELLIS_USER_ID",
+    "TRELLIS_USER_EMAIL",
 )
 
 
@@ -430,7 +432,10 @@ def test_connect_kwargs_raise_the_inbound_frame_cap():
     assert headers == {"Authorization": "Bearer tok"}
 
 
-@pytest.mark.parametrize("code", [protocol.CLOSE_REVOKED, protocol.CLOSE_SUPERSEDED])
+@pytest.mark.parametrize(
+    "code",
+    [protocol.CLOSE_REVOKED, protocol.CLOSE_SUPERSEDED, protocol.CLOSE_VERSION],
+)
 def test_next_backoff_never_retries_a_terminal_close_fast(code):
     assert proxy._next_backoff(proxy._BACKOFF_MIN_S, 1.0, code) == proxy._BACKOFF_MAX_S
     # A revoked token stays revoked, however healthy the session had been.
@@ -438,6 +443,22 @@ def test_next_backoff_never_retries_a_terminal_close_fast(code):
         proxy._next_backoff(proxy._BACKOFF_MIN_S, proxy._BACKOFF_STABLE_S * 2, code)
         == proxy._BACKOFF_MAX_S
     )
+
+
+def test_a_version_mismatch_is_diagnosed_as_central_being_old():
+    """4001 is terminal: a v0.5 edge cannot fix an un-upgraded relay by retrying, and a
+    generic "disconnected" line would hide the one action that helps (upgrade central)."""
+    assert protocol.CLOSE_VERSION in proxy._TERMINAL_CLOSE_CODES
+
+    message = proxy._terminal_close_message(protocol.CLOSE_VERSION, "plant-floor")
+
+    assert "version mismatch" in message
+    assert "upgrade central" in message
+    assert "older tunnel protocol" in message
+    assert "4001" in message
+    # The other terminal codes keep their own diagnosis.
+    assert "revoked" in proxy._terminal_close_message(protocol.CLOSE_REVOKED, "site")
+    assert "superseded" in proxy._terminal_close_message(protocol.CLOSE_SUPERSEDED, "site")
 
 
 def test_next_backoff_grows_after_a_short_session():
@@ -485,7 +506,7 @@ def test_call_is_cancelled_at_the_caller_deadline(tmp_path, monkeypatch):
     """An abandoned call must not hold an inflight slot for the tool's full timeout."""
     monkeypatch.setattr(proxy, "MAX_INFLIGHT", 1)
 
-    async def fake_handle(config_map, frame):
+    async def fake_handle(config_map, frame, *, proxy_config=None, credential_modes=None):
         if frame.get("tool") == "slow":
             await asyncio.sleep(30)
         return proxy._result_frame(frame["id"], 0, result={"tool": frame["tool"]})
@@ -553,6 +574,45 @@ def test_handle_call_returns_result(tmp_path, monkeypatch):
     assert frame["ok"] is True
     assert frame["result"] == {"ok": True}
     assert isinstance(frame["ms"], int)
+
+
+def test_handle_call_exports_the_caller_identity_to_the_tool(tmp_path, monkeypatch):
+    seen = {}
+
+    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None):
+        seen.update(env)
+        return {"ok": True}
+
+    monkeypatch.setattr(proxy.tool_runtime, "execute_tool", fake_execute)
+    config_map = {"demo": (make_config(), tmp_path)}
+
+    frame = asyncio.run(
+        proxy.handle_call(
+            config_map,
+            call_frame(user="user-1", user_email="user-1@corp.example"),
+        )
+    )
+
+    assert frame["ok"] is True
+    assert seen["TRELLIS_USER_ID"] == "user-1"
+    assert seen["TRELLIS_USER_EMAIL"] == "user-1@corp.example"
+
+
+def test_handle_call_without_identity_exports_no_identity_vars(tmp_path, monkeypatch):
+    seen = {}
+
+    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None):
+        seen.update(env)
+        return {"ok": True}
+
+    monkeypatch.setattr(proxy.tool_runtime, "execute_tool", fake_execute)
+    config_map = {"demo": (make_config(), tmp_path)}
+
+    asyncio.run(proxy.handle_call(config_map, call_frame()))
+
+    # Absent, not empty: a tool branches on presence.
+    assert "TRELLIS_USER_ID" not in seen
+    assert "TRELLIS_USER_EMAIL" not in seen
 
 
 def test_handle_call_unknown_tool(tmp_path, monkeypatch):
@@ -635,7 +695,7 @@ def test_hello_frame_publishes_the_catalog(tmp_path):
         "beta": (make_config("beta"), tmp_path),
     }
 
-    frame = proxy.hello_frame(config_map)
+    frame = proxy.hello_frame(config_map, None)
 
     assert frame["t"] == "hello"
     assert frame["proto"] == protocol.PROTO
@@ -644,14 +704,72 @@ def test_hello_frame_publishes_the_catalog(tmp_path):
     assert frame["tools"][0]["inputs"] == {"q": {"type": "string", "required": False}}
 
     # The relay validates the catalog on arrival; make sure it accepts ours.
-    _, _, tools = protocol.validate_hello(frame)
+    _, _, tools, mcps, caps = protocol.validate_hello(frame)
     assert [tool.name for tool in tools] == ["alpha", "beta"]
+    assert mcps == [] and caps == ["tools"]
+
+
+def test_hello_frame_with_mcp_catalogs_passes_the_relay_validator(tmp_path):
+    """A proto-2 hello must satisfy the relay's caps/mcps contract."""
+    schema = {
+        "type": "object",
+        "oneOf": [
+            {"properties": {"action": {"const": "list_actions"}}, "required": ["action"]},
+            {"properties": {"action": {"const": "get_tenant"}, "id": {"type": "string"}}},
+        ],
+    }
+    catalog = protocol.validate_mcps(
+        [
+            {
+                "name": "devops-cli",
+                "transport": "stdio",
+                "tools": [
+                    {"name": "tenant_tools", "description": "meta", "inputSchema": schema}
+                ],
+            }
+        ]
+    )[0]
+
+    frame = proxy.hello_frame({}, {"devops-cli": catalog})
+
+    assert frame["caps"] == ["tools", "mcp"]
+    assert [mcp["name"] for mcp in frame["mcps"]] == ["devops-cli"]
+
+    proto, _version, tools, mcps, caps = protocol.validate_hello(frame)
+    assert proto == protocol.PROTO == 2
+    assert tools == []
+    assert caps == ["tools", "mcp"]
+    assert mcps[0].tools[0].input_schema == schema
 
 
 def test_build_env_prepends_the_tool_bin_dir(tmp_path):
     env = proxy.build_env(tmp_path)
 
     assert env["PATH"].split(":")[0] == str((tmp_path / "bin").resolve())
+
+
+def test_build_env_exports_the_caller_identity(tmp_path):
+    env = proxy.build_env(
+        tmp_path, identity={"user": "u1", "user_email": "u1@corp.example"}
+    )
+
+    assert env["TRELLIS_USER_ID"] == "u1"
+    assert env["TRELLIS_USER_EMAIL"] == "u1@corp.example"
+
+
+def test_build_env_sets_only_the_identity_it_was_given(tmp_path):
+    env = proxy.build_env(tmp_path, identity={"user": "u1"})
+
+    assert env["TRELLIS_USER_ID"] == "u1"
+    assert "TRELLIS_USER_EMAIL" not in env
+
+
+def test_build_env_never_exports_an_empty_identity(tmp_path):
+    """A tool tests presence, so "None"/"" must never reach the environment."""
+    env = proxy.build_env(tmp_path, identity={"user": "", "user_email": None})
+
+    assert "TRELLIS_USER_ID" not in env
+    assert "TRELLIS_USER_EMAIL" not in env
 
 
 def test_edge_version_is_never_empty():
@@ -900,9 +1018,33 @@ def test_token_file_is_loaded_from_proxy_yaml(tmp_path):
 
 def test_once_fails_when_the_relay_hangs_up_before_welcome(monkeypatch):
     """A clean close before the catalog is accepted must not look like success."""
+    _install_fake_connect(monkeypatch, close_code=1011)
+
+    with pytest.raises(RuntimeError, match="before the relay accepted") as excinfo:
+        asyncio.run(proxy.run(_once_config(), once=True))
+
+    assert "1011" in str(excinfo.value)
+
+
+def test_once_surfaces_a_version_mismatch_close_code(monkeypatch):
+    """`--once` is the diagnostic path: it must name 4001, not just fail."""
+    _install_fake_connect(monkeypatch, close_code=protocol.CLOSE_VERSION)
+
+    with pytest.raises(RuntimeError, match="before the relay accepted") as excinfo:
+        asyncio.run(proxy.run(_once_config(), once=True))
+
+    assert str(protocol.CLOSE_VERSION) in str(excinfo.value)
+
+
+def _once_config():
+    return proxy.ProxyConfig(site="plant-floor", server_url="ws://relay.local/edge/v1/connect")
+
+
+def _install_fake_connect(monkeypatch, close_code):
+    """``_serve`` is a no-op and the socket closes with ``close_code``: the session never
+    reaches `accepted`, which is exactly the handshake-refusal shape."""
     from types import SimpleNamespace
 
-    config = proxy.ProxyConfig(site="plant-floor", server_url="ws://relay.local/edge/v1/connect")
     monkeypatch.setenv("TRELLIS_EDGE_TOKEN", "edge_plant-floor_secret")
     monkeypatch.setattr(proxy, "_SECRET_ENV_NAMES", set())
 
@@ -917,7 +1059,7 @@ def test_once_fails_when_the_relay_hangs_up_before_welcome(monkeypatch):
             pass
 
         async def __aenter__(self):
-            return SimpleNamespace(close_code=1011, send=_noop, close=_noop)
+            return SimpleNamespace(close_code=close_code, send=_noop, close=_noop)
 
         async def __aexit__(self, *exc):
             return False
@@ -927,6 +1069,3 @@ def test_once_fails_when_the_relay_hangs_up_before_welcome(monkeypatch):
 
     monkeypatch.setattr(proxy, "_serve", _noop_serve)
     monkeypatch.setattr(proxy, "_connect_factory", lambda: _fake_connect)
-
-    with pytest.raises(RuntimeError, match="before the relay accepted"):
-        asyncio.run(proxy.run(config, once=True))

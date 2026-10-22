@@ -42,6 +42,9 @@ DEV_MODE_AUTH_TOKEN = "dev-token"
 EDGES_PREFIX = "/registry/edges/"
 EDGE_TOKENS_PREFIX = "/edge_tokens/"
 EDGE_TOOLS_PREFIX = "/registry/tools/"
+# MCP servers the relay publishes for a site, and the tool embeddings under
+# `/registry/tools/mcp__<site>__<mcp>__<tool>` that go with them.
+EDGE_MCPS_PREFIX = "/registry/mcps/"
 EDGE_MANAGED_BY = "edge-relay"
 
 
@@ -129,6 +132,10 @@ def retry_etcd(max_retries=10, delay=2):
                 except EtcdContentionError:
                     # The CAS loop already spent its own backoff-driven retry budget; re-running
                     # it here would only multiply attempts (and hold the caller for ~20s).
+                    raise
+                except ValueError:
+                    # Input validation (e.g. an illegal registry name), not a transient
+                    # etcd fault: retrying cannot succeed, so fail fast.
                     raise
                 except Exception as e:
                     # Fast-fail immediately on non-transient resource exhaustion (e.g. gRPC message > 4MB)
@@ -841,6 +848,19 @@ class IdentityManager:
 
     @retry_etcd()
     def save_mcp_config(self, name: str, config: Dict) -> None:
+        """Persist one MCP config.
+
+        A **central** MCP name may not contain ``__``: the name is the middle segment of
+        ``mcp__<server>__<tool>``, and a name with ``__`` inside it makes that reference
+        splittable two ways (a central server ``srv`` with tool ``do__thing`` versus an
+        edge site ``srv`` exporting MCP ``do``). The relay's own keys -- ``<site>__<mcp>``
+        -- are the one legitimate exception, and it tags them ``managed_by: "edge-relay"``.
+        """
+        if "__" in name and (config or {}).get("managed_by") != "edge-relay":
+            raise ValueError(
+                f"MCP name '{name}' may not contain '__'; that separator is reserved "
+                f"for edge '<site>__<mcp>' registry keys."
+            )
         self.client.put(f"/registry/mcps/{name}/config", json.dumps(config))
 
     @retry_etcd()
@@ -946,8 +966,8 @@ class IdentityManager:
         owner, and an edge token authenticates one tunnel, not a person.
 
         Validation and the duplicate check sit outside the retried body on purpose:
-        ``retry_etcd`` retries *any* exception, so a ``ValueError`` raised inside it
-        would take ten backoff cycles to reach the admin.
+        a ``ValueError`` inside it would skip the backoff entirely (``retry_etcd``
+        fast-fails on it), and the admin should see the reason immediately.
         """
         site = _validated_edge_name(name)
         if self.get_edge_config(site):
@@ -1069,7 +1089,7 @@ class IdentityManager:
 
     @retry_etcd()
     def delete_edge(self, name: str) -> None:
-        """Remove a site: index entry, config, status, and its `<site>__*` tools.
+        """Remove a site: index entry, config, status, and its `<site>__*` inventory.
 
         The token index key is deleted first. If the tool pass then fails, the retry
         re-reads an already-deleted config and would no longer know the hash to
@@ -1082,12 +1102,21 @@ class IdentityManager:
         self.client.delete(f"{EDGES_PREFIX}{name}/config")
         self.client.delete(f"{EDGES_PREFIX}{name}/status")
         removed = self._delete_edge_tools(name)
-        logger.info(f"Edge '{name}' deleted along with {removed} published tool(s).")
+        removed_mcps = self._delete_edge_mcps(name)
+        logger.info(
+            f"Edge '{name}' deleted along with {removed} published tool(s) "
+            f"and {removed_mcps} MCP server(s)."
+        )
 
     @retry_etcd()
     def delete_edge_tools(self, name: str) -> int:
         """Delete the tool configs and embeddings the relay published for a site."""
         return self._delete_edge_tools(name)
+
+    @retry_etcd()
+    def delete_edge_mcps(self, name: str) -> int:
+        """Delete the MCP configs and tool embeddings the relay published for a site."""
+        return self._delete_edge_mcps(name)
 
     def _delete_edge_tools(self, name: str) -> int:
         """Count and remove `<site>__*` tools, refusing anything the relay does not own."""
@@ -1110,6 +1139,38 @@ class IdentityManager:
                 logger.warning(f"Refusing to delete tool '{tool_name}': not managed by the edge relay.")
                 continue
             delete_tool(self, tool_name)
+            removed += 1
+        return removed
+
+    def _delete_edge_mcps(self, name: str) -> int:
+        """Count and remove `<site>__*` MCP servers, refusing anything the relay does not own.
+
+        Each config's tool embeddings live at
+        ``/registry/tools/mcp__<site>__<mcp>__<tool>/embedding``; that prefix is cleared
+        too, or deleting a site leaves its tools ranking in search forever. The prefix
+        is written out rather than delegating to ``delete_mcp_tool_embeddings`` so the
+        mutator keeps one retry loop (see ``_read_edge_record``).
+        """
+        prefix = f"{EDGE_MCPS_PREFIX}{name}__"
+        removed = 0
+        for value, metadata in self.client.get_prefix(prefix):
+            key = metadata.key.decode('utf-8')
+            if not key.startswith(prefix) or not key.endswith("/config"):
+                continue
+            mcp_name = key[len(EDGE_MCPS_PREFIX):-len("/config")]
+            try:
+                config = json.loads(value.decode('utf-8')) if value else {}
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                config = None
+            if not isinstance(config, dict) or config.get("managed_by") != EDGE_MANAGED_BY:
+                # `<site>__` is a name prefix, not proof of ownership: a local MCP or an
+                # older scheme may hold the name.
+                logger.warning(
+                    f"Refusing to delete MCP '{mcp_name}': not managed by the edge relay."
+                )
+                continue
+            self.client.delete(f"{EDGE_MCPS_PREFIX}{mcp_name}/config")
+            self.client.delete_prefix(f"/registry/tools/mcp__{mcp_name}__")
             removed += 1
         return removed
 

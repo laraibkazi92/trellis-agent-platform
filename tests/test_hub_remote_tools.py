@@ -52,6 +52,18 @@ def _reset_registered_tools():
     hub._unreadable_tool_names.clear()
 
 
+@pytest.fixture(autouse=True)
+def _no_real_identity_lookup(monkeypatch):
+    """The email lookup is etcd I/O; each test pins its own profile instead.
+
+    DEV_MODE is forced off so a developer's shell cannot turn a profile lookup into
+    the dev fallback email.
+    """
+    monkeypatch.delenv("DEV_MODE", raising=False)
+    monkeypatch.delenv("DEV_USER_EMAIL", raising=False)
+    monkeypatch.setattr(hub.identity_mgr, "get_user", lambda user_id: None)
+
+
 def make_remote_config(**kw):
     payload = {
         "name": REGISTRY_NAME,
@@ -210,10 +222,110 @@ def test_remote_dispatch_success_returns_result_and_records_health(monkeypatch):
         "args": {"unit": "1"},
         "deadline_ms": 330_000,  # (300 s tunable + 30 s slack) * 1000
         "user": "user-1",
+        # No profile in the registry stub, so nothing is forwarded.
+        "user_email": None,
     }
     # The tunable resolves to a float; the relay's strict schema rejects 330000.0.
     # Caught by the P1 end-to-end run, not by equality (float == int is True).
     assert isinstance(body["deadline_ms"], int)
+
+
+def test_remote_call_forwards_the_resolved_user_email(monkeypatch):
+    monkeypatch.setattr(
+        hub.identity_mgr, "get_user", lambda user_id: {"email": "user-1@corp.example"}
+    )
+    config = make_remote_config()
+    install_fake_health(monkeypatch)
+    requests = install_transport(
+        monkeypatch, json_response(200, {"tool": TOOL, "result": {"ok": True}})
+    )
+
+    run_remote(config, {}, user_id="user-1")
+
+    body = json.loads(requests[0].content)
+    assert body["user"] == "user-1"
+    assert body["user_email"] == "user-1@corp.example"
+
+
+def test_remote_call_in_dev_mode_sends_the_dev_user_email(monkeypatch):
+    monkeypatch.setenv("DEV_MODE", "true")
+    called = []
+    monkeypatch.setattr(
+        hub.identity_mgr, "get_user", lambda user_id: called.append(user_id)
+    )
+    config = make_remote_config()
+    install_fake_health(monkeypatch)
+    requests = install_transport(
+        monkeypatch, json_response(200, {"tool": TOOL, "result": {"ok": True}})
+    )
+
+    run_remote(config, {}, user_id="user-1")
+
+    body = json.loads(requests[0].content)
+    assert body["user_email"] == "dev-user@local.host"
+    # DEV_MODE short-circuits the registry read entirely.
+    assert called == []
+
+
+def test_remote_call_for_a_service_agent_forwards_no_email(monkeypatch):
+    """A service identity has no user profile, so no email is forwarded at all."""
+    called = []
+    monkeypatch.setattr(
+        hub.identity_mgr,
+        "get_user",
+        lambda user_id: called.append(user_id) or None,
+    )
+    config = make_remote_config()
+    install_fake_health(monkeypatch)
+    requests = install_transport(
+        monkeypatch, json_response(200, {"tool": TOOL, "result": {"ok": True}})
+    )
+
+    run_remote(config, {}, user_id="svc_agent_triage")
+
+    body = json.loads(requests[0].content)
+    assert body["user"] == "svc_agent_triage"
+    assert body["user_email"] is None
+    # The lookup was attempted (and found nothing) rather than skipped by DEV_MODE.
+    assert called == ["svc_agent_triage"]
+
+
+def test_remote_call_survives_an_identity_lookup_failure(monkeypatch):
+    """An etcd hiccup costs the call its email, never the call itself."""
+    def boom(user_id):
+        raise RuntimeError("etcd unavailable")
+
+    monkeypatch.setattr(hub.identity_mgr, "get_user", boom)
+    config = make_remote_config()
+    install_fake_health(monkeypatch)
+    requests = install_transport(
+        monkeypatch, json_response(200, {"tool": TOOL, "result": {"ok": True}})
+    )
+
+    result = run_remote(config, {}, user_id="user-1")
+
+    assert result == {"ok": True}
+    assert json.loads(requests[0].content)["user_email"] is None
+
+
+def test_build_tool_env_exports_the_caller_email_for_local_tools(monkeypatch, tmp_path):
+    """The refactor onto resolve_user_email must not drop the local-tool variable."""
+    monkeypatch.setattr(
+        hub.identity_mgr, "get_user", lambda user_id: {"email": "local@corp.example"}
+    )
+    monkeypatch.setattr(
+        hub.identity_mgr, "generate_execution_token", lambda user_id: "token"
+    )
+    monkeypatch.setattr(
+        hub.identity_mgr, "get_config", lambda key, default=None: default
+    )
+    config = ToolConfig(
+        name="echo", description="echo", runtime="python", entrypoint="main.py"
+    )
+
+    env = asyncio.run(hub._build_tool_env(config, tmp_path, "user-1"))
+
+    assert env["TRELLIS_USER_EMAIL"] == "local@corp.example"
 
 
 def test_remote_tool_level_error_is_returned_and_recorded_as_failure(monkeypatch):
@@ -706,3 +818,18 @@ def test_run_remote_actually_retries_a_transient_failure(monkeypatch):
 
     assert result == {"temp": 21}
     assert len(attempts) == 3
+
+
+@pytest.mark.parametrize("url", ["garbage/v1", "http://[::1/v1"])
+def test_remote_dispatch_never_raises_on_a_misconfigured_relay_url(monkeypatch, url):
+    """A bad EDGE_RELAY_URL raises InvalidURL/UnsupportedProtocol, which is not a
+    TransportError: without an explicit clause it escaped into the agent turn."""
+    config = make_remote_config()
+    health = install_fake_health(monkeypatch)
+    monkeypatch.setenv("EDGE_RELAY_URL", url)
+
+    result = run_remote(config, {})
+
+    assert "EDGE_RELAY_URL" in result["error"]
+    assert url in result["error"]
+    assert health[0]["is_success"] is False

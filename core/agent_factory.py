@@ -34,9 +34,11 @@ from core import llm_defaults, llm_factory
 from core.console_backend import SanitizedLocalBackend
 from core.env_sanitize import sanitized_env
 from core.llm_factory import build_model_settings, resolve_model
-from core.models import AgentConfig, MCPConfig, is_agent_external, is_agent_internal
+from core.mcp_schema import normalize_schema_for_provider
+from core.models import AgentConfig, MCPConfig, EDGE_MCP_WILDCARD_RE, is_agent_external, is_agent_internal
 from core.health import HealthMonitor, evaluate_health_status
 from core.discovery import is_agent_configured
+from core.remote_mcp import call_edge_mcp
 from core.tool_search import execute_whitelisted_tool
 from core.tunables import resolve as resolve_tunable
 
@@ -46,6 +48,10 @@ logger = logging.getLogger(__name__)
 _hub_client: Optional[FastMCPClient] = None
 _hub_tools_cache: List[Any] = []
 _external_mcp_tools: Dict[str, List[Any]] = {}
+# Registry key -> (site, mcp) for the servers discovered as edge-exported (a `remote`
+# block). Populated by discover_external_mcps so registration never has to guess an edge
+# server from the shape of its key: a central MCP may be named `a__b` too.
+_external_remote_mcps: Dict[str, tuple[str, str]] = {}
 _last_discovery_time: float = 0
 DISCOVERY_CACHE_TTL = 60 # Cache discovery for 60 seconds
 
@@ -307,13 +313,14 @@ async def get_hub_client() -> FastMCPClient:
     return _hub_client
 
 async def discover_external_mcps(force: bool = False):
-    global _external_mcp_tools, _last_discovery_time
+    global _external_mcp_tools, _external_remote_mcps, _last_discovery_time
     
     now = time.time()
     if not force and (now - _last_discovery_time) < DISCOVERY_CACHE_TTL and _external_mcp_tools:
         return
 
     new_mcp_tools = {}
+    new_remote_mcps: Dict[str, tuple[str, str]] = {}
     identity_mgr = get_identity_manager()
     mcp_names = await asyncio.to_thread(identity_mgr.list_mcps)
     for name in mcp_names:
@@ -321,6 +328,17 @@ async def discover_external_mcps(force: bool = False):
         if not config_data: continue
         try:
             config = MCPConfig(**config_data)
+            if config.remote is not None:
+                # Edge-exported MCP server: the relay publishes its catalog
+                # statically, so there is nothing to connect and no central secret
+                # to resolve (the MCP session and its credentials live on the edge).
+                if not config.tools:
+                    logger.debug(f"Edge MCP '{name}' published no tools; skipping")
+                    continue
+                key = f"{config.remote.site}__{config.remote.mcp}"
+                new_mcp_tools[key] = config.tools
+                new_remote_mcps[key] = (config.remote.site, config.remote.mcp)
+                continue
             if config.tools:
                 new_mcp_tools[name] = config.tools
                 continue
@@ -346,6 +364,7 @@ async def discover_external_mcps(force: bool = False):
             logger.error(f"Failed to discover tools for MCP '{name}': {e}")
             
     _external_mcp_tools = new_mcp_tools
+    _external_remote_mcps = new_remote_mcps
     _last_discovery_time = now
 
 def _register_mcp_tool(agent: Agent, mcp_tool: Any):
@@ -375,7 +394,16 @@ def _register_mcp_tool(agent: Agent, mcp_tool: Any):
     else:
         agent.tool(name=tool_name_for_agent, description=safe_mcp_tool.description)(tool_wrapper)
 
-def _register_external_mcp_tool(agent: Agent, mcp_name: str, mcp_tool: Any, prefixed_name: str = None):
+def _register_external_mcp_tool(
+    agent: Agent, mcp_name: str, mcp_tool: Any, prefixed_name: str = None, provider: str = None
+):
+    """Registers one tool of a central MCP server.
+
+    ``provider`` only affects the JSON schema handed to ``Tool.from_schema`` -- a root
+    ``oneOf``/``anyOf`` is flattened for providers that cannot carry it (see
+    ``core.mcp_schema``). The discovered tool keeps its verbatim schema: the registry
+    and every other catalog still publish what the server declared.
+    """
     safe_mcp_tool = copy.deepcopy(mcp_tool) if hasattr(mcp_tool, "model_copy") else mcp_tool
     tool_name_for_agent = prefixed_name or safe_mcp_tool.name
 
@@ -399,12 +427,132 @@ def _register_external_mcp_tool(agent: Agent, mcp_name: str, mcp_tool: Any, pref
             function=tool_wrapper,
             name=tool_name_for_agent,
             description=safe_mcp_tool.description,
-            json_schema=input_schema,
+            json_schema=normalize_schema_for_provider(provider, input_schema),
             takes_ctx=True
         )
         agent._function_toolset.add_tool(tool_obj)
     else:
         agent.tool(name=tool_name_for_agent, description=safe_mcp_tool.description)(tool_wrapper)
+
+
+def _register_remote_mcp_tool(
+    agent: Agent, site: str, mcp: str, mcp_tool: Any, prefixed_name: str = None, provider: str = None
+):
+    """Registers one tool of an edge-exported MCP server.
+
+    Deliberately never touches ``get_external_mcp_client``/``mcp_client_cache``:
+    the MCP session lives on the edge (keyed per user) and central only POSTs the
+    call to the relay. No health gate either: an edge MCP tool has no per-tool health
+    record, and its readiness is ``discovery._remote_tool_configuration_status`` (is the
+    owning edge connected), which the gateway and `is_tool_configured` both use — so
+    nothing here needs to reset or probe health.
+
+    ``provider`` behaves exactly as in ``_register_external_mcp_tool``: the edge's
+    published catalog stays verbatim, only the provider-facing copy is normalized.
+    """
+    safe_mcp_tool = copy.deepcopy(mcp_tool) if hasattr(mcp_tool, "model_copy") else mcp_tool
+    tool_name_for_agent = prefixed_name or f"mcp__{site}__{mcp}__{safe_mcp_tool.name}"
+
+    async def tool_wrapper(ctx: RunContext[None], **kwargs: Any) -> Any:
+        user_id = user_id_var.get()
+        if not user_id: raise Exception("No user_id found")
+        result = await call_edge_mcp(site, mcp, safe_mcp_tool.name, kwargs, user_id)
+        if isinstance(result, dict) and "error" in result:
+            return f"Tool '{tool_name_for_agent}' returned an error: {result['error']}"
+        return result.get("content") if isinstance(result, dict) else result
+
+    input_schema = getattr(safe_mcp_tool, "inputSchema", None) or getattr(safe_mcp_tool, "input_schema", None)
+    if input_schema:
+        from pydantic_ai.tools import Tool
+        tool_obj = Tool.from_schema(
+            function=tool_wrapper,
+            name=tool_name_for_agent,
+            description=safe_mcp_tool.description,
+            json_schema=normalize_schema_for_provider(provider, input_schema),
+            takes_ctx=True
+        )
+        agent._function_toolset.add_tool(tool_obj)
+    else:
+        agent.tool(name=tool_name_for_agent, description=safe_mcp_tool.description)(tool_wrapper)
+
+
+def _register_mcp_server_tools(agent: Agent, mcp_name: str, tools: List[Any], allowed_mcps: List[str], allowed_tools: List[str], provider: str = None) -> None:
+    """Registers the allowed tools of one discovered MCP server on ``agent``.
+
+    An edge-exported server (``<site>__<mcp>``) always takes the 4-part
+    ``mcp__<site>__<mcp>__<tool>`` name: bare tool names would collide across
+    sites, and 4-part is the only form the gateway can route back.
+
+    Whether a server is edge-exported comes from ``discover_external_mcps``'s own record
+    (``_external_remote_mcps``, keyed off the config's ``remote`` block) — never from
+    ``"__" in mcp_name``, which would also match a central server named ``a__b``.
+
+    ``allowed_mcps`` may also carry the ``<site>__*`` sugar: it grants every tool of every
+    edge server *this site currently exports* — i.e. the ones in the discovery snapshot
+    this rebuild just read. There is no stored expansion, and the match is on the
+    discovered server's own site, so ``dc1__*`` can never reach ``dc10__x`` or a central
+    server (only an edge server has ``edge_parts``).
+
+    ``provider`` is the agent's effective provider; it only reaches the schema handed to
+    ``Tool.from_schema`` (root-union normalization), never the catalogs.
+    """
+    edge_parts = _external_remote_mcps.get(mcp_name)
+    wildcard = f"{edge_parts[0]}__*" if edge_parts else None
+    for tool in tools:
+        prefixed_name = f"mcp__{mcp_name}__{tool.name}"
+        # Register if the entire MCP is allowed (by name or site wildcard), OR if the
+        # specific tool (by prefixed or base name) is allowed.
+        if not (
+            mcp_name in allowed_mcps
+            or (wildcard is not None and wildcard in allowed_mcps)
+            or prefixed_name in allowed_tools
+            or tool.name in allowed_tools
+        ):
+            continue
+        if edge_parts:
+            _register_remote_mcp_tool(agent, edge_parts[0], edge_parts[1], tool, prefixed_name=prefixed_name, provider=provider)
+            continue
+        name_to_use = prefixed_name if (mcp_name not in allowed_mcps and prefixed_name in allowed_tools) else tool.name
+        _register_external_mcp_tool(agent, mcp_name, tool, prefixed_name=name_to_use, provider=provider)
+
+
+def _edge_wildcard_sites(allowed_mcps: List[str]) -> Dict[str, str]:
+    """``{site: entry}`` for the well-formed ``<site>__*`` entries in ``allowed_mcps``.
+
+    A malformed entry (``*``, ``__*``, ``dc1*``, ``dc1__*__x``) is ignored with one
+    debug line: it cannot match a discovered server (the grant compares the whole
+    discovered ``<site>__*`` string), and a typo in an agent config must never fail a
+    build.
+    """
+    sites: Dict[str, str] = {}
+    for entry in allowed_mcps or []:
+        if not isinstance(entry, str) or "*" not in entry:
+            continue
+        if EDGE_MCP_WILDCARD_RE.fullmatch(entry) is None:
+            logger.debug(
+                "Ignoring malformed allowed_mcps wildcard %r (expected '<site>__*')", entry
+            )
+            continue
+        sites[entry[: -len("__*")]] = entry
+    return sites
+
+
+def _log_unmatched_mcp_wildcards(allowed_mcps: List[str]) -> None:
+    """Debug-log ``<site>__*`` entries whose site has no discovered MCP right now.
+
+    Not a warning: an edge that has not dialled in yet is a normal bring-up state, and
+    the same config becomes effective on the next build once it does (the wildcard is
+    expanded per build, never stored).
+    """
+    discovered_sites = {site for site, _mcp in _external_remote_mcps.values()}
+    for site, entry in _edge_wildcard_sites(allowed_mcps).items():
+        if site not in discovered_sites:
+            logger.debug(
+                "allowed_mcps wildcard %r matches no discovered MCPs for site '%s'; "
+                "it grants nothing until that edge connects",
+                entry,
+                site,
+            )
 
 async def build_agent(agent_name: str) -> Agent:
     identity_mgr = get_identity_manager()
@@ -548,13 +696,9 @@ async def build_agent(agent_name: str) -> Agent:
     # 6. External MCP Tools (This is now CACHED globally)
     await discover_external_mcps()
     allowed_mcps = config.allowed_mcps or []
+    _log_unmatched_mcp_wildcards(allowed_mcps)
     for mcp_name, tools in _external_mcp_tools.items():
-        for tool in tools:
-            prefixed_name = f"mcp__{mcp_name}__{tool.name}"
-            # Register if the entire MCP is allowed, OR if the specific tool (by prefixed or base name) is allowed.
-            if mcp_name in allowed_mcps or prefixed_name in allowed_tools or tool.name in allowed_tools:
-                name_to_use = prefixed_name if (mcp_name not in allowed_mcps and prefixed_name in allowed_tools) else tool.name
-                _register_external_mcp_tool(agent, mcp_name, tool, prefixed_name=name_to_use)
+        _register_mcp_server_tools(agent, mcp_name, tools, allowed_mcps, allowed_tools, provider=provider)
 
     # 7. Admin Tools
     if agent_name == "supervisor":
@@ -849,6 +993,7 @@ def _register_admin_tools(agent: Agent):
             is_configured=is_tool_configured,
             get_hub_client_fn=get_hub_client,
             get_external_mcp_client_fn=get_external_mcp_client,
+            call_edge_mcp_fn=call_edge_mcp,
         )
 
     @agent.tool_plain(name="manage_agent", description="Enable, disable or reload an agent.")

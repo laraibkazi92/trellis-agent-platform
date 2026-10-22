@@ -20,10 +20,15 @@ services:
     # Same non-root posture as the central services: tools run as this uid.
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     command: python core/proxy.py --config /etc/trellis/proxy.yaml
-    # Credentials the exported tools need (API keys, service accounts). Keep it mode 0600
-    # and never commit it: none of it is ever sent to the central host. The tunnel token
-    # is deliberately NOT here -- Docker injects secrets as a mounted file, which keeps
-    # the token out of the process environment (and out of /proc/<pid>/environ).
+    # Non-secret runtime settings only (HTTPS_PROXY, SANDBOX_RLIMIT_AS_MB=8192 for Node MCP
+    # servers, ...). Credentials do NOT belong here: the shared store is
+    # `edge-secrets/<tool-or-mcp>.env` and per-user credentials are
+    # `edge-user-secrets/<normalized-email>.env` (both mounted below, mode 0600, written by
+    # `python core/proxy.py user-secrets set <email>`). The process env is only the last
+    # fallback in the resolution chain, for a legacy install that still carries a value
+    # here. The tunnel token is deliberately NOT here either -- Docker injects secrets as a
+    # mounted file, which keeps the token out of the process environment (and out of
+    # /proc/<pid>/environ).
     env_file: .env
     secrets:
       - edge_token
@@ -33,6 +38,21 @@ services:
       # tool writes files -- a read-only mount fails at write time with an opaque
       # sandbox error. Mount it `:ro` only when every tool is read-only.
       - ./workspace:/app/workspace
+      # `mcps_dir` from proxy.yaml: the exported MCP servers' manifests. Already part of
+      # the workspace mount above; listed explicitly because proxy.yaml names this path,
+      # and so a deployment that keeps manifests on a separate volume can replace this
+      # one line and point mcps_dir at /etc/trellis/mcps instead.
+      - ./workspace/mcps:/app/workspace/mcps
+      # `secrets_dir`: one <tool-or-mcp>.env per exported item, holding the edge's
+      # shared service-account credentials. Deliberately OUTSIDE /app/workspace: tool
+      # code runs as this uid and can read whatever the workspace exposes, so a store
+      # inside it would hand every exported tool every other item's secrets.
+      # Create it 0700 and owned by TRELLIS_UID on the host before starting.
+      - ./edge-secrets:/etc/trellis/edge-secrets
+      # `user_secrets_dir`: one <normalized-email>.env per operator, written by
+      # `python core/proxy.py user-secrets set <email>` (mode 0600). Same reason it
+      # must not be inside the workspace.
+      - ./edge-user-secrets:/etc/trellis/edge-user-secrets
       - ./proxy.yaml:/etc/trellis/proxy.yaml:ro
     # PID 1 must reap tool children, same reason as the central hub: a tool that
     # daemonizes would otherwise leave zombies under a long-lived proxy.

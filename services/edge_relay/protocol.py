@@ -20,7 +20,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-PROTO = 1
+PROTO = 2
+# A proto-1 edge is the v0.4 tools-only edge: it degrades cleanly, never gets
+# an MCP call, and the relay keeps publishing its tool catalog exactly as before.
+SUPPORTED_PROTOS = frozenset({1, 2})
 SUBPROTOCOL = "trellis.edge.v1"
 
 # WebSocket close codes (4000-4999 is the application-private range).
@@ -37,6 +40,14 @@ MAX_TOOLS = 200
 MAX_TOOL_NAME = 64
 MAX_INFLIGHT = 16
 MAX_DEADLINE_MS = 3_600_000
+# MCP catalogs ride the same hello frame, so every cap here is also bounded by
+# MAX_FRAME_BYTES. The reference workload is ~92 KB total / ~26 KB per schema.
+MAX_MCPS = 50
+MAX_MCP_TOOLS_PER_SERVER = 256
+MAX_MCP_SCHEMA_BYTES = 131_072
+MAX_MCP_DESC_CHARS = 8_192
+# RFC 5321 caps a forward path at 256 bytes including the angle brackets.
+MAX_USER_EMAIL_CHARS = 254
 # Slightly above the hub's default tool timeout (300 s) so the edge's own,
 # structured timeout wins the race and the caller gets the tool's error instead
 # of a bare relay 504.
@@ -54,6 +65,11 @@ EDGE_FRAMES = frozenset({"hello", "result", "ping"})
 RELAY_FRAMES = frozenset({"welcome", "call", "ping", "catalog", "drain"})
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+# hello.caps: what the edge can serve. Tools-only is the v0.4 default.
+SUPPORTED_CAPS = frozenset({"tools", "mcp"})
+# mcp.yaml transports the relay is willing to store; the edge owns the actual client.
+SUPPORTED_MCP_TRANSPORTS = frozenset({"stdio", "http", "streamable-http", "sse"})
 
 
 def _check_namespace(name: str, what: str) -> None:
@@ -190,16 +206,185 @@ def validate_tools(raw_tools: Any) -> List[EdgeTool]:
     return tools
 
 
-def validate_hello(frame: Dict[str, Any]) -> Tuple[int, str, List[EdgeTool]]:
+@dataclass(frozen=True)
+class EdgeMcpTool:
+    """One tool of an edge-exported MCP server.
+
+    ``input_schema`` is the MCP server's own JSON Schema, carried **verbatim**
+    (root-level ``oneOf``/``anyOf``/``$ref`` included): the wire catalog, the
+    registry and the agent-facing tool must all see the same bytes.
+    """
+
+    name: str
+    description: str = ""
+    input_schema: Dict[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "inputSchema": self.input_schema,
+        }
+
+
+@dataclass(frozen=True)
+class EdgeMcp:
+    """An MCP server an edge exports. ``transport`` is the edge's, not the relay's."""
+
+    name: str
+    transport: str = "stdio"
+    tools: List[EdgeMcpTool] = field(default_factory=list)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "transport": self.transport,
+            "tools": [tool.as_dict() for tool in self.tools],
+        }
+
+
+def _validate_mcp_schema(tool: str, raw: Any) -> Dict[str, Any]:
+    """Size-check an input schema without touching it.
+
+    No key cleaning and no truncation: a flattened or re-typed schema silently
+    changes what the model is allowed to send (L6).
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ProtocolError(f"mcp tool {tool!r} inputSchema must be an object")
+    if (
+        len(json.dumps(raw, separators=(",", ":")).encode("utf-8"))
+        > MAX_MCP_SCHEMA_BYTES
+    ):
+        raise ProtocolError(
+            f"mcp tool {tool!r} inputSchema exceeds {MAX_MCP_SCHEMA_BYTES} bytes"
+        )
+    return raw
+
+
+def _validate_mcp_tools(server: str, raw_tools: Any) -> List[EdgeMcpTool]:
+    if raw_tools in (None, []):
+        return []
+    if not isinstance(raw_tools, list):
+        raise ProtocolError(f"mcp {server!r} tools must be a list")
+    if len(raw_tools) > MAX_MCP_TOOLS_PER_SERVER:
+        raise ProtocolError(
+            f"mcp {server!r} exceeds {MAX_MCP_TOOLS_PER_SERVER} tools"
+        )
+
+    tools: List[EdgeMcpTool] = []
+    seen = set()
+    for raw in raw_tools:
+        if not isinstance(raw, dict):
+            raise ProtocolError("mcp tool entries must be objects")
+        name = raw.get("name")
+        if not isinstance(name, str) or not NAME_RE.match(name):
+            raise ProtocolError(f"invalid mcp tool name: {name!r}")
+        _check_namespace(name, "mcp tool name")
+        if name in seen:
+            raise ProtocolError(f"duplicate mcp tool name: {name}")
+        seen.add(name)
+        description = raw.get("description") or ""
+        if not isinstance(description, str):
+            raise ProtocolError(f"mcp tool {name!r} description must be a string")
+        tools.append(
+            EdgeMcpTool(
+                name=name,
+                # Truncated, not rejected: a long description costs an integer's
+                # worth of tokens in every prompt, and refusal would drop the
+                # whole server from the catalog.
+                description=description[:MAX_MCP_DESC_CHARS],
+                input_schema=_validate_mcp_schema(name, raw.get("inputSchema")),
+            )
+        )
+    return tools
+
+
+def validate_mcps(raw_mcps: Any) -> List[EdgeMcp]:
+    """Validate an edge's MCP catalog. Names must be unique and namespace-safe."""
+    if raw_mcps in (None, []):
+        return []
+    if not isinstance(raw_mcps, list):
+        raise ProtocolError("hello.mcps must be a list")
+    if len(raw_mcps) > MAX_MCPS:
+        raise ProtocolError(f"hello.mcps exceeds {MAX_MCPS} servers")
+
+    mcps: List[EdgeMcp] = []
+    seen = set()
+    for raw in raw_mcps:
+        if not isinstance(raw, dict):
+            raise ProtocolError("mcp entries must be objects")
+        name = raw.get("name")
+        if not isinstance(name, str) or not NAME_RE.match(name):
+            raise ProtocolError(f"invalid mcp name: {name!r}")
+        _check_namespace(name, "mcp name")
+        if name in seen:
+            raise ProtocolError(f"duplicate mcp name: {name}")
+        seen.add(name)
+        transport = raw.get("transport", "stdio")
+        if transport is None:
+            transport = "stdio"
+        if transport not in SUPPORTED_MCP_TRANSPORTS:
+            raise ProtocolError(
+                f"mcp {name!r} has unsupported transport {transport!r}"
+            )
+        mcps.append(
+            EdgeMcp(
+                name=name,
+                transport=transport,
+                tools=_validate_mcp_tools(name, raw.get("tools")),
+            )
+        )
+    return mcps
+
+
+def _validate_caps(raw: Any) -> List[str]:
+    """Parse ``hello.caps``; absent means the v0.4 tools-only edge."""
+    if raw is None:
+        return ["tools"]
+    if not isinstance(raw, list):
+        raise ProtocolError("hello.caps must be a list")
+    caps: List[str] = []
+    for cap in raw:
+        if not isinstance(cap, str) or cap not in SUPPORTED_CAPS:
+            raise ProtocolError(f"unknown capability: {cap!r}")
+        if cap in caps:
+            raise ProtocolError(f"duplicate capability: {cap}")
+        caps.append(cap)
+    return caps
+
+
+def validate_hello(
+    frame: Dict[str, Any],
+) -> Tuple[int, str, List[EdgeTool], List[EdgeMcp], List[str]]:
+    """Parse a hello frame, returning ``(proto, version, tools, mcps, caps)``.
+
+    ``proto`` is the peer's actual version (1 or 2), not the module default, so
+    callers can key behaviour on what the edge speaks rather than on what this
+    relay prefers.
+    """
     proto = frame.get("proto")
-    if proto != PROTO:
+    # bool is an int subclass: a JSON ``true`` must not read as proto 1.
+    if (
+        isinstance(proto, bool)
+        or not isinstance(proto, int)
+        or proto not in SUPPORTED_PROTOS
+    ):
         raise ProtocolError(
             f"protocol mismatch: peer={proto!r} relay={PROTO}", CLOSE_VERSION
         )
     version = frame.get("edge_version") or ""
     if not isinstance(version, str):
         raise ProtocolError("edge_version must be a string")
-    return PROTO, version[:64], validate_tools(frame.get("tools"))
+    caps = _validate_caps(frame.get("caps"))
+    raw_mcps = frame.get("mcps")
+    if "mcp" not in caps and raw_mcps:
+        # An edge that publishes catalogs it did not claim is not understood by
+        # this relay; refusing beats silently dropping them.
+        raise ProtocolError("hello.mcps requires the 'mcp' capability")
+    mcps = validate_mcps(raw_mcps) if "mcp" in caps else []
+    return proto, version[:64], validate_tools(frame.get("tools")), mcps, caps
 
 
 def validate_call(frame: Dict[str, Any]) -> Dict[str, Any]:
@@ -207,10 +392,25 @@ def validate_call(frame: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(call_id, str) or not call_id or len(call_id) > 128:
         raise ProtocolError("call.id must be a non-empty string")
 
+    # Absent means a v0.4 tool call: the frame shape predates MCP routing.
+    kind = frame.get("kind") or "tool"
+    if kind not in ("tool", "mcp"):
+        raise ProtocolError(f"invalid call.kind: {kind!r}")
+
+    mcp: Optional[str] = None
+    if kind == "mcp":
+        mcp = frame.get("mcp")
+        if not isinstance(mcp, str) or not NAME_RE.match(mcp):
+            raise ProtocolError(f"invalid call.mcp: {mcp!r}")
+        _check_namespace(mcp, "call.mcp")
+
     tool = frame.get("tool")
     if not isinstance(tool, str) or not NAME_RE.match(tool):
         raise ProtocolError(f"invalid call.tool: {tool!r}")
 
+    # object + size only. MCP arguments are validated by the target server (its
+    # schemas are discriminated unions); coercing here would rewrite the caller's
+    # payload and rejecting unknown keys would break every union branch.
     args = frame.get("args") or {}
     if not isinstance(args, dict):
         raise ProtocolError("call.args must be an object")
@@ -226,12 +426,28 @@ def validate_call(frame: Dict[str, Any]) -> Dict[str, Any]:
     if user is not None and not isinstance(user, str):
         raise ProtocolError("call.user must be a string or null")
 
+    user_email = frame.get("user_email")
+    if user_email is not None:
+        if not isinstance(user_email, str):
+            raise ProtocolError("call.user_email must be a string or null")
+        if len(user_email) > MAX_USER_EMAIL_CHARS:
+            raise ProtocolError(
+                f"call.user_email exceeds {MAX_USER_EMAIL_CHARS} characters"
+            )
+        # The email is forwarded verbatim to the edge's tool subprocess, so a
+        # newline or NUL must not get in.
+        if any(ord(char) < 32 for char in user_email):
+            raise ProtocolError("call.user_email must not contain control characters")
+
     return {
         "id": call_id,
+        "kind": kind,
+        "mcp": mcp,
         "tool": tool,
         "args": args,
         "deadline_ms": deadline,
         "user": user,
+        "user_email": user_email,
     }
 
 

@@ -17,6 +17,7 @@ from fastmcp import FastMCP
 from starlette.responses import JSONResponse
 from core.models import ToolConfig
 from core.auth import get_identity_manager
+from core.caller_identity import resolve_user_email
 from core.env_sanitize import sanitized_env
 from core.devmode import enforce_dev_mode_safety
 from core import sandbox_preflight
@@ -223,12 +224,9 @@ async def _build_tool_env(config: ToolConfig, tool_dir: Path, user_id: Optional[
         env["FRAMEWORK_API_URL"] = framework_url
 
         # Auto-inject user identity (email)
-        if os.getenv("DEV_MODE", "false").lower() == "true":
-            env["TRELLIS_USER_EMAIL"] = os.getenv("DEV_USER_EMAIL", "dev-user@local.host")
-        else:
-            user_profile = await asyncio.to_thread(identity_mgr.get_user, user_id)
-            if user_profile and user_profile.get("email"):
-                env["TRELLIS_USER_EMAIL"] = user_profile["email"]
+        user_email = await resolve_user_email(identity_mgr, user_id)
+        if user_email:
+            env["TRELLIS_USER_EMAIL"] = user_email
 
     return env
 
@@ -333,6 +331,15 @@ async def _run_remote(config: ToolConfig, arguments: Dict[str, Any], user_id: Op
         except Exception as exc:
             logger.warning(f"Failed to record health for remote tool {config.name}: {exc}")
 
+    # Resolved before the request so a slow (or failing) registry read cannot eat
+    # into the call's timeout budget. Fail-open: an identity lookup hiccup costs
+    # this call its email, not the call itself.
+    try:
+        user_email = await resolve_user_email(identity_mgr, user_id)
+    except Exception as exc:
+        logger.warning(f"Could not resolve the caller email for remote tool {config.name}: {exc}")
+        user_email = None
+
     try:
         async with _remote_client(timeout_seconds + 35) as client:
             response = await client.post(
@@ -342,6 +349,7 @@ async def _run_remote(config: ToolConfig, arguments: Dict[str, Any], user_id: Op
                     "args": arguments,
                     "deadline_ms": deadline_ms,
                     "user": user_id,
+                    "user_email": user_email,
                 },
             )
     except httpx.TimeoutException as exc:
@@ -368,10 +376,28 @@ async def _run_remote(config: ToolConfig, arguments: Dict[str, Any], user_id: Op
             raise TransientToolError(message)
         await record_health(False, message)
         return {"error": message}
+    except (httpx.InvalidURL, httpx.UnsupportedProtocol) as exc:
+        # A broken EDGE_RELAY_URL is a central config error, not a lost edge: nothing was
+        # sent, so it is never transient and the message must name the cause.
+        message = (
+            f"Tool '{config.name}' could not be dispatched: the edge relay URL "
+            f"'{_relay_url()}' is unusable ({type(exc).__name__}: {exc}). Check EDGE_RELAY_URL."
+        )
+        await record_health(False, message)
+        return {"error": message}
     except httpx.TransportError as exc:
         message = (
             f"Tool '{config.name}' lost its connection to edge '{site}' mid-call "
             f"({type(exc).__name__}). It may already have run on the edge."
+        )
+        await record_health(False, message)
+        return {"error": message}
+    except httpx.HTTPError as exc:
+        # Anything else httpx can raise on the way out (redirect loop, decoding, ...).
+        # Never let it escape into an agent turn as a bare traceback.
+        message = (
+            f"Tool '{config.name}' could not be dispatched to edge '{site}' "
+            f"({type(exc).__name__}: {exc}). Check the relay at '{_relay_url()}'."
         )
         await record_health(False, message)
         return {"error": message}

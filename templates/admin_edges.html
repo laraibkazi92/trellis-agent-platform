@@ -119,6 +119,12 @@
                 {% if edge.edge_version %}
                 <span class="font-mono text-[10px] font-bold bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400 px-2 py-0.5 rounded border border-neutral-200 dark:border-neutral-700 uppercase">v{{ edge.edge_version }}</span>
                 {% endif %}
+                {% if edge.proto is not none %}
+                <span class="font-mono text-[10px] font-bold border border-neutral-200 dark:border-neutral-700 text-neutral-500 dark:text-neutral-400 px-1.5 py-0.5 uppercase tracking-widest">proto {{ edge.proto }}</span>
+                {% endif %}
+                {% for cap in edge.caps %}
+                <span class="font-mono text-[10px] font-bold px-1.5 py-0.5 uppercase tracking-widest border {% if cap == 'mcp' %}border-accent text-accent dark:border-accent-dark dark:text-accent-dark{% else %}border-neutral-200 dark:border-neutral-700 text-neutral-500 dark:text-neutral-400{% endif %}">{{ cap }}</span>
+                {% endfor %}
             </div>
 
             <div class="p-5 space-y-4">
@@ -126,6 +132,10 @@
                     <div>
                         <dt class="text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Tools</dt>
                         <dd class="mt-1 text-neutral-900 dark:text-neutral-100 font-bold">{{ edge.tools | length }}</dd>
+                    </div>
+                    <div>
+                        <dt class="text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">MCPs</dt>
+                        <dd class="mt-1 text-neutral-900 dark:text-neutral-100 font-bold">{{ edge.mcps | length }}</dd>
                     </div>
                     <div>
                         <dt class="text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Token</dt>
@@ -148,6 +158,34 @@
                     {% endfor %}
                 </div>
                 {% endif %}
+
+                <div class="space-y-2">
+                    <h3 class="font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">MCP servers exported</h3>
+                    {% if edge.mcps %}
+                    <div class="overflow-x-auto border border-neutral-200 dark:border-neutral-800 rounded">
+                        <table class="w-full text-left font-mono text-xs">
+                            <thead class="bg-neutral-50 dark:bg-neutral-950 text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">
+                                <tr>
+                                    <th scope="col" class="px-3 py-2 font-normal">Name</th>
+                                    <th scope="col" class="px-3 py-2 font-normal">Tools</th>
+                                    <th scope="col" class="px-3 py-2 font-normal">Transport</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-neutral-200 dark:divide-neutral-800">
+                                {% for mcp in edge.mcps %}
+                                <tr>
+                                    <td class="px-3 py-2 text-neutral-900 dark:text-neutral-100 break-all">{{ mcp.name }}</td>
+                                    <td class="px-3 py-2 text-neutral-700 dark:text-neutral-300">{{ mcp.tools }}</td>
+                                    <td class="px-3 py-2 text-neutral-700 dark:text-neutral-300">{% if mcp.transport %}{{ mcp.transport }}{% else %}&mdash;{% endif %}</td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                    {% else %}
+                    <p class="font-mono text-xs text-neutral-400 dark:text-neutral-500">no MCPs exported</p>
+                    {% endif %}
+                </div>
 
                 {% if edge.last_error %}
                 <div class="flex items-start gap-2 border border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-900/10 px-3 py-2">

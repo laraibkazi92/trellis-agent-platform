@@ -16,7 +16,7 @@ from typing import List, Dict, Any, Optional
 
 from core.auth import get_identity_manager
 from core.embeddings import embed_text, cosine
-from core.discovery import is_tool_configured
+from core.discovery import is_tool_configured, resolve_edge_mcp_target
 from core.tunables import resolve as resolve_tunable
 
 logger = logging.getLogger(__name__)
@@ -207,14 +207,27 @@ async def is_tool_publicly_whitelisted(tool_name: str, identity_manager: Optiona
     Fails closed on anything unexpected (unknown tool, malformed `mcp__` name, non-`True`
     `public` value, non-list `public_tools`) — mirrors the secure-by-default checks
     already applied in `is_tool_configured`/`search_tools`.
+
+    MCP tool names resolve through ``resolve_edge_mcp_target``: a name is an
+    edge-exported server only when its ``<site>__<mcp>`` key is a registered config with
+    a ``remote`` block; every other ``mcp__`` name is a central server. That keeps
+    ``mcp__srv__do__thing`` (central server ``srv``, tool ``do__thing``) working exactly
+    as before instead of being denied as an edge name.
+
+    Anything malformed (too few parts, missing server) fails closed.
     """
     mgr = identity_manager or identity_mgr
     if tool_name.startswith("mcp__"):
-        parts = tool_name.split("__", 2)
-        if len(parts) != 3:
-            return False
-        _, server_name, sub_tool_name = parts
-        config = await asyncio.to_thread(mgr.get_mcp_config, server_name)
+        target = await resolve_edge_mcp_target(tool_name, mgr)
+        if target:
+            server_key = f"{target[0]}__{target[1]}"
+            sub_tool_name = target[2]
+        else:
+            parts = tool_name.split("__", 2)
+            if len(parts) < 3 or not parts[1]:
+                return False
+            _, server_key, sub_tool_name = parts
+        config = await asyncio.to_thread(mgr.get_mcp_config, server_key)
         if not config:
             return False
         public_tools_raw = config.get("public_tools", [])
@@ -227,6 +240,27 @@ async def is_tool_publicly_whitelisted(tool_name: str, identity_manager: Optiona
     return config.get("public") is True
 
 
+def _edge_tool_output(result: Any) -> Any:
+    """Map ``call_edge_mcp``'s hub-shaped dict onto the raw value a direct caller
+    expects, mirroring :func:`extract_tool_output` (structured value > content text).
+    """
+    if not isinstance(result, dict):
+        return result
+    if "error" in result:
+        return f"SYSTEM: {result['error']}"
+    structured = result.get("structuredContent")
+    if structured is not None:
+        return structured
+    texts = [
+        block["text"]
+        for block in (result.get("content") or [])
+        if isinstance(block, dict) and isinstance(block.get("text"), str)
+    ]
+    if texts:
+        return "\n".join(texts)
+    return None
+
+
 async def execute_whitelisted_tool(
     tool_name: str,
     arguments: Dict[str, Any],
@@ -236,13 +270,15 @@ async def execute_whitelisted_tool(
     is_configured=is_tool_configured,
     get_hub_client_fn=None,
     get_external_mcp_client_fn=None,
+    call_edge_mcp_fn=None,
 ) -> Any:
     """Shared use_tool execution flow: whitelist check -> configuration check -> dispatch -> output extraction.
 
     Returns the raw structured tool output, or a 'SYSTEM: ...' error string. Callers inject
-    their own module-level seams (`is_configured`, hub/external client getters) so existing
-    monkeypatch targets keep working; `identity_manager` defaults to this module's
-    `identity_mgr` (the `is_configured` default binds this module's name at def time).
+    their own module-level seams (`is_configured`, hub/external client getters, the edge
+    MCP caller) so existing monkeypatch targets keep working; `identity_manager` defaults
+    to this module's `identity_mgr` (the `is_configured` default binds this module's name
+    at def time).
     """
     mgr = identity_manager or identity_mgr
 
@@ -267,8 +303,16 @@ async def execute_whitelisted_tool(
         missing_text = ", ".join(missing) if missing else "required configuration"
         return f"SYSTEM: Tool '{tool_name}' requires configuration before it can be used. Missing: {missing_text}. Configure at /configuration"
 
+    edge_parts: Optional[tuple] = None
     try:
-        if tool_name.startswith("mcp__"):
+        edge_parts = await resolve_edge_mcp_target(tool_name, mgr)
+        if edge_parts:
+            if call_edge_mcp_fn is None:
+                logger.error("Edge MCP tool %r dispatched without an edge caller seam", tool_name)
+                return f"SYSTEM: Error executing tool '{tool_name}'. Please try again later."
+            site, mcp_name, sub_tool_name = edge_parts
+            result = await call_edge_mcp_fn(site, mcp_name, sub_tool_name, arguments, user_id)
+        elif tool_name.startswith("mcp__"):
             _, server_name, sub_tool_name = tool_name.split("__", 2)
             client = await get_external_mcp_client_fn(server_name, user_id)
             result = await client.call_tool(sub_tool_name, arguments, raise_on_error=False)
@@ -280,7 +324,7 @@ async def execute_whitelisted_tool(
         return f"SYSTEM: Error executing tool '{tool_name}'. Please try again later."
 
     try:
-        return extract_tool_output(result)
+        return _edge_tool_output(result) if edge_parts else extract_tool_output(result)
     except Exception as e:
         logger.error("Error extracting output for tool %r: %s", tool_name, e, exc_info=True)
         return f"SYSTEM: Error executing tool '{tool_name}'. Please try again later."

@@ -60,6 +60,7 @@ def record(
     *,
     site: str,
     outcome: str,
+    mcp: Optional[str] = None,
     tool: Optional[str] = None,
     call_id: Optional[str] = None,
     user: Optional[str] = None,
@@ -74,6 +75,8 @@ def record(
         "site": site,
         "outcome": outcome,
     }
+    if mcp is not None:
+        entry["mcp"] = mcp
     if tool is not None:
         entry["tool"] = tool
     if call_id is not None:

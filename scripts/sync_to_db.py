@@ -15,7 +15,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.auth import IdentityManager
 from core.embeddings import embed_text
-from core.models import coerce_bool_flag, AgentRule, GlobalRule, RoutingRulesConfig
+from core.models import (
+    BACKGROUND_AGENT_TYPES,
+    EDGE_MCP_REF_RE,
+    EDGE_MCP_TOOL_REF_RE,
+    EDGE_MCP_WILDCARD_RE,
+    coerce_bool_flag,
+    AgentRule,
+    GlobalRule,
+    RoutingRulesConfig,
+)
 from core.tool_index import delete_tool, index_tool
 
 BASE_DIR = Path(__file__).parent.parent
@@ -51,7 +60,81 @@ MCP_DISCOVERY_TIMEOUT_SECONDS = 20
 # Supervisor is an internal core agent
 SUPERVISOR_DIR = BASE_DIR / "core" / "assets" / "supervisor"
 
-def sync_agent(identity_mgr, agent_dir, name=None, default_type=None):
+def _edge_ref_kind(entry):
+    """``("site"|"mcp"|"pair", key)`` when ``entry`` names an edge resource, else ``None``.
+
+    ``site`` is a ``<site>__*`` wildcard (any MCP that site exports), ``mcp`` is the
+    registry key behind a 4-part ``mcp__<site>__<mcp>__<tool>`` name, and ``pair`` is a
+    2-part ``<site>__<name>`` -- which is an edge MCP *or* an edge tool, so the registry
+    decides. Everything central (a bare tool name, a 3-part ``mcp__<server>__<tool>``)
+    returns ``None``: sync must stay silent about references it cannot judge.
+    """
+    if not isinstance(entry, str):
+        return None
+    if EDGE_MCP_WILDCARD_RE.fullmatch(entry):
+        return "site", entry[: -len("__*")]
+    if EDGE_MCP_TOOL_REF_RE.fullmatch(entry):
+        _prefix, site, mcp, _tool = entry.split("__", 3)
+        return "mcp", f"{site}__{mcp}"
+    if EDGE_MCP_REF_RE.fullmatch(entry):
+        # `core.models.EDGE_TOOL_REF_RE` is the same pattern -- same `<site>__<name>`
+        # shape and segment language, just a different registry prefix -- so one match
+        # decides both readings.
+        return "pair", entry
+    return None
+
+
+def _edge_refs_of(name, config):
+    """Edge references an agent/workflow declares, as warning-ready tuples.
+
+    Scanned while the config is being synced (before the registry is authoritative),
+    but only *resolved* after the MCP pass -- a reference to an MCP defined in this
+    same workspace must not warn just because this is the first run that persists it.
+    """
+    label = "workflow" if config.get("type") in BACKGROUND_AGENT_TYPES else "agent"
+    refs = []
+    seen = set()
+    for entry in list(config.get("allowed_mcps") or []) + list(config.get("allowed_tools") or []):
+        if not isinstance(entry, str) or entry in seen:
+            continue
+        seen.add(entry)
+        found = _edge_ref_kind(entry)
+        if found:
+            refs.append((label, name, entry, found[0], found[1]))
+    return refs
+
+
+def _warn_unresolved_edge_refs(refs, known_mcps, known_tools):
+    """One ``WARNING`` per edge reference the registry cannot resolve yet; never fails.
+
+    An edge that has not dialled in yet (or whose catalog the relay has not published
+    yet) is a normal bring-up state: the same manifest starts working the moment it
+    connects, because the reference is resolved at runtime, not at sync time. So this
+    is a warning rather than an error, and neither the exit code nor the prune pass is
+    affected.
+
+    ``known_mcps`` maps every registered MCP name to its config. A 4-part name also
+    resolves when its *central* reading does (a central server whose tool name contains
+    ``__`` produces the same shape -- see ``discovery.resolve_edge_mcp_target``), so this
+    check never second-guesses the runtime's registry-first split.
+    """
+    for label, name, entry, kind, key in refs:
+        if kind == "site":
+            resolved = any(mcp.startswith(f"{key}__") for mcp in known_mcps)
+        elif kind == "mcp":
+            resolved = key in known_mcps or key.split("__", 1)[0] in known_mcps
+        else:
+            resolved = key in known_mcps or key in known_tools
+        if resolved:
+            continue
+        print(
+            f"  WARNING: {label} '{name}' references edge resource '{entry}', which has no "
+            "registry entry yet — edge not connected / catalog not published yet. "
+            "The reference starts working once that edge connects; the sync continues."
+        )
+
+
+def sync_agent(identity_mgr, agent_dir, name=None, default_type=None, edge_refs=None):
     if not name:
         name = agent_dir.name
         
@@ -88,6 +171,9 @@ def sync_agent(identity_mgr, agent_dir, name=None, default_type=None):
 
         config["external"] = coerce_bool_flag(config.get("external"), True)
         config["internal"] = coerce_bool_flag(config.get("internal"), True)
+
+        if edge_refs is not None:
+            edge_refs.extend(_edge_refs_of(name, config))
 
         # Validate declarative routing rules before persisting; drop the raw
         # value rather than crash the whole sync if a config.yaml is malformed.
@@ -211,6 +297,15 @@ def sync_mcp(identity_mgr, config):
     unchanged and embeddings are simply skipped.
     """
     name = config["name"]
+    if "__" in name:
+        # `mcp__<server>__<tool>` has to split unambiguously, and `<site>__<mcp>` keys
+        # belong to the edge relay. Warn and skip: one bad directory must not abort the
+        # whole sync (nor poison the registry with an unsplittable key).
+        print(
+            f"  Skipping MCP '{name}': its name may not contain '__' "
+            f"(reserved for edge '<site>__<mcp>' registry keys)."
+        )
+        return
 
     if not config.get("tools"):
         discovered = _discover_mcp_tools(config)
@@ -307,18 +402,25 @@ def main(argv=None):
     # fail-closed, exactly like an unreadable edge config should be.
     existing_tool_configs = identity_mgr._get_all_configs_by_prefix("/registry/tools/")
     existing_tools = set(existing_tool_configs)
-    existing_mcps = set(identity_mgr._get_all_configs_by_prefix("/registry/mcps/").keys())
+    # Same reason as tools: the prune needs `managed_by` to tell a workspace MCP from
+    # one the edge relay published for a `<site>__<mcp>` that never exists on disk.
+    existing_mcp_configs = identity_mgr._get_all_configs_by_prefix("/registry/mcps/")
+    existing_mcps = set(existing_mcp_configs)
     
     seen_agents = set()
     seen_tools = set()
     seen_mcps = set()
+    # Edge references are collected per agent/workflow during the sync and resolved
+    # after the MCP pass -- one prefix read per run, and no false warning for an MCP
+    # this very run is about to persist for the first time.
+    edge_refs = []
     
     print("Syncing agents to etcd...")
     if AGENTS_DIR.exists():
         for agent_dir in AGENTS_DIR.iterdir():
             if not agent_dir.is_dir() or agent_dir.name == "supervisor":
                 continue
-            name = sync_agent(identity_mgr, agent_dir, default_type="user_agent")
+            name = sync_agent(identity_mgr, agent_dir, default_type="user_agent", edge_refs=edge_refs)
             if name:
                 seen_agents.add(name)
                 
@@ -327,7 +429,7 @@ def main(argv=None):
         for agent_dir in WORKFLOWS_DIR.iterdir():
             if not agent_dir.is_dir():
                 continue
-            name = sync_agent(identity_mgr, agent_dir, default_type="background_agent")
+            name = sync_agent(identity_mgr, agent_dir, default_type="background_agent", edge_refs=edge_refs)
             if name:
                 seen_agents.add(name)
     
@@ -411,6 +513,13 @@ def main(argv=None):
                 sync_mcp(identity_mgr, config)
                 seen_mcps.add(config["name"])
 
+    # Edge references that still resolve to nothing: warn (the edge is not connected
+    # yet, so the relay has published no catalog). Runs after the MCP pass because a
+    # reference may name an MCP from this same workspace.
+    known_mcps = dict(existing_mcp_configs)
+    known_mcps.update({name: {} for name in seen_mcps})
+    _warn_unresolved_edge_refs(edge_refs, known_mcps, existing_tools | seen_tools)
+
     # 2. Prune obsolete items
     #
     # Guard first: refuse when sync saw NOTHING anywhere in the workspace while the
@@ -447,11 +556,11 @@ def main(argv=None):
 
     print("\nPruning obsolete entries from etcd...")
 
-    # Ownership: the edge relay is the sole writer of `<site>__<tool>` entries and
-    # marks them `managed_by: edge-relay`. They never exist on the central disk, so
-    # without this carve-out every rebuild would delete every remote tool. The
-    # carve-out deliberately ignores --force-prune: that flag bypasses the
-    # wiped-workspace guard, never ownership.
+    # Ownership: the edge relay is the sole writer of `<site>__<tool>` and
+    # `<site>__<mcp>` entries and marks them `managed_by: edge-relay`. They never exist
+    # on the central disk, so without this carve-out every rebuild would delete every
+    # remote tool and exported MCP server. The carve-out deliberately ignores
+    # --force-prune: that flag bypasses the wiped-workspace guard, never ownership.
     protected_tools = {
         tool
         for tool, config in existing_tool_configs.items()
@@ -461,6 +570,17 @@ def main(argv=None):
         print(
             f"  Keeping {len(protected_tools)} edge-managed tool(s): "
             f"{', '.join(sorted(protected_tools))}"
+        )
+
+    protected_mcps = {
+        mcp
+        for mcp, config in existing_mcp_configs.items()
+        if config.get("managed_by") == "edge-relay"
+    }
+    if protected_mcps:
+        print(
+            f"  Keeping {len(protected_mcps)} edge-managed MCP(s): "
+            f"{', '.join(sorted(protected_mcps))}"
         )
 
     for agent in existing_agents - seen_agents:
@@ -473,7 +593,7 @@ def main(argv=None):
         print(f"  Deleting obsolete tool: {tool}")
         delete_tool(identity_mgr, tool)
 
-    prune_obsolete_mcps(identity_mgr, existing_mcps, seen_mcps)
+    prune_obsolete_mcps(identity_mgr, existing_mcps - protected_mcps, seen_mcps)
 
     print("\nSync complete.")
     return 0

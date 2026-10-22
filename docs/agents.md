@@ -185,7 +185,7 @@ Both fields can also be set in the admin agent editor.
 
 **`allowed_tools`**: Must exactly match the `name` field in each tool's `tool.yaml`. The hub exposes only listed tools to this agent. Built-in console tools (`ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `execute`) can also be listed. Long-lived background shells (`run_in_background`, `read_output`, `kill_shell`, `list_shells`) are **not** available: their spawn path cannot be env-sanitized, so they are disabled to keep the host's bootstrap secrets out of agent-run commands.
 
-**`allowed_mcps`**: Must exactly match the `name` in each `mcp.yaml`. All tools from that MCP server become available to the agent. Tool names are prefixed `mcp__{mcp_name}__{tool_name}` internally.
+**`allowed_mcps`**: Must exactly match the `name` in each `mcp.yaml`. All tools from that MCP server become available to the agent. Tool names are prefixed `mcp__{mcp_name}__{tool_name}` internally. Edge-exported servers use the reference forms instead (`<site>__<mcp>`, plus `<site>__*` for every server that site publishes) — see [mcp.md → Reference forms](mcp.md#reference-forms-public-manifest-api).
 
 **`a2a_access`**: Enables Agent-to-Agent delegation. The agent can call listed agents as sub-tasks (as if calling a tool). Targets must be `internal: true` (the default) — delegation to agents marked `internal: false` is skipped at build time with a warning. Keep this list small and intentional — the supervisor does not use `a2a_access`; it discovers and delegates dynamically via `search_agents` + `delegate`.
 

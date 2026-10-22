@@ -57,6 +57,7 @@ class FakeEdgeRegistry:
     def __init__(self):
         self.client = _EmptyPrefixClient()
         self.tools = {}
+        self.mcps = {}
         self.statuses = {}
 
     def get_edge_config(self, site):
@@ -64,6 +65,9 @@ class FakeEdgeRegistry:
 
     def save_tool_config(self, name, config):
         self.tools[name] = dict(config)
+
+    def save_mcp_config(self, name, config):
+        self.mcps[name] = dict(config)
 
     def save_edge_status(self, site, status):
         self.statuses[site] = dict(status)
@@ -133,10 +137,36 @@ def _clean_relay():
     app_module.relay.sites.clear()
 
 
-def _install_conn(site="site-a", tools=None):
-    conn = EdgeConn(FakeWebSocket(), site, tools or {"echo": _tool()})
+def _install_conn(site="site-a", tools=None, mcps=None, caps=None):
+    if caps is None and mcps:
+        caps = ["tools", "mcp"]
+    conn = EdgeConn(
+        FakeWebSocket(),
+        site,
+        tools or {"echo": _tool()},
+        mcps or {},
+        caps,
+    )
     app_module.relay.sites[site] = conn
     return conn
+
+
+def _mcp(name="devops-cli", transport="stdio", tools=None):
+    return protocol.EdgeMcp(
+        name=name,
+        transport=transport,
+        tools=tools
+        or [
+            protocol.EdgeMcpTool(
+                name="tenant_account_tools",
+                description="manage tenants",
+                input_schema={
+                    "type": "object",
+                    "oneOf": [{"properties": {"action": {"const": "list_actions"}}}],
+                },
+            )
+        ],
+    )
 
 
 # --- EdgeConn ---------------------------------------------------------------
@@ -164,6 +194,44 @@ def test_call_round_trip():
         assert await task == payload
         assert conn.inflight == {}
         assert conn.resolve(frame["id"], payload) is False
+
+    asyncio.run(_scenario())
+
+
+def test_call_frame_carries_the_caller_email():
+    async def _scenario():
+        ws = FakeWebSocket()
+        conn = EdgeConn(ws, "site-a", {"echo": _tool()})
+        task = asyncio.create_task(
+            conn.request("echo", {"q": "hi"}, 5000, "u1", "ann@example.com")
+        )
+        await _wait_for_frames(ws)
+
+        frame = ws.sent[0]
+        assert frame["user"] == "u1"
+        assert frame["user_email"] == "ann@example.com"
+
+        assert conn.resolve(frame["id"], {"id": frame["id"], "ok": True, "result": {}}) is True
+        await task
+
+    asyncio.run(_scenario())
+
+
+def test_call_frame_omits_user_email_when_not_given():
+    """A call with no email must stay byte-identical to v0.4 (no null key)."""
+
+    async def _scenario():
+        ws = FakeWebSocket()
+        conn = EdgeConn(ws, "site-a", {"echo": _tool()})
+        task = asyncio.create_task(conn.request("echo", {"q": "hi"}, 5000, "u1"))
+        await _wait_for_frames(ws)
+
+        frame = ws.sent[0]
+        assert "user_email" not in frame
+        assert frame["user"] == "u1"
+
+        conn.resolve(frame["id"], {"id": frame["id"], "ok": True, "result": {}})
+        await task
 
     asyncio.run(_scenario())
 
@@ -333,6 +401,46 @@ def test_invalid_arguments_return_400():
     assert "bogus" in payload["message"]
 
 
+def test_call_body_email_reaches_the_edge_connection():
+    conn = _install_conn()
+    seen = {}
+
+    async def _record(tool, args, deadline_ms, user=None, user_email=None):
+        seen.update(tool=tool, user=user, user_email=user_email)
+        return {"id": "x", "ok": True, "result": {"echoed": args}}
+
+    conn.request = _record
+    client = TestClient(app_module.app)
+
+    response = client.post(
+        "/v1/sites/site-a/call",
+        json={
+            "tool": "echo",
+            "args": {"q": "x"},
+            "user": "u1",
+            "user_email": "ann@example.com",
+        },
+    )
+
+    assert response.status_code == 200
+    assert seen == {"tool": "echo", "user": "u1", "user_email": "ann@example.com"}
+
+
+def test_a_malformed_email_is_rejected_before_forwarding():
+    """The edge closes the tunnel on a bad call frame, so the relay must pre-filter."""
+    conn = _install_conn()
+    client = TestClient(app_module.app)
+
+    response = client.post(
+        "/v1/sites/site-a/call",
+        json={"tool": "echo", "args": {"q": "x"}, "user_email": "ann@example.com\n"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_arguments"
+    assert conn.ws.sent == []
+
+
 def test_oversize_args_are_rejected_before_forwarding():
     conn = _install_conn(tools={"echo": _tool("echo", q={"type": "string"})})
     client = TestClient(app_module.app)
@@ -377,6 +485,298 @@ def test_relay_error_does_not_leak_the_failure():
     }
 
 
+# --- MCP routing ------------------------------------------------------------
+
+
+def test_mcp_call_round_trip_carries_kind_and_mcp():
+    async def _scenario():
+        ws = FakeWebSocket()
+        conn = EdgeConn(
+            ws, "site-a", {"echo": _tool()}, {"devops-cli": _mcp()}, ["tools", "mcp"]
+        )
+        task = asyncio.create_task(
+            conn.request_mcp(
+                "devops-cli", "tenant_account_tools", {"action": "list_actions"}, 5000, "u1"
+            )
+        )
+        await _wait_for_frames(ws)
+
+        frame = ws.sent[0]
+        assert frame == {
+            "t": "call",
+            "id": frame["id"],
+            "kind": "mcp",
+            "mcp": "devops-cli",
+            "tool": "tenant_account_tools",
+            "args": {"action": "list_actions"},
+            "deadline_ms": 5000,
+            "user": "u1",
+        }
+        # Same rule as a tool call: an absent email stays absent (v0.4-sized frame).
+        assert "user_email" not in frame
+
+        payload = {
+            "id": frame["id"],
+            "ok": True,
+            "result": {"content": [{"type": "text", "text": "ok"}], "isError": False},
+        }
+        assert conn.resolve(frame["id"], payload) is True
+        assert await task == payload
+        assert conn.inflight == {}
+
+    asyncio.run(_scenario())
+
+
+def test_mcp_call_frame_carries_the_caller_email():
+    async def _scenario():
+        ws = FakeWebSocket()
+        conn = EdgeConn(ws, "site-a", {}, {"devops-cli": _mcp()}, ["tools", "mcp"])
+        task = asyncio.create_task(
+            conn.request_mcp(
+                "devops-cli", "tenant_account_tools", {}, 5000, "u1", "ann@example.com"
+            )
+        )
+        await _wait_for_frames(ws)
+
+        frame = ws.sent[0]
+        assert frame["user_email"] == "ann@example.com"
+        assert frame["user"] == "u1"
+
+        conn.resolve(frame["id"], {"id": frame["id"], "ok": True, "result": {}})
+        await task
+
+    asyncio.run(_scenario())
+
+
+def test_mcp_call_rejects_an_mcp_the_site_never_published():
+    conn = EdgeConn(FakeWebSocket(), "site-a", {}, {"devops-cli": _mcp()}, ["tools", "mcp"])
+
+    async def _scenario():
+        with pytest.raises(app_module.EdgeUnknownMcp):
+            await conn.request_mcp("other", "tenant_account_tools", {}, 5000)
+
+    asyncio.run(_scenario())
+
+
+def test_a_closed_connection_refuses_an_mcp_call():
+    conn = EdgeConn(FakeWebSocket(), "site-a", {}, {"devops-cli": _mcp()}, ["tools", "mcp"])
+    conn.closed = True
+
+    async def _scenario():
+        with pytest.raises(EdgeDisconnected):
+            await conn.request_mcp("devops-cli", "tenant_account_tools", {}, 5000)
+
+    asyncio.run(_scenario())
+
+
+def test_mcp_calls_share_the_inflight_cap():
+    async def _scenario():
+        conn = EdgeConn(FakeWebSocket(), "site-a", {}, {"devops-cli": _mcp()}, ["tools", "mcp"])
+        loop = asyncio.get_running_loop()
+        conn.inflight.update(
+            {f"id-{i}": loop.create_future() for i in range(protocol.MAX_INFLIGHT)}
+        )
+        with pytest.raises(EdgeOverloaded):
+            await conn.request_mcp("devops-cli", "tenant_account_tools", {}, 5000)
+        for future in conn.inflight.values():
+            future.cancel()
+
+    asyncio.run(_scenario())
+
+
+def test_mcp_endpoint_routes_to_the_edge_connection():
+    conn = _install_conn(mcps={"devops-cli": _mcp()})
+    seen = {}
+    result = {"content": [{"type": "text", "text": "ok"}], "isError": False}
+
+    async def _record(mcp, tool, args, deadline_ms, user=None, user_email=None):
+        seen.update(
+            mcp=mcp, tool=tool, args=args, deadline_ms=deadline_ms, user=user,
+            user_email=user_email,
+        )
+        return {"id": "x", "ok": True, "result": result}
+
+    conn.request_mcp = _record
+    client = TestClient(app_module.app)
+
+    response = client.post(
+        "/v1/sites/site-a/mcps/devops-cli/call",
+        json={
+            "tool": "tenant_account_tools",
+            "args": {"action": "list_actions"},
+            "user": "u1",
+            "user_email": "ann@example.com",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"tool": "tenant_account_tools", "result": result}
+    assert seen == {
+        "mcp": "devops-cli",
+        "tool": "tenant_account_tools",
+        # Forwarded un-coerced: the MCP server owns argument validation.
+        "args": {"action": "list_actions"},
+        "deadline_ms": protocol.DEFAULT_DEADLINE_MS,
+        "user": "u1",
+        "user_email": "ann@example.com",
+    }
+
+
+def test_mcp_endpoint_404s_on_a_v04_edge():
+    """A tools-only edge has no MCP router: saying so beats a 504 after the deadline."""
+    _install_conn()
+    client = TestClient(app_module.app)
+
+    response = client.post(
+        "/v1/sites/site-a/mcps/devops-cli/call",
+        json={"tool": "tenant_account_tools", "args": {}},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "unknown_mcp"
+    assert "does not export MCPs" in response.json()["error"]["message"]
+
+
+def test_mcp_endpoint_404s_on_an_unknown_mcp():
+    _install_conn(mcps={"devops-cli": _mcp()})
+    client = TestClient(app_module.app)
+
+    response = client.post(
+        "/v1/sites/site-a/mcps/other/call",
+        json={"tool": "tenant_account_tools", "args": {}},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "unknown_mcp"
+
+
+def test_mcp_endpoint_503s_when_the_site_is_offline():
+    client = TestClient(app_module.app)
+
+    response = client.post(
+        "/v1/sites/ghost/mcps/devops-cli/call",
+        json={"tool": "tenant_account_tools", "args": {}},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "edge_offline"
+
+
+def test_an_edge_side_refusal_is_a_completed_call():
+    """Unknown tool, mcp_session_lost, missing credentials: 200 with `error`."""
+    conn = _install_conn(mcps={"devops-cli": _mcp()})
+    error = {"code": "unknown_tool", "message": "tool not published by this mcp"}
+
+    async def _record(*args, **kwargs):
+        return {"id": "x", "ok": False, "error": error}
+
+    conn.request_mcp = _record
+    client = TestClient(app_module.app)
+
+    response = client.post(
+        "/v1/sites/site-a/mcps/devops-cli/call",
+        json={"tool": "tenant_account_tools", "args": {}},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"tool": "tenant_account_tools", "error": error}
+
+
+def test_invalid_mcp_arguments_are_rejected_before_forwarding():
+    conn = _install_conn(mcps={"devops-cli": _mcp()})
+    client = TestClient(app_module.app)
+
+    response = client.post(
+        "/v1/sites/site-a/mcps/devops-cli/call",
+        json={"tool": "tenant_account_tools", "args": {"blob": "x" * (protocol.MAX_ARGS_BYTES + 1)}},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_arguments"
+    assert conn.ws.sent == []
+
+
+def test_an_mcp_call_consumes_the_site_tool_budget(monkeypatch):
+    """One bucket per site: whatever the edge is asked to run, it is one budget."""
+    conn = _install_conn(mcps={"devops-cli": _mcp()})
+    monkeypatch.setattr(app_module, "limiter", SiteLimiter(default_rate_per_min=1))
+
+    async def _record(*args, **kwargs):
+        return {"id": "x", "ok": True, "result": {}}
+
+    conn.request_mcp = _record
+    client = TestClient(app_module.app)
+
+    # The MCP call spends the site's only token...
+    first = client.post(
+        "/v1/sites/site-a/mcps/devops-cli/call",
+        json={"tool": "tenant_account_tools", "args": {}},
+    )
+    assert first.status_code == 200
+
+    # ...so the tool endpoint is refused, from the same bucket.
+    second = client.post("/v1/sites/site-a/call", json={"tool": "missing", "args": {}})
+    assert second.status_code == 429
+    assert second.json()["error"]["code"] == "rate_limited"
+
+
+def test_the_mcp_endpoint_is_rate_limited_by_a_tool_call(monkeypatch):
+    conn = _install_conn(mcps={"devops-cli": _mcp()})
+    monkeypatch.setattr(app_module, "limiter", SiteLimiter(default_rate_per_min=1))
+    client = TestClient(app_module.app)
+
+    assert client.post("/v1/sites/site-a/call", json={"tool": "missing", "args": {}}).status_code == 404
+    response = client.post(
+        "/v1/sites/site-a/mcps/devops-cli/call",
+        json={"tool": "tenant_account_tools", "args": {}},
+    )
+
+    assert response.status_code == 429
+    assert conn.ws.sent == []
+
+
+def test_mcp_calls_are_audited_without_payloads(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        app_module.audit, "record", lambda event, **kw: events.append({"event": event, **kw})
+    )
+    conn = _install_conn(mcps={"devops-cli": _mcp()})
+
+    async def _refuse(*args, **kwargs):
+        return {"id": "x", "ok": False, "error": {"code": "unknown_tool", "message": "nope"}}
+
+    conn.request_mcp = _refuse
+    client = TestClient(app_module.app)
+
+    client.post(
+        "/v1/sites/ghost/mcps/devops-cli/call",
+        json={"tool": "tenant_account_tools", "args": {"secret": "secret-value"}},
+    )
+    client.post(
+        "/v1/sites/site-a/mcps/other/call",
+        json={"tool": "tenant_account_tools", "args": {"secret": "secret-value"}},
+    )
+    response = client.post(
+        "/v1/sites/site-a/mcps/devops-cli/call",
+        json={"tool": "tenant_account_tools", "args": {"secret": "secret-value"}, "user": "u1"},
+    )
+
+    assert response.status_code == 200
+    assert [e["event"] for e in events] == ["mcp_call", "mcp_call", "mcp_call"]
+    assert [e["outcome"] for e in events] == ["edge_offline", "unknown_mcp", "tool_error"]
+    last = events[-1]
+    assert last["site"] == "site-a"
+    assert last["mcp"] == "devops-cli"
+    assert last["tool"] == "tenant_account_tools"
+    assert last["call_id"]
+    assert last["user"] == "u1"
+    assert last["args_bytes"] > 0
+    # The audit trail records shape, never payload.
+    assert "secret-value" not in str(events)
+    assert all("args" not in event for event in events)
+    assert all("result" not in event for event in events)
+
+
 def test_healthz_reports_connected_sites():
     _install_conn()
     client = TestClient(app_module.app)
@@ -386,7 +786,9 @@ def test_healthz_reports_connected_sites():
     assert response.status_code == 200
     assert response.json() == {
         "status": "ok",
-        "sites": {"site-a": {"connected": True, "tools": 1, "inflight": 0}},
+        "sites": {
+            "site-a": {"connected": True, "tools": 1, "mcps": 0, "inflight": 0}
+        },
     }
 
 
@@ -663,6 +1065,112 @@ def test_duplicate_tool_names_close_with_4000(monkeypatch):
     assert exc.value.code == protocol.CLOSE_MALFORMED
 
 
+def _mcp_catalog():
+    return [
+        {
+            "name": "devops-cli",
+            "transport": "stdio",
+            "tools": [
+                {
+                    "name": "tenant_account_tools",
+                    "description": "meta",
+                    "inputSchema": {
+                        "type": "object",
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {"action": {"const": "list_actions"}},
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    ]
+
+
+def test_proto2_hello_registers_mcps_and_caps(monkeypatch):
+    """A proto-2 edge's catalogs land on the live connection, not in the registry."""
+    import httpx
+    from websockets.asyncio.client import connect
+
+    def resolver(token):
+        return {"name": "site-a"} if token == "tok" else None
+
+    with _live_relay(monkeypatch, resolver) as (ws_url, http_url):
+        async def _scenario():
+            async with connect(
+                ws_url,
+                additional_headers={"Authorization": "Bearer tok"},
+                subprotocols=[protocol.SUBPROTOCOL],
+                proxy=None,
+                max_size=protocol.MAX_FRAME_BYTES,
+            ) as ws:
+                await ws.send(
+                    protocol.encode(
+                        _hello(caps=["tools", "mcp"], mcps=_mcp_catalog())
+                    )
+                )
+                welcome = protocol.decode(await ws.recv(), protocol.RELAY_FRAMES)
+                assert welcome["t"] == "welcome"
+
+                _wait_until(
+                    lambda: app_module.relay.get("site-a") is not None,
+                    "the site was never registered",
+                )
+                conn = app_module.relay.get("site-a")
+                assert conn.caps == ["tools", "mcp"]
+                assert list(conn.mcps) == ["devops-cli"]
+                assert conn.mcps["devops-cli"].transport == "stdio"
+                tool = conn.mcps["devops-cli"].tools[0]
+                assert tool.name == "tenant_account_tools"
+                assert tool.input_schema["oneOf"][0]["properties"]["action"]["const"] == (
+                    "list_actions"
+                )
+
+                async with httpx.AsyncClient(
+                    base_url=http_url, trust_env=False
+                ) as client:
+                    health = (await client.get("/healthz")).json()
+
+                assert health["sites"]["site-a"]["mcps"] == 1
+                assert health["sites"]["site-a"]["tools"] == 1
+
+        asyncio.run(_scenario())
+
+
+def test_a_proto1_hello_still_connects_as_a_tools_only_edge(monkeypatch):
+    """v0.4 edge: no caps, no mcps. It must keep working, with tools defaults."""
+    monkeypatch.setattr(app_module, "resolve_token", lambda token: {"name": "site-a"})
+    client = TestClient(app_module.app)
+
+    with _connect(client) as ws:
+        ws.send_json(_hello(proto=1))
+        assert ws.receive_json()["t"] == "welcome"
+        _wait_until(
+            lambda: app_module.relay.get("site-a") is not None,
+            "the site was never registered",
+        )
+
+        conn = app_module.relay.get("site-a")
+        assert conn.caps == ["tools"]
+        assert conn.mcps == {}
+        ws.close()
+
+
+def test_a_proto3_hello_is_refused_with_4001(monkeypatch):
+    """A newer edge than this relay speaks a version it cannot parse."""
+    monkeypatch.setattr(app_module, "resolve_token", lambda token: {"name": "site-a"})
+    client = TestClient(app_module.app)
+
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with _connect(client) as ws:
+            ws.send_json(_hello(proto=3))
+            ws.receive_text()
+
+    assert exc.value.code == protocol.CLOSE_VERSION
+
+
 # --- Tokens -----------------------------------------------------------------
 
 
@@ -868,6 +1376,68 @@ def test_end_to_end_tunnel_call(monkeypatch):
 
                         health = (await client.get("/healthz")).json()
                         assert health["sites"]["site-a"]["tools"] == 1
+                finally:
+                    responder.cancel()
+                    await asyncio.gather(responder, return_exceptions=True)
+
+        asyncio.run(_scenario())
+
+
+def test_end_to_end_wire_frame_carries_the_caller_email(monkeypatch):
+    """The email crosses the real tunnel; without one the frame has no such key."""
+    import httpx
+    from websockets.asyncio.client import connect
+
+    def resolver(token):
+        return {"name": "site-a"} if token == "tok" else None
+
+    with _live_relay(monkeypatch, resolver) as (ws_url, http_url):
+        async def _scenario():
+            async with connect(
+                ws_url,
+                additional_headers={"Authorization": "Bearer tok"},
+                subprotocols=[protocol.SUBPROTOCOL],
+                proxy=None,
+                max_size=protocol.MAX_FRAME_BYTES,
+            ) as ws:
+                await ws.send(protocol.encode(_hello()))
+                assert protocol.decode(await ws.recv(), protocol.RELAY_FRAMES)["t"] == "welcome"
+
+                async def edge_loop():
+                    while True:
+                        frame = protocol.decode(await ws.recv(), protocol.RELAY_FRAMES)
+                        if frame["t"] == "call":
+                            await ws.send(
+                                protocol.encode(
+                                    {
+                                        "t": "result",
+                                        "id": frame["id"],
+                                        "ok": True,
+                                        "result": frame,
+                                    }
+                                )
+                            )
+
+                responder = asyncio.create_task(edge_loop())
+                try:
+                    async with httpx.AsyncClient(
+                        base_url=http_url, trust_env=False
+                    ) as client:
+                        with_email = await client.post(
+                            "/v1/sites/site-a/call",
+                            json={
+                                "tool": "echo",
+                                "args": {"q": "hi"},
+                                "user_email": "ann@example.com",
+                            },
+                        )
+                        assert with_email.json()["result"]["user_email"] == "ann@example.com"
+
+                        without_email = await client.post(
+                            "/v1/sites/site-a/call",
+                            json={"tool": "echo", "args": {"q": "hi"}},
+                        )
+                        assert "user_email" not in without_email.json()["result"]
                 finally:
                     responder.cancel()
                     await asyncio.gather(responder, return_exceptions=True)
@@ -1150,9 +1720,10 @@ def test_unchanged_token_hash_keeps_the_tunnel(monkeypatch):
 def test_heartbeat_republishes_after_an_admin_changes_the_exports(monkeypatch):
     """An un-exported tool must stop being callable without waiting for a reconnect."""
     conn = _install_conn(site="plant-floor")
-    conn.published_signature = (("echo",), False, (), None)
+    conn.published_signature = (("echo",), False, (), None, ())
     conn.edge_version = "0.3.0"
     published = []
+    published_mcps = []
 
     class _Mgr:
         def get_edge_config(self, site):
@@ -1173,6 +1744,13 @@ def test_heartbeat_republishes_after_an_admin_changes_the_exports(monkeypatch):
             (site, len(tools), version)
         ) or [],
     )
+    monkeypatch.setattr(
+        app_module.registry,
+        "publish_mcp_catalog",
+        lambda mgr, site, mcps, version, **kwargs: published_mcps.append(
+            (site, len(mcps), version)
+        ) or [],
+    )
     monkeypatch.setattr(app_module, "HEARTBEAT_S", 0.01)
 
     async def run():
@@ -1180,7 +1758,7 @@ def test_heartbeat_republishes_after_an_admin_changes_the_exports(monkeypatch):
         # The keepalive is sent first; the republish follows it on the same beat.
         await _wait_for_frames(conn.ws, count=1)
         for _ in range(200):
-            if published:
+            if published and published_mcps:
                 break
             await asyncio.sleep(0.01)
         task.cancel()
@@ -1190,13 +1768,15 @@ def test_heartbeat_republishes_after_an_admin_changes_the_exports(monkeypatch):
     asyncio.run(run())
 
     assert published == [("plant-floor", 1, "0.3.0")]
+    # A tool-side change republishes the MCP half too: one site record, two catalogs.
+    assert published_mcps == [("plant-floor", 0, "0.3.0")]
     assert conn.rate_limit_per_min == 30
-    assert conn.published_signature == (("echo", "new_tool"), True, (), 30)
+    assert conn.published_signature == (("echo", "new_tool"), True, (), 30, ())
 
 
 def test_heartbeat_does_not_republish_without_an_admin_change(monkeypatch):
     conn = _install_conn(site="plant-floor")
-    conn.published_signature = ((), False, (), None)
+    conn.published_signature = ((), False, (), None, ())
     published = []
 
     class _Mgr:
@@ -1225,7 +1805,7 @@ def test_heartbeat_does_not_republish_without_an_admin_change(monkeypatch):
 def test_an_admin_export_change_is_allowed_to_empty_the_catalog(monkeypatch):
     """An explicit admin narrowing is intent, unlike a handshake that sent nothing."""
     conn = _install_conn(site="plant-floor")
-    conn.published_signature = (("echo",), False, (), None)
+    conn.published_signature = (("echo",), False, (), None, ())
     seen = {}
 
     class _Mgr:
@@ -1238,6 +1818,9 @@ def test_an_admin_export_change_is_allowed_to_empty_the_catalog(monkeypatch):
         app_module.registry,
         "publish_catalog",
         lambda *args, **kwargs: seen.update(kwargs) or [],
+    )
+    monkeypatch.setattr(
+        app_module.registry, "publish_mcp_catalog", lambda *args, **kwargs: []
     )
     monkeypatch.setattr(app_module, "HEARTBEAT_S", 0.01)
 
@@ -1254,4 +1837,83 @@ def test_an_admin_export_change_is_allowed_to_empty_the_catalog(monkeypatch):
 
     asyncio.run(run())
 
+    assert seen.get("allow_empty") is True
+
+
+def test_a_probe_for_an_unknown_mcp_consumes_the_site_budget(monkeypatch):
+    """404 probes are accounted for, exactly like the tool endpoint's unknown_tool.
+
+    Moving the limiter ahead of the capability/catalog checks is what keeps a leaked
+    token from being turned into an unmetered scanner for MCP names.
+    """
+    _install_conn(mcps={"devops-cli": _mcp()})
+    monkeypatch.setattr(app_module, "limiter", SiteLimiter(default_rate_per_min=1))
+    client = TestClient(app_module.app)
+
+    first = client.post(
+        "/v1/sites/site-a/mcps/not-exported/call",
+        json={"tool": "tenant_account_tools", "args": {}},
+    )
+    second = client.post(
+        "/v1/sites/site-a/mcps/not-exported/call",
+        json={"tool": "tenant_account_tools", "args": {}},
+    )
+
+    assert first.status_code == 404
+    assert first.json()["error"]["code"] == "unknown_mcp"
+    assert second.status_code == 429
+    assert second.json()["error"]["code"] == "rate_limited"
+
+
+def test_an_admin_visibility_edit_republishes_the_mcp_config(monkeypatch):
+    """`public`/`public_tools` are admin-owned, so an edit must reach the MCP half too.
+
+    `_catalog_signature` covers both fields; this pins the republish end to end (the
+    signature check alone would pass with a stale MCP config).
+    """
+    config = {
+        "name": "site-a",
+        "enabled": True,
+        "exports": [],
+        "public": False,
+        "public_tools": ["mcp__site-a__devops-cli__tenant_account_tools"],
+        "rate_limit_per_min": None,
+    }
+    fake = app_module._identity_manager()
+    fake.get_edge_config = lambda site: dict(config)
+    conn = _install_conn(site="site-a", mcps={"devops-cli": _mcp()})
+    conn.published_signature = ((), False, (), None, ("devops-cli",))
+    conn.edge_version = "0.5.0"
+
+    asyncio.run(app_module._apply_admin_changes(conn, config))
+
+    published = fake.mcps["site-a__devops-cli"]
+    assert published["public"] is False
+    assert published["public_tools"] == ["tenant_account_tools"]
+
+
+def test_an_admin_edit_is_allowed_to_empty_the_mcp_catalog(monkeypatch):
+    """Removing every server from export_mcps is explicit intent: without
+    `allow_empty_mcps`, the registry entry would be unprunable from the admin UI."""
+    conn = _install_conn(site="site-a", mcps={})
+    conn.published_signature = ((), False, (), None, ("devops-cli",))
+    conn.edge_version = "0.5.0"
+    seen = {}
+
+    monkeypatch.setattr(app_module.registry, "publish_catalog", lambda *a, **k: [])
+    monkeypatch.setattr(
+        app_module.registry,
+        "publish_mcp_catalog",
+        lambda *args, **kwargs: seen.update(kwargs) or [],
+    )
+
+    asyncio.run(
+        app_module._apply_admin_changes(
+            conn,
+            {"name": "site-a", "enabled": True, "exports": [], "public": False,
+             "public_tools": [], "rate_limit_per_min": None},
+        )
+    )
+
+    # The MCP publish must also be told an empty catalog is intent, not a bad edge.
     assert seen.get("allow_empty") is True

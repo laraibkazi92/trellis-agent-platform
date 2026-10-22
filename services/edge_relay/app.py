@@ -20,7 +20,7 @@ import logging
 import os
 import time
 import uuid
-from typing import Annotated, Any, Dict, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import JSONResponse
@@ -36,6 +36,7 @@ from services.edge_relay.protocol import (
     MAX_FRAME_BYTES,
     MAX_INFLIGHT,
     SUBPROTOCOL,
+    EdgeMcp,
     EdgeTool,
     ProtocolError,
 )
@@ -73,6 +74,10 @@ class EdgeUnknownTool(Exception):
     """The site never published this tool."""
 
 
+class EdgeUnknownMcp(Exception):
+    """The site never published this MCP server."""
+
+
 class EdgeOverloaded(Exception):
     """The site already has MAX_INFLIGHT calls in flight."""
 
@@ -94,12 +99,25 @@ def _consume_exception(future: "asyncio.Future[Any]") -> None:
 class EdgeConn:
     """One accepted edge socket: its catalog, its pending calls, its liveness."""
 
-    def __init__(self, ws: Any, site: str, tools: Optional[Dict[str, EdgeTool]] = None):
+    def __init__(
+        self,
+        ws: Any,
+        site: str,
+        tools: Optional[Dict[str, EdgeTool]] = None,
+        mcps: Optional[Dict[str, EdgeMcp]] = None,
+        caps: Optional[List[str]] = None,
+    ):
         self.ws = ws
         self.site = site
         self.tools: Dict[str, EdgeTool] = dict(tools or {})
+        # Held in memory only: publishing MCP catalogs is the central consumer's
+        # job (PR 4), this phase only accepts and accounts for them.
+        self.mcps: Dict[str, EdgeMcp] = dict(mcps or {})
+        self.caps: List[str] = ["tools"] if caps is None else list(caps)
         self.inflight: Dict[str, "asyncio.Future[Any]"] = {}
         self.closed = False
+        # What the edge claimed at handshake; echoed back in the site status.
+        self.proto: Optional[int] = None
         # Per-site override from the edge config; None uses the deployment default.
         self.rate_limit_per_min: Optional[int] = None
         # Digest of the token presented at handshake; a rotation changes it.
@@ -123,51 +141,97 @@ class EdgeConn:
         args: Dict[str, Any],
         deadline_ms: int = DEFAULT_DEADLINE_MS,
         user: Optional[str] = None,
+        user_email: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Forward one call and await its validated result frame.
-
-        The deadline is clamped here as well as on the edge so the local timer
-        and the frame's ``deadline_ms`` cannot disagree.
-        """
+        """Forward one tool call and await its validated result frame."""
         if self.closed:
             raise EdgeDisconnected(f"edge '{self.site}' is closed")
         if tool not in self.tools:
             raise EdgeUnknownTool(f"tool '{tool}' is not exported by edge '{self.site}'")
+        return await self._forward(
+            self._call_frame(tool, args, deadline_ms, user, user_email), tool
+        )
+
+    async def request_mcp(
+        self,
+        mcp: str,
+        tool: str,
+        args: Dict[str, Any],
+        deadline_ms: int = DEFAULT_DEADLINE_MS,
+        user: Optional[str] = None,
+        user_email: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Forward one MCP ``tools/call`` through the same tunnel.
+
+        The tool name is *not* checked here: the edge owns that authority (it refuses
+        a name it did not publish), and its refusal arrives as an ordinary error
+        result rather than a relay-side 404.
+        """
+        if self.closed:
+            raise EdgeDisconnected(f"edge '{self.site}' is closed")
+        if mcp not in self.mcps:
+            raise EdgeUnknownMcp(f"mcp '{mcp}' is not exported by edge '{self.site}'")
+        frame = self._call_frame(tool, args, deadline_ms, user, user_email)
+        frame["kind"] = "mcp"
+        frame["mcp"] = mcp
+        return await self._forward(frame, tool, mcp=mcp)
+
+    def _call_frame(
+        self,
+        tool: str,
+        args: Dict[str, Any],
+        deadline_ms: int,
+        user: Optional[str],
+        user_email: Optional[str],
+    ) -> Dict[str, Any]:
+        """Build one ``call`` frame with the deadline clamped to the wire cap."""
+        frame: Dict[str, Any] = {
+            "t": "call",
+            "id": uuid.uuid4().hex,
+            "tool": tool,
+            "args": args,
+            "deadline_ms": max(1_000, min(int(deadline_ms), MAX_DEADLINE_MS)),
+            "user": user,
+        }
+        # Omitted when absent so a v0.4 edge sees the exact same bytes.
+        if user_email is not None:
+            frame["user_email"] = user_email
+        return frame
+
+    async def _forward(
+        self, frame: Dict[str, Any], tool: str, mcp: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Send a call frame and await its result.
+
+        The deadline is read back from the frame (``_call_frame`` already clamped it)
+        so the local timer and the edge's cannot disagree.
+        """
         if len(self.inflight) >= MAX_INFLIGHT:
             raise EdgeOverloaded(f"edge '{self.site}' is at {MAX_INFLIGHT} in-flight calls")
 
-        timeout_ms = max(1_000, min(int(deadline_ms), MAX_DEADLINE_MS))
-        call_id = uuid.uuid4().hex
+        timeout_ms = frame["deadline_ms"]
+        call_id = frame["id"]
         future: "asyncio.Future[Any]" = asyncio.get_running_loop().create_future()
         future.add_done_callback(_consume_exception)
         self.inflight[call_id] = future
         started = time.perf_counter()
 
         try:
-            await self.send(
-                {
-                    "t": "call",
-                    "id": call_id,
-                    "tool": tool,
-                    "args": args,
-                    "deadline_ms": timeout_ms,
-                    "user": user,
-                }
-            )
+            await self.send(frame)
             try:
                 payload = await asyncio.wait_for(future, timeout_ms / 1000)
             except asyncio.TimeoutError:
-                self._log(tool, call_id, started, "timeout")
+                self._log(tool, call_id, started, "timeout", mcp=mcp)
                 raise EdgeTimeout(
                     f"edge '{self.site}' did not answer '{tool}' within {timeout_ms}ms"
                 ) from None
             except BaseException:
-                self._log(tool, call_id, started, "error")
+                self._log(tool, call_id, started, "error", mcp=mcp)
                 raise
         finally:
             self.inflight.pop(call_id, None)
 
-        self._log(tool, call_id, started, "ok" if payload.get("ok") else "tool_error")
+        self._log(tool, call_id, started, "ok" if payload.get("ok") else "tool_error", mcp=mcp)
         return payload
 
     def resolve(self, call_id: str, payload: Dict[str, Any]) -> bool:
@@ -190,13 +254,27 @@ class EdgeConn:
         with contextlib.suppress(Exception):
             await self.ws.close(code=code)
 
-    def _log(self, tool: str, call_id: str, started: float, outcome: str) -> None:
+    def _log(
+        self, tool: str, call_id: str, started: float, outcome: str, mcp: Optional[str] = None
+    ) -> None:
+        duration = int((time.perf_counter() - started) * 1000)
+        if mcp is None:
+            logger.info(
+                "edge call site=%s tool=%s id=%s duration_ms=%d outcome=%s",
+                self.site,
+                tool,
+                call_id,
+                duration,
+                outcome,
+            )
+            return
         logger.info(
-            "edge call site=%s tool=%s id=%s duration_ms=%d outcome=%s",
+            "edge call site=%s mcp=%s tool=%s id=%s duration_ms=%d outcome=%s",
             self.site,
+            mcp,
             tool,
             call_id,
-            int((time.perf_counter() - started) * 1000),
+            duration,
             outcome,
         )
 
@@ -271,29 +349,84 @@ async def _apply_admin_changes(conn: EdgeConn, config: Dict[str, Any]) -> None:
     Those fields are read at handshake, so without this a removed tool stayed callable
     (and a new one invisible) until the edge happened to reconnect. The heartbeat
     already re-reads the record; acting on a change is one extra registry write.
+
+    Both catalogs are republished: the site record is the authority for what the site
+    publishes, and a refresh that touched only the tool half would leave the MCP status
+    (and its prune) stale.
     """
-    signature = _catalog_signature(config)
+    signature = _catalog_signature(config, conn.mcps)
     conn.rate_limit_per_min = config.get("rate_limit_per_min")
     if conn.published_signature is None or signature == conn.published_signature:
         return
     try:
-        published = await asyncio.to_thread(
-            registry.publish_catalog,
-            _identity_manager(),
+        published, published_mcps = await asyncio.to_thread(
+            _publish_catalogs,
             conn.site,
             list(conn.tools.values()),
+            list(conn.mcps.values()),
             conn.edge_version,
+            proto=conn.proto,
+            caps=conn.caps,
+            # An admin edit (exports/public/public_tools) is explicit intent for both
+            # halves: without the MCP flag, removing the last server from export_mcps
+            # would leave a stale registry entry the admin has no way to prune.
             allow_empty=True,
+            allow_empty_mcps=True,
         )
     except Exception:
         logger.exception("could not refresh the catalog for site=%s", conn.site)
         return
     conn.published_signature = signature
     logger.info(
-        "edge catalog refreshed from admin changes site=%s tools=%d",
+        "edge catalog refreshed from admin changes site=%s tools=%d mcps=%d",
         conn.site,
         len(published),
+        len(published_mcps),
     )
+
+
+def _publish_catalogs(
+    site: str,
+    tools: List[EdgeTool],
+    mcps: List[EdgeMcp],
+    edge_version: str,
+    *,
+    proto: Optional[int],
+    caps: Optional[List[str]],
+    allow_empty: bool = False,
+    allow_empty_mcps: bool = False,
+) -> tuple:
+    """Publish both catalogs for one site; returns ``(tool_names, mcp_names)``.
+
+    One function so the handshake and an admin-driven refresh cannot publish half a
+    catalog. Tools go first: their write owns ``last_error``, and the MCP write keeps it.
+
+    ``allow_empty`` and ``allow_empty_mcps`` are separate because their empties mean
+    different things: an admin narrowing ``exports`` to nothing is intent for tools,
+    while nothing on the site record filters MCPs -- an empty MCP catalog from a
+    connected edge is always a suspected edge-side misconfiguration.
+    """
+    mgr = _identity_manager()
+    published = registry.publish_catalog(
+        mgr,
+        site,
+        tools,
+        edge_version,
+        allow_empty=allow_empty,
+        mcps=mcps,
+        proto=proto,
+        caps=caps,
+    )
+    published_mcps = registry.publish_mcp_catalog(
+        mgr,
+        site,
+        mcps,
+        edge_version,
+        allow_empty=allow_empty_mcps,
+        proto=proto,
+        caps=caps,
+    )
+    return published, published_mcps
 
 
 def _mark_all_disconnected(reason: str) -> None:
@@ -330,15 +463,27 @@ class CallBody(BaseModel):
     # Strict: pydantic would otherwise accept ``true`` as ``1``.
     deadline_ms: Annotated[int, Field(strict=True)] = DEFAULT_DEADLINE_MS
     user: Optional[str] = None
+    # Length/control-char rules live in protocol.validate_call: one code path, so a
+    # bad value is a 400 invalid_arguments rather than FastAPI's 422 echo.
+    user_email: Optional[str] = None
 
 
-def _catalog_signature(config: Dict[str, Any]) -> tuple:
-    """The admin-editable fields that change what a site publishes or how fast."""
+class McpCallBody(CallBody):
+    """Same shape as ``CallBody``; the MCP name rides the path, not the body."""
+
+
+def _catalog_signature(config: Dict[str, Any], mcps: Any = ()) -> tuple:
+    """The admin-editable fields that change what a site publishes or how fast.
+
+    The MCP names are part of the signature as well: nothing on the site record
+    filters MCP catalogs yet, so the published set is their half of it.
+    """
     return (
         tuple(config.get("exports") or []),
         bool(config.get("public")),
         tuple(config.get("public_tools") or []),
         config.get("rate_limit_per_min"),
+        tuple(sorted(mcps)),
     )
 
 
@@ -473,15 +618,22 @@ async def edge_connect(ws: WebSocket) -> None:
         if frame["t"] != "hello":
             await ws.close(code=protocol.CLOSE_MALFORMED)
             return
-        _, edge_version, tools = protocol.validate_hello(frame)
+        proto, edge_version, tools, mcps, caps = protocol.validate_hello(frame)
     except ProtocolError as exc:
         await ws.close(code=exc.close_code)
         return
     except (WebSocketDisconnect, RuntimeError):
         return
 
-    conn = EdgeConn(ws, site, {tool.name: tool for tool in tools})
+    conn = EdgeConn(
+        ws,
+        site,
+        {tool.name: tool for tool in tools},
+        {mcp.name: mcp for mcp in mcps},
+        caps,
+    )
     conn.rate_limit_per_min = config.get("rate_limit_per_min")
+    conn.proto = proto
     # Pinned at handshake so a rotation closes this socket on the next heartbeat:
     # `enabled` stays true across a rotation, so checking only that would leave a
     # leaked tunnel alive until it happened to drop.
@@ -502,7 +654,13 @@ async def edge_connect(ws: WebSocket) -> None:
 
     try:
         await asyncio.to_thread(
-            registry.publish_catalog, _identity_manager(), site, tools, edge_version
+            _publish_catalogs,
+            site,
+            tools,
+            mcps,
+            edge_version,
+            proto=proto,
+            caps=caps,
         )
     except ValueError as exc:
         # The token was valid moments ago, but the site can be deleted or revoked
@@ -522,10 +680,16 @@ async def edge_connect(ws: WebSocket) -> None:
         relay.unregister(site, conn)
         return
 
-    conn.published_signature = _catalog_signature(config)
+    conn.published_signature = _catalog_signature(config, conn.mcps)
     conn.edge_version = edge_version
     await relay.register(site, conn)
-    logger.info("edge connected site=%s version=%s tools=%d", site, edge_version, len(tools))
+    logger.info(
+        "edge connected site=%s version=%s tools=%d mcps=%d",
+        site,
+        edge_version,
+        len(tools),
+        len(mcps),
+    )
     audit.record("connect", site=site, outcome="ok")
 
     heartbeat = asyncio.create_task(_heartbeat(conn))
@@ -622,6 +786,10 @@ async def call_site_tool(site: str, body: CallBody) -> JSONResponse:
                 "tool": body.tool,
                 "args": body.args,
                 "deadline_ms": body.deadline_ms,
+                # Re-checked here, not only on the edge: the edge reports a bad
+                # email as a tool_error, so filtering here keeps the 400
+                # invalid_arguments contract and skips a wasted edge round trip.
+                "user_email": body.user_email,
             }
         )
     except ProtocolError as exc:
@@ -635,7 +803,9 @@ async def call_site_tool(site: str, body: CallBody) -> JSONResponse:
         return _error(400, "invalid_arguments", str(exc))
 
     try:
-        payload = await conn.request(body.tool, args, body.deadline_ms, body.user)
+        payload = await conn.request(
+            body.tool, args, body.deadline_ms, body.user, body.user_email
+        )
     except EdgeOverloaded as exc:
         audit_call("edge_overloaded")
         return _error(503, "edge_overloaded", str(exc))
@@ -664,12 +834,122 @@ async def call_site_tool(site: str, body: CallBody) -> JSONResponse:
     )
 
 
+@app.post("/v1/sites/{site}/mcps/{mcp}/call")
+async def call_site_mcp(site: str, mcp: str, body: McpCallBody) -> JSONResponse:
+    """Internal-only: central routes an edge-exported MCP ``tools/call`` here.
+
+    Same contract as the tool endpoint, one deliberate difference: arguments are
+    checked as an object within the size cap and forwarded un-coerced. An MCP
+    server's schemas are discriminated unions, so the *server* validates them; the
+    edge refuses a tool name it did not publish, and that refusal arrives as a
+    normal ``200`` with ``error``.
+    """
+    started = time.monotonic()
+    args_bytes = len(protocol.encode(body.args))
+    call_id = uuid.uuid4().hex
+
+    def audit_call(outcome: str, **extra: Any) -> None:
+        audit.record(
+            "mcp_call",
+            site=site,
+            mcp=mcp,
+            tool=body.tool,
+            call_id=call_id,
+            user=body.user,
+            outcome=outcome,
+            ms=int((time.monotonic() - started) * 1000),
+            args_bytes=args_bytes,
+            **extra,
+        )
+
+    try:
+        conn = relay.require(site)
+    except EdgeOffline as exc:
+        audit_call("edge_offline")
+        return _error(503, "edge_offline", str(exc))
+
+    # The same bucket as tool calls: one site has one budget, whatever it is asked to
+    # run. Checked before the capability/catalog 404s (as on the tool endpoint) so a
+    # probe for a non-existent MCP is accounted too.
+    if not limiter.allow(site, conn.rate_limit_per_min):
+        audit_call("rate_limited")
+        return _error(
+            429,
+            "rate_limited",
+            f"edge '{site}' exceeded its call rate; retry shortly",
+        )
+
+    # A v0.4 edge claims only "tools": it has no MCP router, so the request can never
+    # be served, and saying so beats a timeout against a peer that cannot answer.
+    if "mcp" not in conn.caps:
+        audit_call("unknown_mcp")
+        return _error(404, "unknown_mcp", f"edge '{site}' does not export MCPs")
+    if mcp not in conn.mcps:
+        audit_call("unknown_mcp")
+        return _error(404, "unknown_mcp", f"mcp '{mcp}' is not exported by edge '{site}'")
+
+    try:
+        protocol.validate_call(
+            {
+                "id": "http",
+                "kind": "mcp",
+                "mcp": mcp,
+                "tool": body.tool,
+                "args": body.args,
+                "deadline_ms": body.deadline_ms,
+                # Re-checked here for the same reason as on the tool endpoint: keep
+                # the 400 invalid_arguments contract and skip a wasted round trip.
+                "user_email": body.user_email,
+            }
+        )
+    except ProtocolError as exc:
+        audit_call("invalid_arguments")
+        return _error(400, "invalid_arguments", str(exc))
+
+    try:
+        payload = await conn.request_mcp(
+            mcp, body.tool, body.args, body.deadline_ms, body.user, body.user_email
+        )
+    except EdgeOverloaded as exc:
+        audit_call("edge_overloaded")
+        return _error(503, "edge_overloaded", str(exc))
+    except EdgeDisconnected as exc:
+        audit_call("edge_disconnected")
+        return _error(503, "edge_disconnected", str(exc))
+    except EdgeTimeout as exc:
+        audit_call("edge_timeout")
+        return _error(504, "edge_timeout", str(exc))
+    except Exception:
+        logger.exception("relay error site=%s mcp=%s tool=%s", site, mcp, body.tool)
+        audit_call("relay_error")
+        return _error(500, "relay_error", "relay failed while forwarding the call")
+
+    if not payload.get("ok"):
+        # Covers an edge-side refusal (unknown tool, mcp_session_lost, credentials):
+        # a completed round trip that failed at the source, not a relay fault.
+        audit_call("tool_error")
+        return JSONResponse(
+            status_code=200,
+            content={"tool": body.tool, "error": payload.get("error")},
+        )
+    audit_call("ok", result_bytes=len(protocol.encode(payload.get("result"))))
+    return JSONResponse(
+        status_code=200,
+        content={"tool": body.tool, "result": payload.get("result")},
+    )
+
+
 @app.get("/healthz")
 async def healthz() -> Dict[str, Any]:
     return {
         "status": "ok",
         "sites": {
-            site: {"connected": True, "tools": len(conn.tools), "inflight": len(conn.inflight)}
+            site: {
+                "connected": True,
+                "tools": len(conn.tools),
+                "mcps": len(conn.mcps),
+                "inflight": len(conn.inflight),
+            }
             for site, conn in relay.sites.items()
             if relay.get(site) is conn and not conn.closed
         },

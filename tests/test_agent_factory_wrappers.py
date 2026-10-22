@@ -18,6 +18,7 @@ All tests are hermetic: every etcd-backed seam (`get_identity_manager`,
 `_agent_cache` / `_supervisor_registry` are replaced with fresh objects.
 """
 import asyncio
+import copy
 import logging
 import threading
 import time
@@ -28,6 +29,7 @@ from typing import Any, Dict
 
 from core import agent_factory
 from core.auth import user_id_var
+from core.models import MCPToolDefinition
 from subagents_pydantic_ai import SubAgentConfig
 
 
@@ -563,8 +565,36 @@ class FakeBuildMemory:
         return False
 
 
-def _install_build_stubs(monkeypatch, config, defaults=None):
+class FakeToolSet:
+    def __init__(self):
+        self.tools: Dict[str, Any] = {}
+
+    def add_tool(self, tool):
+        self.tools[tool.name] = tool
+
+
+class FakeSchemaAgent(FakeBuildAgent):
+    """`build_agent`'s Agent stand-in for MCP registration: `Tool.from_schema` needs a
+    `_function_toolset` to land in."""
+
+    def __init__(self, model, **kwargs):
+        super().__init__(model, **kwargs)
+        self._function_toolset = FakeToolSet()
+        self.tools: Dict[str, Any] = {}
+
+    def tool(self, name=None, description=None):
+        def decorator(fn):
+            self.tools[name or fn.__name__] = fn
+            return fn
+
+        return decorator
+
+
+def _install_build_stubs(monkeypatch, config, defaults=None, *, discovered=None, remote_mcps=None):
     """Stub every etcd/network seam `build_agent` touches.
+
+    ``discovered`` / ``remote_mcps`` pre-populate the discovery caches (central MCP
+    servers and edge-exported ones respectively) so registration runs for real.
 
     Returns a dict of recorders: ``resolve_model`` args, ``build_model_settings``
     args, and the framework-defaults reads.
@@ -608,11 +638,12 @@ def _install_build_stubs(monkeypatch, config, defaults=None):
     monkeypatch.setattr(
         agent_factory.llm_factory, "get_provider_api_key", fake_get_provider_api_key
     )
-    monkeypatch.setattr(agent_factory, "Agent", FakeBuildAgent)
+    monkeypatch.setattr(agent_factory, "Agent", FakeSchemaAgent)
     monkeypatch.setattr(agent_factory, "get_hub_client", fake_get_hub_client)
     monkeypatch.setattr(agent_factory, "discover_external_mcps", fake_discover_external_mcps)
     monkeypatch.setattr(agent_factory, "_hub_tools_cache", [])
-    monkeypatch.setattr(agent_factory, "_external_mcp_tools", {})
+    monkeypatch.setattr(agent_factory, "_external_mcp_tools", discovered or {})
+    monkeypatch.setattr(agent_factory, "_external_remote_mcps", remote_mcps or {})
     monkeypatch.setattr(core_memory, "get_memory_manager", lambda: FakeBuildMemory())
 
     recorded["sentinel"] = sentinel
@@ -742,4 +773,85 @@ def test_install_llm_defaults_watch_is_idempotent(monkeypatch):
     agent_factory.install_llm_defaults_watch()
 
     assert registered == ["/config/framework/default_llm_"]
+
+
+# --- Phase 6: provider-facing root-union normalization -----------------------
+
+META_TOOL = "tenant_account_tools"
+
+# The workload's meta-tool shape: a root union with no top-level `properties`. Gemini
+# silently drops it, so the model calls the tool with no arguments at all.
+ROOT_UNION_SCHEMA = {
+    "type": "object",
+    "oneOf": [
+        {
+            "properties": {"action": {"const": "get"}, "id": {"type": "integer"}},
+            "required": ["action", "id"],
+        },
+        {
+            "properties": {"action": {"const": "list_actions"}},
+            "required": ["action"],
+        },
+    ],
+}
+
+FLATTENED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {"const": "get"},
+        "id": {"type": "integer"},
+    },
+    "required": ["action"],
+}
+
+
+def _build_agent_with_central_mcp(monkeypatch, provider: str, model: str, schema: dict):
+    """`build_agent` over one discovered central MCP server carrying ``schema``."""
+    tool = MCPToolDefinition(
+        name=META_TOOL, description="Tenant tools.", inputSchema=copy.deepcopy(schema)
+    )
+    _install_build_stubs(
+        monkeypatch,
+        {"name": "mcp-agent", "provider": provider, "model": model, "allowed_mcps": ["srv"]},
+        discovered={"srv": [tool]},
+    )
+    agent = asyncio.run(agent_factory.build_agent("mcp-agent"))
+    return agent, tool
+
+
+def _registered_schema(agent) -> dict:
+    return agent._function_toolset.tools[META_TOOL].function_schema.json_schema
+
+
+def test_central_mcp_root_union_is_flattened_for_google(monkeypatch):
+    agent, tool = _build_agent_with_central_mcp(
+        monkeypatch, "google", "gemini-2.5-flash", ROOT_UNION_SCHEMA
+    )
+
+    assert _registered_schema(agent) == FLATTENED_SCHEMA
+    # Central MCPs are fixed by the same rule as edge MCPs; the catalog stays verbatim.
+    assert tool.inputSchema == ROOT_UNION_SCHEMA
+
+
+def test_central_mcp_root_union_is_unchanged_for_openai(monkeypatch):
+    agent, tool = _build_agent_with_central_mcp(
+        monkeypatch, "openai", "gpt-4o", ROOT_UNION_SCHEMA
+    )
+
+    assert _registered_schema(agent) == ROOT_UNION_SCHEMA
+    assert tool.inputSchema == ROOT_UNION_SCHEMA
+
+
+def test_central_mcp_non_union_schema_is_unchanged_for_google(monkeypatch):
+    schema = {
+        "type": "object",
+        "properties": {"id": {"type": "integer"}},
+        "required": ["id"],
+    }
+
+    agent, tool = _build_agent_with_central_mcp(monkeypatch, "google", "gemini-2.5-flash", schema)
+
+    assert _registered_schema(agent) == schema
+    assert tool.inputSchema == schema
+
 

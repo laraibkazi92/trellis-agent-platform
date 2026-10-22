@@ -1,67 +1,255 @@
-# trellis-proxy configuration -- one file per edge node.
+# trellis-proxy configuration -- one file per edge node (engine 0.5.x).
 #
 # Copy to proxy.yaml next to this file's docker-compose.yml and edit. It is mounted
-# read-only at /etc/trellis/proxy.yaml.
+# read-only at /etc/trellis/proxy.yaml; the container paths below (`/etc/trellis/...`,
+# `/app/workspace/...`) are the mounts the sample compose creates.
 #
-# SECRETS: the enrollment token is never written here, only the name of the env var that
-# holds it. Tool credentials (API keys, service accounts) are read from THIS host's
-# environment or secret store by the tool processes themselves -- they are never sent to
-# the central install, never stored in etcd, and never leave this VM.
+# ENROLLMENT TOKEN: never written here, only the name of the file or env var that
+# holds it. See token_file: below.
 #
-# Apply exports/tools_dir changes with SIGHUP (`docker kill -s HUP trellis-proxy`), which
-# reloads this file and re-publishes the catalog (the proxy reconnects; in-flight calls
-# fail rather than being replayed). site/server_url/token/tls/sandbox changes need a
-# restart, and the proxy logs a warning for each one you try to apply with SIGHUP.
+# TOOL/MCP CREDENTIALS: edge-local files (edge-secrets/, edge-user-secrets/), never on
+# the tunnel and never in the central etcd. Since 0.5.0 a child process receives only
+# the keys its manifest DECLARES -- `secrets`, `optional_secrets`, `variables` and the
+# field keys of `secret_groups` in tool.yaml / mcp.yaml. An undeclared process
+# environment variable is invisible to the tool; the tunnel token and the framework's
+# own control-plane secrets are stripped in every mode.
+#
+# RELOAD: SIGHUP (`docker kill -s HUP trellis-proxy`) re-reads this file and
+# re-publishes the catalog (the proxy reconnects; in-flight calls fail rather than
+# being replayed).
+#   live-reloadable: exports, export_mcps, tools_dir, mcps_dir
+#   restart-required: site, server_url, token_env, token_file, tls_*, sandbox,
+#     env_passthrough, and the secrets_dir/user_secrets_dir *paths* -- for each one you
+#     try to apply with SIGHUP the proxy logs a warning and keeps the current value
+# Credential file *contents* are a third case: tool calls re-read them every time, while
+# MCP sessions resolve credentials once at creation, so a SIGHUP retires every live
+# session and the next call reopens it with the edited file. Moving either directory is
+# a path change, i.e. a restart.
 
-# Site id, pre-registered by an admin in Admin -> Edges. It must match the site the token
-# was issued for. The central relay derives identity from the token hash and never trusts
-# this value, so a wrong site cannot impersonate another edge -- the proxy logs a warning
-# when the relay reports a different site than the one configured here.
-site: plant-floor
+# Site id, pre-registered by an admin in Admin -> Edges. It must match the site the
+# token was issued for. The central relay derives identity from the token hash and never
+# trusts this value, so a wrong site cannot impersonate another edge -- the proxy logs a
+# warning when the relay reports a different site than the one configured here.
+# Odd chars are refused at load: it becomes half of every `<site>__<tool>` registry name.
+# Env equivalent: TRELLIS_EDGE_SITE.
+site: dc1
 
 # Central Trellis host, WebSocket endpoint. Use wss:// in production: the tunnel carries
 # the bearer token and internal tool arguments. The path is fixed.
 #
 # The proxy verifies the relay's certificate and has no switch to disable that. For an
-# internal CA point tls_ca_file at the CA (see docs/proxy-tls.md):
-#   server_url: wss://trellis.internal/edge/v1/connect
-#   tls_ca_file: /etc/trellis/tls/ca.pem
+# internal CA point tls_ca_file at the CA (see docs/proxy-tls.md).
+# Env equivalent: TRELLIS_SERVER_URL.
 server_url: wss://trellis.example.com/edge/v1/connect
 
 # Where the enrollment token (edge_<site>_<random>) is read from. The file form is
 # preferred: it is not part of the process environment, so it never lands in
-# /proc/<pid>/environ where a tool could read it. The sample compose mounts it as a docker
-# secret. The proxy reads the file once and unlinks it when the mount allows that.
+# /proc/<pid>/environ where a tool could read it. The sample compose mounts it as a
+# docker secret. The proxy reads the file once and unlinks it when the mount allows it.
 # Env equivalent: TRELLIS_EDGE_TOKEN_FILE.
 token_file: /run/secrets/edge_token
 
-# Fallback for installs that cannot mount a file: name of the env var holding the token.
-# Only used when token_file is empty. Never inline the token itself: this file is
+# Fallback for installs that cannot mount a file: name of the env var holding the token
+# (used only when token_file is absent). Never inline the token itself: this file is
 # read-only inside the container but still copied by backups.
 # token_env: TRELLIS_EDGE_TOKEN
 
+# ---------------------------------------------------------------- tools
+#
 # Directory holding this edge's tool.yaml directories. Same schema as the central
 # workspace (workspace/tools/<tool>/tool.yaml). The sample compose mounts the workspace
-# read-write at /app/workspace because the sandbox grants tools exactly that one writable
-# path (override with SANDBOX_RW_PATH); mount :ro only for read-only tools.
+# at /app/workspace read-write because the sandbox grants tools exactly that one
+# writable path (override with SANDBOX_RW_PATH); mount :ro only for read-only tools.
+# Env equivalent: TRELLIS_EDGE_TOOLS_DIR.
 tools_dir: ./workspace/tools
 
-# Allowlist of tools this node publishes to the central install, e.g.
-#   exports: [boiler_status, plant_readings]
-# Empty list publishes NOTHING -- this is an allowlist, not a denylist. A tool that is not
-# listed is never advertised in the catalog, and the proxy refuses it locally even if the
-# central side asks for it, so a compromised relay cannot invoke an unexported tool.
-exports: []
+# Allowlist of tools this node publishes to central. Empty list publishes NOTHING --
+# this is an allowlist, not a denylist. An unlisted tool is never advertised, and the
+# proxy refuses it locally even if central asks, so a compromised relay cannot invoke
+# an unexported tool.
+#
+# Two forms:
+#   - bare name                        -> credential_mode: shared (the default)
+#   - {name, credential_mode} mapping  -> that tool's credential policy
+# Modes: shared | per_user | per_user_required (see "Credential modes" below).
+exports:
+  # Stateless tool, no credentials of its own: reads the edge service account.
+  - boiler_status
+  # Python CLI wrappers (stdin/stdout tool protocol) whose tool.yaml declares its keys
+  # through `secret_groups` (one group per target environment: staging | production).
+  # Each operator needs a file of their own -- `user-secrets set` -- before this works;
+  # an unmapped user falls back to the shared file, then the process env.
+  - name: node_ssh
+    credential_mode: per_user
+  - name: node_file_transfer
+    credential_mode: per_user
 
-# Optional mutual TLS. Only needed when the central relay is configured with
-# EDGE_MTLS_CA. Mount the files read-only into this container; the proxy presents the
-# certificate on the WebSocket handshake and verifies the relay against tls_ca_file.
+# ---------------------------------------------------------------- MCP servers
+#
+# Directory holding this edge's mcp.yaml directories (workspace/mcps/<mcp>/mcp.yaml,
+# same MCPConfig schema as central). Nothing here is connected from the central side:
+# the edge publishes each tool's inputSchema verbatim and executes tools/call locally.
+# Env equivalent: TRELLIS_EDGE_MCPS_DIR.
+mcps_dir: ./workspace/mcps
+
+# Allowlist of MCP servers this node publishes. Same two forms as `exports`, plus the
+# per-server policy an MCP needs:
+#   include_tools         publish only these tool names (empty = all of them)
+#   exclude_tools         never publish/serve these names, even if listed above
+#   credential_mode       shared | per_user | per_user_required
+#   session_ttl_minutes   idle TTL before a user's server process is retired (30)
+#   max_sessions          concurrent sessions for this server (8; 32 per edge)
+#
+# Sessions are keyed per (mcp, user identity) -- one long-lived server process and one
+# HOME/TMPDIR per user -- so login state survives calls and tunnel reconnects and never
+# crosses between users. A dead session is reported in that call's result
+# (`mcp_session_lost`) and restarted lazily on the next one; no call is ever replayed.
+export_mcps:
+  # Operational CLI MCP server: stdio, Node, keeps its login session in files under
+  # HOME. Its mcp.yaml declares an explicit `tools:` catalog (8 category meta-tools with
+  # top-level oneOf schemas), so publishing needs no live discovery.
+  # per_user_required: no per-user file = fail closed with
+  # `no credentials for <email> on edge dc1`, nothing is spawned.
+  - name: devops-cli
+    include_tools:
+      - tenant_account_tools
+      - tenant_network_tools
+      - node_power_tools
+      - list_actions
+    exclude_tools:
+      # Read-only audit view is fine centrally; the destructive reset is not.
+      - tenant_admin_tools
+    credential_mode: per_user_required
+    session_ttl_minutes: 30
+    max_sessions: 8
+  # Bare form: shared credentials, default session settings.
+  - coralogix
+
+# ---------------------------------------------------------------- credentials
+#
+# Edge-local credential stores. Both must live OUTSIDE the tool-writable workspace: tool
+# code runs as this uid and can read whatever the workspace exposes, so a per-user store
+# inside it would hand every caller every other caller's password.
+#
+#   secrets_dir       <tool-or-mcp>.env per exported item (one service account)
+#   user_secrets_dir  <normalized-email>.env per person, written by
+#                     `python core/proxy.py user-secrets set <email>`
+#
+# Defaults are ./edge-secrets and ./edge-user-secrets; the sample compose bind-mounts
+# them at the paths below. Files are mode 0600, directories 0700, and nothing here is
+# ever sent to central or stored in etcd.
+# Env equivalents: TRELLIS_EDGE_SECRETS_DIR / TRELLIS_EDGE_USER_SECRETS_DIR.
+secrets_dir: /etc/trellis/edge-secrets
+user_secrets_dir: /etc/trellis/edge-user-secrets
+#
+# Credential modes, resolved per declared key:
+#   shared             edge-secrets/<name>.env -> process env -> unset
+#   per_user           edge-user-secrets/<email>.env -> shared -> process env -> unset
+#   per_user_required  the user's file ONLY; no file, or none of the declared keys in
+#                      it, refuses the call (`missing_credentials`) before anything runs
+# An empty value (`KEY=`) counts as unset in every layer, so a blank template line
+# cannot blank a working credential.
+#
+# One shared file per item, `/etc/trellis/edge-secrets/devops-cli.env`
+# (comments must be on their own line: a trailing `#` becomes part of the value):
+#   DEVOPS_URL=https://devops.internal
+#   DEVOPS_USERNAME=svc-edge
+#   DEVOPS_PASSWORD=...
+#   CORALOGIX_API_KEY=...
+# The last key is optional_secrets in mcp.yaml.
+# One per-user file per operator:
+#   docker compose exec -T trellis-proxy \
+#     python core/proxy.py user-secrets set ops@example.com \
+#     --config /etc/trellis/proxy.yaml <<'EOF'
+#   NODE_SSH_USER=ops
+#   NODE_SSH_PASSWORD=...
+#   EOF
+
+# ---------------------------------------------------------------- environment
+#
+# 0.5.0 gives a child process an allowlist base env (PATH, HOME, LANG, TZ, TMPDIR, the
+# proxy vars, LC_*, TRELLIS_*) plus only the keys its manifest declares. Set this to
+# true ONLY for a legacy tool that cannot declare every key it reads: it restores the
+# v0.4 "whole sanitized environment" behaviour (the tunnel token and framework secrets
+# are still stripped). Costs you the isolation between tools.
+# Env equivalent: TRELLIS_EDGE_ENV_PASSTHROUGH=true.
+env_passthrough: false
+
+# ---------------------------------------------------------------- sandbox
+#
+# Sandbox backend for tool processes and stdio MCP servers: auto | bwrap | landlock.
+# Same semantics as the central hub's SANDBOX_BACKEND: `auto` prefers bwrap and falls
+# back to Landlock when bwrap cannot run (no user namespaces, restrictive AppArmor).
+sandbox: auto
+#
+# Node MCP servers need more address space than the 4 GiB default: export
+# SANDBOX_RLIMIT_AS_MB=8192 in the compose .env (existing knob, applied by the Landlock
+# helper; under bwrap the container's own limits are the backstop).
+# RLIMIT_CPU counts consumed CPU, so a 600 s default does not evict an idle session.
+
+# ---------------------------------------------------------------- mutual TLS
+#
+# Optional. Only needed when the central relay is configured with EDGE_MTLS_CA. Mount
+# the files read-only into this container; the proxy presents the certificate on the
+# WebSocket handshake and verifies the relay against tls_ca_file. The key pair must be
+# set together, and all three require a wss:// server_url.
 # Env equivalents: TRELLIS_EDGE_TLS_CA / _CERT / _KEY.
 # tls_ca_file: /etc/trellis/tls/ca.pem
 # tls_cert_file: /etc/trellis/tls/edge.pem
 # tls_key_file: /etc/trellis/tls/edge-key.pem
 
-# Sandbox backend for tool processes: auto | bwrap | landlock. Same semantics as the
-# central hub's SANDBOX_BACKEND: `auto` prefers bwrap and falls back to Landlock when
-# bwrap cannot run (no user namespaces, restrictive AppArmor). See deploy/proxy/README.md.
-sandbox: auto
+# ---------------------------------------------------------------- what the manifests look like
+#
+# These live in workspace/mcps/<name>/mcp.yaml and workspace/tools/<name>/tool.yaml; they
+# are NOT read from this file. They are here to show what `per_user_required` and
+# `secret_groups` need on the other side of the pointer.
+#
+# workspace/mcps/devops-cli/mcp.yaml
+#   name: devops-cli
+#   transport: stdio
+#   command: node
+#   args: [/opt/devops-cli-mcp/dist/index.js]
+#   network: allow                 # stdio sandbox net policy; `none` cuts the IP network
+#   secrets: [DEVOPS_URL, DEVOPS_USERNAME, DEVOPS_PASSWORD]
+#   optional_secrets: [CORALOGIX_API_KEY]
+#   variables: [CORALOGIX_DOMAIN]
+#   tools:                         # explicit catalog: no live discovery at publish time
+#     - name: tenant_account_tools
+#       description: Tenant accounts -- create, read, update, list.
+#       inputSchema:               # published and delivered VERBATIM
+#         type: object
+#         oneOf:
+#           - type: object
+#             properties:
+#               action: {const: get_account}
+#               params: {type: object}
+#             required: [action]
+#           - type: object
+#             properties:
+#               action: {const: list_accounts}
+#             required: [action]
+#     - name: list_actions
+#       description: List every action this meta-tool accepts.
+#       inputSchema: {type: object}
+#
+# workspace/tools/node_ssh/tool.yaml
+#   name: node_ssh
+#   runtime: python
+#   entrypoint: node_ssh.py        # stdin JSON -> stdout JSON, no argv
+#   description: Run a command on a backbone node over SSH.
+#   timeout_seconds: 120
+#   retry_on_transient: false      # non-idempotent/high-privilege: never re-execute
+#   secret_groups:                 # every field key below is a DECLARED key on the edge
+#     - label: Target environment
+#       select_label: Environment
+#       options:
+#         - value: production
+#           label: Production backbone
+#           fields:
+#             - {key: PROD_NODE_SSH_USER, label: SSH user, type: text}
+#             - {key: PROD_NODE_SSH_PASSWORD, label: Password, type: password}
+#         - value: staging
+#           label: Staging backbone
+#           fields:
+#             - {key: STAGING_NODE_SSH_USER, label: SSH user, type: text}
+#             - {key: STAGING_NODE_SSH_PASSWORD, label: Password, type: password}

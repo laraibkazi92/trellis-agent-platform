@@ -91,8 +91,8 @@
             <h1 class="text-xl font-bold tracking-tight uppercase">{{ name }} <span class="text-neutral-400 font-normal ml-2">/ CONFIG</span></h1>
         </div>
         <div class="space-x-6 text-sm font-bold font-mono">
-            <a href="{% if type == 'agent' %}/agents{% else %}/tools{% endif %}" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase tracking-widest inline-flex items-center gap-2">
-                <i data-lucide="arrow-left" class="w-4 h-4"></i> Back to {% if type == 'agent' %}Agents{% else %}Tools{% endif %}
+            <a href="{% if type == 'agent' %}/agents{% elif type == 'mcp' %}/mcps{% else %}/tools{% endif %}" class="hover:text-accent dark:hover:text-accent-dark transition-colors uppercase tracking-widest inline-flex items-center gap-2">
+                <i data-lucide="arrow-left" class="w-4 h-4"></i> Back to {% if type == 'agent' %}Agents{% elif type == 'mcp' %}MCP Servers{% else %}Tools{% endif %}
             </a>
         </div>
     </nav>
@@ -285,6 +285,51 @@
                     <input type="text" name="entrypoint" value="{{ config.entrypoint }}" class="form-input font-mono text-accent dark:text-accent-dark">
                 </div>
                 <input type="hidden" name="rel_path" value="{{ config.rel_path }}">
+                </fieldset>
+            {% elif type == 'mcp' %}
+                {% if edge_managed %}
+                <div class="flex items-start gap-3 border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 p-4 mb-8">
+                    <i data-lucide="lock" class="w-5 h-5 shrink-0 text-amber-600 dark:text-amber-400"></i>
+                    <div class="font-mono text-xs text-amber-800 dark:text-amber-300 space-y-1">
+                        <p class="font-bold uppercase tracking-widest">Read-only &mdash; managed by the edge relay</p>
+                        <p class="whitespace-normal">
+                            This MCP server runs on edge &lsquo;{{ edge_site }}&rsquo; and is managed by the edge relay.
+                            Its transport and catalog come from the edge; edit the server there and reconnect.
+                            <a href="/admin/edges" class="underline hover:text-amber-900 dark:hover:text-amber-200">Manage edge nodes</a>.
+                        </p>
+                    </div>
+                </div>
+                {% endif %}
+                <fieldset {% if edge_managed %}disabled{% endif %} class="min-w-0">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-8">
+                    <div>
+                        <label class="form-label">Transport</label>
+                        <select name="transport" class="form-input">
+                            {% if config.get('transport') == 'remote' %}
+                            <option value="remote" selected>remote (assigned by the edge relay)</option>
+                            {% endif %}
+                            {% for t in ['stdio', 'http', 'streamable-http', 'sse'] %}
+                            <option value="{{ t }}" {% if config.get('transport') == t %}selected{% endif %}>{{ t }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div>
+                        <label class="form-label">Command / URL</label>
+                        <input type="text" name="command" value="{{ config.get('command') or '' }}" class="form-input">
+                    </div>
+                </div>
+                <div class="mb-8">
+                    <label class="form-label">Arguments (comma separated)</label>
+                    <input type="text" name="args" value="{{ (config.get('args') or []) | join(', ') }}" class="form-input font-mono">
+                </div>
+                <div class="mb-8">
+                    <label class="form-label">Environment (JSON)</label>
+                    <textarea name="env" rows="4" class="form-input font-mono">{{ (config.get('env') or {}) | tojson }}</textarea>
+                </div>
+                <div class="mb-8">
+                    <label class="form-label">Secrets (comma separated)</label>
+                    <input type="text" name="secrets" value="{% if config.get('secrets') is mapping %}{{ config.get('secrets') | tojson }}{% else %}{{ (config.get('secrets') or []) | join(', ') }}{% endif %}" class="form-input font-mono">
+                </div>
                 </fieldset>
             {% endif %}
             

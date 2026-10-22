@@ -993,6 +993,56 @@ def _parse_edge_rate(raw: str | None) -> int | None:
     return max(1, min(rate, 6000))
 
 
+def _normalize_edge_mcp(entry) -> dict | None:
+    """One status MCP entry -> {name, tools, transport}; junk is dropped.
+
+    A v0.5 relay writes ``{"name", "tools", "transport"}``; a bare name is accepted so
+    the page survives a relay that publishes a plain list of server names.
+    """
+    if isinstance(entry, str):
+        name = entry.strip()
+        return {"name": name, "tools": 0, "transport": ""} if name else None
+    if not isinstance(entry, dict):
+        return None
+    name = entry.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    try:
+        tools = max(0, int(entry.get("tools")))
+    except (TypeError, ValueError):
+        tools = 0
+    transport = entry.get("transport")
+    return {
+        "name": name.strip(),
+        "tools": tools,
+        "transport": transport.strip() if isinstance(transport, str) else "",
+    }
+
+
+def _normalize_edge_mcps(raw) -> list[dict]:
+    """Tolerate v0.4 (absent), a single mapping, and any junk value."""
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [mcp for mcp in (_normalize_edge_mcp(entry) for entry in raw) if mcp]
+
+
+def _normalize_edge_proto(raw) -> int | None:
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None
+    return raw
+
+
+def _normalize_edge_caps(raw) -> list[str]:
+    """Caps default to tools-only: that is what a v0.4 relay is worth."""
+    if isinstance(raw, (list, tuple)):
+        caps = [cap for cap in raw if isinstance(cap, str) and cap]
+        if caps:
+            return caps
+    return ["tools"]
+
+
 @router.get("/admin/edges", response_class=HTMLResponse)
 async def admin_edges_page(request: Request):
     if redirect := require_admin(request, '/admin'):
@@ -1022,6 +1072,9 @@ async def admin_edges_page(request: Request):
             "token_preview": config.get("token_preview") or "",
             "created_at": config.get("created_at") or "",
             "last_error": status.get("last_error") or "",
+            "mcps": _normalize_edge_mcps(status.get("mcps")),
+            "proto": _normalize_edge_proto(status.get("proto")),
+            "caps": _normalize_edge_caps(status.get("caps")),
             "last_seen": (
                 status.get("connected_at") or status.get("disconnected_at")
                 or config.get("last_seen") or ""
@@ -1203,6 +1256,62 @@ async def delete_edge(request: Request):
     )
     return RedirectResponse(url='/admin/edges', status_code=303)
 
+
+def _agent_editor_tool_rows(local_tool_configs, mcp_configs):
+    """Rows the agent editor's "Allowed MCP Tools" picker renders.
+
+    Hub tools plus every tool of every registered MCP (central and edge). Shared by the
+    page and its save handler so the save can tell an entry it *could* have rendered
+    (governed by the form) from one it never showed (must be preserved).
+    """
+    rows = [
+        {
+            "name": t_name,
+            "type": "local",
+            "source": "Hub",
+            "version": (t_config or {}).get("version", ""),
+            "description": (t_config or {}).get("description", ""),
+        }
+        for t_name, t_config in local_tool_configs.items()
+    ]
+    for mcp_name, mcp_config in mcp_configs.items():
+        for tool in (mcp_config or {}).get("tools") or []:
+            rows.append({
+                "name": tool.get("name", ""),
+                "type": "mcp",
+                "source": mcp_name,
+                "version": tool.get("version", ""),
+                "description": tool.get("description", ""),
+            })
+    rows.sort(key=lambda row: row["name"])
+    return rows
+
+
+async def _agent_editor_catalog():
+    """``(tool configs, mcp configs, mcp names)`` -- one bulk read per editor surface."""
+    local_tool_configs = await asyncio.to_thread(identity_mgr.get_all_tool_configs)
+    mcp_configs = await asyncio.to_thread(identity_mgr.get_all_mcp_configs)
+    all_mcps = await asyncio.to_thread(identity_mgr.list_mcps)
+    return local_tool_configs, mcp_configs, all_mcps
+
+
+def _merge_unrendered_entries(submitted, existing, rendered):
+    """Union the submitted allowlist with entries the editor had no checkbox for.
+
+    The editor renders one checkbox per registered tool / MCP name, so a config can
+    legitimately carry entries the form cannot show: a `<site>__*` edge wildcard, or a
+    reference to an edge MCP that has not connected yet. The form is authoritative only
+    for what it rendered; rewriting the list from `form.getlist` alone would delete the
+    rest on every save -- and dual-write the deletion to `workspace/agents/<name>/`.
+    """
+    ordered = list(submitted)
+    ordered.extend(
+        entry for entry in existing or []
+        if entry not in rendered and entry not in ordered
+    )
+    return ordered
+
+
 @router.get("/editor/{type}/{name}", response_class=HTMLResponse)
 async def editor_page(request: Request, type: str, name: str):
     fallback_url = '/agents' if type == 'agent' else '/tools'
@@ -1231,36 +1340,8 @@ async def editor_page(request: Request, type: str, name: str):
             if n != safe_name and safe_name in (cfg.get("a2a_access") or [])
         ]
 
-        all_tools_data = []
-        # Bulk fetch all tools and MCPs
-        local_tool_configs = await asyncio.to_thread(identity_mgr.get_all_tool_configs)
-        mcp_configs = await asyncio.to_thread(identity_mgr.get_all_mcp_configs)
-        
-        # Local Tools
-        for t_name, t_config in local_tool_configs.items():
-            all_tools_data.append({
-                "name": t_name, 
-                "type": "local", 
-                "source": "Hub",
-                "version": t_config.get("version", ""),
-                "description": t_config.get("description", "")
-            })
-            
-        # MCP Tools
-        for mcp_name, mcp_config in mcp_configs.items():
-            if mcp_config and "tools" in mcp_config:
-                for t in mcp_config["tools"]:
-                    all_tools_data.append({
-                        "name": t.get("name", ""), 
-                        "type": "mcp", 
-                        "source": mcp_name,
-                        "version": t.get("version", ""),
-                        "description": t.get("description", "")
-                    })
-                    
-        all_tools_data.sort(key=lambda x: x["name"])
-        all_tools = all_tools_data
-        all_mcps = await asyncio.to_thread(identity_mgr.list_mcps)
+        local_tool_configs, mcp_configs, all_mcps = await _agent_editor_catalog()
+        all_tools = _agent_editor_tool_rows(local_tool_configs, mcp_configs)
         
         if not config:
             request.session["flash_msg"] = "Agent not found."
@@ -1324,6 +1405,11 @@ async def editor_page(request: Request, type: str, name: str):
         if not config:
             request.session["flash_msg"] = "MCP not found."
             return RedirectResponse(url='/mcps', status_code=303)
+        # Edge-exported servers are published by the relay from the edge's own catalog;
+        # the editor renders read-only and names the owning site.
+        edge_site = (config.get("remote") or {}).get("site") or (
+            safe_name.split("__", 1)[0] if "__" in safe_name else ""
+        )
         return templates.TemplateResponse(
             request=request,
             name="editor.html", 
@@ -1332,7 +1418,9 @@ async def editor_page(request: Request, type: str, name: str):
                 "type": type,
                 "name": safe_name,
                 "config": config,
-                "error": flash_msg
+                "error": flash_msg,
+                "edge_managed": config.get("managed_by") == "edge-relay",
+                "edge_site": edge_site,
             }
         )
     return RedirectResponse(url='/admin', status_code=303)
@@ -1433,8 +1521,19 @@ async def save_agent(request: Request, name: str):
         target for target in form.getlist("a2a_access")
         if is_agent_internal(all_agent_configs.get(target, {}))
     ]
-    config["allowed_tools"] = form.getlist("allowed_tools")
-    config["allowed_mcps"] = form.getlist("allowed_mcps")
+    # Union, not overwrite: the editor renders one checkbox per registered tool / MCP,
+    # so anything it cannot show -- a `<site>__*` wildcard, a reference to an edge MCP
+    # that has not connected yet -- is absent from the form and must survive the save.
+    local_tool_configs, mcp_configs, all_mcps = await _agent_editor_catalog()
+    rendered_tools = {
+        row["name"] for row in _agent_editor_tool_rows(local_tool_configs, mcp_configs)
+    }
+    config["allowed_tools"] = _merge_unrendered_entries(
+        form.getlist("allowed_tools"), config.get("allowed_tools"), rendered_tools
+    )
+    config["allowed_mcps"] = _merge_unrendered_entries(
+        form.getlist("allowed_mcps"), config.get("allowed_mcps"), set(all_mcps)
+    )
     # Checkbox: only present in form when checked.
     config["agent_memory"] = form.get("agent_memory") == "true"
     skills_content = form.get("skills_content", "")
@@ -1477,6 +1576,16 @@ async def delete_mcp(request: Request, name: str = Form(...)):
         request.session["flash_msg"] = "Invalid name parameter."
         return RedirectResponse(url='/mcps', status_code=303)
 
+    # An edge-published MCP is the relay's: deleting it here would be silently undone by
+    # the next catalog publish, and it is the site (not the entry) that owns it.
+    config = await asyncio.to_thread(identity_mgr.get_mcp_config, safe_name)
+    if (config or {}).get("managed_by") == "edge-relay":
+        request.session["flash_msg"] = (
+            f"MCP '{safe_name}' is managed by the edge relay and cannot be deleted here. "
+            f"Remove it from the edge's export_mcps and reconnect, or delete the site."
+        )
+        return RedirectResponse(url='/mcps', status_code=303)
+
     await asyncio.to_thread(identity_mgr.delete_mcp, safe_name)
     await asyncio.to_thread(identity_mgr.delete_mcp_tool_embeddings, safe_name)
 
@@ -1508,7 +1617,22 @@ async def save_mcp(request: Request, name: str):
     form = await request.form()
     
     config = await asyncio.to_thread(identity_mgr.get_mcp_config, safe_name) or {"name": safe_name}
+    # Same defence as save_tool: an edge-published MCP is the relay's, and a save here
+    # would be overwritten on the next catalog publish.
+    if config.get("managed_by") == "edge-relay":
+        request.session["flash_msg"] = (
+            f"MCP '{safe_name}' is managed by the edge relay and cannot be edited here. "
+            f"Change it on the edge and reconnect."
+        )
+        return RedirectResponse(url='/mcps', status_code=303)
     config["transport"] = form.get("transport")
+    # `remote` is a registry pointer written by the relay, not a transport an operator can
+    # pick: a hand-written one has no usable `remote` block and would be routed nowhere.
+    if config.get("transport") == "remote":
+        request.session["flash_msg"] = (
+            "Transport 'remote' is assigned by the edge relay and cannot be selected here."
+        )
+        return RedirectResponse(url=f'/editor/mcp/{safe_name}', status_code=303)
     config["command"] = form.get("command")
     
     args_str = form.get("args", "")
@@ -1526,7 +1650,13 @@ async def save_mcp(request: Request, name: str):
     secrets_str = form.get("secrets", "")
     config["secrets"] = [s.strip() for s in secrets_str.split(",") if s.strip()] if secrets_str else []
     
-    await asyncio.to_thread(identity_mgr.save_mcp_config, safe_name, config)
+    try:
+        await asyncio.to_thread(identity_mgr.save_mcp_config, safe_name, config)
+    except ValueError as exc:
+        # Name rule violations (e.g. a central name containing "__") are user input
+        # problems, not server faults.
+        request.session["flash_msg"] = str(exc)
+        return RedirectResponse(url='/mcps', status_code=303)
     
     # Dual-write to the workspace file so the registry sync re-applies this edit on the
     # next rebuild instead of reverting it to the previous on-disk version.

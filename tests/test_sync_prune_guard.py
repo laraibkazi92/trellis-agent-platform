@@ -22,19 +22,23 @@ class _FakeClient:
 
 
 class FakeIdentityManager:
-    def __init__(self, agents=(), tools=(), mcps=(), tool_configs=None):
+    def __init__(self, agents=(), tools=(), mcps=(), tool_configs=None, mcp_configs=None):
         self._prefix_map = {
             "/registry/agents/": dict.fromkeys(agents, {}),
             "/registry/tools/": {
                 name: dict((tool_configs or {}).get(name, {})) for name in tools
             },
-            "/registry/mcps/": dict.fromkeys(mcps, {}),
+            "/registry/mcps/": {
+                name: dict((mcp_configs or {}).get(name, {})) for name in mcps
+            },
         }
         self.deleted = []
         self.saved_configs = {}
+        self.prefix_reads = []
         self.client = _FakeClient(self)
 
     def _get_all_configs_by_prefix(self, prefix):
+        self.prefix_reads.append(prefix)
         return self._prefix_map.get(prefix, {})
 
     def delete_mcp_tool_embeddings(self, name):
@@ -359,3 +363,200 @@ def test_prune_never_deletes_an_undecodable_tool_config(sync_env, monkeypatch):
 
     assert rc == 0
     assert "/registry/tools/broken/config" in store
+
+
+# --- edge references warn, never fail (Phase 7) -------------------------------------
+#
+# An agent authored against an edge that has not dialled in yet (or whose catalog the
+# relay has not published yet) is a normal bring-up state. db-sync names the reference
+# and carries on: exit code and prune behaviour are untouched, and the reference starts
+# working the moment the edge connects (resolution is at runtime, not at sync).
+
+EDGE_MCP_KEY = "dc1__devops-cli"
+GHOST_MCP_KEY = "dc1__ghost-mcp"
+EDGE_WILDCARD = "dc1__*"
+
+
+def _edge_mcp_config(name):
+    site, mcp = name.split("__", 1)
+    return {
+        "name": name,
+        "transport": "remote",
+        "remote": {"site": site, "mcp": mcp},
+        "managed_by": "edge-relay",
+        "tools": [],
+    }
+
+
+def _seed_agent(sync_env, name, **allowlists):
+    """Write a workspace agent whose config.yaml declares ``allowlists``."""
+    agent_dir = sync_env / "agents" / name
+    agent_dir.mkdir()
+    lines = [f"name: {name}", "type: user_agent"]
+    for key, entries in allowlists.items():
+        lines.append(f"{key}:")
+        lines.extend(f"  - {entry}" for entry in entries)
+    (agent_dir / "config.yaml").write_text("\n".join(lines) + "\n")
+
+
+@pytest.mark.parametrize(
+    "entry,expected",
+    [
+        (EDGE_MCP_KEY, ("pair", EDGE_MCP_KEY)),
+        (EDGE_WILDCARD, ("site", "dc1")),
+        ("mcp__dc1__devops-cli__tenant_account_tools", ("mcp", EDGE_MCP_KEY)),
+        # Central / not-a-reference forms are never judged by db-sync.
+        ("mcp__devops-cli__action", None),
+        ("devops-cli", None),
+        ("text_stats", None),
+        # Ambiguous shapes resolve to nothing rather than to a guessed edge key.
+        ("dc1__a__b", None),
+        ("dc1__", None),
+        (42, None),
+    ],
+)
+def test_edge_ref_kind(entry, expected):
+    assert sync_to_db._edge_ref_kind(entry) == expected
+
+
+def test_main_warns_on_a_reference_to_a_not_yet_connected_edge_mcp(
+    sync_env, monkeypatch, capsys
+):
+    _seed_agent(sync_env, "edge-agent", allowed_mcps=[GHOST_MCP_KEY])
+    fake = FakeIdentityManager(agents={"edge-agent"})
+    _install_registry(monkeypatch, fake)
+
+    rc = sync_to_db.main([])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "WARNING:" in out
+    assert "agent 'edge-agent'" in out
+    assert GHOST_MCP_KEY in out
+    assert "edge not connected / catalog not published yet" in out
+    # The agent was still saved: a warning never aborts the sync.
+    assert "edge-agent" in fake.saved_configs
+
+
+def test_a_warning_does_not_change_the_prune(sync_env, monkeypatch, capsys):
+    _seed_agent(sync_env, "edge-agent", allowed_mcps=[GHOST_MCP_KEY])
+    fake = FakeIdentityManager(
+        agents={"edge-agent", "gone-agent"},
+        tools={"text_stats"},
+    )
+    _install_registry(monkeypatch, fake)
+
+    rc = sync_to_db.main([])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "WARNING:" in out
+    assert "/registry/agents/gone-agent/config" in fake.deleted
+    assert "/registry/tools/text_stats/config" in fake.deleted
+
+
+def test_no_warning_for_a_registered_edge_mcp(sync_env, monkeypatch, capsys):
+    _seed_agent(sync_env, "edge-agent", allowed_mcps=[EDGE_MCP_KEY])
+    fake = FakeIdentityManager(
+        agents={"edge-agent"},
+        mcps={EDGE_MCP_KEY},
+        mcp_configs={EDGE_MCP_KEY: _edge_mcp_config(EDGE_MCP_KEY)},
+    )
+    _install_registry(monkeypatch, fake)
+
+    rc = sync_to_db.main([])
+
+    assert rc == 0
+    assert "WARNING" not in capsys.readouterr().out
+    assert fake.deleted == []
+
+
+def test_no_warning_for_central_mcp_references(sync_env, monkeypatch, capsys):
+    """A plain server name or a 3-part `mcp__<server>__<tool>` is central: silent."""
+    _seed_agent(
+        sync_env,
+        "central-agent",
+        allowed_mcps=["example-mcp"],
+        allowed_tools=["mcp__example-mcp__list", "text_stats"],
+    )
+    fake = FakeIdentityManager(agents={"central-agent"}, mcps={"example-mcp"})
+    _install_registry(monkeypatch, fake)
+
+    rc = sync_to_db.main([])
+
+    assert rc == 0
+    assert "WARNING" not in capsys.readouterr().out
+
+
+def test_a_wildcard_resolves_against_any_mcp_of_that_site(sync_env, monkeypatch, capsys):
+    """`<site>__*` is satisfied by any `<site>__…` registry entry, and only by that site:
+    `dc1__*` must not be satisfied by `dc10__x`."""
+    _seed_agent(sync_env, "edge-agent", allowed_mcps=[EDGE_WILDCARD, "dc9__*"])
+    fake = FakeIdentityManager(
+        agents={"edge-agent"},
+        mcps={EDGE_MCP_KEY},
+        mcp_configs={EDGE_MCP_KEY: _edge_mcp_config(EDGE_MCP_KEY)},
+    )
+    _install_registry(monkeypatch, fake)
+
+    rc = sync_to_db.main([])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "dc9__*" in out
+    assert "dc1__*" not in out
+
+
+def test_a_four_part_reference_to_a_ghost_edge_mcp_warns(sync_env, monkeypatch, capsys):
+    entry = "mcp__dc1__ghost-mcp__chat"
+    _seed_agent(sync_env, "edge-agent", allowed_tools=[entry])
+    fake = FakeIdentityManager(agents={"edge-agent"})
+    _install_registry(monkeypatch, fake)
+
+    rc = sync_to_db.main([])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert entry in out
+    assert "edge not connected / catalog not published yet" in out
+
+
+def test_a_two_part_reference_to_a_registered_edge_tool_does_not_warn(
+    sync_env, monkeypatch, capsys
+):
+    """`<site>__<name>` is also the edge *tool* form; the tools prefix decides."""
+    _seed_agent(sync_env, "edge-agent", allowed_tools=[EDGE_TOOL])
+    fake = FakeIdentityManager(
+        agents={"edge-agent"}, tools={EDGE_TOOL}, tool_configs={EDGE_TOOL: EDGE_CONFIG}
+    )
+    _install_registry(monkeypatch, fake)
+
+    rc = sync_to_db.main([])
+
+    assert rc == 0
+    assert "WARNING" not in capsys.readouterr().out
+    assert f"/registry/tools/{EDGE_TOOL}/config" not in fake.deleted
+
+
+def test_edge_reference_resolution_reads_the_mcps_prefix_once(sync_env, monkeypatch, capsys):
+    """Four edge references, one `/registry/mcps/` read.
+
+    The prune already needs the prefix, and the reference pass must reuse that snapshot:
+    a per-reference read would put an etcd round trip on every `allowed_mcps` entry of
+    every agent in the workspace.
+    """
+    _seed_agent(
+        sync_env,
+        "edge-agent",
+        allowed_mcps=[EDGE_WILDCARD, GHOST_MCP_KEY, EDGE_MCP_KEY],
+        allowed_tools=["mcp__dc1__ghost-mcp__chat", EDGE_TOOL],
+    )
+    fake = FakeIdentityManager(agents={"edge-agent"})
+    _install_registry(monkeypatch, fake)
+
+    rc = sync_to_db.main([])
+
+    assert rc == 0
+    assert fake.prefix_reads.count("/registry/mcps/") == 1
+    assert "edge not connected / catalog not published yet" in capsys.readouterr().out
+

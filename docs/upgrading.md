@@ -477,6 +477,222 @@ unchanged.
 
 ---
 
+### v0.5.0 — 2026-10-22
+
+Changes since `v0.4.1`: an edge can now export **MCP servers** over the same outbound
+tunnel, caller identity reaches the edge, edge tool/MCP environments are scoped to
+declared keys, and credentials can live per user on the edge. This release does **not**
+move the `TRELLIS_IMAGE` default — the compose files still pin `v0.4.1` — so pin the new
+tag yourself in `.env` before pulling (see
+[Standard upgrade](#standard-upgrade-published-images)); bumping the compose default is a
+separate release-time step.
+
+Everything is additive for an install that never enrolls an edge, but several behaviour
+changes can bite silently. Read all seven under
+[Behaviour changes to announce](#behaviour-changes-to-announce); the three most likely to
+break an existing deployment are the edge **env allowlist** (undeclared variables stop
+being inherited), 4-part edge MCP tool names, and a site that is already `public: true`
+now also exposing its MCP tools.
+
+#### Upgrade order: central first, then edges
+
+The wire protocol moves to `proto: 2`. The handshake stays strict, so ordering matters:
+
+| Central | Edge | Result |
+| --- | --- | --- |
+| v0.5 | v0.4.x | **Supported.** Tools work unchanged; the relay sees `caps=["tools"]`, no MCPs; MCP calls answer `404` |
+| v0.4.x | v0.5 | **Clean refusal.** `CLOSE_VERSION` (close code `4001`) at the handshake; the edge logs one terminal "version mismatch — upgrade central first" line and retries only at the maximum backoff (60 s, jittered) |
+| v0.5 | v0.5 | Full feature set |
+
+Upgrade **central first**, verify it is healthy, then upgrade edge VMs one at a time. A
+v0.5 edge pointed at an old central is not broken silently — it stops at the handshake
+and says so — but it does stop serving until central is upgraded.
+
+#### Standard upgrade (published images)
+
+```bash
+git fetch --tags
+# This release does not move the compose default, so pin the image yourself:
+#   TRELLIS_IMAGE=<registry>/<image>:v0.5.0   (e.g. the GHCR tag in the release notes)
+# in .env before pulling. Without it you keep running the v0.4.1 default.
+docker compose pull
+docker compose up -d
+```
+
+No new nginx route lands in `v0.5.0`: a `v0.4.x` gateway already proxies `/edge`. If you
+do rebuild it (for example you are coming from an older tag), use the two-step form:
+
+```bash
+docker compose build nginx-gateway
+docker compose up -d --no-build --no-deps nginx-gateway
+```
+
+**Never `docker compose up -d --build` on a published-image box.** `--build` on `up`
+builds every service with a `build:` section in the service's dependency graph, replacing
+the image you just pulled with a local build that reports `TRELLIS_VERSION=dev` and
+carries no attestation. The two-step proxy rebuild is the supported form, same as
+`v0.4.0`/`v0.4.1`.
+
+Building from source (`TRELLIS_IMAGE` unset or overridden) is the one case where
+`docker compose up -d --build` is correct.
+
+#### New `proxy.yaml` keys (edge only, all optional)
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `env_passthrough` | `false` | `true` restores the v0.4 denylist env (tunnel token still stripped) |
+| `mcps_dir` | `workspace/mcps` | where this edge's `mcp.yaml` files live |
+| `export_mcps` | `[]` | allowlist: bare name or mapping `{name, include_tools, exclude_tools, credential_mode, session_ttl_minutes, max_sessions}` |
+| `secrets_dir` | `edge-secrets` | shared credential store, `<tool-or-mcp>.env` |
+| `user_secrets_dir` | `edge-user-secrets` | per-user store, `<normalized-email>.env` |
+
+`exports` entries also accept the mapping form `{name, credential_mode}` (a bare name
+means `shared`). `mcp.yaml` gains `network: allow|none` (default `allow`, stdio only;
+`http`/`sse` ignore it). An unknown value warns and falls back to `allow` rather than
+dropping the config.
+
+New edge env vars, each an override for the key above: `TRELLIS_EDGE_ENV_PASSTHROUGH`,
+`TRELLIS_EDGE_MCPS_DIR`, `TRELLIS_EDGE_SECRETS_DIR`, `TRELLIS_EDGE_USER_SECRETS_DIR`.
+No new `.env` keys on central. Values that are not valid are ignored/warn — they never
+fail startup.
+
+#### Compose and volume changes
+
+Central: **nothing new**. `edge-relay` and the `/edge` route already exist since
+`v0.4.0`; the same service now routes MCP calls.
+
+Edge (`deploy/proxy/docker-compose.yml`): the sample now mounts the three new
+directories. If you maintain your own edge compose file, add the equivalents:
+
+```yaml
+volumes:
+  - ./workspace:/app/workspace
+  - ./workspace/mcps:/app/workspace/mcps           # mcps_dir (part of workspace, listed explicitly)
+  - ./proxy.yaml:/etc/trellis/proxy.yaml:ro
+  - ./edge-secrets:/etc/trellis/edge-secrets       # shared service accounts
+  - ./edge-user-secrets:/etc/trellis/edge-user-secrets   # per-user, written by the CLI
+```
+
+- Create both credential directories `0700`, owned by `TRELLIS_UID`, before starting.
+- The credential stores must live **outside** the sandbox-writable workspace: tool code
+  runs as the same uid and can read whatever the workspace exposes, so a per-user store
+  inside it hands every caller every other caller's password.
+- `mcps_dir` defaults to `workspace/mcps` and is only read at publish time. If the MCP
+  manifests are not part of the workspace checkout, point `mcps_dir:` at a separate
+  mount instead (`/etc/trellis/mcps`).
+- **stdio MCP sessions need a writable sandbox root.** Each session's `HOME`/`TMPDIR`
+  lives under it (`mcp-sessions/`), so a `:ro` workspace is fine for tools but not for an
+  edge that exports stdio MCP servers.
+
+#### Behaviour changes to announce
+
+1. **Env allowlist (the biggest silent break).** An exported tool or stdio MCP server no
+   longer inherits the edge container's environment. It sees a fixed base
+   (`PATH`, `HOME`, `LANG`, `TZ`, `TMPDIR`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`,
+   `SSL_CERT_FILE`, `LC_*`, `TRELLIS_*`) plus only the keys its `tool.yaml`/`mcp.yaml`
+   declares (`secrets`, `optional_secrets`, `variables`, `secret_groups` fields).
+   A tool reading an undeclared variable silently sees it unset — declare the key, or set
+   `env_passthrough: true` and restart the proxy to restore v0.4 behaviour (minus the
+   token; `SIGHUP` cannot apply it).
+2. **CA-bundle variables are not in the allowlist.** `REQUESTS_CA_BUNDLE`,
+   `CURL_CA_BUNDLE` and `SSL_CERT_DIR` must be declared by any tool/MCP server that needs
+   them (only `SSL_CERT_FILE` is always present). A corporate base image that set just
+   those will start failing TLS calls after the upgrade.
+3. **Edge MCP tool names are 4-part** — `mcp__<site>__<mcp>__<tool>`. An agent that lists
+   an edge MCP tool in `allowed_tools` must use that form.
+4. **Central MCP names may not contain `__`.** The separator is what distinguishes an
+   edge MCP from a central one. Such a name is now rejected when saved (`ValueError`) and
+   warned-and-skipped by the registry sync. Rename before upgrading if you wrote one by
+   hand.
+5. **`public: true` on a site now also exposes its MCP tools.** Site visibility used to
+   cover tools only. Review public sites before an edge starts exporting MCP servers.
+6. **`SIGHUP` retires every live MCP session.** Credentials for a session are resolved
+   once at creation, so the signal is how an edited credential file takes effect without
+   waiting out the idle TTL. The next call reopens the session (no error), which costs the
+   user one re-login. Tunnel reconnects do **not** retire sessions.
+7. **Session directories for email users move once.** They are now keyed by a normalized
+   email (`sha256` of the lowercased address), so directories written by a build that
+   keyed the raw address are orphaned: those users log in once more. Nothing else reads
+   the old directories; they can be deleted.
+
+#### Preparing edge credentials before switching a mode
+
+Default `shared` needs nothing beyond the files. Do these **in order** before setting any
+`credential_mode` (per entry in `exports`/`export_mcps`):
+
+1. Create and mount the `secrets_dir` / `user_secrets_dir` volumes (above).
+2. Populate the shared file for each exported tool or MCP server —
+   `<secrets_dir>/<tool-or-mcp>.env`, mode `0600`:
+   ```bash
+   install -m 600 /dev/null ./edge-secrets/devops-cli.env   # then edit it
+   ```
+3. Provision each operator who will use a `per_user`/`per_user_required` entry:
+   ```bash
+   docker compose exec -T trellis-proxy \
+     python core/proxy.py user-secrets set ops@example.com \
+     --config /etc/trellis/proxy.yaml <<'EOF'
+   DEVOPS_USERNAME=ops
+   DEVOPS_PASSWORD=...
+   EOF
+   ```
+4. **Then** set `credential_mode` and `SIGHUP`. Switching to `per_user_required` before
+   step 3 makes every call for an unprovisioned user fail closed with
+   `no credentials for <email> on edge <site>`.
+
+`user-secrets list` prints key names only, so it is safe to paste into a ticket. Verify
+with `SIGHUP` and one real call per user; credentials never cross the tunnel, so nothing
+appears centrally to check.
+
+#### Enabling MCP export
+
+Add `export_mcps:` to the edge's `proxy.yaml` and `SIGHUP` — the catalog republishes
+without a restart (a stdio server with no static `tools:` block is discovered live, 20 s
+per server, concurrently). Verify in **Admin → Edges**: the site shows `proto 2`, the
+`mcp` capability badge, and one row per server. If a server is missing, the edge log names
+it — the usual causes are a name colliding with a central MCP, an oversized schema, or a
+hello frame over the 10 MiB cap (the largest catalogs are dropped, tools stay online).
+
+#### Node MCP servers and sandbox limits
+
+Set `SANDBOX_RLIMIT_AS_MB=8192` for stdio MCP servers written in Node — the `4096`
+default is tight and an allocation failure looks like a crash. `SANDBOX_RLIMIT_CPU_S`
+counts **consumed** CPU, so the 600 s default does not retire an idle long-lived session.
+Both apply to the Landlock backend only; see
+[deploy.md → Sandbox settings and rollback](deploy.md#sandbox-settings-and-rollback).
+
+#### Rollback
+
+- **Revert central to `v0.4.x`:** v0.5 edges stop at the handshake (`CLOSE_VERSION`). That
+  is safe and visible; their tools go offline until central is restored. Nothing on the
+  edge is corrupted.
+- **Revert only the edges:** central keeps serving, including its tools. A reverted edge
+  advertises `caps=["tools"]`, and central **keeps** the leftover `/registry/mcps/*`
+  entries rather than pruning them on an empty catalog, so agents that list
+  `allowed_mcps: ["<site>__<mcp>"]` still see those tools but every call answers the
+  `404` from the failure table. They are pruned by the next v0.5 publish from that site.
+- **Restoring central while edges are newer** is the safer direction; the reverse
+  (old central, new edge) is the one that refuses.
+
+Changes to declare:
+
+- **Compose services:** none added or removed on central. Edge compose gains volumes for
+  `mcps_dir`, `secrets_dir`, `user_secrets_dir`.
+- **`.env` keys:** none added centrally. Edge gains four `TRELLIS_EDGE_*` overrides
+  (optional); `SANDBOX_RLIMIT_AS_MB=8192` recommended for Node MCP servers.
+- **Registry sync:** `/registry/mcps/` is preserved for `managed_by: edge-relay` entries,
+  like `/registry/tools/`; a reference to a not-yet-connected edge warns instead of
+  failing.
+- **Tool protocol / `workspace/` layout:** unchanged. `mcp.yaml` gains optional
+  `network:`; `proxy.yaml` gains five keys; edge MCP tool names are 4-part.
+- **Data migrations:** none in etcd. One-time move of edge MCP session directories for
+  email users (one re-login).
+- **Image pins:** compose files still default `TRELLIS_IMAGE` to `v0.4.1`; this page's
+  instructions assume you pin `<registry>/<image>:v0.5.0` in `.env` yourself. Bumping the
+  compose default to `v0.5.0`, and the Hindsight/etcd pins, is a release-time task outside
+  this change.
+
+---
+
 ## Release checklist (maintainer template)
 
 Copy this into the release PR/notes and fill it in per release.

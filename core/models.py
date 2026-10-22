@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import re
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Optional, Literal, Dict, Any, Union
@@ -215,10 +216,68 @@ class MCPToolDefinition(BaseModel):
     description: str
     inputSchema: dict
 
+# An edge name (site / exported tool / exported MCP): `NAME_RE` with `__` banned.
+#
+# pydantic-core's regex engine has no lookarounds, so "no `__` anywhere" is spelled
+# structurally instead of `(?!.*__)`: an underscore may only appear when followed by a
+# non-underscore character (or at the very end). That rejects `a__b`, `a__`, `__a`.
+_EDGE_REF_NAME_PATTERN = r"^[A-Za-z0-9](?:[A-Za-z0-9-]|_[A-Za-z0-9-])*_?$"
+
+
+# --- Public reference forms (v0.5.0 L7; documented manifest API) -------------------
+# One site / MCP / tool name: `NAME_RE`'s character set and 64-char cap with `__` banned
+# structurally (`_` must be followed by an alphanumeric or `-`). The same
+# ban is enforced at every write boundary -- the relay's `_check_namespace`, the
+# `Remote*Spec` patterns above, `save_mcp_config`, `sync_mcp` -- and it is repeated here
+# on purpose: it is what makes each form below a *single* unambiguous statement.
+# Without it, `mcp__dc1__mcp__tool` would also match the 3-part central form (server
+# `dc1__mcp`), and `dc1__a__b` would read as an edge MCP named `a__b`.
+#
+# Deliberately stricter than `NAME_RE` in one respect: a segment may not *end* with `_`
+# (`a_` is rejected). A trailing underscore is legal for a name on its own, but inside a
+# ref it makes the `__` boundary ambiguous -- `a___b` would be "site `a_` + `b`" or
+# "site `a` + name `_b`" depending on the split direction. One character per repetition
+# (`{0,63}` after the mandatory first character) keeps the length at 1..64; the
+# lookahead is a Python-`re` feature, so this form is for the documented refs only --
+# pydantic-core (`_EDGE_REF_NAME_PATTERN`) spells the ban without one.
+_EDGE_REF_SEGMENT = r"[A-Za-z0-9](?:[A-Za-z0-9-]|_(?=[A-Za-z0-9-])){0,63}"
+_EDGE_REF_PAIR = rf"{_EDGE_REF_SEGMENT}__{_EDGE_REF_SEGMENT}"
+
+# `<site>__<tool>`: an edge tool, the registry key `/registry/tools/<site>__<tool>`.
+EDGE_TOOL_REF_RE = re.compile(rf"^{_EDGE_REF_PAIR}$")
+# `<site>__<mcp>`: an edge MCP server, the registry key `/registry/mcps/<site>__<mcp>`,
+# and a valid entry in an agent's `allowed_mcps`.
+EDGE_MCP_REF_RE = re.compile(rf"^{_EDGE_REF_PAIR}$")
+# `<site>__*`: optional sugar in `allowed_mcps` for every MCP that site currently
+# exports. Expanded against discovery at build time; never stored expanded.
+EDGE_MCP_WILDCARD_RE = re.compile(rf"^{_EDGE_REF_SEGMENT}__\*$")
+# `mcp__<site>__<mcp>__<tool>`: 4 parts -- the agent/gateway name of an edge MCP tool.
+EDGE_MCP_TOOL_REF_RE = re.compile(rf"^mcp__{_EDGE_REF_PAIR}__{_EDGE_REF_SEGMENT}$")
+# `mcp__<server>__<tool>`: 3 parts -- a central MCP tool. Because a central MCP name
+# may not contain `__`, the 4-part name above cannot also read as this form, and a
+# 3-part name can never be mistaken for an edge target (see
+# `core.discovery.resolve_edge_mcp_target`, which still lets the registry decide).
+CENTRAL_MCP_TOOL_REF_RE = re.compile(rf"^mcp__{_EDGE_REF_PAIR}$")
+
+
+class RemoteMcpSpec(BaseModel):
+    """Where a remote (edge-hosted) MCP server actually executes.
+
+    ``site`` is the edge id and the routing key; ``mcp`` is the server's name in
+    that edge's exported catalog. Both are written by the edge relay from the
+    catalog the edge published, never by a caller or an ``mcp.yaml``.
+
+    Neither may contain ``__`` (see ``_EDGE_REF_NAME_PATTERN``): that separator is what
+    makes ``mcp__<site>__<mcp>__<tool>`` split, and the two halves form a registry key.
+    """
+    site: str = Field(..., pattern=_EDGE_REF_NAME_PATTERN, max_length=64)
+    mcp: str = Field(..., pattern=_EDGE_REF_NAME_PATTERN, max_length=64)
+
+
 class MCPConfig(BaseModel):
     """Configuration for an external MCP server, parsed from mcp.yaml or DB."""
     name: str
-    transport: Literal["stdio", "sse", "http", "streamable-http"] = "stdio"
+    transport: Literal["stdio", "sse", "http", "streamable-http", "remote"] = "stdio"
     command: Optional[str] = None
     args: Optional[List[str]] = Field(default_factory=list)
     env: Optional[Dict[str, str]] = Field(default_factory=dict)
@@ -228,15 +287,45 @@ class MCPConfig(BaseModel):
     optional_secrets: Optional[List[str]] = Field(default_factory=list, description="Secrets injected when present but not required for the MCP to start.")
     variables: Optional[Union[List[str], Dict[str, List[str]]]] = Field(default_factory=list, description="List of non-sensitive configuration variables required by this MCP.")
     tools: Optional[List[MCPToolDefinition]] = Field(default_factory=list, description="Optional statically defined tools to bypass dynamic discovery.")
+    network: str = Field(default="allow", description="Network policy for this MCP server's stdio process: 'allow' or 'none'. 'none' gives it no IP network access (bwrap --unshare-net, or Landlock TCP deny on ABI >= 4). Only stdio servers spawn a process; http/sse transports ignore it.")
+    remote: Optional[RemoteMcpSpec] = Field(default=None, description="Set for edge-hosted MCP servers: the site and the server name inside that site's catalog. Written only by the edge relay, never parsed from an mcp.yaml. Remote servers are never connected from central: calls are POSTed to the relay, and their tools come from the static `tools` catalog.")
+
+    @field_validator("network")
+    @classmethod
+    def _normalize_network(cls, value: str) -> str:
+        return normalize_network_policy(value, "mcp")
 
 class RemoteToolSpec(BaseModel):
     """Where a remote (edge-hosted) tool actually executes.
 
     ``site`` is both the edge id and the routing key; it is written by the edge
-    relay from the catalog the edge published, never by a caller.
+    relay from the catalog the edge published, never by a caller. Neither field may
+    contain ``__`` (see ``_EDGE_REF_NAME_PATTERN``): a site is the left half of
+    ``<site>__<tool>``, and a tool name is the last segment of an
+    ``mcp__<site>__<mcp>__<tool>`` reference.
     """
-    site: str = Field(..., pattern="^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-    tool: str = Field(..., pattern="^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    site: str = Field(..., pattern=_EDGE_REF_NAME_PATTERN, max_length=64)
+    tool: str = Field(..., pattern=_EDGE_REF_NAME_PATTERN, max_length=64)
+
+
+def normalize_network_policy(value: Any, what: str) -> str:
+    """Normalize an ``allow|none`` network field; an unknown value warns.
+
+    As a Literal a typo (`network: deny`) raised ValidationError, and the loaders
+    drop any config that fails to parse. The safer failure is the default policy
+    plus a visible warning. Shared by ToolConfig and MCPConfig so the two cannot
+    drift into different typo behaviour.
+    """
+    normalized = str(value).strip().lower()
+    if normalized in {"allow", "none"}:
+        return normalized
+    logger.warning(
+        "Invalid %s network policy %r; falling back to 'allow'. "
+        "Use 'allow' or 'none'.",
+        what,
+        value,
+    )
+    return "allow"
 
 
 class ToolConfig(BaseModel):
@@ -262,21 +351,7 @@ class ToolConfig(BaseModel):
     @field_validator("network")
     @classmethod
     def _normalize_network(cls, value: str) -> str:
-        """Normalize the policy; an unknown value warns instead of dropping the tool.
-
-        As a Literal a typo (`network: deny`) raised ValidationError, and
-        ``load_tool_configs`` drops any tool whose config fails to parse. The
-        safer failure is the default policy plus a visible warning.
-        """
-        normalized = str(value).strip().lower()
-        if normalized in {"allow", "none"}:
-            return normalized
-        logger.warning(
-            "Invalid tool network policy %r; falling back to 'allow'. "
-            "Use 'allow' or 'none'.",
-            value,
-        )
-        return "allow"
+        return normalize_network_policy(value, "tool")
 
     @model_validator(mode="after")
     def _validate_remote(self) -> "ToolConfig":
