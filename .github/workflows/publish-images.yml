@@ -79,16 +79,24 @@ jobs:
       # A tag push reaches this workflow directly, bypassing CI -- v0.3.0 and v0.4.0
       # both published images from commits whose test suite was failing. Refuse to
       # build unless every workflow that ran for this commit succeeded.
+      #
+      # The run list includes THIS run, which is in progress by definition; counting it
+      # would leave `pending` above zero until the timeout and fail every release. It is
+      # filtered out first, so the gate only judges the other workflows for the commit.
       - name: Require green CI for the tagged commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
           TIMEOUT_SECONDS: "900"
         run: |
           deadline=$(( SECONDS + TIMEOUT_SECONDS ))
           saw_any=false
           while :; do
-            runs=$(gh run list --commit "$SHA" --limit 50 --json workflowName,status,conclusion)
+            runs=$(gh run list --commit "$SHA" --limit 50 \
+                     --json databaseId,workflowName,status,conclusion)
+            runs=$(jq -c --arg run "$RUN_ID" \
+                     '[.[] | select((.databaseId|tostring) != $run)]' <<<"$runs")
             if [[ "$runs" != "[]" ]]; then
               saw_any=true
             fi
