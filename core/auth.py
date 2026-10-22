@@ -122,6 +122,23 @@ def _decrypt_string(ciphertext: str) -> str:
         logger.warning("Decryption failed — returning value as-is (may be unencrypted legacy data)")
         return ciphertext
 
+def _reject_trailing_underscore(name: str, what: str) -> None:
+    """Refuse a registry name that ends with ``_`` at the write boundary.
+
+    A trailing underscore is a legal name character, but no reference form can express
+    it: ``<site>__<tool>`` and ``mcp__<server>__<tool>`` are separated by ``__``, so a
+    segment ending in ``_`` makes the boundary ambiguous (``a___b`` reads as site ``a_``
+    or as name ``_b`` depending on the split direction). Publishing such a name would
+    leave an entry that exists, works, and can never be named by an agent manifest --
+    refused where the name is written instead (sync skips it with a warning).
+    """
+    if name.endswith("_"):
+        raise ValueError(
+            f"{what} name '{name}' may not end with '_': no unambiguous '__'-separated "
+            f"reference form exists for it (end with a letter, digit or '-')."
+        )
+
+
 def retry_etcd(max_retries=10, delay=2):
     def decorator(func):
         @wraps(func)
@@ -779,6 +796,10 @@ class IdentityManager:
 
     @retry_etcd()
     def save_tool_config(self, name: str, config: Dict) -> None:
+        # Only an edge tool's name is a reference segment (`<site>__<tool>`); a central
+        # tool is addressed by its bare name, so a trailing `_` stays legal there.
+        if (config or {}).get("managed_by") == "edge-relay":
+            _reject_trailing_underscore(name, "edge tool")
         self.client.put(f"/registry/tools/{name}/config", json.dumps(config))
 
     @retry_etcd()
@@ -861,6 +882,7 @@ class IdentityManager:
                 f"MCP name '{name}' may not contain '__'; that separator is reserved "
                 f"for edge '<site>__<mcp>' registry keys."
             )
+        _reject_trailing_underscore(name, "MCP")
         self.client.put(f"/registry/mcps/{name}/config", json.dumps(config))
 
     @retry_etcd()

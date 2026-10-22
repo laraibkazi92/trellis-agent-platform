@@ -306,6 +306,14 @@ def sync_mcp(identity_mgr, config):
             f"(reserved for edge '<site>__<mcp>' registry keys)."
         )
         return
+    if name.endswith("_"):
+        # Same class of problem: every reference segment must end with a letter, digit
+        # or '-', so a name ending in `_` can be published but never referenced.
+        print(
+            f"  Skipping MCP '{name}': its name may not end with '_' "
+            f"(no unambiguous reference form)."
+        )
+        return
 
     if not config.get("tools"):
         discovered = _discover_mcp_tools(config)

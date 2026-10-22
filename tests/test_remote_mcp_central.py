@@ -1032,6 +1032,70 @@ def test_sync_mcp_warns_and_skips_a_name_containing_the_separator(capsys):
     assert "may not contain '__'" in capsys.readouterr().out
 
 
+def test_save_mcp_config_refuses_a_name_ending_in_underscore():
+    """No `mcp__<server>__<tool>` ref can end in `_`, so the name is refused on write."""
+    from core.auth import IdentityManager
+
+    class Client:
+        def __init__(self):
+            self.puts = []
+
+        def put(self, key, value):
+            self.puts.append(key)
+
+    mgr = IdentityManager.__new__(IdentityManager)
+    mgr.client = Client()
+
+    with pytest.raises(ValueError, match="may not end with '_'"):
+        mgr.save_mcp_config("trailing_", {"name": "trailing_"})
+
+    mgr.save_mcp_config("trailing-", {"name": "trailing-"})
+    assert mgr.client.puts == ["/registry/mcps/trailing-/config"]
+
+
+def test_save_tool_config_refuses_an_edge_tool_name_ending_in_underscore():
+    """Only edge `<site>__<tool>` keys are reference segments; central tool names are
+    addressed bare, so a trailing `_` stays legal for them."""
+    from core.auth import IdentityManager
+
+    class Client:
+        def __init__(self):
+            self.puts = []
+
+        def put(self, key, value):
+            self.puts.append(key)
+
+    mgr = IdentityManager.__new__(IdentityManager)
+    mgr.client = Client()
+
+    with pytest.raises(ValueError, match="may not end with '_'"):
+        mgr.save_tool_config(
+            "plant-floor__boiler_status_",
+            {"name": "boiler_status_", "managed_by": "edge-relay"},
+        )
+
+    mgr.save_tool_config("boiler_status_", {"name": "boiler_status_"})
+    mgr.save_tool_config(
+        "plant-floor__boiler_status", {"name": "boiler_status", "managed_by": "edge-relay"}
+    )
+    assert mgr.client.puts == [
+        "/registry/tools/boiler_status_/config",
+        "/registry/tools/plant-floor__boiler_status/config",
+    ]
+
+
+def test_sync_mcp_warns_and_skips_a_name_ending_in_underscore(capsys):
+    from scripts import sync_to_db
+
+    saved = []
+    mgr = SimpleNamespace(save_mcp_config=lambda name, config: saved.append(name))
+
+    sync_to_db.sync_mcp(mgr, {"name": "devops-cli_", "transport": "stdio"})
+
+    assert saved == []
+    assert "may not end with '_'" in capsys.readouterr().out
+
+
 def test_a_four_part_allowed_tool_does_not_require_the_site_named_central_mcp():
     """`allowed_tools: [mcp__dc1__devops-cli__tenant_account_tools]` must resolve to the
     edge server's config, never to a central MCP that happens to be named `dc1`."""

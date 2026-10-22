@@ -560,3 +560,26 @@ def test_edge_reference_resolution_reads_the_mcps_prefix_once(sync_env, monkeypa
     assert fake.prefix_reads.count("/registry/mcps/") == 1
     assert "edge not connected / catalog not published yet" in capsys.readouterr().out
 
+
+
+# --- unreferenceable names ----------------------------------------------------------
+
+
+def test_main_keeps_a_central_tool_name_ending_in_underscore(sync_env, monkeypatch, capsys):
+    """A central tool is addressed by its bare name, so a trailing `_` stays legal --
+    the reference-segment rule only applies to edge `<site>__<tool>` keys."""
+    tool_dir = sync_env / "tools" / "odd"
+    tool_dir.mkdir(parents=True)
+    (tool_dir / "tool.yaml").write_text(
+        "name: boiler_status_\nruntime: python\nentrypoint: run.py\n"
+    )
+    agent_dir = sync_env / "agents" / "keep-agent"
+    agent_dir.mkdir()
+    (agent_dir / "config.yaml").write_text("name: keep-agent\ntype: user_agent\n")
+    fake = FakeIdentityManager(agents={"keep-agent"})
+    _install_registry(monkeypatch, fake)
+
+    rc = sync_to_db.main([])
+
+    assert rc == 0
+    assert "boiler_status_" in fake.saved_configs

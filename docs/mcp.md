@@ -150,13 +150,18 @@ rejected in a reference, because it makes the `__` boundary ambiguous — `a___b
 either as site `a_` + name `b` or as site `a` + name `_b`. Inside a segment, `_` must be
 followed by a letter, digit or `-`; that is how the `__` ban is spelled. (The regex is a
 Python `re` pattern in `core/models.py`; pydantic-core, which validates the registry
-`Remote*Spec` fields, has no lookarounds and spells the same ban without one — so a site
-or tool name ending in `_` can be published but not expressed as a reference.)
+`Remote*Spec` fields, has no lookarounds and spells the same ban without one.) A name
+that becomes a reference segment therefore may not end in `_`: `save_mcp_config` and
+Admin → Edges reject it outright, an edge-published tool is skipped with a warning, and
+db-sync skips that one MCP manifest instead of failing the run. A **central tool** is
+addressed by its bare name, so a trailing `_` stays legal there.
 
 Ambiguity rules:
 
-- Site, MCP and tool names cannot contain `__`; that double underscore is the separator,
-  and a name containing one is rejected when the manifest is saved or synced.
+- Site and MCP names cannot contain `__` or end with `_`, and an edge tool name cannot
+  end with `_`; the separator and the trailing underscore both make a
+  `<site>__<tool>` reference ambiguous, and such a name is rejected when the manifest is
+  saved or synced.
 - `mcp` is a **reserved site name**, so no site can make its tools collide with the
   `mcp__…` namespace.
 - The split is therefore unique: a tool name starting `mcp__` with **four** parts is an

@@ -968,6 +968,14 @@ def _edge_name_error(name: str) -> str | None:
         return "Edge name is required."
     if "__" in name:
         return "Invalid edge name: '__' is reserved as the tool-name separator."
+    if name.endswith("_"):
+        # Every '<site>__<tool>' / '<site>__*' reference needs the site segment to end
+        # with a letter, digit or '-' (core/models.py); a trailing '_' would make the
+        # site's tools unreachable by name.
+        return (
+            "Invalid edge name: it may not end with '_' (references need the site "
+            "segment to end with a letter, digit or '-')."
+        )
     if name.lower() in _EDGE_RESERVED_NAMES:
         return f"Invalid edge name: '{name}' is reserved."
     if not _EDGE_NAME_RE.match(name):

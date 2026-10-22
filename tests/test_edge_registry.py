@@ -1167,3 +1167,32 @@ def test_a_reconnect_after_a_disconnect_records_a_new_connect_time(mgr):
     status = mgr.get_edge_status(SITE)
     assert status["connected"] is True
     assert status["connected_at"] != "2026-01-01T00:00:00+00:00"
+
+
+# --- unreferenceable names ---------------------------------------------------------
+
+
+def test_publish_skips_a_tool_name_ending_in_underscore(mgr, caplog):
+    """`<site>__<tool>` needs a non-underscore last character; publishing a name that
+    can never be referenced would leave a callable tool no manifest can name."""
+    mgr.create_edge(SITE, "Plant floor", "admin@example.com")
+
+    with caplog.at_level(logging.WARNING):
+        published = registry.publish_catalog(
+            mgr, SITE, [_tool(name="boiler_status_")], "0.5.0"
+        )
+
+    assert published == []
+    assert mgr.get_tool_config(f"{SITE}__boiler_status_") is None
+    assert "has no reference form; skipped" in caplog.text
+
+
+def test_publish_mcp_skips_a_name_ending_in_underscore(mgr, caplog):
+    mgr.create_edge(SITE, "Plant floor", "admin@example.com")
+
+    with caplog.at_level(logging.WARNING):
+        published = _publish_mcps(mgr, [_mcp(name="devops-cli_")])
+
+    assert published == []
+    assert _mcp_config(mgr, f"{SITE}__devops-cli_") is None
+    assert "has no reference form; skipped" in caplog.text

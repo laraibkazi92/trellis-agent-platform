@@ -247,6 +247,16 @@ def publish_catalog(
     # edge tool must not pay a provider call for a vector search will never rank.
     published: List[str] = []
     for tool in catalog:
+        if tool.name.endswith("_"):
+            # No `<site>__<tool>` reference can end in `_` (see core/models.py): the
+            # tool would be callable by nobody. Refuse to write it rather than publish
+            # an entry every manifest is unable to name.
+            logger.warning(
+                "edge '%s' tool '%s' ends with '_' and has no reference form; skipped",
+                site,
+                tool.name,
+            )
+            continue
         name = tool_name(site, tool.name)
         current = existing.get(name)
         if current is not None and current.get("managed_by") != MANAGED_BY:
@@ -461,6 +471,16 @@ def publish_mcp_catalog(
     existing = _site_mcp_configs(identity_mgr, site)
     published: List[str] = []
     for mcp in mcps:
+        if mcp.name.endswith("_"):
+            # Same rule as the tool half: `allowed_mcps: ["<site>__<mcp>"]` cannot
+            # name a segment that ends in `_`, so the server would be unreachable by
+            # reference. (<site>__* still reaches nothing it cannot name.)
+            logger.warning(
+                "edge '%s' mcp '%s' ends with '_' and has no reference form; skipped",
+                site,
+                mcp.name,
+            )
+            continue
         name = mcp_registry_name(site, mcp.name)
         current = existing.get(name)
         if current is not None and current.get("managed_by") != MANAGED_BY:

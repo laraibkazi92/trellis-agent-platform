@@ -450,7 +450,7 @@ def test_create_valid_edge_shows_token_once(monkeypatch):
     assert TOKEN not in second.body.decode()
 
 
-@pytest.mark.parametrize("bad_name", ["mcp", "a__b", "bad name!"])
+@pytest.mark.parametrize("bad_name", ["mcp", "a__b", "bad name!", "plant-floor_"])
 def test_create_rejects_invalid_names(monkeypatch, bad_name):
     fake = FakeEdgeIdentityManager()
     monkeypatch.setattr(admin, "identity_mgr", fake)
