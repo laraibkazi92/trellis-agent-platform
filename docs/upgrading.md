@@ -481,11 +481,10 @@ unchanged.
 
 Changes since `v0.4.1`: an edge can now export **MCP servers** over the same outbound
 tunnel, caller identity reaches the edge, edge tool/MCP environments are scoped to
-declared keys, and credentials can live per user on the edge. This release does **not**
-move the `TRELLIS_IMAGE` default — the compose files still pin `v0.4.1` — so pin the new
-tag yourself in `.env` before pulling (see
-[Standard upgrade](#standard-upgrade-published-images)); bumping the compose default is a
-separate release-time step.
+declared keys, and credentials can live per user on the edge. The compose files now
+default `TRELLIS_IMAGE` to `v0.5.0`, so `docker compose pull && docker compose up -d`
+moves an install that does not pin its own tag; if you do pin one, update it (see
+[Standard upgrade](#standard-upgrade-published-images)).
 
 Everything is additive for an install that never enrolls an edge, but several behaviour
 changes can bite silently. Read all seven under
@@ -512,12 +511,13 @@ and says so — but it does stop serving until central is upgraded.
 
 ```bash
 git fetch --tags
-# This release does not move the compose default, so pin the image yourself:
-#   TRELLIS_IMAGE=<registry>/<image>:v0.5.0   (e.g. the GHCR tag in the release notes)
-# in .env before pulling. Without it you keep running the v0.4.1 default.
+# The compose files default TRELLIS_IMAGE to v0.5.0, so this pulls the release image:
 docker compose pull
 docker compose up -d
 ```
+
+If you pin `TRELLIS_IMAGE` in `.env`, repoint it at the new tag (or digest) first —
+otherwise you keep running whatever you pinned.
 
 No new nginx route lands in `v0.5.0`: a `v0.4.x` gateway already proxies `/edge`. If you
 do rebuild it (for example you are coming from an older tag), use the two-step form:
@@ -686,10 +686,9 @@ Changes to declare:
   `network:`; `proxy.yaml` gains five keys; edge MCP tool names are 4-part.
 - **Data migrations:** none in etcd. One-time move of edge MCP session directories for
   email users (one re-login).
-- **Image pins:** compose files still default `TRELLIS_IMAGE` to `v0.4.1`; this page's
-  instructions assume you pin `<registry>/<image>:v0.5.0` in `.env` yourself. Bumping the
-  compose default to `v0.5.0`, and the Hindsight/etcd pins, is a release-time task outside
-  this change.
+- **Image pins:** `TRELLIS_IMAGE` default moves `v0.4.1` → `v0.5.0` in `docker-compose.yml`,
+  `.env.example` and both egress compose files. If you pin a tag or digest in `.env`,
+  update it yourself — the default only applies when `TRELLIS_IMAGE` is unset.
 
 ---
 
