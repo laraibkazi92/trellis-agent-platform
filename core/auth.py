@@ -893,8 +893,20 @@ class IdentityManager:
         Registry sync saves those vectors under the ``use_tool`` name
         ``mcp__{server}__{tool}`` -- i.e. ``/registry/tools/mcp__{server}__{tool}/embedding``
         -- so an MCP pruned from the registry must also clear that key range, or its
-        embeddings outlive the config and keep ranking in tool search as ghosts."""
-        self.client.delete_prefix(f"/registry/tools/mcp__{mcp_name}__/embedding")
+        embeddings outlive the config and keep ranking in tool search as ghosts.
+
+        The range is walked instead of ``delete_prefix``: the embedding key ends with
+        the *tool* name, not with ``/embedding`` directly after the server prefix, so
+        only keys under the name prefix that really are embeddings are removed (a
+        local tool an operator happened to name ``mcp__{server}__{tool}`` keeps its
+        config).
+        """
+        prefix = f"/registry/tools/mcp__{mcp_name}__"
+        suffix = "/embedding"
+        for _value, metadata in self.client.get_prefix(prefix):
+            key = metadata.key.decode("utf-8")
+            if key.startswith(prefix) and key.endswith(suffix):
+                self.client.delete(key)
 
     # --- Edges (trellis-proxy) -------------------------------------------------
     #

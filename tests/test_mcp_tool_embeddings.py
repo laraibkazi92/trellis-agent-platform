@@ -245,3 +245,65 @@ def test_synced_mcp_embedding_keys_match_search_lookups(monkeypatch):
     results = asyncio.run(tool_search.search_tools("customer service nodes"))
 
     assert results[0]["name"] == "mcp__example-mcp__connector_restart"
+
+
+# --- pruning one server's vectors ---------------------------------------------------
+
+
+class _PrefixClient:
+    """In-memory client for the embedding walk (``get_prefix`` + ``delete``)."""
+
+    class _Meta:
+        def __init__(self, key):
+            self.key = key.encode("utf-8")
+
+    def __init__(self, keys):
+        self.store = {key: b"[1.0]" for key in keys}
+        self.deleted = []
+
+    def get_prefix(self, prefix):
+        return [
+            (value, self._Meta(key))
+            for key, value in sorted(self.store.items())
+            if key.startswith(prefix)
+        ]
+
+    def delete(self, key):
+        self.deleted.append(key)
+
+
+def test_delete_mcp_tool_embeddings_deletes_the_servers_vectors_only():
+    """The embedding key ends with the tool name (`mcp__srv__tool/embedding`), so the
+    old `/mcp__srv__/embedding` prefix matched nothing and every pruned server's vectors
+    stayed behind as ghost search hits."""
+    from core.auth import IdentityManager
+
+    client = _PrefixClient([
+        "/registry/tools/mcp__example-mcp__clusters_get_all/embedding",
+        "/registry/tools/mcp__example-mcp__connector_restart/embedding",
+        # A local tool whose name merely starts the same way is not an embedding.
+        "/registry/tools/mcp__example-mcp__clusters_get_all/config",
+        # Another server with a shared name prefix.
+        "/registry/tools/mcp__example-mcp-v2__clusters_get_all/embedding",
+    ])
+    mgr = IdentityManager.__new__(IdentityManager)
+    mgr.client = client
+
+    mgr.delete_mcp_tool_embeddings("example-mcp")
+
+    assert sorted(client.deleted) == [
+        "/registry/tools/mcp__example-mcp__clusters_get_all/embedding",
+        "/registry/tools/mcp__example-mcp__connector_restart/embedding",
+    ]
+
+
+def test_delete_mcp_tool_embeddings_is_a_noop_when_nothing_matches():
+    from core.auth import IdentityManager
+
+    client = _PrefixClient(["/registry/tools/plain/embedding"])
+    mgr = IdentityManager.__new__(IdentityManager)
+    mgr.client = client
+
+    mgr.delete_mcp_tool_embeddings("gone-mcp")
+
+    assert client.deleted == []
