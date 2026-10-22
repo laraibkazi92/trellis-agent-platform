@@ -692,6 +692,37 @@ Changes to declare:
 
 ---
 
+### v0.5.1 — 2026-10-22
+
+Two fixes on top of `v0.5.0`. No compose service, `.env` key, wire-protocol or registry
+schema changed; `TRELLIS_IMAGE` default moves to `v0.5.1`.
+
+- **A pruned MCP no longer leaves ghost search hits.** `delete_mcp_tool_embeddings` built the
+  prefix `.../mcp__<server>__/embedding`, which matches no real key (they end
+  `.../mcp__<server>__<tool>/embedding`), so a pruned central MCP's tool vectors survived and
+  kept ranking in tool search as calls that fail. It now deletes exactly the `/embedding`
+  keys under the server's name prefix. Nothing extra to run: the next prune deletes cleanly.
+  Vectors orphaned by a prune **before** this release are not rediscovered automatically —
+  if tool search still shows a server you deleted, clear that server's range once (only its
+  embeddings live there; the config is already gone):
+
+  ```bash
+  docker compose exec etcd etcdctl del --prefix "/registry/tools/mcp__<server>__"
+  ```
+
+- **A reference name may no longer end in `_`.** `a___b` splits two ways, so a trailing
+  underscore leaves no unambiguous `<site>__<tool>` / `mcp__<server>__<tool>` form.
+  `save_mcp_config` refuses it for any MCP, `save_tool_config` for edge (`managed_by:
+  edge-relay`) keys, db-sync skips that one MCP manifest with a warning instead of failing
+  the run, Admin → Edges rejects a site id ending in `_`, and the relay skips such an entry
+  published by an older edge. A **central tool** is addressed by its bare name, so a trailing
+  `_` stays legal there and an existing workspace is unaffected.
+
+- **Image pins:** `TRELLIS_IMAGE` default → `v0.5.1` in `docker-compose.yml`, `.env.example`
+  and both egress compose files.
+
+---
+
 ## Release checklist (maintainer template)
 
 Copy this into the release PR/notes and fill it in per release.
