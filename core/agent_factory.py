@@ -380,7 +380,7 @@ def _register_mcp_tool(agent: Agent, mcp_tool: Any):
         result = await client.call_tool(safe_mcp_tool.name, kwargs)
         return result.content
 
-    input_schema = getattr(safe_mcp_tool, "inputSchema", None) or getattr(safe_mcp_tool, "input_schema", None)
+    input_schema = getattr(safe_mcp_tool, "input_schema", None) or getattr(safe_mcp_tool, "inputSchema", None)
     if input_schema:
         from pydantic_ai.tools import Tool
         tool_obj = Tool.from_schema(
@@ -420,7 +420,7 @@ def _register_external_mcp_tool(
         except Exception as e:
             return f"Tool '{safe_mcp_tool.name}' returned an error: {e}"
 
-    input_schema = getattr(safe_mcp_tool, "inputSchema", None) or getattr(safe_mcp_tool, "input_schema", None)
+    input_schema = getattr(safe_mcp_tool, "input_schema", None) or getattr(safe_mcp_tool, "inputSchema", None)
     if input_schema:
         from pydantic_ai.tools import Tool
         tool_obj = Tool.from_schema(
@@ -461,7 +461,7 @@ def _register_remote_mcp_tool(
             return f"Tool '{tool_name_for_agent}' returned an error: {result['error']}"
         return result.get("content") if isinstance(result, dict) else result
 
-    input_schema = getattr(safe_mcp_tool, "inputSchema", None) or getattr(safe_mcp_tool, "input_schema", None)
+    input_schema = getattr(safe_mcp_tool, "input_schema", None) or getattr(safe_mcp_tool, "inputSchema", None)
     if input_schema:
         from pydantic_ai.tools import Tool
         tool_obj = Tool.from_schema(
