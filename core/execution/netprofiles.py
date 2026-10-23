@@ -253,12 +253,32 @@ def install_rules(
     profiles: Iterable[str] = (PROFILE_INTERNAL, PROFILE_INTERNET),
     iptables: str = "iptables",
 ) -> list[str]:
-    """Idempotently install the rules; returns the ones that were missing."""
+    """Idempotently install the rules; returns the ones that were missing.
+
+    When anything is missing the chain is rebuilt from the plan instead of
+    appending the delta. Order is load-bearing: an allowlisted ``ACCEPT`` must
+    precede the internal profile's blanket ``REJECT``. Appending a newly planned
+    rule after that reject -- which is what happens when an operator adds a CIDR
+    to ``TRELLIS_INTERNAL_CIDRS`` and re-runs the installer -- would make the
+    allowlist unreachable. The rebuild also drops entries the current plan no
+    longer contains (a removed CIDR must stop being accepted).
+    """
+    planned = [rule for profile in profiles for rule in plan(profile).rules]
+    missing = [rule for rule in planned if not _rule_present(rule, iptables)]
+    planned_ids = {_rule_identity(list(rule.args[1:])) for rule in planned}
+    stale = [
+        spec
+        for spec in _owned_rule_specs(profiles, iptables)
+        if _rule_identity(spec) not in planned_ids
+    ]
+    if not missing and not stale:
+        return []
+
+    teardown_rules(profiles, iptables)
+
     added: list[str] = []
     for profile in profiles:
         for rule in plan(profile).rules:
-            if _rule_present(rule, iptables):
-                continue
             argv = list(rule.args)
             if rule.head:
                 # Insert at position 1 (top), not merely at the op's default.
@@ -270,19 +290,65 @@ def install_rules(
     return added
 
 
+def _rule_identity(spec: list[str]) -> tuple:
+    """``(source, destination, target)`` -- what a rule decides, not how it is spelled.
+
+    ``iptables -S`` spells a REJECT with ``--reject-with`` even when the plan does
+    not, and omits ``-d`` for the default destination, so a raw list comparison
+    would call every installed rule stale.
+    """
+
+    def after(flag: str) -> Optional[str]:
+        return spec[spec.index(flag) + 1] if flag in spec else None
+
+    return (after("-s"), after("-d") or "0.0.0.0/0", after("-j"))
+
+
+def _owned_rule_specs(
+    profiles: Iterable[str] = (PROFILE_INTERNAL, PROFILE_INTERNET),
+    iptables: str = "iptables",
+) -> list[list[str]]:
+    """Every ``DOCKER-USER`` rule sourced from one of the profile networks.
+
+    Those subnets belong to networks this module creates, so any rule installed
+    for them is ours -- including one from a previous plan (an allowlisted CIDR
+    that has since been removed from the environment, which the current plan no
+    longer knows about). Rules an operator added for other sources are untouched.
+    """
+    subnets = {subnet_for(profile) for profile in profiles}
+    subnets.discard(None)
+    code, out = _run([iptables, "-S", DOCKER_USER_CHAIN])
+    if code != 0:
+        return []
+    specs: list[list[str]] = []
+    for line in out.splitlines():
+        parts = line.split()
+        if not parts or parts[0] != "-A" or len(parts) < 2 or parts[1] != DOCKER_USER_CHAIN:
+            continue
+        if "-s" not in parts:
+            continue
+        source = parts[parts.index("-s") + 1]
+        if source in subnets:
+            specs.append(parts[1:])
+    return specs
+
+
 def teardown_rules(
     profiles: Iterable[str] = (PROFILE_INTERNAL, PROFILE_INTERNET),
     iptables: str = "iptables",
 ) -> int:
-    """Remove the rules this module owns; returns the count removed."""
+    """Remove every rule this module owns; returns the count removed.
+
+    Driven by the live chain (source subnet match), not by the current plan: a
+    rule installed for a CIDR that has since been removed from the environment
+    must still come out, or it would keep accepting traffic the operator has
+    already revoked.
+    """
     removed = 0
-    for profile in profiles:
-        for rule in plan(profile).rules:
-            probe = list(rule.args)
-            probe[0] = "-D"
-            code, _ = _run([iptables, *probe])
-            if code == 0:
-                removed += 1
+    for spec in _owned_rule_specs(profiles, iptables):
+        code, _ = _run([iptables, "-D", *spec])
+        if code == 0:
+            removed += 1
     return removed
 
 

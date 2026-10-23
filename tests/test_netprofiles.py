@@ -243,7 +243,7 @@ def test_install_rules_skips_rules_that_are_already_present(monkeypatch):
 
     assert netprofiles.install_rules(["internal", "internet"]) == []
     assert calls
-    assert all(argv[1] == "-C" for argv in calls)
+    assert all(argv[1] in ("-C", "-S") for argv in calls)
     assert not [argv for argv in calls if argv[1] in ("-A", "-I")]
 
 
@@ -255,6 +255,10 @@ def test_install_rules_is_idempotent(monkeypatch):
     def fake_run(argv):
         calls.append(list(argv))
         args = list(argv[1:])
+        if args[0] == "-S":
+            return 0, ""
+        if args[0] == "-D":
+            return 1, ""
         if args[0] == "-C":
             return (0 if tuple(args[1:]) in installed else 1), ""
         if args[0] in ("-A", "-I"):
@@ -282,7 +286,7 @@ def test_install_rules_is_idempotent(monkeypatch):
 
     before = len(calls)
     assert netprofiles.install_rules(["internal"]) == []
-    assert all(argv[1] == "-C" for argv in calls[before:])
+    assert all(argv[1] in ("-C", "-S") for argv in calls[before:])
 
 
 def test_install_rules_raises_on_iptables_failure(monkeypatch):
@@ -299,19 +303,88 @@ def test_install_rules_raises_on_iptables_failure(monkeypatch):
     assert "Permission denied" in str(excinfo.value)
 
 
-def test_teardown_removes_only_present_rules(monkeypatch):
-    probe_calls = []
+def _chain(*rules):
+    return "\n".join(["*filter", "-N DOCKER-USER", *rules, "COMMIT", ""])
+
+
+def test_teardown_removes_every_rule_owned_by_the_profile_networks(monkeypatch):
+    """Including a stale allowlisted CIDR the current plan no longer knows about."""
+    chain = _chain(
+        "-A DOCKER-USER -s 172.31.241.0/24 -d 1.1.1.1/32 -j ACCEPT",
+        "-A DOCKER-USER -s 172.31.241.0/24 -j REJECT",
+        "-A DOCKER-USER -s 10.9.9.0/24 -d 1.1.1.1/32 -j ACCEPT",  # operator rule
+    )
+    deleted = []
 
     def fake_run(argv):
-        probe_calls.append(list(argv))
-        # Pretend the EC2 metadata rule exists; everything else is already gone.
-        return (0 if "169.254.169.254" in argv else 1), ""
+        if argv[1] == "-S":
+            return 0, chain
+        if argv[1] == "-D":
+            deleted.append(list(argv[2:]))
+            return 0, ""
+        return 1, ""
 
     monkeypatch.setattr(netprofiles, "_run", fake_run)
 
     removed = netprofiles.teardown_rules(["internal"])
 
-    assert removed == 1
-    assert len(probe_calls) == len(netprofiles.plan("internal").rules)
-    assert all(argv[1] == "-D" for argv in probe_calls)
-    assert any("169.254.169.254" in argv for argv in probe_calls)
+    assert removed == 2
+    assert all("172.31.241.0/24" in argv for argv in deleted)
+    assert not any("10.9.9.0/24" in argv for argv in deleted)
+
+
+def test_install_rebuilds_the_chain_when_the_plan_changed(monkeypatch):
+    """A new allowlist entry must not be appended after the blanket reject."""
+    chain = _chain("-A DOCKER-USER -s 172.31.241.0/24 -j REJECT")
+    events = []
+
+    def fake_run(argv):
+        if argv[1] == "-S":
+            return 0, chain
+        if argv[1] == "-C":
+            return 1, ""  # nothing from the new plan is present yet
+        if argv[0] == "iptables":
+            events.append(list(argv[1:]))
+        return 0, ""
+
+    monkeypatch.setattr(netprofiles, "_run", fake_run)
+    monkeypatch.setenv("TRELLIS_INTERNAL_CIDRS", "1.1.1.1/32")
+
+    netprofiles.install_rules(["internal"])
+
+    ops = [argv[0] for argv in events]
+    assert ops[0] == "-D"  # rebuild, not append
+    installs = [argv for argv in events if argv[0] in ("-A", "-I")]
+    accept = next(i for i, argv in enumerate(installs) if "-d" in argv and "1.1.1.1/32" in argv)
+    blanket = next(
+        i
+        for i, argv in enumerate(installs)
+        if argv[0] == "-A" and "0.0.0.0/0" in argv and "REJECT" in argv
+    )
+    assert accept < blanket
+
+
+def test_install_removes_a_stale_allowlist_even_when_every_planned_rule_exists(monkeypatch):
+    """Shrinking TRELLIS_INTERNAL_CIDRS must revoke the removed destination."""
+    chain = _chain(
+        "-A DOCKER-USER -s 172.31.241.0/24 -d 1.1.1.1/32 -j ACCEPT",  # no longer planned
+        "-A DOCKER-USER -s 172.31.241.0/24 -j REJECT --reject-with icmp-port-unreachable",
+    )
+    deleted = []
+
+    def fake_run(argv):
+        if argv[1] == "-S":
+            return 0, chain
+        if argv[1] == "-C":
+            return 0, ""  # every planned rule is present
+        if argv[1] == "-D":
+            deleted.append(list(argv[2:]))
+            return 0, ""
+        return 0, ""
+
+    monkeypatch.setattr(netprofiles, "_run", fake_run)
+
+    added = netprofiles.install_rules(["internal"])
+
+    assert any("-d" in spec and "1.1.1.1/32" in spec for spec in deleted)
+    assert added  # the chain was rebuilt after the stale entry came out
