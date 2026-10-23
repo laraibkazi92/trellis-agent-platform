@@ -732,8 +732,8 @@ deny-by-default profile (`none` / `internal` / `internet`) and per-container res
 come from a `limits:` block instead of helper rlimits. The shipped compose default moves
 to `SANDBOX_BACKEND=container`, and `TRELLIS_IMAGE` to `v0.6.0`.
 
-This section covers phases 1–3. Phase 4 — edge-sealed per-user credentials — ships in a
-later release of this same version and is documented with it.
+This section covers all four phases, including the edge-sealed per-user credentials
+added in phase 4 (see "Per-user credentials and the edge key" in `docs/proxy.md`).
 
 #### Breaking: the agent allowlist is now enforced server-side
 
