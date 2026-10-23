@@ -27,6 +27,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketDisconnect
 
+from core import agent_token as agent_token_module
+from core import allowlist
 from services.edge_relay import audit, protocol, registry
 from services.edge_relay.ratelimit import SiteLimiter, normalise_rate
 from services.edge_relay.protocol import (
@@ -142,6 +144,8 @@ class EdgeConn:
         deadline_ms: int = DEFAULT_DEADLINE_MS,
         user: Optional[str] = None,
         user_email: Optional[str] = None,
+        agent_token: Optional[str] = None,
+        sealed: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forward one tool call and await its validated result frame."""
         if self.closed:
@@ -149,7 +153,8 @@ class EdgeConn:
         if tool not in self.tools:
             raise EdgeUnknownTool(f"tool '{tool}' is not exported by edge '{self.site}'")
         return await self._forward(
-            self._call_frame(tool, args, deadline_ms, user, user_email), tool
+            self._call_frame(tool, args, deadline_ms, user, user_email, agent_token, sealed),
+            tool,
         )
 
     async def request_mcp(
@@ -160,6 +165,8 @@ class EdgeConn:
         deadline_ms: int = DEFAULT_DEADLINE_MS,
         user: Optional[str] = None,
         user_email: Optional[str] = None,
+        agent_token: Optional[str] = None,
+        sealed: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forward one MCP ``tools/call`` through the same tunnel.
 
@@ -171,7 +178,7 @@ class EdgeConn:
             raise EdgeDisconnected(f"edge '{self.site}' is closed")
         if mcp not in self.mcps:
             raise EdgeUnknownMcp(f"mcp '{mcp}' is not exported by edge '{self.site}'")
-        frame = self._call_frame(tool, args, deadline_ms, user, user_email)
+        frame = self._call_frame(tool, args, deadline_ms, user, user_email, agent_token, sealed)
         frame["kind"] = "mcp"
         frame["mcp"] = mcp
         return await self._forward(frame, tool, mcp=mcp)
@@ -183,6 +190,8 @@ class EdgeConn:
         deadline_ms: int,
         user: Optional[str],
         user_email: Optional[str],
+        agent_token: Optional[str] = None,
+        sealed: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build one ``call`` frame with the deadline clamped to the wire cap."""
         frame: Dict[str, Any] = {
@@ -196,6 +205,14 @@ class EdgeConn:
         # Omitted when absent so a v0.4 edge sees the exact same bytes.
         if user_email is not None:
             frame["user_email"] = user_email
+        # Forwarded verbatim: the edge verifies signature/expiry even though the
+        # authorization decision was already made here.
+        if agent_token is not None:
+            frame["agent_token"] = agent_token
+        # Opaque ciphertext: the relay cannot open it, so it forwards the bytes and
+        # never stores, logs or audits them.
+        if sealed is not None:
+            frame["sealed"] = sealed
         return frame
 
     async def _forward(
@@ -321,6 +338,12 @@ async def _lifespan(_app: FastAPI):
     from core.devmode import enforce_dev_mode_safety
 
     enforce_dev_mode_safety("edge-relay")
+    # Fail closed without a key outside DEV_MODE: the relay verifies agent tokens on
+    # both call routes, so an unkeyed relay would silently permit every caller.
+    from core.log_redaction import install as install_redaction
+
+    install_redaction()
+    agent_token_module.require_secret("edge-relay")
     audit.configure()
     # The site map is in-process: after a restart nothing is connected, so any
     # `connected: true` left in the registry is stale. Clear it before serving,
@@ -466,6 +489,82 @@ class CallBody(BaseModel):
     # Length/control-char rules live in protocol.validate_call: one code path, so a
     # bad value is a 400 invalid_arguments rather than FastAPI's 422 echo.
     user_email: Optional[str] = None
+    # Minted by the agent runtime; verified here and forwarded verbatim to the edge.
+    agent_token: Optional[str] = None
+    # Browser-sealed per-user credentials: opaque to the relay, forwarded verbatim and
+    # never logged or audited (only ``has_sealed`` reaches the audit line). Typed as
+    # ``Any`` so a non-object body is a 400 from ``validate_call``, not pydantic's 422.
+    sealed: Optional[Any] = None
+
+
+# Principals that are not agents: the gateway is an authenticated front door with its
+# own tool whitelist, so an agent's `allowed_tools` does not apply to it.
+SYSTEM_PRINCIPALS = frozenset({"gateway"})
+
+
+async def _authorize_agent(
+    raw_token: Optional[str], *, site: str, tool: str, mcp: Optional[str] = None
+) -> tuple[Optional[agent_token_module.Claims], Optional[tuple[str, str]]]:
+    """Verify the agent token and the agent's effective allowlist for one edge call.
+
+    Returns ``(claims, denial)``. ``denial`` is ``(code, message)`` for a 403, or
+    ``None`` when the call may proceed. The allowlist is resolved from the registry
+    here, at call time, so a caller cannot assert permissions it does not hold; the
+    edge re-checks signature and expiry as defense in depth (it has no registry).
+
+    In ``log`` mode a refusal is logged and the call still runs (one rollout window);
+    ``off`` skips the check entirely.
+    """
+    mode = agent_token_module.mode()
+    if mode == "off":
+        return None, None
+
+    try:
+        claims = agent_token_module.verify(raw_token)
+    except agent_token_module.AgentTokenError as exc:
+        message = f"access_denied: agent token rejected ({exc.code})"
+        if mode == "log":
+            logger.warning(
+                "relay: would deny site=%s tool=%r (%s)", site, tool, message
+            )
+            return None, None
+        return None, ("access_denied", message)
+
+    # Signature and expiry still applied above: a system principal is authenticated,
+    # it just has no agent record to resolve an allowlist from.
+    if claims.principal == "system" or claims.agent in SYSTEM_PRINCIPALS:
+        return claims, None
+
+    config = await asyncio.to_thread(
+        _identity_manager().get_agent_config, claims.agent
+    )
+    permitted = False
+    reference = f"{site}__{tool}"
+    if not config:
+        message = f"access_denied: unknown agent '{claims.agent}'"
+    else:
+        allowed = allowlist.resolve(config)
+        if mcp is None:
+            permitted = allowlist.permits_tool(allowed, reference)
+        else:
+            # The composed reference already folds in the server grant, the
+            # wildcard and a per-tool grant — the same rule that registers tools.
+            reference = f"mcp__{site}__{mcp}__{tool}"
+            permitted = allowlist.permits_tool(allowed, reference)
+        message = agent_token_module.deny_message(claims.agent, reference)
+
+    if permitted:
+        return claims, None
+    if mode == "log":
+        logger.warning(
+            "relay: would deny site=%s tool=%r agent=%s: %s",
+            site,
+            tool,
+            claims.agent,
+            message,
+        )
+        return claims, None
+    return claims, ("access_denied", message)
 
 
 class McpCallBody(CallBody):
@@ -618,7 +717,9 @@ async def edge_connect(ws: WebSocket) -> None:
         if frame["t"] != "hello":
             await ws.close(code=protocol.CLOSE_MALFORMED)
             return
-        proto, edge_version, tools, mcps, caps = protocol.validate_hello(frame)
+        hello = protocol.validate_hello(frame)
+        proto, edge_version, tools, mcps, caps = hello
+        credentials = hello.credentials
     except ProtocolError as exc:
         await ws.close(code=exc.close_code)
         return
@@ -682,6 +783,15 @@ async def edge_connect(ws: WebSocket) -> None:
 
     conn.published_signature = _catalog_signature(config, conn.mcps)
     conn.edge_version = edge_version
+    # The credential key/name material belongs to the site record, not to a tool
+    # config: central's seal form reads it from there. A registry hiccup must not tear
+    # down a working tunnel -- the edge would redial and publish the same catalog.
+    try:
+        await asyncio.to_thread(
+            registry.publish_edge_credentials, _identity_manager(), site, credentials
+        )
+    except Exception as exc:
+        logger.warning("could not record edge credential material site=%s: %s", site, exc)
     await relay.register(site, conn)
     logger.info(
         "edge connected site=%s version=%s tools=%d mcps=%d",
@@ -755,6 +865,8 @@ async def call_site_tool(site: str, body: CallBody) -> JSONResponse:
             outcome=outcome,
             ms=int((time.monotonic() - started) * 1000),
             args_bytes=args_bytes,
+            # Presence only: the blob is opaque ciphertext and must never be stored.
+            has_sealed=body.sealed is not None,
             **extra,
         )
 
@@ -774,6 +886,16 @@ async def call_site_tool(site: str, body: CallBody) -> JSONResponse:
             f"edge '{site}' exceeded its call rate; retry shortly",
         )
 
+    # Authorization before export lookup: an unauthenticated caller must not be
+    # able to enumerate a site's exports through 404 vs 403.
+    claims, denial = await _authorize_agent(
+        body.agent_token, site=site, tool=body.tool
+    )
+    if denial is not None:
+        code, message = denial
+        audit_call("access_denied", agent=claims.agent if claims else None)
+        return _error(403, code, message)
+
     tool = conn.tools.get(body.tool)
     if tool is None:
         audit_call("unknown_tool")
@@ -790,6 +912,8 @@ async def call_site_tool(site: str, body: CallBody) -> JSONResponse:
                 # email as a tool_error, so filtering here keeps the 400
                 # invalid_arguments contract and skips a wasted edge round trip.
                 "user_email": body.user_email,
+                "agent_token": body.agent_token,
+                "sealed": body.sealed,
             }
         )
     except ProtocolError as exc:
@@ -804,7 +928,13 @@ async def call_site_tool(site: str, body: CallBody) -> JSONResponse:
 
     try:
         payload = await conn.request(
-            body.tool, args, body.deadline_ms, body.user, body.user_email
+            body.tool,
+            args,
+            body.deadline_ms,
+            body.user,
+            body.user_email,
+            agent_token=body.agent_token,
+            sealed=body.sealed,
         )
     except EdgeOverloaded as exc:
         audit_call("edge_overloaded")
@@ -859,6 +989,8 @@ async def call_site_mcp(site: str, mcp: str, body: McpCallBody) -> JSONResponse:
             outcome=outcome,
             ms=int((time.monotonic() - started) * 1000),
             args_bytes=args_bytes,
+            # Presence only: never the blob itself.
+            has_sealed=body.sealed is not None,
             **extra,
         )
 
@@ -888,6 +1020,8 @@ async def call_site_mcp(site: str, mcp: str, body: McpCallBody) -> JSONResponse:
         audit_call("unknown_mcp")
         return _error(404, "unknown_mcp", f"mcp '{mcp}' is not exported by edge '{site}'")
 
+    # Same gate as the tool route, plus the server grant: the MCP call requires both
+    # `permits_mcp` and `permits_tool` for the fully-qualified tool reference.
     try:
         protocol.validate_call(
             {
@@ -900,15 +1034,32 @@ async def call_site_mcp(site: str, mcp: str, body: McpCallBody) -> JSONResponse:
                 # Re-checked here for the same reason as on the tool endpoint: keep
                 # the 400 invalid_arguments contract and skip a wasted round trip.
                 "user_email": body.user_email,
+                "agent_token": body.agent_token,
+                "sealed": body.sealed,
             }
         )
     except ProtocolError as exc:
         audit_call("invalid_arguments")
         return _error(400, "invalid_arguments", str(exc))
 
+    claims, denial = await _authorize_agent(
+        body.agent_token, site=site, tool=body.tool, mcp=mcp
+    )
+    if denial is not None:
+        code, message = denial
+        audit_call("access_denied", agent=claims.agent if claims else None)
+        return _error(403, code, message)
+
     try:
         payload = await conn.request_mcp(
-            mcp, body.tool, body.args, body.deadline_ms, body.user, body.user_email
+            mcp,
+            body.tool,
+            body.args,
+            body.deadline_ms,
+            body.user,
+            body.user_email,
+            agent_token=body.agent_token,
+            sealed=body.sealed,
         )
     except EdgeOverloaded as exc:
         audit_call("edge_overloaded")

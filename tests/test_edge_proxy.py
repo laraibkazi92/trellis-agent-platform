@@ -15,12 +15,13 @@ import json
 import logging
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
-from core import proxy
-from core.models import ToolConfig
+from core import agent_token, proxy
+from core.models import MCPConfig, ToolConfig
 from services.edge_relay import protocol
 
 
@@ -506,7 +507,9 @@ def test_call_is_cancelled_at_the_caller_deadline(tmp_path, monkeypatch):
     """An abandoned call must not hold an inflight slot for the tool's full timeout."""
     monkeypatch.setattr(proxy, "MAX_INFLIGHT", 1)
 
-    async def fake_handle(config_map, frame, *, proxy_config=None, credential_modes=None):
+    async def fake_handle(
+        config_map, frame, *, proxy_config=None, credential_modes=None, **_kwargs
+    ):
         if frame.get("tool") == "slow":
             await asyncio.sleep(30)
         return proxy._result_frame(frame["id"], 0, result={"tool": frame["tool"]})
@@ -1069,3 +1072,252 @@ def _install_fake_connect(monkeypatch, close_code):
 
     monkeypatch.setattr(proxy, "_serve", _noop_serve)
     monkeypatch.setattr(proxy, "_connect_factory", lambda: _fake_connect)
+
+
+# ---------------------------------------------------------------- agent tokens
+#
+# The edge verifies signature and expiry only: it has no agent registry, so the
+# allowlist decision belongs to the relay (staffed with etcd). The token must still
+# ride through to the tool call and to the MCP session container, where the runner
+# verifies it again -- that is the part these tests pin.
+
+TOKEN_SECRET = "test-agent-token-secret-0123456789abcdef"
+
+
+@pytest.fixture
+def enforcing_tokens(monkeypatch):
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", TOKEN_SECRET)
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+
+
+def test_handle_call_refuses_an_invalid_token_when_enforcing(
+    tmp_path, monkeypatch, enforcing_tokens
+):
+    monkeypatch.setattr(proxy.tool_runtime, "execute_tool", pytest.fail)
+
+    frame = asyncio.run(
+        proxy.handle_call(
+            {"demo": (make_config(), tmp_path)},
+            call_frame(agent_token="t1.forged.signature"),
+        )
+    )
+
+    assert frame["ok"] is False
+    assert frame["error"]["code"] == "access_denied"
+    assert "bad_sig" in frame["error"]["message"]
+
+
+def test_handle_call_refuses_a_missing_token_when_enforcing(
+    tmp_path, monkeypatch, enforcing_tokens
+):
+    monkeypatch.setattr(proxy.tool_runtime, "execute_tool", pytest.fail)
+
+    frame = asyncio.run(proxy.handle_call({"demo": (make_config(), tmp_path)}, call_frame()))
+
+    assert frame["ok"] is False
+    assert frame["error"]["code"] == "access_denied"
+    assert "missing" in frame["error"]["message"]
+
+
+def test_handle_call_refuses_an_expired_token_when_enforcing(
+    tmp_path, monkeypatch, enforcing_tokens
+):
+    monkeypatch.setattr(proxy.tool_runtime, "execute_tool", pytest.fail)
+    token = agent_token.mint("demo", now=time.time() - 10_000, ttl_s=60)
+
+    frame = asyncio.run(
+        proxy.handle_call(
+            {"demo": (make_config(), tmp_path)}, call_frame(agent_token=token)
+        )
+    )
+
+    assert frame["ok"] is False
+    assert "expired" in frame["error"]["message"]
+
+
+def test_handle_call_passes_the_agent_token_to_the_tool(
+    tmp_path, monkeypatch, enforcing_tokens
+):
+    seen = {}
+
+    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None, agent_token=None):
+        seen["agent_token"] = agent_token
+        return {"ok": True}
+
+    monkeypatch.setattr(proxy.tool_runtime, "execute_tool", fake_execute)
+    token = agent_token.mint("demo")
+
+    frame = asyncio.run(
+        proxy.handle_call(
+            {"demo": (make_config(), tmp_path)}, call_frame(agent_token=token)
+        )
+    )
+
+    assert frame["ok"] is True
+    assert seen["agent_token"] == token
+
+
+def test_a_bad_token_only_warns_in_log_mode(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", TOKEN_SECRET)
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "log")
+
+    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None, agent_token=None):
+        return {"ok": True}
+
+    monkeypatch.setattr(proxy.tool_runtime, "execute_tool", fake_execute)
+
+    with caplog.at_level(logging.WARNING, logger="core.proxy"):
+        frame = asyncio.run(
+            proxy.handle_call(
+                {"demo": (make_config(), tmp_path)},
+                call_frame(agent_token="t1.forged.signature"),
+            )
+        )
+
+    assert frame["ok"] is True
+    assert "access_denied" in caplog.text
+
+
+def test_handle_mcp_call_refuses_an_invalid_token_when_enforcing(
+    monkeypatch, enforcing_tokens
+):
+    class Manager:
+        async def call(self, *args, **kwargs):
+            pytest.fail("an unauthenticated MCP call must not reach the manager")
+
+    frame = asyncio.run(
+        proxy.handle_mcp_call(
+            Manager(),
+            {
+                "t": "call",
+                "id": "m1",
+                "kind": "mcp",
+                "mcp": "devops-cli",
+                "tool": "stateful",
+                "args": {},
+                "agent_token": "t1.forged.signature",
+            },
+        )
+    )
+
+    assert frame["ok"] is False
+    assert frame["error"]["code"] == "access_denied"
+
+
+def test_handle_mcp_call_passes_the_agent_token_to_the_manager(
+    monkeypatch, enforcing_tokens
+):
+    seen = {}
+
+    class Manager:
+        site = "plant-floor"
+
+        async def call(
+            self, mcp, tool, args, identity, deadline_ms, *, agent_token=None, sealed=None
+        ):
+            seen["agent_token"] = agent_token
+            seen["sealed"] = sealed
+            return {"content": [], "isError": False}
+
+    token = agent_token.mint("demo")
+    frame = asyncio.run(
+        proxy.handle_mcp_call(
+            Manager(),
+            {
+                "t": "call",
+                "id": "m1",
+                "kind": "mcp",
+                "mcp": "devops-cli",
+                "tool": "stateful",
+                "args": {},
+                "agent_token": token,
+            },
+        )
+    )
+
+    assert frame["ok"] is True
+    assert seen["agent_token"] == token
+    assert seen["sealed"] is None
+
+
+def test_the_session_manager_opens_the_transport_with_the_token(tmp_path, monkeypatch):
+    """The token is used at open time only: a warm session keeps what it has."""
+    from core import proxy_mcp
+
+    seen = {}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def call_tool(self, tool, args, **kwargs):
+            return SimpleNamespace(content=[], is_error=False)
+
+    def fake_transport(
+        entry,
+        env,
+        token_env=None,
+        *,
+        kind="mcp_session",
+        deadline_ms=0,
+        identity=None,
+        agent_token=None,
+    ):
+        seen["agent_token"] = agent_token
+        return FakeClient()
+
+    monkeypatch.setattr(proxy_mcp, "_transport", fake_transport)
+    entry = proxy_mcp.McpExport(
+        name="devops-cli",
+        config=MCPConfig(name="devops-cli", command="node", args=["server.js"]),
+        directory=tmp_path,
+    )
+    manager = proxy_mcp.McpSessionManager()
+    manager.set_entries(
+        {"devops-cli": entry},
+        {
+            "devops-cli": protocol.EdgeMcp(
+                name="devops-cli",
+                tools=[protocol.EdgeMcpTool(name="stateful")],
+            )
+        },
+    )
+
+    result = asyncio.run(
+        manager.call(
+            "devops-cli",
+            "stateful",
+            {},
+            {"user_email": "ops@example.com"},
+            5000,
+            agent_token="t1.payload.signature",
+        )
+    )
+
+    assert result["isError"] is False
+    assert seen["agent_token"] == "t1.payload.signature"
+
+
+def test_the_runner_stdio_transport_receives_the_agent_token(tmp_path, monkeypatch):
+    from core import proxy_mcp
+    from core.execution import stdio_transport
+
+    seen = {}
+
+    class FakeRunnerTransport:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+    monkeypatch.setattr(stdio_transport, "RunnerStdioTransport", FakeRunnerTransport)
+    entry = proxy_mcp.McpExport(
+        name="devops-cli",
+        config=MCPConfig(name="devops-cli", command="node", args=["server.js"]),
+        directory=tmp_path,
+    )
+
+    proxy_mcp._runner_transport(entry, {}, agent_token="t1.payload.signature")
+
+    assert seen["agent_token"] == "t1.payload.signature"

@@ -9,23 +9,30 @@ central's ``get_external_mcp_client(mcp_name, user_id)``, except the state stays
 the edge. Sessions are owned by :class:`McpSessionManager`, not by the tunnel
 socket, so a reconnect re-publishes the catalog without losing state.
 
+Each session is a **runner container**: the MCP server no longer runs as a child of
+the proxy process and nothing about it is written to host disk. Its ``HOME`` and
+``TMPDIR`` are the container's tmpfs, so two users cannot see one another's login
+state and a retired session takes that state with it. ``sandbox.writable_root()`` is
+not involved at all; a pre-existing ``mcp-sessions/`` directory is dead state.
+
 Enforcement is edge-local (plan §2.3): the published catalog is the name authority,
 ``exclude_tools`` refuses even a name that is listed, and no MCP call is ever
 replayed -- a dead session is reported in that call's result and respawned on the
 next one.
 
-Credentials come from edge-local files (``core.edge_user_secrets``) through the
-export's ``credential_mode``. They are resolved **once, at session creation**: editing
-a file does not touch a live session (its env/HOME are already fixed), so the new value
-arrives with the next session -- after TTL expiry, eviction, a **SIGHUP** (which retires
-every live session and reopens it on the next call), or a restart. ``per_user_required``
-with no file for the caller fails closed (``missing_credentials``) before any process is
-spawned, and a declared key the file does not define is never taken from the process
-environment.
+Credentials come from ``core.edge_user_secrets`` through the export's
+``credential_mode``: either this edge's shared file or the caller's sealed per-user set
+(opened by ``core.proxy`` from the call frame). They are resolved **once, at session
+creation**: a new value does not touch a live session (its container env is already
+fixed), so it arrives with the next session -- after TTL expiry, eviction, a **SIGHUP**
+(which retires every live session and reopens it on the next call), or a restart.
+``per_user_required`` with no sealed set for the caller fails closed
+(``missing_credentials``) before any container is created, and a declared key the set
+does not define is never taken from the process environment or the shared file.
 
 Edge-only by design, like ``core.edge_env``: no etcd, no FastAPI, no
-``core.discovery``. The only shared contracts are ``core.models.MCPConfig`` and
-``services.edge_relay.protocol``.
+``core.discovery``. The only shared contracts are ``core.models.MCPConfig``,
+``core.execution.spec`` and ``services.edge_relay.protocol``.
 """
 
 from __future__ import annotations
@@ -35,6 +42,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -44,16 +52,42 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 import yaml
 
 from core import edge_env, edge_user_secrets, sandbox
+from core.execution.spec import declared_env_keys, manifest_digest
 from core.models import MCPConfig
 from core.tool_runtime import MAX_RESULT_CHARS
 from services.edge_relay import protocol
 
 logger = logging.getLogger(__name__)
 
-MAX_SESSIONS_PER_MCP = 8
-MAX_SESSIONS_EDGE = 32
+
+def _env_positive_int(name: str, default: int) -> int:
+    """Read a capacity from the environment, ignoring a bad value (keep the default)."""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Ignoring %s=%r (not an integer); using %d", name, raw, default)
+        return default
+    if value < 1:
+        logger.warning("Ignoring %s=%r (must be positive); using %d", name, raw, default)
+        return default
+    return value
+
+
+# Sessions are containers now, so the caps bound how many containers this edge
+# keeps warm. Sizing rule: ``MAX_SESSIONS_EDGE x limits.memory_mb <= 60% of RAM``
+# (docs/mcp.md).
+MAX_SESSIONS_PER_MCP = _env_positive_int("MAX_SESSIONS_PER_MCP", 8)
+MAX_SESSIONS_EDGE = _env_positive_int("MAX_SESSIONS_EDGE", 32)
 DEFAULT_SESSION_TTL_MINUTES = 30
-DISCOVERY_TIMEOUT_S = 20
+# Slack on top of a session's idle TTL before the runner's reaper reclaims the
+# container, so a session is always retired by its owner first.
+SESSION_DEADLINE_MARGIN_S = 300
+DEFAULT_SESSION_DEADLINE_MS = 3_600_000
+DISCOVERY_TIMEOUT_S = 60
+DISCOVERY_DEADLINE_MS = 60_000
 # One-shot "your session died" markers are kept bounded: a long-lived edge with
 # many users would otherwise grow the set without limit. FIFO eviction only drops
 # the oldest marker, and a marker still fires exactly once.
@@ -403,56 +437,84 @@ def clear_discovery_cache() -> None:
 def _fastmcp():
     """Lazy import: a tools-only edge never loads the MCP client stack."""
     from fastmcp import Client
-    from fastmcp.client import SSETransport, StdioTransport, StreamableHttpTransport
+    from fastmcp.client import SSETransport, StreamableHttpTransport
 
-    return Client, StdioTransport, StreamableHttpTransport, SSETransport
+    return Client, StreamableHttpTransport, SSETransport
 
 
-def build_stdio_argv(entry: McpExport, home_dir: Path, backend: Any = None) -> List[str]:
-    """Sandboxed argv for one stdio server.
+# Logged once per process, not once per manager: ``proxy.run`` builds a session
+# (and therefore a manager) on every start, and the message would repeat.
+_DEAD_SESSION_STATE_WARNED = False
 
-    Module-level (not a method) so tests can substitute ``[sys.executable, fixture]``
-    and run the suite without a sandbox backend. ``backend`` defaults to the
-    selected one so callers never have to pass it.
+
+def _warn_about_dead_session_state() -> None:
+    """Tell the operator that ``<writable_root>/mcp-sessions`` is a v0.5 leftover.
+
+    Session HOME directories used to live there. They are never read or written
+    now (state belongs to a container tmpfs), so the directory is dead weight that
+    still contains old login state -- safe, and recommended, to delete.
     """
-    if not entry.config.command:
-        raise McpCallError("mcp_session_lost", f"mcp {entry.name!r} has no command to run")
-    uid, gid = sandbox.sandbox_preflight.resolve_sandbox_identity()
-    return sandbox.build_cmd(
-        backend or sandbox.select_backend(),
-        [entry.config.command, *(entry.config.args or [])],
-        entry.directory,
-        Path(home_dir),
-        uid,
-        gid,
-        network=entry.config.network,
+    global _DEAD_SESSION_STATE_WARNED
+    if _DEAD_SESSION_STATE_WARNED:
+        return
+    _DEAD_SESSION_STATE_WARNED = True
+    try:
+        legacy = sandbox.writable_root() / "mcp-sessions"
+        if legacy.exists():
+            logger.warning(
+                "Found %s: MCP sessions no longer use host directories (they run in "
+                "runner containers). This is dead state from v0.5 and may be deleted.",
+                legacy,
+            )
+    except Exception:  # a broken SANDBOX_RW_PATH must not stop the edge
+        logger.debug("Could not check for legacy MCP session state", exc_info=True)
+
+
+def _session_deadline_ms(entry: McpExport) -> int:
+    """Idle TTL plus a margin: the container outlives its session by a little."""
+    return (entry.session_ttl_minutes * 60 + SESSION_DEADLINE_MARGIN_S) * 1000
+
+
+def _runner_transport(
+    entry: McpExport,
+    env: Mapping[str, str],
+    *,
+    kind: str = "mcp_session",
+    deadline_ms: int = DEFAULT_SESSION_DEADLINE_MS,
+    identity: Optional[Mapping[str, Any]] = None,
+    agent_token: Optional[str] = None,
+) -> Any:
+    """The stdio transport seam: one runner session container per session.
+
+    Module-level so tests can substitute an in-memory transport without a runner
+    or Docker. ``session_key`` is random per transport: it indexes the runner's
+    session registry and is never derived from the caller (two identities must
+    never collide, and a respawn must not reuse a dead container's key).
+    """
+    from core.execution.stdio_transport import RunnerStdioTransport
+
+    return RunnerStdioTransport(
+        target=entry.name,
+        session_key=secrets.token_hex(16),
+        env=dict(env),
+        manifest_digest=manifest_digest(entry.config),
+        agent=None,
+        user_id=(identity or {}).get("user"),
+        user_email=(identity or {}).get("user_email"),
+        # Verified by the runner when the session opens; a warm session keeps the
+        # token it was created with (no re-mint, plan §3.4(c)).
+        agent_token=agent_token,
+        deadline_ms=deadline_ms,
+        kind=kind,
     )
 
 
-def _session_root() -> Path:
-    return sandbox.writable_root() / "mcp-sessions"
-
-
-def _private_dir(directory: Path) -> Path:
-    """Create ``directory`` 0700: a session (or discovery) HOME holds login state."""
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        # mkdir's mode is masked by umask and ignored when the dir already exists.
-        os.chmod(directory, 0o700)
-    except OSError:
-        logger.debug("Could not chmod MCP directory %s", directory, exc_info=True)
-    return directory
-
-
-def _session_dir(mcp: str, user_key: str) -> Path:
-    """Per-(mcp, user) state dir, 0700: this is what isolates two users' logins."""
-    digest = hashlib.sha256(user_key.encode("utf-8")).hexdigest()[:16]
-    return _private_dir(_session_root() / mcp / digest)
-
-
-def _discovery_dir(mcp: str) -> Path:
-    """Throwaway HOME for a discovery client: still 0700, it sees the real creds."""
-    return _private_dir(_session_root() / "_discovery" / mcp)
+def _credential_tag(sealed: Optional[Mapping[str, str]]) -> str:
+    """Stable, value-free tag for the caller's sealed credential set."""
+    if not sealed:
+        return "shared"
+    payload = json.dumps(dict(sorted(sealed.items())), separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _identity_key(identity: Optional[Mapping[str, Any]]) -> str:
@@ -460,8 +522,8 @@ def _identity_key(identity: Optional[Mapping[str, Any]]) -> str:
 
     The email is normalized (``core.edge_user_secrets.normalize_email``, edge-only) for
     the same reason the credential file is: ``Ops@Example.com`` and ``ops@example.com``
-    are one person, and two spellings must not get two sessions (two server processes,
-    two ``HOME`` dirs, two logins). ``user`` and ``"anonymous"`` are passed through.
+    are one person, and two spellings must not get two sessions (two containers, two
+    logins). ``user`` and ``"anonymous"`` are passed through.
     """
     email = (identity or {}).get("user_email")
     if isinstance(email, str) and email.strip():
@@ -516,27 +578,31 @@ def _http_headers(
 
 
 def _transport(
-    entry: McpExport, home_dir: Path, env: Dict[str, str], token_env: Optional[str] = None
+    entry: McpExport,
+    env: Dict[str, str],
+    token_env: Optional[str] = None,
+    *,
+    kind: str = "mcp_session",
+    deadline_ms: int = DEFAULT_SESSION_DEADLINE_MS,
+    identity: Optional[Mapping[str, Any]] = None,
+    agent_token: Optional[str] = None,
 ):
-    """A client for one server. Only stdio spawns a process, so only it is sandboxed.
+    """A client for one server. Only stdio runs code, and it runs in a container.
 
-    ``keep_alive=False`` is not optional: a session enters its client once and holds
-    it for the session's whole lifetime, so keeping the transport alive past
-    ``__aexit__`` buys nothing -- and it is exactly what made every retired session
-    leak an OS process. Closing the client must terminate the server.
+    A session enters its client once and holds it for the session's whole lifetime,
+    so closing the client must tear the runner session down -- that is the only
+    lifecycle a warm session has. Nothing here spawns a host process.
     """
-    Client, StdioTransport, StreamableHttpTransport, SSETransport = _fastmcp()
+    Client, StreamableHttpTransport, SSETransport = _fastmcp()
     if entry.config.transport == "stdio":
-        argv = build_stdio_argv(entry, home_dir, None)
         return Client(
-            StdioTransport(
-                command=argv[0],
-                args=argv[1:],
-                env=env,
-                # Same cwd as a tool subprocess: a relative config/asset path in the
-                # server's own manifest resolves against its directory.
-                cwd=str(entry.directory),
-                keep_alive=False,
+            _runner_transport(
+                entry,
+                env,
+                kind=kind,
+                deadline_ms=deadline_ms,
+                identity=identity,
+                agent_token=agent_token,
             )
         )
     headers = _http_headers(entry, env, token_env)
@@ -552,12 +618,19 @@ def resolve_credentials(
     *,
     credentials: Optional[edge_user_secrets.CredentialStore] = None,
     site: Optional[str] = None,
+    sealed: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, str]:
     """The declared credentials for this session, via the entry's ``credential_mode``.
 
-    Raises ``edge_user_secrets.MissingCredentials`` under ``per_user_required``; the
-    caller turns that into ``missing_credentials``. Runs once per session, at creation:
-    an edited file never changes a live session (plan §7 Phase 5).
+    ``sealed`` is the caller's already-decrypted per-user mapping (``None`` = no
+    blob). Its presence switches the all-or-nothing branch on: only declared secret
+    names it carries are used, and a missing one is never filled from the shared file
+    or the process env (plan §5 Phase 4 R8). Variables still come from the shared
+    file / process env.
+
+    Raises ``edge_user_secrets.MissingCredentials`` under ``per_user_required`` when
+    there is no sealed set; the caller turns that into ``missing_credentials``. Runs
+    once per session, at creation: a new value never changes a live session.
     """
     store = credentials or edge_user_secrets.CredentialStore.from_config(None)
     email = (identity or {}).get("user_email")
@@ -567,12 +640,12 @@ def resolve_credentials(
         email=email if isinstance(email, str) else None,
         site=site or "",
         mode=entry.credential_mode,
+        sealed=sealed,
     )
 
 
 def _server_env(
     entry: McpExport,
-    home_dir: Path,
     identity: Optional[Mapping[str, Any]],
     *,
     passthrough: bool,
@@ -580,19 +653,30 @@ def _server_env(
     credentials: Optional[edge_user_secrets.CredentialStore] = None,
     site: Optional[str] = None,
     credential_env: Optional[Mapping[str, str]] = None,
+    sealed: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, str]:
-    """Declared keys + literal ``mcp.yaml`` env + session HOME + caller identity.
+    """Declared keys + literal ``mcp.yaml`` env + caller identity, and nothing else.
 
     Order matters: the scoped process env first, then the manifest's literal ``env:``,
     then the **resolved credentials last**, so a stale literal value can never shadow
-    a credential file (which would defeat ``per_user_required`` whenever the caller's
-    file happens to define the key). Under ``per_user_required`` a declared key the
-    file does not define is then removed outright, even with ``passthrough``.
+    a credential (which would defeat ``per_user_required`` whenever the caller's
+    sealed set happens to define the key).
+
+    When ``sealed`` is set the per-user branch is all-or-nothing: a declared secret
+    the caller's set omits is removed outright, even with ``passthrough`` and even if
+    a literal ``env:`` carries it -- the shared file and the container never fill the
+    gap. Declared ``variables`` are still the edge's own configuration.
+
+    The result is intersected with the manifest's declared keys: the runner rejects
+    anything else (``400``), and a caller cannot smuggle a control-plane name in.
+    ``HOME``/``TMPDIR`` are *not* set here -- the container's tmpfs owns them.
     """
     resolved = (
         credential_env
         if credential_env is not None
-        else resolve_credentials(entry, identity, credentials=credentials, site=site)
+        else resolve_credentials(
+            entry, identity, credentials=credentials, site=site, sealed=sealed
+        )
     )
     env = edge_env.scoped_env(
         (),
@@ -606,24 +690,24 @@ def _server_env(
             if isinstance(key, str)
         }
     )
-    # Credentials from the store win over the process env and over a literal ``env:``
-    # (``shared`` mode's point, and the only source under ``per_user_required``).
+    # Credentials win over the process env and over a literal ``env:`` (``shared``
+    # mode's point, and the only source under ``per_user_required``).
     env.update(resolved)
-    edge_user_secrets.enforce_per_user_required(
-        env, entry.config, resolved, entry.credential_mode
-    )
-    # Neither a credential file nor a literal env: may reintroduce a control-plane name.
+    if sealed is not None:
+        for key in edge_user_secrets.declared_secret_keys(entry.config):
+            if key not in resolved:
+                env.pop(key, None)
+    # Neither a credential nor a literal env: may reintroduce a control-plane name.
     edge_env.strip_framework_names(env, token_env=token_env)
     # Identity is per frame: never inherit a stale one from ``TRELLIS_*``.
     env.pop("TRELLIS_USER_ID", None)
     env.pop("TRELLIS_USER_EMAIL", None)
-    home = str(home_dir)
-    env.update({"HOME": home, "TMPDIR": home, "TMP": home, "TEMP": home})
     for var, field in (("TRELLIS_USER_ID", "user"), ("TRELLIS_USER_EMAIL", "user_email")):
         value = (identity or {}).get(field)
         if isinstance(value, str) and value:
             env[var] = value
-    return env
+    declared = declared_env_keys(entry.config)
+    return {key: value for key, value in env.items() if key in declared}
 
 
 async def _discover(
@@ -634,17 +718,20 @@ async def _discover(
     credentials: Optional[edge_user_secrets.CredentialStore] = None,
     site: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Live ``list_tools()`` against a throwaway client; cached per export signature."""
+    """Live ``list_tools()`` against a throwaway session; cached per export signature.
+
+    The discovery session is a container too (``kind="discovery"``), so it leaves no
+    ``_discovery/`` directory and no container behind: ``_list()`` always exits its
+    client, which deletes the runner session.
+    """
     signature = entry.signature()
     cached = _DISCOVERY_CACHE.get(entry.name)
     if cached is not None and cached[0] == signature:
         return cached[1]
 
-    directory = _discovery_dir(entry.name)
     try:
         env = _server_env(
             entry,
-            directory,
             None,
             passthrough=passthrough,
             token_env=token_env,
@@ -659,7 +746,13 @@ async def _discover(
             f"mcp {entry.name!r} needs per-user credentials to discover its tools; "
             "declare a static 'tools:' catalog in mcp.yaml",
         ) from exc
-    client = _transport(entry, directory, env, token_env)
+    client = _transport(
+        entry,
+        env,
+        token_env,
+        kind="discovery",
+        deadline_ms=DISCOVERY_DEADLINE_MS,
+    )
 
     async def _list() -> List[Any]:
         async with client:
@@ -794,9 +887,10 @@ def _truncate(payload: Dict[str, Any]) -> Dict[str, Any]:
 class _ServerSession:
     """One live MCP client for one ``(mcp, user)`` pair."""
 
-    def __init__(self, mcp: str, client: Any) -> None:
+    def __init__(self, mcp: str, client: Any, credential_tag: str = "shared") -> None:
         self.mcp = mcp
         self.client = client
+        self.credential_tag = credential_tag
         # Calls are serialized per session (plan §3.4); the client multiplexes
         # across servers, the server itself does not need concurrent calls.
         self.lock = asyncio.Lock()
@@ -814,10 +908,12 @@ class McpSessionManager:
         credentials: Optional[edge_user_secrets.CredentialStore] = None,
         site: Optional[str] = None,
     ) -> None:
+        _warn_about_dead_session_state()
         self.passthrough = passthrough
         self.token_env = token_env
-        # Where per-user/shared credential files live, and the site named in a
-        # fail-closed message. Both are restart-required (see proxy._Session.reload).
+        # The shared credential store and the site named in a fail-closed message.
+        # Both are restart-required (see proxy._Session.reload). A per-user sealed set
+        # is not stored here: it arrives with the call that opens the session.
         self.credentials = credentials or edge_user_secrets.CredentialStore.from_config(None)
         self.site = site
         self._entries: Dict[str, McpExport] = {}
@@ -862,11 +958,18 @@ class McpSessionManager:
         args: Dict[str, Any],
         identity: Dict[str, Any],
         deadline_ms: int,
+        *,
+        agent_token: Optional[str] = None,
+        sealed: Optional[Mapping[str, str]] = None,
     ) -> Dict[str, Any]:
         """Execute one MCP ``tools/call`` and return the mapped payload.
 
         Refusals and crashes raise ``McpCallError``; the caller turns that into a
-        ``result`` frame. Nothing here ever retries a call.
+        ``result`` frame. Nothing here ever retries a call. ``agent_token`` is used
+        only when a session opens; a warm session keeps the one it was created with.
+
+        ``sealed`` is this call's decrypted per-user mapping, used only if the session
+        has to open (a warm session already fixed its env, including credentials).
         """
         entry = self._entries.get(mcp)
         if entry is None:
@@ -877,6 +980,7 @@ class McpSessionManager:
             )
 
         user_key = _identity_key(identity)
+        credential_tag = _credential_tag(sealed)
         key = (mcp, user_key)
         await self._sweep()
 
@@ -889,16 +993,24 @@ class McpSessionManager:
             )
 
         session = self._sessions.get(key)
+        if session is not None and session.credential_tag != credential_tag:
+            # A warm session fixed its credentials when it opened. A changed set
+            # (store or clear) must take effect on the next call, not after TTL.
+            self._retire(key, tombstone=False)
+            await self.reap()
+            session = None
         if session is None:
             async with self._create_lock:
                 session = self._sessions.get(key)
                 if session is None:
                     # Resolved before eviction/creation: a fail-closed refusal must not
                     # retire a live session or spawn a process it cannot serve.
-                    credential_env = self._credential_env(entry, identity)
+                    credential_env = self._credential_env(entry, identity, sealed)
                     self._evict_for(entry)
                     await self.reap()
-                    session = await self._open(entry, user_key, identity, credential_env)
+                    session = await self._open(
+                        entry, key, identity, credential_env, agent_token, sealed
+                    )
 
         async with session.lock:
             session.last_used = time.monotonic()
@@ -985,17 +1097,26 @@ class McpSessionManager:
         return self._entries.get(name)
 
     def _credential_env(
-        self, entry: McpExport, identity: Mapping[str, Any]
+        self,
+        entry: McpExport,
+        identity: Mapping[str, Any],
+        sealed: Optional[Mapping[str, str]] = None,
     ) -> Dict[str, str]:
         """This session's credentials, or a ``missing_credentials`` refusal.
 
-        Read once here, at creation: a live session keeps the credentials it started
-        with until its TTL, a SIGHUP that retires it, or a restart (documented in
-        ``proxy._Session.reload``).
+        Resolved once here, at creation: a live session keeps the credentials it
+        started with until its TTL, a SIGHUP that retires it, or a restart
+        (documented in ``proxy._Session.reload``). A ``sealed`` blob that cannot be
+        resolved -- e.g. ``per_user_required`` with no blob -- fails here, before any
+        container is created.
         """
         try:
             return resolve_credentials(
-                entry, identity, credentials=self.credentials, site=self.site
+                entry,
+                identity,
+                credentials=self.credentials,
+                site=self.site,
+                sealed=sealed,
             )
         except edge_user_secrets.MissingCredentials as exc:
             logger.warning("MCP %r: %s", entry.name, exc.message)
@@ -1004,28 +1125,36 @@ class McpSessionManager:
     async def _open(
         self,
         entry: McpExport,
-        user_key: str,
+        session_key: Tuple[str, str],
         identity: Mapping[str, Any],
         credential_env: Mapping[str, str],
+        agent_token: Optional[str] = None,
+        sealed: Optional[Mapping[str, str]] = None,
     ) -> _ServerSession:
-        directory = _session_dir(entry.name, user_key)
         env = _server_env(
             entry,
-            directory,
             identity,
             passthrough=self.passthrough,
             token_env=self.token_env,
             credential_env=credential_env,
+            sealed=sealed,
         )
         try:
-            # keep_alive=False inside: closing the client kills the server process.
-            client = _transport(entry, directory, env, self.token_env)
+            # Closing the client tears the runner session (container) down.
+            client = _transport(
+                entry,
+                env,
+                self.token_env,
+                deadline_ms=_session_deadline_ms(entry),
+                identity=identity,
+                agent_token=agent_token,
+            )
             await client.__aenter__()
         except Exception as exc:
             # Type only: an http/sse transport's message can echo the endpoint URL.
             logger.error(
-                "MCP %r: could not start a session (%s); the endpoint or command may "
-                "be unreachable or misconfigured",
+                "MCP %r: could not start a session (%s); the endpoint, command or "
+                "runner may be unreachable or misconfigured",
                 entry.name,
                 type(exc).__name__,
             )
@@ -1034,8 +1163,10 @@ class McpSessionManager:
                 f"mcp {entry.name!r} failed to start; it will be retried on the next call",
             ) from exc
 
-        session = _ServerSession(entry.name, client)
-        self._sessions[(entry.name, user_key)] = session
+        session = _ServerSession(
+            entry.name, client, _credential_tag(sealed)
+        )
+        self._sessions[session_key] = session
         return session
 
     async def _sweep(self) -> None:

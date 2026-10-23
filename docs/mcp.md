@@ -31,8 +31,8 @@ The `mcp.yaml` defines how the Universal Agent Host (`core/host.py`) connects to
 - `variables` (Optional): Non-sensitive configuration variables. Same structure as `secrets` (including contextual scoping); resolved and injected exactly like secrets, just stored as plain variables.
 - `public` (Optional): Expose **all** tools from this MCP server directly to external MCP clients via the Gateway's `search_tools`/`use_tool` tools (no agent hop required).
 - `public_tools` (Optional): A whitelist of specific tool names to expose publicly when `public` is not set server-wide.
-- `tools` (Optional): A static list of tool definitions (`name`, `description`, `inputSchema`) exposed by the server. You normally don't write this by hand: when it's absent, the registry sync live-connects to the server (spawning the `stdio` command or opening the HTTP URL, with a ~20s budget), discovers its tools, and persists the discovered list into the registry config automatically. That list then feeds the runtime's discovery fast-path and the semantic tool-search index (`mcp__{server}__{tool}` embeddings). Hand-listing `tools` in `mcp.yaml` skips discovery entirely — useful when the server can't be reached from the sync environment; if discovery fails, the config is still saved and the runtime falls back to live discovery.
-- `network` (Optional): `allow` (default) or `none`. Only applies to `stdio` servers: `none` gives the spawned process no IP network (bwrap `--unshare-net`, or Landlock TCP deny on ABI ≥ 4). `http`/`sse` transports ignore it. On an edge this is the stdio MCP server's sandbox net policy, and it is enforced on the edge, not here.
+- `tools` (Optional): A static list of tool definitions (`name`, `description`, `inputSchema`) exposed by the server. You normally don't write this by hand: when it's absent, the registry sync live-connects to the server (opening a discovery session in a runner container for `stdio`, or connecting to the HTTP URL, with a ~20s budget), discovers its tools, and persists the discovered list into the registry config automatically. That list then feeds the runtime's discovery fast-path and the semantic tool-search index (`mcp__{server}__{tool}` embeddings). Hand-listing `tools` in `mcp.yaml` skips discovery entirely — useful when the server can't be reached from the sync environment; if discovery fails, the config is still saved and the runtime falls back to live discovery.
+- `network` (Optional): `none` (default) | `internal` | `internet`; the legacy `allow` maps to `internet`. Only applies to `stdio` servers, and it is enforced on the runner's container (see [How stdio MCP servers run](#how-stdio-mcp-servers-run)). `http`/`sse` transports ignore it.
 - `remote` (Optional): **written by the edge relay only, never authored in a file.** A `{site, mcp}` block marks the server as edge-hosted: central never connects to it and never resolves central secrets for it. See [Edge-hosted MCP servers](#edge-hosted-mcp-servers).
 
 ## Secure Secret Management
@@ -70,6 +70,52 @@ env:
 secrets:
   - "MY_DB_PASSWORD"
 ```
+
+## How stdio MCP servers run
+
+A `stdio` server is **not** a child of `host` or `trellis-proxy`. Since v0.6 it runs in a
+container created by the local `runner` service, from the manifest on disk:
+
+- **One container per session.** A central agent's session (per MCP, per user) and an edge
+  session (per MCP, per caller identity) each get their own container, with `HOME`/`TMPDIR`
+  on that container's tmpfs. Two users on the same server therefore share no filesystem, no
+  process namespace and no `HOME`, and an ordinary tool call sees neither.
+- **Login state dies with the session.** Anything the server writes under `$HOME` (tokens,
+  cookies, SSH keys it generated) lives in the tmpfs: it is gone on TTL expiry, LRU
+  eviction, `SIGHUP`, a runner restart, or process death. There is no persisted per-user
+  login state to back up or clean up — and no host directory where another user could read
+  it. A server that needs durable state must be given a real mount by its own image or
+  manifest; `$HOME` is not one.
+- **Discovery is a throwaway container.** Catalog discovery (`discover_external_mcps` on
+  central, the edge's live `list_tools()`) opens a session with `kind="discovery"` and a
+  60 s deadline, then tears it down. It leaves no container and no directory behind; the
+  catalog is cached in memory (edge: per export signature, dropped on `SIGHUP`).
+- **Only declared env is sent.** The request carries the manifest's declared keys
+  (`secrets`, `optional_secrets`, `variables`, the `env:` block) plus
+  `TRELLIS_USER_ID`/`TRELLIS_USER_EMAIL`. The runner rejects any other key with `400`, and
+  it builds `PATH` and the rest of the base environment itself.
+- **`mcp.yaml`'s `network:` selects the profile** (`none` by default). There is no bind
+  mount of the workspace beyond the MCP's own directory (read-only) plus `shared/`.
+- **A lost session is reported, not retried.** If the runner no longer has the session
+  (restart, reaper, deleted container), that call returns `mcp_session_lost`; the next
+  call starts a fresh container. No MCP call is ever replayed automatically.
+
+### Memory sizing (sessions × `limits.memory_mb` ≤ 60 % of host RAM)
+
+Each warm session is a running container, so plan for their peak memory:
+
+```text
+MAX_SESSIONS_EDGE × limits.memory_mb  ≤  0.6 × host RAM
+```
+
+The default `limits.memory_mb` is 2048. On a 16 GiB edge that allows at most
+`floor(16 × 0.6 × 1024 / 2048) = 4` concurrent session containers, so set
+`MAX_SESSIONS_EDGE=4` in the edge's `.env` (and `max_sessions:` per `export_mcps` entry
+below that). Lower `limits.memory_mb` per MCP only if its manifest says so — a Node
+server usually needs the 2 GiB default, and a `tmpfs_mb` at or near `memory_mb` will
+OOM-kill it. On central, warm sessions are the cached per-user MCP clients (TTL 300 s,
+at most 100); the runner's own container limits still apply, so size the host for the
+number of agents × users you expect to hold a session at once.
 
 ## Applying Changes
 
@@ -250,7 +296,8 @@ catalog itself, and a non-google agent sees the discriminated union.
 | Deadline (`edge_timeout`) | `504` → `MCP tool '…' timed out on edge '<site>' (no result before the deadline).` The session is kept and **the call is never replayed** |
 | Tool error reported by the edge | `200` with `error` → `MCP tool '…' failed on edge '<site>': <reason>`. A server that answers `isError: true` is a normal result and is passed through as such |
 | Session lost (`mcp_session_lost`) | In-call result: the server crashed, or the session hit its TTL/LRU cap. **Recoverable — retry manually**; the next call starts a fresh session (login state is gone) |
-| Missing credentials (`missing_credentials`) | In-call result with exactly `no credentials for <email> on edge <site>` under `per_user_required` (`anonymous` in place of an address when the call carries no identity). **Recoverable** once an operator runs `user-secrets set` |
+| Missing credentials (`missing_credentials`) | In-call result with exactly `no credentials for <email> on edge <site>` under `per_user_required` (`anonymous` in place of an address when the call carries no identity). **Recoverable** once the user seals the declared secret keys in Configuration → Edge credentials |
+| Credential rejected (`credential_rejected`) | The sealed blob is bound to another target/user/site or to a retired edge key. **Recoverable** after reloading the credential form and re-entering the set; the call never ran |
 
 All of these reach the model as an error string for that one call. Central has no retry
 hook for edge MCP calls — a state-changing action must never be re-executed automatically.

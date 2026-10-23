@@ -365,6 +365,203 @@ The base hub already runs as `${TRELLIS_UID}` with `cap_drop: [ALL]` and an empt
 
 One caveat: `docker compose up --wait` fails when `/healthz` returns 503 — that is the intended signal, not a broken deploy. `host` depends on `hub` with `condition: service_started`, not `service_healthy`, so chat-only agents still start.
 
+## Execution isolation (v0.6)
+
+Since v0.6 every local tool call runs in its **own gVisor container**, created by a
+dedicated `runner` service. The hub no longer forks tool subprocesses and no longer
+needs a sandbox of its own: the compose default is `SANDBOX_BACKEND=container`, and the
+in-process `auto`/`bwrap`/`landlock` backends are **local-development only**. Each
+container sees its own toolkit directory read-only, `shared/` read-only, a sized tmpfs
+for `/tmp`, and (only when the tool declares `output_dirs`) the calling agent's output
+directory. The network is a deny-by-default profile.
+
+### Prerequisite: gVisor (`runsc`)
+
+The runner refuses to start when its configured runtime is missing or cannot start a
+trivial container — there is no silent fallback to `runc`.
+
+1. Install `runsc` on the **host** (not in a container) from the gVisor release you
+   have tested, and pin that version in your own provisioning. Releases since
+   2025 ship `runsc` **plus a `gvisor-bin/` directory next to it**; installing only
+   the `runsc` binary starts fine but fails every container with
+   `sidecar "gvisor_sentry" not usable`:
+
+   ```bash
+   # x86_64; use gvisor-aarch64.* on arm hosts
+   VER=release-20261019.0
+   curl -fsSLO "https://github.com/google/gvisor/releases/download/$VER/gvisor-x86_64.tar.bz2"
+   curl -fsSLO "https://github.com/google/gvisor/releases/download/$VER/SHA512SUMS"
+   grep ' gvisor-x86_64.tar.bz2$' SHA512SUMS | sha512sum -c -
+   sudo tar -xjmf gvisor-x86_64.tar.bz2 -C /usr/bin --no-same-owner
+   sudo chmod 0755 /usr/bin/runsc /usr/bin/containerd-shim-runsc-v1 /usr/bin/gvisor-bin/*
+   ```
+
+   (The `storage.googleapis.com/gvisor/releases/release/latest/...` URLs printed in
+   older guides return 404 for current releases; use the GitHub release assets.)
+
+2. Register it with the Docker daemon and restart Docker:
+
+   ```json
+   {
+     "runtimes": {
+       "runsc": {
+         "path": "/usr/bin/runsc",
+         "runtimeArgs": ["--network=sandbox"]
+       }
+     }
+   }
+   ```
+
+   `--network=sandbox` keeps networking in gVisor's netstack so the `DOCKER-USER`
+   profile rules apply to the traffic that leaves the container. Do **not** add
+   `--ignore-cgroups=true`: per-container `--memory`/`--cpus`/`--pids-limit` come from
+   the manifest `limits:` block and need cgroups.
+
+   Registering a runtime is one of the few daemon settings Docker reloads in place:
+   after editing `daemon.json`, `sudo systemctl reload docker` is enough
+   (`docker info --format '{{json .Runtimes}}'` shows it). A full restart also
+   works but restarts every running container.
+
+3. Prove it before starting the stack:
+
+   ```bash
+   docker info --format '{{json .Runtimes}}' | grep runsc
+   docker run --rm --runtime=runsc hello-world
+   ```
+
+   Both must succeed. A per-tool `container_runtime: runc` in `tool.yaml` is the escape
+   hatch for a tool that cannot run under gVisor; it forfeits the kernel-syscall
+   isolation and must be justified per tool.
+
+### The runner service and its socket
+
+`runner` is the **only** service that mounts `/var/run/docker.sock`. Treat access to
+that socket as root on the host, and do not mount it anywhere else — not into `hub`,
+`host`, an edge proxy, or a debugging container.
+
+- **API:** a Unix socket at `/run/trellis/runner.sock`, shared read-write through the
+  `runner-run` volume with `host`, `hub`, `gateway` and `taskiq-worker`. It is never a
+  TCP port; `network_mode: "none"` means no tool network can reach it.
+- **Auth:** `RUNNER_TOKEN` is required and must be identical on the runner and every
+  caller. Generate it with `openssl rand -hex 32`. The only exception is
+  `DEV_MODE=true`, which logs a loud warning and accepts unauthenticated calls.
+- **Posture:** `read_only` rootfs, `cap_drop: [ALL]` plus `CHOWN` and
+  `DAC_OVERRIDE` (`CHOWN` to chgrp the control socket to `${TRELLIS_GID}`;
+  `DAC_OVERRIDE` because the workspace is owned by `${TRELLIS_UID}` and the runner
+  writes the canary and the agents' output directories there), `no-new-privileges`,
+  a tmpfs `/tmp`. It runs as root only to open the Docker socket; every container
+  it starts runs as `${TRELLIS_UID}:${TRELLIS_GID}`.
+- **Restart:** `restart: unless-stopped` with a healthcheck that probes `/v1/healthz`.
+  It is a single process on purpose (container slots live in memory), so it is also a
+  single point of failure: while it is down, local tool calls fail with a clear error
+  and chat-only agents keep working. Do not scale it to two replicas.
+- **No etcd dependency:** it starts independently of the registry and reads manifests
+  from its workspace mount.
+
+Startup gates (logged, fail closed) are: the runtime is present *and* starts a trivial
+container, `RUNNER_IMAGE` exists locally (the runner never pulls), the network-profile
+rules verify, the socket is `0660` for the app gid, and the host-path canary passes. Use
+`python scripts/runner_preflight.py` with the runner's environment to see each gate
+without fighting a restart loop.
+
+### `TRELLIS_HOST_WORKSPACE` must be the host path
+
+Docker resolves every bind mount for a tool container against the **host** filesystem,
+so the runner needs to know where its `/app/workspace` actually lives:
+
+```bash
+# .env
+TRELLIS_WORKSPACE_DIR=../my-org-workspace/workspace   # what compose mounts
+TRELLIS_HOST_WORKSPACE=/srv/trellis/my-org-workspace/workspace   # absolute host path
+```
+
+Pointing it at a container path (`/app/workspace`) is the classic mistake. The startup
+canary writes a marker through the runner's view and reads it back through the host
+path; a mismatch refuses to serve, with:
+
+```text
+TRELLIS_HOST_WORKSPACE='/app/workspace' must be the HOST path of the workspace (the
+directory that is mounted at /app/workspace inside the runner); pointing it at a
+container path makes every bind mount resolve to the wrong files.
+```
+
+The check re-runs on `SIGHUP` and every `RUNNER_REAP_INTERVAL_S` seconds (default 300).
+A failed re-check stops new calls (`runner_path_mismatch`) rather than running a tool
+against the wrong tree.
+
+### Network profiles
+
+| Profile | Docker network | Subnet (default) | Egress policy |
+| --- | --- | --- | --- |
+| `none` | — (`network_mode: none`) | — | loopback only |
+| `internal` | `trellis-tools-internal` | `172.31.241.0/24` | ACCEPT `TRELLIS_INTERNAL_CIDRS` + the resolver in `TOOLS_INTERNAL_DNS`; DROP everything else |
+| `internet` | `trellis-tools-internet` | `172.31.240.0/24` | ACCEPT public; DROP RFC1918, CGNAT, link-local, multicast, metadata, engine subnets |
+
+`tool.yaml`'s `network:` defaults to `none`; legacy `allow` maps to `internet`. On top
+of the per-profile policy, `DOCKER-USER` drops — for every profile — cloud metadata
+(`169.254.169.254`, `fd00:ec2::254`, `100.100.100.200`, `169.254.169.123`), the host
+bridge gateway, and every compose network in `TRELLIS_ENGINE_SUBNETS` (etcd, redis,
+hub, relay, host). The rules are matched on the profile networks' CIDRs so they also
+cover gVisor netstack traffic exiting through the Docker bridge.
+
+Create the networks and rules once per host, as root:
+
+```bash
+sudo scripts/setup-network-profiles.sh            # networks + rules (idempotent)
+sudo scripts/setup-network-profiles.sh --verify   # exit non-zero if anything is missing
+```
+
+The two tool networks are created by this script, not by `docker compose`, because they
+need pinned subnets and `enable_icc=false`; they are deliberately absent from the
+compose `networks:` block. Re-run `--verify` after a reboot, a firewall reload, or a
+Docker upgrade (Docker recreates `DOCKER-USER` empty), and from provisioning before
+`docker compose up -d`. The runner performs the same check at startup. `--teardown`
+removes only the rules, which is useful for tests.
+
+For a tool that needs to reach an internal API or SSH, add the destination to
+`TRELLIS_INTERNAL_CIDRS` (comma-separated) and give it `network: internal`. SSH is L3
+traffic, so a CIDR is enough — hostname allowlists still need the opt-in CONNECT proxy
+from [Egress mode](#egress-mode-opt-in).
+
+**Name resolution.** gVisor cannot reach Docker's embedded resolver (`127.0.0.11`),
+which Docker writes into the resolv.conf of every container on a user-defined network,
+so `getaddrinfo` fails inside every network profile by default. The runner therefore
+generates a resolv.conf per profile and bind-mounts it read-only over the container's:
+
+| Profile | Variable | Default |
+| --- | --- | --- |
+| `internet` | `TOOLS_INTERNET_DNS` | `1.1.1.1,8.8.8.8` |
+| `internal` | `TOOLS_INTERNAL_DNS` | empty (no resolver) |
+
+The file lives at `<workspace>/.runner-dns/<profile>.conf` (the workspace is the only
+path both the runner and the Docker daemon can see) and contains resolver addresses
+only. Set the variable to an empty string to keep Docker's file, or to a comma-separated
+list of IPs to override it; entries that are not IP addresses are ignored with a warning.
+An `internal` resolver must itself be inside an allowlisted `TRELLIS_INTERNAL_CIDRS`
+entry, otherwise the profile's blanket deny drops the queries. Tools on `none` have no
+network and therefore no DNS.
+
+### Sizing
+
+Each concurrent tool call is a container with its own memory/CPU/pids limits
+(`limits:` in `tool.yaml`; defaults 512 MiB, 1.0 CPU, 256 pids). Budget:
+
+```text
+runner RAM ≈ RUNNER_MAX_CONTAINERS × typical memory_mb × 1.5
+```
+
+The 1.5 factor covers gVisor's own overhead and page cache, which is charged to the
+container's cgroup. With the defaults (32 global × 512 MiB) plan for ~24 GiB before you
+raise `RUNNER_MAX_CONTAINERS`; lower the global or per-tool caps on a small host
+(`RUNNER_MAX_CONTAINERS`, `RUNNER_MAX_CONTAINERS_PER_TOOL`). Remember that a tool's
+`tmpfs_mb` counts against its `memory_mb` (validators keep `tmpfs_mb ≤ memory_mb / 2`).
+Image layers are shared, so the first pull dominates disk, not per-call cost.
+
+Rolling back to the in-process sandbox is `SANDBOX_BACKEND=auto` plus uncommenting the
+hub's legacy `security_opt` lines; the runner service stays in the compose file, idle.
+That path is for development hosts only — see [Sandbox settings and
+rollback](#sandbox-settings-and-rollback).
+
 ## Egress mode (opt-in)
 
 By default the hub — and therefore every tool it spawns — has the same unrestricted outbound access as any other container on `trellis-network`. Egress mode removes that: the hub gets a route to **one** CONNECT proxy and nothing else, and that proxy only connects to domains some tool declared in its `tool.yaml`. LLM providers are unaffected: those calls are made by `host`, which keeps its default-network route.
@@ -395,7 +592,7 @@ What the override adds:
 - `egress-proxy`, the only container on both `toolnet` and `default`, running `scripts/egress_proxy.py`;
 - `HTTP_PROXY`/`HTTPS_PROXY` (and lowercase forms) plus `NO_PROXY` on the hub, which tools inherit.
 
-`NO_PROXY` is load-bearing: tools call the framework API at `FRAMEWORK_API_URL=http://host:8000`, and the hub talks to etcd. Those names must bypass the proxy, which is why the override lists `etcd,redis,host,hub,gateway,taskiq-worker,localhost,127.0.0.1,::1`.
+`NO_PROXY` is load-bearing: the hub talks to etcd and the runner socket path must never be proxied. Those names must bypass the proxy, which is why the override lists `etcd,redis,host,hub,gateway,taskiq-worker,localhost,127.0.0.1,::1`.
 
 ### The allowlist
 

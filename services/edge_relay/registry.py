@@ -23,13 +23,15 @@ from typing import Any, Dict, List, Optional
 
 from core.health import HealthMonitor
 from core.tool_index import delete_tool, index_tool
-from services.edge_relay.protocol import EdgeMcp, EdgeTool, tool_name
+from services.edge_relay.protocol import EdgeCredentials, EdgeMcp, EdgeTool, tool_name
 
 logger = logging.getLogger(__name__)
 
 TOOLS_PREFIX = "/registry/tools/"
 MCPS_PREFIX = "/registry/mcps/"
 MANAGED_BY = "edge-relay"
+# Display-only rotation trail (the overlap set that gates writes is ``edge_key_fps``).
+MAX_KEY_HISTORY = 10
 
 
 def _now_iso() -> str:
@@ -541,6 +543,105 @@ def publish_mcp_catalog(
         len(published),
     )
     return published
+
+
+def publish_edge_credentials(
+    identity_mgr: Any, site: str, credentials: EdgeCredentials, *, now: Optional[str] = None
+) -> bool:
+    """Merge an edge's hello credential material into its site record.
+
+    The relay owns ``/registry/edges/<site>/config`` only for these fields; every
+    admin-editable field is preserved. ``edge_key_fps`` is the **overlap** set -- the
+    fingerprints a blob may still be sealed to -- so a key the edge stopped reporting
+    (``--drop-old-key``) stops accepting writes; the cumulative rotation trail goes to
+    ``edge_key_history`` for display. ``credential_keys`` is names only: the browser
+    seal form reads declared key names from here because ``<site>__<name>`` configs
+    deliberately omit ``secrets``/``variables``.
+
+    Returns whether the record changed. A site with no registry record (the DEV_MODE
+    hatch) is not written: it has no config to merge into.
+    """
+    record = identity_mgr.get_edge_config(site)
+    if not record:
+        return False
+
+    incoming = credentials.as_record()
+    if not incoming:
+        return False
+
+    stamp = now or _now_iso()
+    updated = dict(record)
+    changed = False
+
+    for key, value in incoming.items():
+        if key in ("prev_edge_key_fp", "edge_key_fps", "edge_key_history", "edge_key_rotated_at"):
+            continue
+        if updated.get(key) != value:
+            updated[key] = value
+            changed = True
+
+    new_fp = incoming.get("edge_key_fp")
+    prev_fp = incoming.get("prev_edge_key_fp")
+    if not new_fp:
+        # The edge lost or deleted its key: stop advertising a public key central
+        # can no longer be decrypted with. The old fp stays in the history.
+        for stale in ("edge_pubkey", "edge_key_fp", "edge_key_id"):
+            if stale in updated:
+                updated.pop(stale)
+                changed = True
+    if new_fp:
+        old_fp = record.get("edge_key_fp")
+        if old_fp and old_fp != new_fp:
+            updated["edge_key_rotated_at"] = stamp
+            changed = True
+
+        overlap = [prev_fp] if prev_fp and prev_fp != new_fp else []
+        if updated.get("edge_key_fps") != overlap:
+            updated["edge_key_fps"] = overlap
+            changed = True
+        if "prev_edge_key_fp" in record and prev_fp is None:
+            updated.pop("prev_edge_key_fp", None)
+            changed = True
+        elif prev_fp is not None and record.get("prev_edge_key_fp") != prev_fp:
+            updated["prev_edge_key_fp"] = prev_fp
+            changed = True
+
+        history = _key_history_entries(record.get("edge_key_history"))
+        for candidate, retired_at in ((old_fp, updated.get("edge_key_rotated_at")), (prev_fp, stamp)):
+            if candidate and candidate != new_fp and candidate not in {entry["fp"] for entry in history}:
+                history.append({"fp": candidate, "retired_at": retired_at or stamp})
+                changed = True
+        history = [entry for entry in history if entry["fp"] != new_fp][-MAX_KEY_HISTORY:]
+        if updated.get("edge_key_history") != history:
+            updated["edge_key_history"] = history
+            changed = True
+
+    if not changed:
+        return False
+    identity_mgr.save_edge_config(site, updated)
+    logger.info(
+        "edge credential material recorded site=%s key_fp=%s overlap=%d targets=%d",
+        site,
+        new_fp or "",
+        len(updated.get("edge_key_fps") or []),
+        len(updated.get("credential_keys") or {}),
+    )
+    return True
+
+
+def _key_history_entries(raw: Any) -> List[Dict[str, str]]:
+    """Normalize a stored history list to ``[{fp, retired_at}]`` (best effort)."""
+    entries: List[Dict[str, str]] = []
+    if not isinstance(raw, (list, tuple)):
+        return entries
+    for item in raw:
+        if isinstance(item, str) and item:
+            entries.append({"fp": item, "retired_at": ""})
+        elif isinstance(item, dict):
+            fp = item.get("fp") or item.get("fingerprint")
+            if isinstance(fp, str) and fp:
+                entries.append({"fp": fp, "retired_at": str(item.get("retired_at") or "")})
+    return entries
 
 
 def mark_disconnected(identity_mgr: Any, site: str, reason: str) -> None:

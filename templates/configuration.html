@@ -19,6 +19,58 @@
 
 {% set search_placeholder = "Search keys, type, or tools..." %}{% include "partials/_config_search_bar.html" %}
 
+    {% if edge_credentials %}
+    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 p-6 shadow-sm mb-6">
+        <h2 class="font-mono text-sm font-bold uppercase tracking-wide text-neutral-900 dark:text-neutral-100">Edge credentials</h2>
+        <p class="font-mono text-xs text-neutral-500 dark:text-neutral-400 mt-1 mb-4">
+            Credentials for tools and MCP servers that run on an edge node. They are encrypted in this
+            browser to that edge's key before they are stored &mdash; central keeps ciphertext only.
+        </p>
+        <div class="divide-y divide-neutral-100 dark:divide-neutral-800/60">
+            {% for cred in edge_credentials %}
+            <div class="py-4 first:pt-0 last:pb-0 flex flex-wrap items-start gap-3">
+                <div class="min-w-0 flex-1 space-y-1">
+                    <div class="flex flex-wrap items-center gap-2">
+                        <span class="font-mono text-sm font-bold uppercase tracking-wide text-neutral-900 dark:text-neutral-100 break-all">{{ cred.registry_name }}</span>
+                        <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-mono font-bold uppercase border border-neutral-300 text-neutral-500 dark:border-neutral-700 dark:text-neutral-400 rounded">{{ cred.kind }}</span>
+                        {% if cred.needs_reentry %}
+                        <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-mono font-bold uppercase border border-amber-500/40 bg-amber-50 text-amber-600 dark:bg-amber-950/20 dark:text-amber-400 rounded">
+                            re-enter credentials (edge key rotated)
+                        </span>
+                        {% elif cred.stored %}
+                        <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-mono font-bold uppercase border border-emerald-500/40 bg-emerald-50 text-emerald-600 dark:bg-emerald-950/20 dark:text-emerald-400 rounded">
+                            Stored encrypted
+                        </span>
+                        {% else %}
+                        <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-mono font-bold uppercase border border-neutral-300 text-neutral-500 dark:border-neutral-700 dark:text-neutral-400 rounded">
+                            Not configured
+                        </span>
+                        {% endif %}
+                    </div>
+                    {% if cred.secret_keys %}
+                    <p class="font-mono text-[10px] text-neutral-500 dark:text-neutral-400 break-all">Secrets: {{ cred.secret_keys | join(', ') }}</p>
+                    {% endif %}
+                    {% if cred.variable_keys %}
+                    <p class="font-mono text-[10px] text-neutral-400 dark:text-neutral-500 break-all">On the edge only: {{ cred.variable_keys | join(', ') }}</p>
+                    {% endif %}
+                </div>
+                <button type="button"
+                        data-edge-secret-open
+                        data-site="{{ cred.site }}"
+                        data-kind="{{ cred.kind }}"
+                        data-name="{{ cred.name }}"
+                        data-stored="{{ '1' if cred.stored else '0' }}"
+                        data-key-fp="{{ cred.key_fp }}"
+                        data-needs-reentry="{{ '1' if cred.needs_reentry else '0' }}"
+                        class="ml-auto shrink-0 border border-neutral-300 dark:border-neutral-700 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 font-mono font-bold text-xs uppercase tracking-widest px-4 py-2 transition-colors rounded">
+                    {% if cred.stored %}Re-enter{% else %}Set credentials{% endif %}
+                </button>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
     <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 p-6 shadow-sm">
         <form action="/configuration" method="POST" class="space-y-6">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -131,4 +183,5 @@
 </div>
 
 {% set secret_group_note = true %}{% include "partials/_config_search_pagination.html" %}
+{% include "partials/edge_secret_form.html" %}
 {% endblock %}

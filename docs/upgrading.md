@@ -723,6 +723,353 @@ schema changed; `TRELLIS_IMAGE` default moves to `v0.5.1`.
 
 ---
 
+### v0.6.0 — 2026-10-23
+
+Changes since `v0.5.1`: **execution isolation, phase 1**. Every local tool call now
+runs in its own gVisor (`runsc`) container, created by a new `runner` service from the
+tool's manifest — the hub no longer forks tool subprocesses. Network access becomes a
+deny-by-default profile (`none` / `internal` / `internet`) and per-container resources
+come from a `limits:` block instead of helper rlimits. The shipped compose default moves
+to `SANDBOX_BACKEND=container`, and `TRELLIS_IMAGE` to `v0.6.0`.
+
+This section covers phases 1–3. Phase 4 — edge-sealed per-user credentials — ships in a
+later release of this same version and is documented with it.
+
+#### Breaking: the agent allowlist is now enforced server-side
+
+The agent runtime mints a short-lived HMAC token per run (`AGENT_TOKEN_SECRET`, at least
+32 bytes, on `host`, `hub`, `edge-relay`, `gateway`, `taskiq-worker` and both `runner`
+services; the edge proxy needs the same value). The hub, the relay and the runner verify it and resolve the
+agent's `allowed_tools`/`allowed_mcps` themselves. A call with no token, a forged token,
+an expired token, or a tool outside the agent's allowlist is refused with
+`access_denied`, even if the caller is the framework itself.
+
+- `ENFORCE_AGENT_TOKENS` is `enforce` in the shipped compose. `log` records every
+  would-be denial and still runs the call (one rollout window); `off` skips the check.
+- `AGENT_TOKEN_SECRET` is a `;`-separated list: the first value signs, every value
+  verifies. Rotate by prepending the new key, deploying, then removing the old one.
+- Tokens live 15 minutes by default and there is no revocation list. A leaked token ages
+  out; a leaked *key* means rotating `AGENT_TOKEN_SECRET` everywhere.
+- The `gateway` principal may call tools directly (its own whitelist search governs which
+  tools it surfaces); it is not subject to an agent's allowlist.
+- Agent configs do not change: `allowed_tools` / `allowed_mcps` keep their existing
+  syntax and wildcards (`<site>__*`) now expand against the live registry per call.
+
+#### Before you upgrade: install, register, and prove gVisor
+
+The runner fails closed when `runsc` is missing or cannot start a trivial container:
+there is no fallback to `runc`. On such a host, chat-only agents keep working and every
+tool call reports `sandbox_unavailable`.
+
+1. Install `runsc` on every host that runs a `runner` (central and each edge), pinned to a
+   version you have tested. On x86_64 (`arm64/` on arm hosts):
+
+   ```bash
+   curl -fsSLO https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/runsc
+   curl -fsSLO https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/runsc.sha512
+   sha512sum -c runsc.sha512 && chmod +x runsc
+   sudo install -m 0755 runsc /usr/bin/runsc
+   ```
+
+2. Register it in `/etc/docker/daemon.json`, keeping every existing key:
+
+   ```json
+   {
+     "runtimes": {
+       "runsc": {
+         "path": "/usr/bin/runsc",
+         "runtimeArgs": ["--network=sandbox"]
+       }
+     }
+   }
+   ```
+
+   Restart Docker. `--network=sandbox` keeps traffic in gVisor's netstack so the
+   `DOCKER-USER` profile rules apply to it. Do **not** add `--ignore-cgroups=true`: the
+   `limits:` block needs cgroups.
+
+3. Prove it before starting the stack:
+
+   ```bash
+   docker info --format '{{json .Runtimes}}' | grep runsc
+   docker run --rm --runtime=runsc hello-world
+   ```
+
+   Both must succeed. A per-tool `container_runtime: runc` is the escape hatch for code
+   gVisor cannot run; it forfeits kernel-syscall isolation and needs a reason per tool.
+   Full detail: [deploy.md → Prerequisite: gVisor](deploy.md#prerequisite-gvisor-runsc).
+
+#### New service: `runner` (socket-only API)
+
+`runner` starts on central and on each edge. It is the **only** service that mounts
+`/var/run/docker.sock`; do not mount that socket anywhere else — access to it is root on
+the host.
+
+- **API:** a Unix socket at `/run/trellis/runner.sock`, shared through the `runner-run`
+  volume with `host`, `hub`, `gateway` and `taskiq-worker`. It never listens on TCP, and
+  the runner's own `network_mode: none` means no tool container can reach it.
+- **Auth:** `RUNNER_TOKEN` is required and must be identical on the runner and every
+  caller (`openssl rand -hex 32`). Only `DEV_MODE=true` skips it, with a warning.
+- **Posture:** one process on purpose (container slots live in memory) — do not scale it
+  to two replicas. It runs as root only to open the Docker socket; every container it
+  starts runs as `${TRELLIS_UID}:${TRELLIS_GID}`.
+- **Startup gates:** runtime registered *and* a trivial container starts, `RUNNER_IMAGE`
+  exists locally (it never pulls), the required profile networks exist, and a host-path
+  canary passes. `python scripts/runner_preflight.py` reports the same gates.
+
+`TRELLIS_HOST_WORKSPACE` must be the **host** path of the workspace directory, not
+`/app/workspace`. Docker resolves every tool bind mount against the host filesystem, and
+a wrong value refuses to serve with:
+
+```text
+TRELLIS_HOST_WORKSPACE='/app/workspace' must be the HOST path of the workspace (the
+directory that is mounted at /app/workspace inside the runner); pointing it at a
+container path makes every bind mount resolve to the wrong files.
+```
+
+#### Firewall and network profiles
+
+The two tool networks need pinned subnets and are created outside compose. Run once per
+host, as root:
+
+```bash
+sudo scripts/setup-network-profiles.sh            # networks + DOCKER-USER rules (idempotent)
+sudo scripts/setup-network-profiles.sh --verify   # exit non-zero if a rule/network is missing
+```
+
+`--verify` is the gate: the runner checks the networks at startup, and provisioning
+should run the rule check before `docker compose up -d`. Re-run it after a reboot, a
+firewall reload, or a Docker upgrade — Docker recreates `DOCKER-USER` empty.
+
+`TRELLIS_INTERNAL_CIDRS` (comma-separated) is the allowlist for `network: internal`
+tools. That profile is what makes **SSH** work: SSH is L3 traffic, so adding the
+destination CIDR is enough. Cloud-metadata addresses are dropped from *every* profile,
+and `TRELLIS_ENGINE_SUBNETS` lists the compose network CIDRs that are dropped too (set it
+when your compose subnet is not the default). Profile table and sizing: [deploy.md →
+Network profiles](deploy.md#network-profiles).
+
+#### Breaking: `network` default flips to `none`
+
+`tool.yaml` and `mcp.yaml` now default to `none`; legacy `allow` still parses and means
+`internet`. Audit your manifests before upgrading:
+
+```bash
+grep -L '^network:' workspace/tools/*/tool.yaml workspace/mcps/*/mcp.yaml
+```
+
+Every file this prints has no egress after the upgrade. If the tool calls a public API it
+now fails on name resolution or `ENETUNREACH` from inside its container and needs
+`network: internet`. A tool reaching an internal API or SSH host needs
+`network: internal` plus its CIDR in `TRELLIS_INTERNAL_CIDRS`. `none` blocks loopback
+too. An unrecognized value now warns and becomes `none` (v0.5 fell back to `allow`).
+
+#### Breaking: `SANDBOX_RLIMIT_*` are inert; use `limits:`
+
+With `SANDBOX_BACKEND=container` the Landlock helper — and its rlimits — never runs.
+Per-container cgroup v2 limits come from the manifest instead:
+
+| v0.5 environment variable | v0.6 replacement | Note |
+| --- | --- | --- |
+| `SANDBOX_RLIMIT_AS_MB` | `limits.memory_mb` | cgroup `--memory`, not an address-space rlimit |
+| `SANDBOX_RLIMIT_CPU_S` | `limits.cpus` | a rate quota, not consumed-CPU seconds |
+| `SANDBOX_RLIMIT_NPROC` | `limits.pids` | cgroup `--pids-limit` |
+| `SANDBOX_RLIMIT_FSIZE_MB` | — | no per-file cap; `limits.tmpfs_mb` bounds `/tmp` |
+
+Defaults (all overridable per tool and per MCP server):
+
+| `limits:` field | Default | Range |
+| --- | --- | --- |
+| `memory_mb` | `512` | 32–65536 |
+| `cpus` | `1.0` | >0–64 |
+| `pids` | `256` | 16–32768 |
+| `tmpfs_mb` | `128` | 1–32768, and ≤ `memory_mb / 2` |
+
+The tmpfs is charged to the container's cgroup, so `tmpfs_mb > memory_mb / 2` is
+rejected rather than becoming an OOM kill on the first temp file. Size the host as
+`RUNNER_MAX_CONTAINERS × typical memory_mb × 1.5` (gVisor overhead is counted in the
+cgroup). Keep the old variables only for a local `auto`/`bwrap`/`landlock` install.
+
+#### New manifest fields
+
+All optional, so an existing `tool.yaml` keeps working; the defaults are the conservative
+ones.
+
+```yaml
+- name: issues_create_ticket
+  # ... required fields ...
+  network: internal               # none (default) | internal | internet; `allow` == internet
+  container_runtime: runsc        # runsc (default) | runsc-variant | runc
+  output_dirs: [reports]          # subset of [reports, output]
+  limits:
+    memory_mb: 1024
+    cpus: 1.5
+    pids: 512
+    tmpfs_mb: 256                 # <= memory_mb / 2
+  image: null                     # reserved; v0.6 ignores it
+```
+
+`output_dirs` grants the calling agent's `reports/<agent>` or `output/<agent>` read-write.
+Only that directory is mounted; the suite and `shared/` stay read-only and no other suite
+is visible. The mount is only created when the call carries an agent identity.
+
+#### New `.env` keys
+
+| Key | Needed by | Purpose |
+| --- | --- | --- |
+| `SANDBOX_BACKEND` | hub, edge proxy | `container` (shipped default); `auto`/`bwrap`/`landlock` for local dev |
+| `RUNNER_TOKEN` | runner + `host`/`hub`/`gateway`/`taskiq-worker` | required bearer for the control socket |
+| `RUNNER_SOCKET` | runner + callers | UDS path shared through `runner-run` |
+| `TRELLIS_HOST_WORKSPACE` | runner | **host** path of the workspace |
+| `CONTAINER_DEFAULT_RUNTIME` | runner | `runsc` unless a manifest overrides it |
+| `RUNNER_IMAGE` | runner | image tool containers start from; must exist locally |
+| `RUNNER_MAX_CONTAINERS` / `RUNNER_MAX_CONTAINERS_PER_TOOL` | runner | capacity; excess returns `429` |
+| `RUNNER_REAP_INTERVAL_S` | runner | canary/orphan sweep interval |
+| `TOOLS_NET_INTERNAL_SUBNET` / `TOOLS_NET_INTERNET_SUBNET` | runner + setup script | pinned profile subnets |
+| `TRELLIS_INTERNAL_CIDRS` | setup script + runner | what `internal` may reach |
+| `TRELLIS_ENGINE_SUBNETS` | setup script | compose CIDRs dropped from every profile |
+| `DOCKER_GID` | runner | docker group for the socket |
+| `TRELLIS_INSTALL_ID` | runner | `trellis.install` label on every container |
+
+Defaults and full comments are in `.env.example`, section *Execution Isolation Runner
+(v0.6)*. Compose refuses to start while `RUNNER_TOKEN` or `TRELLIS_HOST_WORKSPACE` is
+empty.
+
+#### Breaking: `FRAMEWORK_API_URL` / `FRAMEWORK_EXECUTION_TOKEN` are gone
+
+Neither variable is injected into a tool environment any more (audited: no in-tree tool
+read them). A tool that must call back into the framework gets a credential through its
+manifest `secrets:` and must not assume it is loopback-privileged: `network: none` has no
+loopback, and `internal`/`internet` drop the engine's own networks.
+
+#### Phase 2: MCP sessions, discovery and `execute` in containers
+
+MCP servers are no longer children of `host`/`trellis-proxy`, and the agent's shell is no
+longer a child of `host`. Three behaviour changes to know before you upgrade:
+
+1. **`mcp-sessions/` is dead state — delete it.** Session `HOME` directories used to live
+   under the sandbox writable root (`/app/workspace/mcp-sessions/` on central,
+   `${SANDBOX_RW_PATH}/mcp-sessions/` on an edge). A session now runs in a runner
+   container whose `HOME`/`TMPDIR` are that container's tmpfs, so the directory is never
+   read or written again. It still contains old login state (credentials the server
+   cached); remove it after upgrading. The proxy logs one warning at startup if it finds
+   one.
+2. **Central `stdio` MCPs now run in runner session containers.** `host`, `gateway` and
+   `taskiq-worker` must be on the `runner-run` volume and have `RUNNER_TOKEN`/`RUNNER_SOCKET`
+   like `hub` already does; without a reachable runner, central MCP tools fail with
+   `mcp_session_lost` and every non-MCP tool keeps working. Only the manifest's declared
+   env keys are sent (the runner rejects anything else), and the process-environment merge
+   that used to surround them is gone. Discovery opens a throwaway container
+   (`kind="discovery"`, 60 s) instead of spawning a process in `host`.
+3. **`execute` and the console file tools are scoped differently.** `execute` runs
+   `bash -lc <cmd>` in a throwaway container (`network none`, empty `/workspace`), so a
+   command that relied on reading the framework's filesystem or the workspace tree no
+   longer can. `ls`/`read_file`/`write_file`/`edit_file`/`glob`/`grep` stay in-process but
+   are rooted at `reports/<agent>` (central: `${WORKSPACE_ROOT:-/app/workspace}/reports/<agent>`)
+   instead of `/workspace`. Agents writing to other paths must use a tool, not the console.
+
+Session semantics are otherwise unchanged on an edge: same identity key, TTL, caps, LRU,
+tombstones and never-replay. New: `MAX_SESSIONS_EDGE` is read from the environment
+(default 32) and now bounds *containers*, so size it against `limits.memory_mb` — see
+[mcp.md → Memory sizing](mcp.md#memory-sizing-sessions--limitsmemory_mb--60--of-host-ram).
+A runner restart drops every warm session: the next call returns `mcp_session_lost` once
+and a fresh container starts after it.
+
+#### Breaking: per-user plaintext credentials and `user-secrets` are removed
+
+Per-user credentials for edge tools and MCP servers are now **browser-sealed**: the user
+enters them in central (Configuration → Edge credentials), the browser encrypts them to the
+edge's public key, and central stores only the envelope. The edge decrypts with a private
+key that never leaves the VM. Consequences for an existing install:
+
+1. **Delete `edge-user-secrets/` (after users re-enter their sets).** The directory and
+   `proxy.yaml`'s `user_secrets_dir` key are gone; the value is ignored (one startup
+   warning names the leftover directory). `TRELLIS_EDGE_USER_SECRETS_DIR` is no longer
+   read. Remove the compose mount
+   (`- ./edge-user-secrets:/etc/trellis/edge-user-secrets`).
+2. **`trellis-proxy user-secrets` is gone.** `set`, `list` and `delete` are unknown
+   commands, not deprecated aliases. There is no CLI replacement: a user seals a set
+   themselves in the UI (or clears it from the same form). The shared
+   `edge-secrets/<item>.env` store is unchanged and still works exactly as before.
+3. **Generate the edge key and mount it.** On each edge host:
+
+   ```bash
+   docker run --rm -v "$PWD":/w -e EDGE_PRIVATE_KEY_PATH=/w/edge-key \
+     ghcr.io/laraibkazi92/trellis-agent-platform:v0.6.0 \
+     python core/proxy.py edge-keygen --path /w/edge-key
+   sudo chown "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}" edge-key
+   ```
+
+   then add to `deploy/proxy/docker-compose.yml` (the shipped file already has it):
+
+   ```yaml
+       environment:
+         EDGE_PRIVATE_KEY_PATH: /etc/trellis/edge-key
+       volumes:
+         - ./edge-key:/etc/trellis/edge-key:ro   # trellis-proxy ONLY, never runner
+   ```
+
+   The proxy must run `sandbox: container` (the v0.6 default). A legacy backend
+   (`auto|bwrap|landlock`) mounts the whole filesystem into the tool process, which would
+   expose this key; sealed calls are refused while one is configured.
+
+   The loader refuses a file with a mode wider than `0400`, a non-RSA key, or a path
+   inside the workspace. **Keep `/etc/trellis/edge-key` in the host backup**: losing it
+   means every user re-enters their set.
+4. **Re-enter per-user credentials.** After the key is mounted and the new proxy has
+   connected (its fingerprint appears in Admin → Edges), each user opens the target's
+   credential form and seals the declared secret keys. Until then a
+   `credential_mode: per_user_required` target fails closed with `missing_credentials`; a
+   `per_user` target uses the shared account.
+5. **Rotation is an overlap, and it needs a SIGHUP.** `edge-keygen --rotate` keeps
+   `edge-key.old`; send `SIGHUP` (or restart) so the running proxy reloads the key and
+   republishes the new fingerprints before users seal to it. Blobs sealed to the old key
+   still open until `--drop-old-key`. After that, the affected records show
+   "re-enter credentials (edge key rotated)". Central's write endpoint accepts a blob only
+   for the current or previous key.
+
+Resolution rules are stricter than v0.5 and are deliberate: a sealed set is
+**all-or-nothing** for secrets (no shared fallback for a missing key) and `variables`
+(endpoints) are never taken from per-user material. That fixes the v0.5 behaviour where a
+partial per-user file silently completed itself from the shared account.
+
+Rollback is not available for this phase: old proxy images read `edge-user-secrets/` only,
+and the directory will have been deleted. Keep a copy until every edge is on v0.6.0.
+
+#### Rollback
+
+`SANDBOX_BACKEND=auto` restores the in-process bwrap/Landlock path (uncomment the hub's
+legacy `security_opt` lines for bwrap). The `runner` service stays in the compose file,
+idle. There is no etcd or workspace migration to undo — the new manifest fields are
+optional.
+
+Two caveats:
+
+- Rollback restores the *process* sandbox, not the old network default: a manifest that
+  omits `network:` is still `none` on the legacy path, so an egressing tool needs
+  `network: internet` either way.
+- That path is for development hosts only. It reintroduces the shared-uid, writable-root
+  posture that v0.6 exists to remove.
+
+Changes to declare:
+
+- **Compose services:** added `runner` (central and edge) with the shared `runner-run`
+  volume; nothing else gains the Docker socket.
+- **`.env` keys:** added (table above); `RUNNER_TOKEN` and `TRELLIS_HOST_WORKSPACE` are
+  required.
+- **Registry sync:** none; manifests are still read from `workspace/`, and the new
+  `network`/`limits`/`output_dirs`/`container_runtime` fields parse as optional.
+- **Edge credentials:** `edge-user-secrets/` and `user-secrets` are removed; a sealed
+  per-user set is re-entered in the UI and `edge-key` must be generated and backed up
+  (breaking section above).
+- **Tool protocol / `workspace/` layout:** stdin/stdout and `TRELLIS_USER_*` unchanged;
+  the visible filesystem inside a tool shrinks to the suite, `shared/` and a declared
+  output dir.
+- **Data migrations:** none.
+- **Image pins:** `TRELLIS_IMAGE` default → `v0.6.0` in `docker-compose.yml`,
+  `.env.example` and both egress compose files.
+
+---
+
 ## Release checklist (maintainer template)
 
 Copy this into the release PR/notes and fill it in per release.

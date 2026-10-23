@@ -45,7 +45,8 @@ _PIPE_CHUNK_BYTES = 64 * 1024
 
 # Injected env names a tool must never be able to override: a secret stored under
 # one of these would otherwise rewrite the interpreter's own search path.
-RESTRICTED_ENV_VARS = {"PATH", "PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "BASH_ENV", "ENV", "HOSTALIASES"}
+RESTRICTED_ENV_VARS = {"PATH", "PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "BASH_ENV", "ENV", "HOSTALIASES",
+                       "AGENT_TOKEN_SECRET", "RUNNER_TOKEN", "RUNNER_SOCKET", "EDGE_PRIVATE_KEY_PATH"}
 
 # Health callback: (is_success, error_message). Runs in a worker thread.
 HealthCallback = Callable[[bool, Optional[str]], None]
@@ -192,6 +193,182 @@ async def _communicate_bounded(
     return await asyncio.wait_for(_run(), timeout=timeout)
 
 
+def container_backend_selected() -> bool:
+    """True when the shipped container path is selected (``SANDBOX_BACKEND``)."""
+    return (os.getenv("SANDBOX_BACKEND") or "").strip().lower() == "container"
+
+
+async def _execute_in_container(
+    config: ToolConfig,
+    arguments: Dict[str, Any],
+    *,
+    env: Dict[str, str],
+    timeout: float,
+    agent: Optional[str],
+    user_id: Optional[str],
+    user_email: Optional[str],
+    run_id: Optional[str],
+    agent_token: Optional[str] = None,
+    record_health,
+) -> Dict[str, Any]:
+    """Run the tool as its own container via the runner.
+
+    Only declared env keys cross the socket; the runner re-sanitizes the base
+    environment and rejects anything the manifest does not declare.
+    """
+    from core.execution.client import RunnerCallError, RunnerClient, RunnerUnavailable
+    from core.execution.contract import ExecRequest
+    from core.execution.spec import declared_env_keys, manifest_digest
+
+    try:
+        input_json = json.dumps(arguments)
+        declared = declared_env_keys(config)
+        request = ExecRequest(
+            kind="tool",
+            target=config.name,
+            manifest_digest=manifest_digest(config),
+            agent=agent,
+            user_id=user_id,
+            user_email=user_email,
+            run_id=run_id,
+            env={k: v for k, v in env.items() if k in declared},
+            agent_token=agent_token,
+            input=input_json,
+            deadline_ms=max(1, int(timeout * 1000)),
+        )
+        async with RunnerClient() as client:
+            result = await client.exec(request)
+    except RunnerCallError as exc:
+        if exc.retryable:
+            raise TransientToolError(
+                f"Tool '{config.name}' could not get a container slot: {exc.message}"
+            ) from exc
+        if exc.code == "timeout":
+            error_msg = f"Tool execution timed out after {timeout:.0f}s."
+            await record_health(False, error_msg)
+            return {"error": error_msg}
+        if exc.code in {"runner_path_mismatch", "runtime_missing", "image_missing"}:
+            error_msg = f"Sandbox unavailable ({exc.code}): {exc.message}"
+            await record_health(False, error_msg)
+            return {
+                "error": error_msg,
+                "sandbox": {
+                    "backend": "container",
+                    "code": exc.code,
+                    "remediation": "Run scripts/runner_preflight.py on the runner host.",
+                },
+            }
+        error_msg = f"Tool '{config.name}' could not run ({exc.code}): {exc.message}"
+        await record_health(False, error_msg)
+        return {"error": error_msg}
+    except RunnerUnavailable as exc:
+        error_msg = f"Sandbox unavailable (runner_unavailable): {exc.message}"
+        await record_health(False, error_msg)
+        return {
+            "error": error_msg,
+            "sandbox": {
+                "backend": "container",
+                "code": "runner_unavailable",
+                "remediation": "Check that the runner service is up and its socket is mounted.",
+            },
+        }
+
+    return await _finalize_result(
+        config,
+        result.stdout.encode("utf-8"),
+        result.stderr.encode("utf-8"),
+        result.exit_code,
+        result.stdout_truncated,
+        record_health=record_health,
+        backend=None,
+    )
+
+
+async def _finalize_result(
+    config: ToolConfig,
+    stdout: bytes,
+    stderr: bytes,
+    returncode: int,
+    stdout_truncated: bool,
+    *,
+    record_health,
+    backend=None,
+) -> Dict[str, Any]:
+    """Shared result normalisation for the legacy and container paths.
+
+    ``backend`` is the sandbox backend for stderr classification; ``None`` means
+    the container runner already produced a plain exit code (no helper stderr to
+    classify).
+    """
+    stderr_text = stderr.decode("utf-8", errors="replace").strip()
+    loggable_stderr = "\n".join(
+        line
+        for line in stderr_text.splitlines()
+        if not line.startswith("trellis-sandbox: warning:")
+    ).strip()
+    if loggable_stderr:
+        if len(loggable_stderr) > 2048:
+            logger.warning(f"Tool {config.name} stderr ({len(loggable_stderr)} chars): {loggable_stderr[:2048]}... [truncated]")
+        else:
+            logger.warning(f"Tool {config.name} stderr: {loggable_stderr}")
+
+    if returncode != 0:
+        stderr_str = stderr.decode("utf-8", errors="replace").strip()
+        failure = (
+            sandbox.classify_failure(stderr_str, backend, returncode)
+            if backend is not None
+            else None
+        )
+        if failure:
+            sandbox.log_failure_once(failure)
+            if failure.code != "landlock_net_unsupported":
+                sandbox.invalidate_after_failure(failure.code)
+            error_msg = (
+                f"Tool failed inside the {backend.value} sandbox "
+                f"({failure.code}): {failure.detail}"
+            )
+            await record_health(False, error_msg)
+            return {
+                "error": error_msg,
+                "stderr": stderr_str,
+                "sandbox": {
+                    "backend": backend.value,
+                    "code": failure.code,
+                    "remediation": failure.remediation,
+                },
+            }
+
+        error_msg = f"Tool exited with code {returncode}: {stderr_str}"
+        await record_health(False, error_msg)
+        config_retry = getattr(config, "retry_on_transient", True)
+        transient_keywords = ["timeout", "connection refused", "econnrefused", "eof", "network is unreachable", "temporary failure"]
+        if config_retry and any(keyword in stderr_str.lower() for keyword in transient_keywords):
+            raise TransientToolError(error_msg)
+        return {"error": error_msg, "stderr": stderr_str}
+
+    try:
+        result = json.loads(stdout.decode("utf-8", errors="replace"))
+        stringified = json.dumps(result)
+        if len(stringified) > MAX_RESULT_CHARS:
+            logger.warning(f"Warning: Tool {config.name} output size ({len(stringified)} chars) exceeded safety limit of {MAX_RESULT_CHARS} chars. Truncating...")
+            result = {
+                "error": f"Global Safety Net: The tool '{config.name}' output exceeded the 24k token limit (96,000 characters). Output was safely truncated to prevent model context crashes.",
+                "partial_data_preview": stringified[:90000] + "... [TRUNCATED DUE TO SAFETY LIMITS]",
+            }
+        await record_health(True)
+        return result
+    except json.JSONDecodeError:
+        decoded = stdout.decode("utf-8", errors="replace").strip()
+        preview = decoded[:90000]
+        truncated = stdout_truncated
+        if len(decoded) > len(preview):
+            preview += TRUNCATION_MARKER.decode()
+            truncated = True
+        error_msg = f"Output was not valid JSON: {decoded[:2048]}"
+        await record_health(False, error_msg)
+        return {"output": preview, "warning": error_msg, "truncated": truncated}
+
+
 async def execute_tool(
     config: ToolConfig,
     tool_dir: Path,
@@ -199,6 +376,11 @@ async def execute_tool(
     *,
     env: Dict[str, str],
     on_health: Optional[HealthCallback] = None,
+    agent: Optional[str] = None,
+    user_id: Optional[str] = None,
+    user_email: Optional[str] = None,
+    run_id: Optional[str] = None,
+    agent_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run one tool invocation and normalize its outcome into a result dict.
 
@@ -206,6 +388,10 @@ async def execute_tool(
     applied secrets and PATH). ``on_health`` replaces the hub's
     ``health_monitor.record_event`` calls; it is invoked in a worker thread so a
     slow store cannot stall concurrent tool I/O.
+
+    With ``SANDBOX_BACKEND=container`` (the shipped default) the tool runs as its
+    own container via the runner; the legacy in-process sandbox stays reachable
+    only for local development (``auto``/``bwrap``/``landlock``).
     """
 
     async def record_health(is_success: bool, error_message: Optional[str] = None) -> None:
@@ -243,6 +429,20 @@ async def execute_tool(
 
         default_timeout = resolve_tunable("tool_execution_timeout")
         timeout = config.timeout_seconds if getattr(config, "timeout_seconds", None) else default_timeout
+
+        if container_backend_selected() and config.remote is None:
+            return await _execute_in_container(
+                config,
+                arguments,
+                env=env,
+                timeout=timeout,
+                agent=agent,
+                user_id=user_id,
+                user_email=user_email,
+                run_id=run_id,
+                agent_token=agent_token,
+                record_health=record_health,
+            )
 
         # Only an explicitly configured policy may override the deployment
         # default; pydantic's "allow" default would otherwise mask
@@ -290,98 +490,15 @@ async def execute_tool(
             # calls are not serialized behind cleanup.
             await asyncio.to_thread(plan.cleanup)
 
-        # The sandbox helper emits a benign "supplementary groups retained"
-        # warning on successful runs. It is not tool output, so keep it out of
-        # the log (raw stderr still feeds error classification below).
-        stderr_text = stderr.decode("utf-8", errors="replace").strip()
-        loggable_stderr = "\n".join(
-            line
-            for line in stderr_text.splitlines()
-            if not line.startswith("trellis-sandbox: warning:")
-        ).strip()
-        if loggable_stderr:
-            if len(loggable_stderr) > 2048:
-                logger.warning(f"Tool {config.name} stderr ({len(loggable_stderr)} chars): {loggable_stderr[:2048]}... [truncated]")
-            else:
-                logger.warning(f"Tool {config.name} stderr: {loggable_stderr}")
-
-        if process.returncode != 0:
-            stderr_str = stderr.decode("utf-8", errors="replace").strip()
-            failure = sandbox.classify_failure(
-                stderr_str, plan.backend, process.returncode
-            )
-            if failure:
-                sandbox.log_failure_once(failure)
-                # The cached verdict no longer matches reality; let the next
-                # selection and /healthz re-probe (cooldown-bounded). A
-                # `landlock_net_unsupported` refusal is a per-tool policy this
-                # kernel cannot express, not a host-sandbox regression: the
-                # re-probe could only reach the same ABI conclusion, so do not
-                # spend it.
-                if failure.code != "landlock_net_unsupported":
-                    sandbox.invalidate_after_failure(failure.code)
-                error_msg = (
-                    f"Tool failed inside the {plan.backend.value} sandbox "
-                    f"({failure.code}): {failure.detail}"
-                )
-                await record_health(False, error_msg)
-                # A sandbox denial can never succeed on retry: skip the
-                # TransientToolError path even if stderr happens to contain a
-                # transient keyword.
-                return {
-                    "error": error_msg,
-                    "stderr": stderr_str,
-                    "sandbox": {
-                        "backend": plan.backend.value,
-                        "code": failure.code,
-                        "remediation": failure.remediation,
-                    },
-                }
-
-            error_msg = f"Tool exited with code {process.returncode}: {stderr_str}"
-            await record_health(False, error_msg)
-            config_retry = getattr(config, "retry_on_transient", True)
-
-            # Identify common transient network errors in stderr
-            transient_keywords = ["timeout", "connection refused", "econnrefused", "eof", "network is unreachable", "temporary failure"]
-            if config_retry and any(keyword in stderr_str.lower() for keyword in transient_keywords):
-                raise TransientToolError(error_msg)
-
-            return {
-                "error": error_msg,
-                "stderr": stderr_str
-            }
-
-        try:
-            result = json.loads(stdout.decode("utf-8", errors="replace"))
-            # Global Safety Net: Safely truncate tool outputs exceeding 24k tokens (96,000 characters)
-            stringified = json.dumps(result)
-            if len(stringified) > MAX_RESULT_CHARS:
-                logger.warning(f"Warning: Tool {config.name} output size ({len(stringified)} chars) exceeded safety limit of {MAX_RESULT_CHARS} chars. Truncating...")
-                result = {
-                    "error": f"Global Safety Net: The tool '{config.name}' output exceeded the 24k token limit (96,000 characters). Output was safely truncated to prevent model context crashes.",
-                    "partial_data_preview": stringified[:90000] + "... [TRUNCATED DUE TO SAFETY LIMITS]"
-                }
-            # A valid JSON payload cannot hit the stdout cap: truncation appends
-            # a marker and breaks the parse, so the flag is only meaningful on
-            # the JSONDecodeError path below.
-            # A valid JSON output with an 'error' key is considered a User-Scoped Failure,
-            # which does NOT trip the global circuit breaker. We count it as a success for global health.
-            await record_health(True)
-            return result
-        except json.JSONDecodeError:
-            # stdout is capped at MAX_STDOUT_BYTES, which is far above the 96k
-            # JSON safety net: returning it whole (plus the same text in the
-            # warning) would flood the model context, so bound both.
-            decoded = stdout.decode("utf-8", errors="replace").strip()
-            preview = decoded[:90000]
-            truncated = stdout_truncated
-            if len(decoded) > len(preview):
-                preview += TRUNCATION_MARKER.decode()
-                truncated = True
-            error_msg = f"Output was not valid JSON: {decoded[:2048]}"
-            await record_health(False, error_msg)
-            return {"output": preview, "warning": error_msg, "truncated": truncated}
+        return await _finalize_result(
+            config,
+            stdout,
+            stderr,
+            process.returncode,
+            stdout_truncated,
+            record_health=record_health,
+            backend=plan.backend,
+        )
 
     except sandbox.SandboxUnavailable as e:
         error_msg = f"Sandbox unavailable ({e.code}): {e.detail or e.remediation}"

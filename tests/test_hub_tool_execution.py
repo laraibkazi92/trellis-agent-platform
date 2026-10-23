@@ -257,7 +257,9 @@ def test_run_tool_preserves_user_id_across_retries(monkeypatch, tmp_path):
     assert len(spawns) == 2
     resolved_user_ids = [call["identity"] for call in fake_identity.resolved_config_calls]
     assert resolved_user_ids.count("user-1") >= 2
-    assert fake_identity.execution_token_calls.count("user-1") >= 2
+    # v0.6 removed the FRAMEWORK_* injection: a tool never receives a
+    # framework loopback credential, so no execution token is minted.
+    assert fake_identity.execution_token_calls == []
     assert fake_identity.get_user_calls.count("user-1") >= 2
     assert ("user-1", "tmpltool") in fake_identity.record_tool_usage_calls
 
@@ -444,7 +446,8 @@ def test_run_tool_preserves_agent_name_across_retries(monkeypatch, tmp_path):
     assert result == {"ok": True}
     assert len(spawns) == 2
     second_stdin = json.loads(spawns[1]["process"].stdin_writes[0].decode())
-    assert second_stdin["__agent_name"] == "triage"
+    # v0.6: agent identity travels in the verified token, never as a stdin field.
+    assert "__agent_name" not in second_stdin
 
 
 def test_run_tool_skips_retry_when_retry_on_transient_false(monkeypatch, tmp_path):

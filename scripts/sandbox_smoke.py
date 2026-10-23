@@ -9,6 +9,12 @@ helper). Every command goes through ``core.sandbox.prepare_execution`` so the
 harness exercises the same argv/env the hub uses for real tools, then reports
 one JSON object on stdout for diffing between backends.
 
+``--backend container`` is the v0.6 path: there is no helper argv and no uid
+drop, so it runs its own three probes through ``core.execution`` / the runner
+(JSON stdin round-trip, no egress on ``network: none``, writable tmpfs HOME/
+TMPDIR) from a throwaway tool suite, and ``--tool`` exercises the hub's real
+runner branch. The helper-specific check flags are ignored in that mode.
+
 The default run (no check flags) is ``--runtime-matrix`` plus the security
 checks (confinement, privilege, seccomp); ``--check-net``, ``--check-egress``
 and ``--tool`` are only exercised when named. Tools run without an identity, so
@@ -31,6 +37,8 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import yaml
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
@@ -51,6 +59,81 @@ func main() {
 """
 
 TS_SOURCE = "console.log('ts-ok')\n"
+
+# --- --backend container probes -------------------------------------------- #
+# The runner only executes registered tools, so the probes are a throwaway
+# suite: it runs inside a real tool container, reads its JSON on stdin and
+# prints one report with all three contract facts.
+CONTAINER_PROBE_TOOL = "trellis_smoke_probe"
+CONTAINER_PROBE_INPUT = {"echo": "the quick brown fox", "n": 3}
+CONTAINER_PROBE_ENTRY = {
+    "name": CONTAINER_PROBE_TOOL,
+    "version": "0.0.1",
+    "description": (
+        "Written by scripts/sandbox_smoke.py --backend container; removed after the run."
+    ),
+    "runtime": "python",
+    "entrypoint": "probe.py",
+    # Deny-by-default on purpose: the probe proves `none` really means no egress.
+    "network": "none",
+}
+
+CONTAINER_PROBE_SOURCE = r'''
+import json, os, socket, sys
+
+
+def tcp(host, port, timeout=2.0):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return "connected"
+    except OSError as exc:
+        return "blocked:" + type(exc).__name__
+
+
+def dns(host, port):
+    try:
+        socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        return "unresolved:" + type(exc).__name__
+    return "resolved"
+
+
+def write_probe(directory):
+    if not directory:
+        return {"path": "", "writable": False}
+    try:
+        with open(os.path.join(directory, "trellis-smoke-probe"), "w") as handle:
+            handle.write("ok")
+    except OSError as exc:
+        return {"path": directory, "writable": False, "error": type(exc).__name__}
+    return {"path": directory, "writable": True}
+
+
+def tmpfs_on(mountpoint):
+    try:
+        with open("/proc/mounts", encoding="utf-8") as handle:
+            for line in handle:
+                fields = line.split()
+                if len(fields) >= 3 and fields[1] == mountpoint:
+                    return fields[2] == "tmpfs"
+    except OSError:
+        pass
+    return False
+
+
+payload = json.load(sys.stdin)
+print(json.dumps({
+    "echo": payload,
+    "home": write_probe(os.environ.get("HOME", "")),
+    "tmpdir": write_probe(os.environ.get("TMPDIR", "")),
+    "tmp_is_tmpfs": tmpfs_on("/tmp"),
+    "network": {
+        "1.1.1.1:443": tcp("1.1.1.1", 443),
+        "169.254.169.254:80": tcp("169.254.169.254", 80),
+        "example.com:443": dns("example.com", 443),
+    },
+}))
+'''
 
 # Filled in per run; /proc/<pid>/environ must not be readable from the sandbox.
 PRIVILEGE_SNIPPET = """
@@ -1011,6 +1094,182 @@ def check_tools(names):
     return {"ok": not errors, "results": results}, errors
 
 
+class ContainerProbeUnavailable(RuntimeError):
+    """``--backend container`` cannot run: no runner, or the runner refused."""
+
+
+def check_container(timeout):
+    """The v0.6 contract, from inside a real tool container.
+
+    Three facts, all through ``RunnerClient`` (a blocking ``POST /v1/exec``):
+    a JSON stdin/stdout round-trip, no egress under ``network: none``, and a
+    writable tmpfs ``HOME``/``TMPDIR``. The probe is a throwaway tool suite
+    under ``workspace/tools``: the runner executes registered manifests, so
+    there is no other way to get code into its container.
+    """
+    try:
+        from core.execution.client import (
+            RunnerCallError,
+            RunnerClient,
+            RunnerUnavailable,
+        )
+        from core.execution.contract import ExecRequest
+        from core.execution.spec import manifest_digest
+        from core.models import ToolConfig
+    except ImportError as exc:  # reported, not a traceback
+        raise ContainerProbeUnavailable(
+            f"core.execution is not importable ({type(exc).__name__}: {exc})"
+        ) from exc
+
+    suite = WORKSPACE / "tools" / f"trellis-smoke-probe-{uuid.uuid4().hex[:8]}"
+    try:
+        suite.mkdir(parents=True, exist_ok=False)
+    except OSError as exc:
+        raise ContainerProbeUnavailable(f"cannot create {suite}: {exc}") from exc
+    try:
+        (suite / "probe.py").write_text(CONTAINER_PROBE_SOURCE, encoding="utf-8")
+        (suite / "tool.yaml").write_text(
+            yaml.safe_dump([CONTAINER_PROBE_ENTRY], sort_keys=False), encoding="utf-8"
+        )
+        config = ToolConfig(**CONTAINER_PROBE_ENTRY)
+        request = ExecRequest(
+            kind="tool",
+            target=config.name,
+            manifest_digest=manifest_digest(config),
+            input=json.dumps(CONTAINER_PROBE_INPUT),
+            deadline_ms=max(1, int(timeout * 1000)),
+        )
+
+        async def _exec():
+            async with RunnerClient() as client:
+                return await client.healthz(), await client.exec(request)
+
+        try:
+            health, result = asyncio.run(_exec())
+        except RunnerUnavailable as exc:
+            raise ContainerProbeUnavailable(exc.message) from exc
+        except RunnerCallError as exc:
+            raise ContainerProbeUnavailable(f"{exc.code}: {exc.message}") from exc
+    finally:
+        shutil.rmtree(suite, ignore_errors=True)
+
+    errors = []
+    observed = {"stdout": result.stdout, "stderr": result.stderr}
+    if not health.ok:
+        errors.append(f"runner reports unhealthy: {health.detail}")
+    info = None
+    for line in (result.stdout or "").strip().splitlines()[::-1]:
+        try:
+            info = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(info, dict):
+            break
+    if result.exit_code != 0 or not isinstance(info, dict):
+        errors.append(f"container probe failed: {_short(_observed(observed))}")
+        info = info if isinstance(info, dict) else {}
+
+    if info.get("echo") != CONTAINER_PROBE_INPUT:
+        errors.append(f"stdin JSON round-trip changed the payload: {info.get('echo')!r}")
+    home = info.get("home") or {}
+    tmpdir = info.get("tmpdir") or {}
+    if not home.get("writable"):
+        errors.append(f"HOME is not writable: {home}")
+    if not tmpdir.get("writable"):
+        errors.append(f"TMPDIR is not writable: {tmpdir}")
+    if info.get("tmp_is_tmpfs") is not True:
+        errors.append("the container's /tmp is not a tmpfs")
+    network = info.get("network") or {}
+    for target, verdict in network.items():
+        if not str(verdict).startswith(("blocked:", "unresolved:")):
+            errors.append(f"network: none still reached {target}: {verdict}")
+
+    report = {
+        "ok": not errors,
+        "backend": "container",
+        "runtime": health.runtime,
+        "image": health.image,
+        "tool": CONTAINER_PROBE_TOOL,
+        "suite": suite.name,
+        "exit_code": result.exit_code,
+        "duration_ms": result.duration_ms,
+        "echo_roundtrip": info.get("echo"),
+        "home_tmpdir": {
+            "home": home,
+            "tmpdir": tmpdir,
+            "tmp_is_tmpfs": info.get("tmp_is_tmpfs"),
+        },
+        "network": network,
+        "output": _short(_observed(observed)),
+    }
+    return report, errors
+
+
+def _run_container(args):
+    """``--backend container``: runner probes only, no core.sandbox selection."""
+    os.environ["SANDBOX_BACKEND"] = "container"
+    report = {
+        "requested": "container",
+        "backend": "container",
+        "checks": {"container": None, "tools": None},
+        "ok": False,
+        "errors": [],
+    }
+
+    skipped = [
+        flag
+        for flag in (
+            "--runtime-matrix",
+            "--check-confinement",
+            "--check-privilege",
+            "--check-seccomp",
+            "--check-net",
+            "--check-egress",
+        )
+        if getattr(args, flag[2:].replace("-", "_"), False)
+    ]
+    if skipped:
+        _log(
+            "container mode ignores helper-specific probes: " + ", ".join(skipped)
+            + " (there is no bwrap/Landlock argv or uid drop to inspect)"
+        )
+
+    if not WORKSPACE.is_dir():
+        report["errors"].append(
+            f"{WORKSPACE} is missing; run this script inside the hub container"
+        )
+        _log(report["errors"][-1])
+        _print_report(report)
+        return 2
+
+    _log("check: container (runner exec probes)")
+    try:
+        result, errors = check_container(max(1.0, args.timeout))
+    except ContainerProbeUnavailable as exc:
+        report["errors"].append(f"container probes unavailable: {exc}")
+        _log(report["errors"][-1])
+        _print_report(report)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - keep stdout a valid JSON report
+        report["errors"].append(
+            f"container probes crashed: {type(exc).__name__}: {exc}"
+        )
+        _log(report["errors"][-1])
+        _print_report(report)
+        return 1
+
+    report["checks"]["container"] = result
+    report["errors"].extend(errors)
+    # --tool goes through hub.run_tool, which routes onto the runner because
+    # SANDBOX_BACKEND is set above.
+    if args.tool:
+        _run_check(report, "tools", lambda: check_tools(args.tool))
+
+    report["ok"] = not report["errors"]
+    _print_report(report)
+    return 0 if report["ok"] else 1
+
+
 def _run_check(report, name, runner):
     _log(f"check: {name}")
     try:
@@ -1031,9 +1290,12 @@ def build_parser():
     )
     parser.add_argument(
         "--backend",
-        choices=("auto", "bwrap", "landlock"),
+        choices=("auto", "bwrap", "landlock", "container"),
         default="auto",
-        help="Sandbox backend to exercise (default: auto).",
+        help=(
+            "Sandbox backend to exercise (default: auto). 'container' runs the "
+            "v0.6 runner probes through core.execution instead of core.sandbox."
+        ),
     )
     parser.add_argument(
         "--tool",
@@ -1109,6 +1371,12 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     timeout = max(1.0, args.timeout)
     egress_enabled = args.check_egress or bool(args.egress_live)
+
+    if args.backend == "container":
+        # The container path has no prepare_execution plan to inspect, so it
+        # returns before backend selection instead of pretending to be one of
+        # the in-process backends.
+        return _run_container(args)
 
     os.environ["SANDBOX_BACKEND"] = args.backend
     sandbox.reset_for_tests()

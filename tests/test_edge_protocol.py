@@ -723,3 +723,49 @@ def test_mcp_calls_still_validate_the_tool_name():
             {"id": "c1", "kind": "mcp", "mcp": "srv", "tool": "has space"}
         )
     assert "call.tool" in str(exc.value)
+
+
+# --- sealed per-user credentials (Phase 4) -----------------------------------
+
+
+def _sealed(ciphertext="AAAA"):
+    return {
+        "v": 1,
+        "alg": "RSA-OAEP-256/AES-256-GCM",
+        "key_fp": "SHA256:" + "A" * 43,
+        "key_id": "abcdefghijklmnop",
+        "aad": "v1|dc1|tool|echo|alice@example.com|abcdefghijklmnop",
+        "wrapped_key": "AAAA",
+        "iv": "AAAA",
+        "ciphertext": ciphertext,
+        "keys": ["DEVOPS_PASSWORD"],
+    }
+
+
+def test_a_call_may_carry_an_opaque_sealed_blob():
+    blob = _sealed()
+
+    validated = protocol.validate_call({"id": "c1", "tool": "echo", "sealed": blob})
+
+    assert validated["sealed"] == blob
+
+
+def test_a_call_without_sealed_carries_none():
+    assert protocol.validate_call({"id": "c1", "tool": "echo"})["sealed"] is None
+
+
+def test_a_malformed_sealed_blob_is_rejected():
+    with pytest.raises(protocol.ProtocolError, match="call.sealed"):
+        protocol.validate_call({"id": "c1", "tool": "echo", "sealed": {"v": 1}})
+
+    with pytest.raises(protocol.ProtocolError, match="call.sealed"):
+        protocol.validate_call({"id": "c1", "tool": "echo", "sealed": ["not", "an", "object"]})
+
+
+def test_an_oversized_sealed_blob_is_rejected():
+    from core.edge_crypto import MAX_SEALED_BYTES
+
+    with pytest.raises(protocol.ProtocolError, match="call.sealed"):
+        protocol.validate_call(
+            {"id": "c1", "tool": "echo", "sealed": _sealed("A" * (MAX_SEALED_BYTES + 4))}
+        )

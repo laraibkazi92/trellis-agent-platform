@@ -9,6 +9,8 @@ endpoints against fake registries, so without this fixture they would write real
 into the repo's workspace/ tree. Redirect the module's roots at a per-test tmp dir.
 """
 
+import os
+
 import pytest
 
 from core import workspace_io
@@ -23,6 +25,23 @@ def _isolated_workspace_io(tmp_path, monkeypatch):
     monkeypatch.setattr(workspace_io, "BASE_DIR", tmp_path)
     monkeypatch.setattr(workspace_io, "WORKSPACE_DIR", ws)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _restore_process_env_after_edge_runs():
+    """``core.proxy.run`` sets backend/mode env vars with ``setdefault``.
+
+    That is correct for a real edge process but leaks into later tests in the same
+    interpreter (the edge default is ``container``), so snapshot and restore them.
+    """
+    names = ("SANDBOX_BACKEND", "RUNNER_SOCKET", "TRELLIS_EDGE_MODE")
+    before = {name: os.environ.get(name) for name in names}
+    yield
+    for name, value in before.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 @pytest.fixture

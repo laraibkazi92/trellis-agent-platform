@@ -1,4 +1,4 @@
-# trellis-proxy configuration -- one file per edge node (engine 0.5.x).
+# trellis-proxy configuration -- one file per edge node (engine 0.6.x).
 #
 # Copy to proxy.yaml next to this file's docker-compose.yml and edit. It is mounted
 # read-only at /etc/trellis/proxy.yaml; the container paths below (`/etc/trellis/...`,
@@ -7,24 +7,28 @@
 # ENROLLMENT TOKEN: never written here, only the name of the file or env var that
 # holds it. See token_file: below.
 #
-# TOOL/MCP CREDENTIALS: edge-local files (edge-secrets/, edge-user-secrets/), never on
-# the tunnel and never in the central etcd. Since 0.5.0 a child process receives only
-# the keys its manifest DECLARES -- `secrets`, `optional_secrets`, `variables` and the
-# field keys of `secret_groups` in tool.yaml / mcp.yaml. An undeclared process
-# environment variable is invisible to the tool; the tunnel token and the framework's
-# own control-plane secrets are stripped in every mode.
+# TOOL/MCP CREDENTIALS: two sources, neither one plaintext for a person.
+#   * edge-secrets/<item>.env -- one shared service account per exported item.
+#   * browser-sealed per-user sets -- entered in the central UI, stored there as
+#     ciphertext, opened here with the edge key (EDGE_PRIVATE_KEY_PATH). There is no
+#     per-user file and no `trellis-proxy user-secrets` command any more.
+# Since 0.5.0 a child process receives only the keys its manifest DECLARES --
+# `secrets`, `optional_secrets`, `variables` and the field keys of `secret_groups` in
+# tool.yaml / mcp.yaml. An undeclared process environment variable is invisible to the
+# tool; the tunnel token and the framework's own control-plane secrets are stripped in
+# every mode.
 #
 # RELOAD: SIGHUP (`docker kill -s HUP trellis-proxy`) re-reads this file and
 # re-publishes the catalog (the proxy reconnects; in-flight calls fail rather than
 # being replayed).
 #   live-reloadable: exports, export_mcps, tools_dir, mcps_dir
 #   restart-required: site, server_url, token_env, token_file, tls_*, sandbox,
-#     env_passthrough, and the secrets_dir/user_secrets_dir *paths* -- for each one you
-#     try to apply with SIGHUP the proxy logs a warning and keeps the current value
-# Credential file *contents* are a third case: tool calls re-read them every time, while
-# MCP sessions resolve credentials once at creation, so a SIGHUP retires every live
-# session and the next call reopens it with the edited file. Moving either directory is
-# a path change, i.e. a restart.
+#     env_passthrough, and the secrets_dir *path* -- for each one you try to apply with
+#     SIGHUP the proxy logs a warning and keeps the current value
+# Credential *contents* are a third case: tool calls read them every time (the sealed
+# set arrives with the call), while MCP sessions resolve credentials once at creation,
+# so a SIGHUP retires every live session and the next call reopens it. Moving the
+# shared directory is a path change, i.e. a restart.
 
 # Site id, pre-registered by an admin in Admin -> Edges. It must match the site the
 # token was issued for. The central relay derives identity from the token hash and never
@@ -58,8 +62,10 @@ token_file: /run/secrets/edge_token
 #
 # Directory holding this edge's tool.yaml directories. Same schema as the central
 # workspace (workspace/tools/<tool>/tool.yaml). The sample compose mounts the workspace
-# at /app/workspace read-write because the sandbox grants tools exactly that one
+# at /app/workspace read-write because the legacy sandbox grants tools exactly that one
 # writable path (override with SANDBOX_RW_PATH); mount :ro only for read-only tools.
+# Under `sandbox: container` the tool gets this suite mounted READ-ONLY plus
+# `shared/` read-only; output dirs are granted one at a time via `output_dirs`.
 # Env equivalent: TRELLIS_EDGE_TOOLS_DIR.
 tools_dir: ./workspace/tools
 
@@ -77,8 +83,8 @@ exports:
   - boiler_status
   # Python CLI wrappers (stdin/stdout tool protocol) whose tool.yaml declares its keys
   # through `secret_groups` (one group per target environment: staging | production).
-  # Each operator needs a file of their own -- `user-secrets set` -- before this works;
-  # an unmapped user falls back to the shared file, then the process env.
+  # Each operator seals their own set in the central UI before this works; without
+  # one, `per_user` falls back to the shared file, then the process env.
   - name: node_ssh
     credential_mode: per_user
   - name: node_file_transfer
@@ -108,7 +114,7 @@ export_mcps:
   # Operational CLI MCP server: stdio, Node, keeps its login session in files under
   # HOME. Its mcp.yaml declares an explicit `tools:` catalog (8 category meta-tools with
   # top-level oneOf schemas), so publishing needs no live discovery.
-  # per_user_required: no per-user file = fail closed with
+  # per_user_required: no sealed set for the caller = fail closed with
   # `no credentials for <email> on edge dc1`, nothing is spawned.
   - name: devops-cli
     include_tools:
@@ -127,27 +133,37 @@ export_mcps:
 
 # ---------------------------------------------------------------- credentials
 #
-# Edge-local credential stores. Both must live OUTSIDE the tool-writable workspace: tool
-# code runs as this uid and can read whatever the workspace exposes, so a per-user store
-# inside it would hand every caller every other caller's password.
+# The shared credential store. It must live OUTSIDE the tool-writable workspace: tool
+# code runs as this uid and can read whatever the workspace exposes, so a store inside
+# it would hand every exported tool every other item's secrets.
 #
 #   secrets_dir       <tool-or-mcp>.env per exported item (one service account)
-#   user_secrets_dir  <normalized-email>.env per person, written by
-#                     `python core/proxy.py user-secrets set <email>`
 #
-# Defaults are ./edge-secrets and ./edge-user-secrets; the sample compose bind-mounts
-# them at the paths below. Files are mode 0600, directories 0700, and nothing here is
-# ever sent to central or stored in etcd.
-# Env equivalents: TRELLIS_EDGE_SECRETS_DIR / TRELLIS_EDGE_USER_SECRETS_DIR.
+# Default is ./edge-secrets; the sample compose bind-mounts it at the path below.
+# Files are mode 0600, directories 0700, and nothing here is ever sent to central or
+# stored in etcd.
+# Env equivalent: TRELLIS_EDGE_SECRETS_DIR.
+#
+# PER-USER CREDENTIALS ARE NOT A FILE ANY MORE. A user enters them in the central UI
+# (Configuration -> Edge credentials); the browser encrypts them to this edge's public
+# key, central stores only the envelope, and the proxy opens it with the private key at
+# EDGE_PRIVATE_KEY_PATH (default /etc/trellis/edge-key, mounted 0400 into this service
+# only). `trellis-proxy edge-keygen` creates it; `--show` prints the public
+# fingerprint; `--rotate` keeps the old key as `edge-key.old` for the overlap window and
+# `--drop-old-key` ends it. Losing the key means every user re-enters their set -- there
+# is no recovery, by design. The old `edge-user-secrets/` directory and the
+# `user-secrets` command were removed in 0.6.
 secrets_dir: /etc/trellis/edge-secrets
-user_secrets_dir: /etc/trellis/edge-user-secrets
 #
 # Credential modes, resolved per declared key:
 #   shared             edge-secrets/<name>.env -> process env -> unset
-#   per_user           edge-user-secrets/<email>.env -> shared -> process env -> unset
-#   per_user_required  the user's file ONLY; no file, or none of the declared keys in
-#                      it, refuses the call (`missing_credentials`) before anything runs
-# An empty value (`KEY=`) counts as unset in every layer, so a blank template line
+#   per_user           the caller's sealed set if present; else shared -> process env
+#   per_user_required  the caller's sealed set ONLY; nothing sealed for them refuses
+#                      the call (`missing_credentials`) before anything runs
+# A sealed set is ALL-OR-NOTHING for secrets: a declared secret it omits stays missing
+# and is never filled from the shared file or the process env. `variables` (endpoints)
+# always come from this edge's shared file / process env, never from a sealed set.
+# An empty value (`KEY=`) in the shared file counts as unset, so a blank template line
 # cannot blank a working credential.
 #
 # One shared file per item, `/etc/trellis/edge-secrets/devops-cli.env`
@@ -157,13 +173,9 @@ user_secrets_dir: /etc/trellis/edge-user-secrets
 #   DEVOPS_PASSWORD=...
 #   CORALOGIX_API_KEY=...
 # The last key is optional_secrets in mcp.yaml.
-# One per-user file per operator:
-#   docker compose exec -T trellis-proxy \
-#     python core/proxy.py user-secrets set ops@example.com \
-#     --config /etc/trellis/proxy.yaml <<'EOF'
-#   NODE_SSH_USER=ops
-#   NODE_SSH_PASSWORD=...
-#   EOF
+# Per-user files are gone; a user's set is entered once at
+#   Configuration -> Edge credentials -> devops-cli
+# and re-entered after a key rotation retires the old one.
 
 # ---------------------------------------------------------------- environment
 #
@@ -177,14 +189,31 @@ env_passthrough: false
 
 # ---------------------------------------------------------------- sandbox
 #
-# Sandbox backend for tool processes and stdio MCP servers: auto | bwrap | landlock.
-# Same semantics as the central hub's SANDBOX_BACKEND: `auto` prefers bwrap and falls
-# back to Landlock when bwrap cannot run (no user namespaces, restrictive AppArmor).
-sandbox: auto
+# Sandbox backend for tool processes and stdio MCP servers:
+#   container | auto | bwrap | landlock
 #
-# Node MCP servers need more address space than the 4 GiB default: export
-# SANDBOX_RLIMIT_AS_MB=8192 in the compose .env (existing knob, applied by the Landlock
-# helper; under bwrap the container's own limits are the backstop).
+# `container` is the DEFAULT for new installs (v0.6) and the only supported
+# production backend: every call runs in its own gVisor (runsc) container created by
+# the edge `runner` service in docker-compose.yml, reached over `runner_socket`
+# below. It requires that service to be up, runsc registered with the edge's Docker
+# daemon, and the runner to be pointed at this host's workspace path via
+# TRELLIS_HOST_WORKSPACE (see docs/proxy.md -> "Edge runner").
+#
+# `auto` (bwrap, then Landlock), `bwrap` and `landlock` are the LEGACY in-process
+# backends, kept for LOCAL DEVELOPMENT ONLY (a laptop without runsc). They execute
+# tools as a child of this container and are not the v0.6 isolation boundary.
+sandbox: container
+#
+# Unix socket of the runner control API, shared with the runner container through the
+# `proxy-runner` volume. Ignored unless `sandbox: container`.
+# Env equivalent: RUNNER_SOCKET.
+runner_socket: /run/trellis/runner.sock
+#
+# Legacy knobs (dev-only backends): Node MCP servers need more address space than the
+# 4 GiB default: export SANDBOX_RLIMIT_AS_MB=8192 in the compose .env (applied by the
+# Landlock helper; under bwrap the container's own limits are the backstop). Under the
+# container backend these rlimits are INERT -- size the manifest's `limits:` block
+# instead.
 # RLIMIT_CPU counts consumed CPU, so a 600 s default does not evict an idle session.
 
 # ---------------------------------------------------------------- mutual TLS

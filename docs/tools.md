@@ -52,6 +52,10 @@ Check the tool's `tool.yaml` for required `inputs`, `secrets`, and `variables` b
 
 ### Sandbox Model
 
+> **Legacy path.** The shipped v0.6 default is the [container execution
+> contract](#container-execution-contract-v06) below. This section describes the
+> in-process `bwrap`/`Landlock` backends, kept for local development.
+
 Every tool invocation runs in one of two sandbox backends, chosen once at hub startup. `auto` (the default) prefers **bwrap** and falls back to **Landlock** when bwrap cannot run; both drop all capabilities. The confinement they provide differs:
 
 | Property | bwrap | Landlock |
@@ -75,6 +79,69 @@ What that means for tool code:
 - **Never persist secrets in `$TMPDIR`.** Under Landlock it is shared between concurrent runs (same uid), so a `0700` directory is not a boundary. Keep credentials in memory or in the injected environment.
 - Keep files the host should see under `/app/workspace` — it is the only path guaranteed to survive the run. Normal Unix permissions still apply, but because the tool runs as the workspace owner, writes into operator-owned directories (including `0755`) work in both backends. Use `$TMPDIR` for throwaway scratch.
 - Avoid POSIX shared memory and PTY allocation under Landlock; use `$TMPDIR` files and subprocess pipes instead.
+
+### Container execution contract (v0.6)
+
+Since v0.6 every local tool call is its **own gVisor container**, created by the `runner`
+service from your manifest. Container paths are the same ones tools already use, so the
+JSON stdin/stdout protocol, `TRELLIS_USER_ID`/`TRELLIS_USER_EMAIL`, and wrapper scripts do
+not change; what changes is what exists around the process.
+
+| Mount | Container path | Mode |
+| --- | --- | --- |
+| your own suite | `/app/workspace/tools/<suite>` | read-only |
+| shared code | `/app/workspace/shared` | read-only |
+| calling agent's reports | `/app/workspace/reports/<agent>` | read-write **iff** `output_dirs` lists `reports` |
+| calling agent's output | `/app/workspace/output/<agent>` | read-write **iff** `output_dirs` lists `output` |
+
+Everything else is absent: no other suite, no `agents/`, no manifests, no `.env`, no
+session state, and no engine network. A tool that must leave a file behind declares
+`output_dirs:` and writes under the mounted agent directory; the mount exists only when
+the call carries an agent identity, so an anonymous caller gets none. `stdout` remains
+the way results reach the agent.
+
+- **`HOME`, `TMPDIR`, `TMP`, `TEMP` are one disposable tmpfs** at `/tmp`, sized by
+  `limits.tmpfs_mb`. It is destroyed with the container, so it is scratch space only and
+  nothing in it is visible on the host.
+- **No network unless declared.** `network:` is `none` (default), `internal`, or
+  `internet`; legacy `allow` still parses and means `internet`. `none` has no route at
+  all (loopback included), `internal` reaches only the CIDRs in
+  `TRELLIS_INTERNAL_CIDRS`, and `internet` blocks RFC1918/CGNAT/link-local/cloud-metadata
+  and the framework's own networks. See [deploy.md](deploy.md#network-profiles).
+- **Environment:** only the keys your manifest declares (`secrets`, `optional_secrets`,
+  `variables`, `secret_groups` fields) plus `TRELLIS_USER_ID`/`TRELLIS_USER_EMAIL` are
+  present; the rest of the environment is the image's base (`PATH`, `LANG`, `TZ`, ...).
+  `FRAMEWORK_API_URL` and `FRAMEWORK_EXECUTION_TOKEN` are no longer injected.
+- **Identity and rootfs:** the tool runs as `TRELLIS_UID:TRELLIS_GID` with all
+  capabilities dropped, a read-only root filesystem and `no-new-privileges`.
+- **Runtime:** `container_runtime` selects `runsc` (default), `runsc-variant`, or `runc`
+  for one tool. `runc` forfeits kernel-syscall isolation and needs a per-tool reason.
+  `image:` is reserved and ignored.
+
+`limits:` sets the container's cgroup v2 limits:
+
+| Field | Default | Range | Effect |
+| --- | --- | --- | --- |
+| `memory_mb` | `512` | 32–65536 | `--memory`; exceeding it OOM-kills only this container |
+| `cpus` | `1.0` | >0–64 | CPU quota (`--cpus`) |
+| `pids` | `256` | 16–32768 | `--pids-limit` |
+| `tmpfs_mb` | `128` | 1–32768, ≤ `memory_mb / 2` | size of the `/tmp` tmpfs |
+
+The tmpfs cap is charged to the same cgroup, so `tmpfs_mb > memory_mb / 2` is rejected
+when the manifest is parsed.
+
+```yaml
+- name: issues_create_ticket
+  # ... required fields ...
+  network: internal               # none (default) | internal | internet
+  container_runtime: runsc        # runsc (default) | runsc-variant | runc
+  output_dirs: [reports]          # subset of [reports, output]
+  limits:
+    memory_mb: 1024
+    cpus: 1.5
+    pids: 512
+    tmpfs_mb: 256                 # <= memory_mb / 2
+```
 
 ### Directory Structure
 
@@ -178,7 +245,8 @@ except Exception as e:
       - BG_SERVICE_URL
   public: false                   # Optional. Expose this tool for direct execution by external MCP
                                   #   clients via the Gateway's search_tools/use_tool (no agent hop).
-  network: allow                  # Optional. allow (default) or none. "none" gives the tool no
+  network: internal               # Optional. none (default), internal, or internet; legacy
+                                  #   `allow` maps to internet. "none" gives the tool no
                                   #   network at all, loopback included.
   egress:                         # Optional. Domains this tool reaches when egress mode is on.
     - api.example.com             #   Plain lowercase DNS suffix: covers the name and *.api.example.com.
@@ -204,7 +272,7 @@ variables:
 
 **`optional_secrets` / `secret_groups`**: `optional_secrets` are injected when the caller has stored them but never count against configuration readiness. `secret_groups` is a UI hint that renders a set of optional secrets as a single card with a selector (e.g. an environment dropdown) on the configuration page; each group is `{label, select_label, options: [{value, label, fields: [{key, label, type}]}]}`.
 
-**`network`**: Set `none` for every tool that does not call an external API — it is the cheapest exfiltration control, since a compromised tool then has nowhere to send the workspace or its injected secrets. `none` also blocks loopback, so a tool that must reach the framework API itself needs `allow`. Under the Landlock backend the policy requires kernel Landlock ABI 4+ (Linux 6.7+); bwrap always supports it with `--unshare-net`. In both backends `none` also refuses UDP and raw IP sockets — under bwrap because there is no interface at all, under Landlock because the helper's seccomp filter (default `SANDBOX_SECCOMP=on`) refuses the socket — so the tool has no IP network at all; AF_UNIX sockets still work. The one exception is `SANDBOX_SECCOMP=off` on the Landlock backend: the filter also goes away, and `none` then denies TCP connect/bind only, leaving UDP usable. Deployments can flip the default for all tools with `SANDBOX_NET_DEFAULT=none`. An unrecognized value warns and falls back to `allow` rather than disqualifying the tool.
+**`network`**: Set `none` for every tool that does not call an external API — it is the cheapest exfiltration control, since a compromised tool then has nowhere to send the workspace or its injected secrets. It is the default in v0.6, and it also blocks loopback, so a tool that must reach the framework API itself needs an explicit profile. `internal` reaches only `TRELLIS_INTERNAL_CIDRS`; `internet` (what legacy `allow` maps to) blocks RFC1918, cloud-metadata and the framework's own networks. An unrecognized value warns and falls back to `none` (the most restrictive profile) rather than disqualifying the tool. Under the legacy Landlock backend the policy additionally requires kernel Landlock ABI 4+ (Linux 6.7+) and the helper's seccomp filter for UDP/raw sockets; bwrap closes them with a private netns. See [deploy.md → Network profiles](deploy.md#network-profiles).
 
 **`egress`**: The domains a tool needs when the operator has enabled [egress mode](deploy.md#egress-mode-opt-in). It is a list of plain DNS suffixes — `example.com` covers `example.com` and every `*.example.com` — and the proxy is the only way out. A leading `*.` is accepted and normalized to the same plain suffix, so `"*.example.com"` and `example.com` are the same entry.
 

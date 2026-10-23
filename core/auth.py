@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 
 auth_token_var = contextvars.ContextVar("auth_token", default=None)
 user_id_var = contextvars.ContextVar("user_id", default=None)
+# v0.6: the short-lived HMAC token proving (agent, user, run) to the hub, relay and
+# runner. Minted once per run; read by every tool wrapper.
+agent_token_var = contextvars.ContextVar("agent_token", default=None)
+run_id_var = contextvars.ContextVar("run_id", default=None)
 
 # Sentinel stamped into auth_token_var for a DEV_MODE request that presented no bearer
 # token. It marks "the caller is the dev user"; it is NOT a credential and must never

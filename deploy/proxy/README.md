@@ -45,41 +45,45 @@ cp -a /path/to/your/mcps/. workspace/mcps/
 # 3. Configure the node.
 cp proxy.yaml.example proxy.yaml
 $EDITOR proxy.yaml          # site, server_url, tools_dir, exports, mcps_dir, export_mcps,
-                            # secrets_dir, user_secrets_dir, sandbox
+                            # secrets_dir, sandbox
 
 # 4. Provide the enrollment token. It is mounted as a docker secret (never an env var,
 #    which a tool could read from /proc/<pid>/environ) and referenced by token_file:.
 umask 077
 printf '%s' 'edge_dc1_...' > edge-token
 
-# 5. Create the two credential stores OUTSIDE the workspace, owned by the uid the
+# 5. Create the shared credential store OUTSIDE the workspace, owned by the uid the
 #    container runs as (TRELLIS_UID/TRELLIS_GID, default 1000). A bind-mount directory
-#    Docker creates for you is root-owned, and the proxy could not write to it.
-install -d -m 0700 edge-secrets edge-user-secrets
-sudo chown -R "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}" edge-secrets edge-user-secrets
+#    Docker creates for you is root-owned, and the proxy could not read it.
+install -d -m 0700 edge-secrets
+sudo chown -R "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}" edge-secrets
 
-# 6. .env holds non-secret edge settings (proxy URL knobs, sandbox limits) and, at most,
-#    legacy credentials -- it is NOT the credential store (mode 0600, never the tunnel
-#    token). Secrets belong in the two stores below; the process env is only the last
-#    fallback in the resolution chain.
+# 6. Generate the per-user credential key OUTSIDE the workspace, mode 0400. The private
+#    half never leaves this host; central and the relay only ever see the public key.
+#    Use the published image so the `cryptography` version matches the proxy.
+docker run --rm -v "$PWD":/w \
+  -e EDGE_PRIVATE_KEY_PATH=/w/edge-key \
+  ghcr.io/laraibkazi92/trellis-agent-platform:latest \
+  python core/proxy.py edge-keygen --path /w/edge-key
+sudo chown "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}" edge-key
+
+# 7. .env holds non-secret edge settings (proxy URL knobs, sandbox limits). It is NOT
+#    the credential store (mode 0600, never the tunnel token). Shared credentials are
+#    one file per exported tool/MCP:
 install -m 0600 /dev/null .env
 $EDITOR .env                # HTTPS_PROXY=..., SANDBOX_RLIMIT_AS_MB=8192 for Node MCPs
-#    Shared credentials, one file per exported tool/MCP:
 install -m 0600 /dev/null edge-secrets/devops-cli.env
 $EDITOR edge-secrets/devops-cli.env      # DEVOPS_URL=..., DEVOPS_PASSWORD=..., ...
 sudo chown "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}" edge-secrets/devops-cli.env
 
-# 7. Start it.
+# 8. Start it.
 docker compose up -d
 
-# 8. Per-user credentials, one file per operator (stdin KEY=VALUE, written 0600).
-docker compose exec -T trellis-proxy \
-  python core/proxy.py user-secrets set ops@example.com --config /etc/trellis/proxy.yaml \
-  <<'EOF'
-NODE_SSH_USER=ops
-NODE_SSH_PASSWORD=...
-EOF
-```
+**Per-user credentials are entered in the central UI**, not here: sign in, open
+Configuration → Edge credentials, pick the target and seal the declared secret keys with
+the edge's published key. Central stores ciphertext; only this VM can open it. There is no
+`edge-user-secrets/` directory and no `user-secrets` command in 0.6 (see
+docs/upgrading.md, "v0.6.0").
 
 **The keys must also be *declared*.** A credential file is not a second environment:
 since 0.5.0 a child process receives an allowlist base env plus only the keys its
@@ -92,49 +96,44 @@ behaviour (the tunnel token and framework secrets are still stripped).
 `proxy.yaml` is mounted read-only at `/etc/trellis/proxy.yaml`. The sample compose mounts
 the workspace at `/app/workspace` read-write, because the sandbox grants tools exactly that
 one writable path; mount it `:ro` only when every exported item is read-only (writes then
-fail with a sandbox error). The other three directories `proxy.yaml` names are mounted at
-the paths the example uses — `workspace/mcps` inside the workspace tree, and
-`edge-secrets` / `edge-user-secrets` outside it. Tool/MCP edits are a content change plus a
-`SIGHUP` to re-publish the catalog (the proxy reconnects, so an in-flight call fails rather
-than being replayed), or a restart. No manual file copy is needed after editing a manifest.
+fail with a sandbox error). `workspace/mcps` sits inside the workspace tree, `edge-secrets`
+outside it, and the edge key is a read-only file mount into `trellis-proxy` only (never
+into `runner`). Tool/MCP edits are a content change plus a `SIGHUP` to re-publish the
+catalog (the proxy reconnects, so an in-flight call fails rather than being replayed), or a
+restart. No manual file copy is needed after editing a manifest.
 
 ## Credentials
 
-Both stores are edge-local: no credential is ever sent over the tunnel or stored in the
-central etcd. `proxy.yaml` chooses, per exported item, which store a call may read:
+The shared store is edge-local: it is never sent over the tunnel or stored in central
+etcd. Per-user sets are browser-sealed ciphertext in central and are opened here with the
+edge key. `proxy.yaml` chooses, per exported item, which source a call may read:
 
 | `credential_mode` | Chain, per declared key |
 | --- | --- |
 | `shared` (default) | `edge-secrets/<name>.env` → process env → unset |
-| `per_user` | `edge-user-secrets/<norm-email>.env` → shared → process env → unset |
-| `per_user_required` | the user's file **only** — no file, or none of the declared keys in it, refuses the call (`missing_credentials`, `no credentials for <email> on edge <site>`) before anything is spawned |
+| `per_user` | the caller's sealed set if present; else shared → process env → unset |
+| `per_user_required` | the caller's sealed set **only** — nothing sealed refuses the call (`missing_credentials`, `no credentials for <email> on edge <site>`) before anything is spawned |
 
-Populate the shared store with one `<tool-or-mcp>.env` per exported item, then per
-operator:
+A sealed set is all-or-nothing for **secrets**: a declared secret it omits stays missing
+and is never filled from the shared file or the process env. `variables` (endpoints) are
+always this edge's configuration and are never taken from a sealed set.
+
+Populate the shared store with one `<tool-or-mcp>.env` per exported item:
 
 ```bash
-# merge new keys into an existing file (later duplicates win)
-docker compose exec -T trellis-proxy \
-  python core/proxy.py user-secrets set ops@example.com \
-  --config /etc/trellis/proxy.yaml <<'EOF'
-NODE_SSH_PASSWORD=rotated
-EOF
+install -m 0600 edge-secrets/devops-cli.env
+$EDITOR edge-secrets/devops-cli.env       # KEY=VALUE lines
+sudo chown "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}" edge-secrets/devops-cli.env
 
-# which users have credentials, and which key names -- never values
-docker compose exec trellis-proxy \
-  python core/proxy.py user-secrets list --config /etc/trellis/proxy.yaml
-# ops@example.com: NODE_SSH_PASSWORD, NODE_SSH_USER
-
-# remove one user's file
-docker compose exec trellis-proxy \
-  python core/proxy.py user-secrets delete ops@example.com --config /etc/trellis/proxy.yaml
+# key names only; values are never printed
+docker compose exec trellis-proxy python -c \
+  'from core.edge_user_secrets import CredentialStore, parse_env_file; \
+   print(sorted(parse_env_file(CredentialStore().shared_file("devops-cli"))))'
 ```
 
-`--config` matters: the CLI's default is `./proxy.yaml`, which does not exist in the
-container working directory. The CLI applies the same directory resolution as the proxy
-(`secrets_dir`/`user_secrets_dir`, else `TRELLIS_EDGE_SECRETS_DIR` /
-`TRELLIS_EDGE_USER_SECRETS_DIR`, else `./edge-secrets` / `./edge-user-secrets`), so if
-the two disagree the next call silently reads nothing.
+The key lifecycle is `edge-keygen` (create), `--show` (public fingerprint), `--rotate`
+(keep `edge-key.old` for the overlap) and `--drop-old-key` (end it). Losing the key means
+every user re-enters their set; there is no recovery, by design.
 
 File format, parsed defensively and never evaluated:
 
@@ -142,18 +141,15 @@ File format, parsed defensively and never evaluated:
 - an optional leading `export ` is accepted (shell/dotenv habit);
 - one layer of matching quotes is stripped, and nothing is interpolated — `$OTHER` stays
   the literal text `$OTHER`;
-- `KEY=` (empty) means **unset** in every layer, so a blank template line cannot blank a
-  working credential;
+- `KEY=` (empty) means **unset** in the shared layer, so a blank template line cannot
+  blank a working credential;
 - values cannot contain newlines, and a malformed line is ignored rather than costing the
-  rest of the file;
-- `user-secrets set` writes atomically, mode 0600 (directories 0700 when it creates them),
-  and refuses to overwrite a file it cannot read instead of dropping the keys in it. The
-  leading `# email:` header is display-only; resolution always uses the caller's address.
+  rest of the file.
 
-Set `credential_mode` last: going to `per_user_required` before every operator has a file
-turns their next call into a fail-closed `missing_credentials` error. A tool's mode is
+Set `credential_mode` last: going to `per_user_required` before every operator has sealed a
+set turns their next call into a fail-closed `missing_credentials` error. A tool's mode is
 applied by `SIGHUP`; MCP sessions resolve credentials once at creation, so `SIGHUP` also
-retires every live session and the next call reopens it with the edited files.
+retires every live session and the next call reopens it with the current set.
 
 ## MCP servers
 
@@ -212,7 +208,9 @@ tool and one exported MCP tool is the end-to-end proof.
 | Tunnel closes with **4001** right after `Connected … as site` | Version mismatch: this edge speaks protocol v2 and the central relay is still v0.4.x — the proxy logs `version mismatch: … upgrade central first` once, then retries only at the maximum backoff | Upgrade **central** first; the proxy reconnects on its own once it is (see `docs/upgrading.md`) |
 | **Nothing published** / no tools in Admin → Edges | `exports` is empty (or names do not match `tool.yaml` `name:` fields, or `tools_dir` does not exist in the container) | `exports` is an allowlist and an empty list publishes nothing. List the tools explicitly, then SIGHUP. Publishing an empty catalog keeps the site's existing central tools and flags a warning, so a typo cannot wipe the inventory |
 | Site connected but **no MCP rows** in Admin → Edges | `export_mcps` is empty, a name does not match an `mcp.yaml` under `mcps_dir`, `include_tools` filtered everything, or the catalog did not fit the hello frame budget | Check `docker compose logs trellis-proxy` for the load/publish warning, fix `export_mcps`/the manifest, then SIGHUP |
-| MCP call fails with **`missing_credentials`** | `credential_mode: per_user_required` and the caller has no file (or the file lacks a declared key) | `user-secrets set <their email>` with the declared keys, or relax the mode to `per_user`/`shared` |
+| MCP call fails with **`missing_credentials`** | `credential_mode: per_user_required` and the caller has no sealed set (or it lacks a declared secret) | Have the user seal the declared secret keys in Configuration → Edge credentials, or relax the mode to `per_user`/`shared` |
+| **`credential_rejected`** on a tool/MCP call | The sealed blob is for another target/user/site, or it was sealed to a key the edge retired | Reload the credential form (it re-fetches the current key) and re-enter the set |
+| Sealed credentials never reach a container | The edge has no key (`No usable edge credential key` at startup), or a rotation dropped the old key too early | Run `edge-keygen --show` and compare the fingerprint with Admin → Edges; generate one if missing |
 | Tool runs but a variable the manifest declares is missing | The key is in the file but **not declared** in `tool.yaml` / `mcp.yaml`, or `KEY=` is empty | Declare it (`secrets`/`optional_secrets`/`variables`/`secret_groups`) and give it a value; `env_passthrough: true` only as a last resort |
 | Node MCP server is killed / fails to start | `SANDBOX_RLIMIT_AS_MB` still at the 4096 default | Put `SANDBOX_RLIMIT_AS_MB=8192` in `.env` and recreate the container |
 | **`503 edge_offline`** on a tool call | The site is not connected: tunnel down, wrong token, or relay restarted | `docker compose logs -f trellis-proxy` for the reconnect reason; edges retry with jittered backoff (1 s → 60 s) |
@@ -245,16 +243,18 @@ pruned by the next v0.5 publish.
   compromised relay still cannot reach an unexported tool or the network behind it.
 - **No inbound path.** The tunnel is outbound from this VM. There is no listener, no
   published port, and nothing on the central side that can dial into this network.
-- **Credentials stay local.** Shared and per-user secrets live in this host's
-  `edge-secrets/` and `edge-user-secrets/` volumes, never in the workspace (tool code runs
-  as the same uid and can read whatever the workspace exposes). Only the keys a manifest
-  declares reach a process; the tunnel token and framework control-plane secrets never
-  do, in any mode. Nothing transits the tunnel and nothing is stored in the central etcd.
+- **Credentials do not mix.** The shared service account lives in this host's
+  `edge-secrets/` volume, never in the workspace (tool code runs as the same uid and can
+  read whatever the workspace exposes). A per-user set exists here only as ciphertext
+  sealed to this edge's public key; the private key is a 0400 file mounted read-only into
+  `trellis-proxy` only and never into a tool container. Only the keys a manifest declares
+  reach a process; the tunnel token and framework control-plane secrets never do, in any
+  mode. Central stores the envelope and can never open it.
 - **The edge trusts central's identity assertion.** `TRELLIS_USER_EMAIL` / `TRELLIS_USER_ID`
-  arrive over the authenticated tunnel, and that email selects the per-user credential
-  file. Central is the authority for who is calling; the edge enforces what that caller
-  may read. Keep the relay's token store and the central admin surface as trusted as the
-  per-user files themselves.
+  arrive over the authenticated tunnel, and that identity is part of the AAD the sealed
+  set is bound to. Central is the authority for who is calling; the edge enforces what
+  that caller may read. A blob stored for one person cannot be opened for another -- the
+  GCM tag fails, which is `credential_rejected`.
 - **Tool code is trusted.** Tools share the proxy's uid, so they can read what it can
   read. Review exported tool code like a service account. The enrollment token is
   file-mounted (not inherited through the environment) and the file is unlinked after

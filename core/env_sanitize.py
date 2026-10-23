@@ -22,6 +22,10 @@ FRAMEWORK_SECRET_ENV: frozenset[str] = frozenset({
     "ADMIN_USERS", "ALLOWED_DOMAINS",
     "HINDSIGHT_API_LLM_API_KEY", "HINDSIGHT_LLM_API_KEY",
     "HINDSIGHT_API_EMBEDDINGS_GEMINI_API_KEY",
+    # v0.6 execution isolation: the runner bearer and the agent-token HMAC key are
+    # control-plane credentials. They must never reach a tool, session or console
+    # container, even if an operator exports them in a service's environment.
+    "AGENT_TOKEN_SECRET", "RUNNER_TOKEN", "EDGE_PRIVATE_KEY_PATH",
 }) | FRAMEWORK_PROVIDER_KEY_ENV
 
 

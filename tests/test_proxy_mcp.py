@@ -3,15 +3,18 @@
 
 """Edge MCP export tests: catalog building, session isolation, refusal, reload.
 
-The stateful suite spawns ``tests/fixtures/mcp_stateful_server.py`` directly (the
-sandbox seam is monkeypatched) so the real client/server session lifecycle is
-exercised without needing bwrap/landlock on the test host.
+Sessions are runner containers now, so there is no child process and no session
+directory to assert on. ``proxy_mcp._runner_transport`` is the seam: the fake here
+returns an in-memory ``ClientTransport`` backed by a real FastMCP server, so the
+client/server session lifecycle (state, timeouts, env) is still exercised for real
+while everything stays inside the test process.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
-import os
+import secrets
 import subprocess
 import sys
 import time
@@ -22,11 +25,12 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+from fastmcp.client.transports.base import ClientTransport
+
 from core import edge_user_secrets, proxy, proxy_mcp
 from core.models import MCPConfig
 from services.edge_relay import protocol
 
-FIXTURE = Path(__file__).parent / "fixtures" / "mcp_stateful_server.py"
 REPO_ROOT = Path(__file__).parent.parent
 
 # A session key is the *normalized* email (``proxy_mcp._identity_key``), not the raw
@@ -38,6 +42,8 @@ SERVER_TOOLS = [
     {"name": "get_value", "description": "read a value", "inputSchema": {"type": "object"}},
     {"name": "get_home", "description": "the session HOME", "inputSchema": {"type": "object"}},
 ]
+ENV_DUMP_TOOL = {"name": "env_dump", "description": "env", "inputSchema": {"type": "object"}}
+SLOW_TOOL = {"name": "slow", "description": "sleep", "inputSchema": {"type": "object"}}
 DEADLINE_MS = 60_000
 
 
@@ -61,35 +67,86 @@ def edge_env(tmp_path, monkeypatch):
     return rw
 
 
-@pytest.fixture
-def fixture_server(monkeypatch, edge_env):
-    """Run the fixture server unsandboxed; without fastmcp there is no fixture."""
-    pytest.importorskip("fastmcp", reason="the stateful fixture server needs fastmcp")
-    monkeypatch.setattr(
-        proxy_mcp,
-        "build_stdio_argv",
-        lambda entry, home_dir, backend=None: [sys.executable, str(FIXTURE)],
-    )
-    return edge_env
+def _fake_server(state, env):
+    """A real FastMCP server whose state lives in ``state`` (per session)."""
+    from fastmcp import FastMCP
+
+    server = FastMCP("stateful")
+
+    @server.tool
+    def set_value(key: str, value: object) -> str:
+        """Store a raw JSON value under key."""
+        state["data"][key] = value
+        return "ok"
+
+    @server.tool
+    def get_value(key: str) -> object:
+        """Read key back from this session's state."""
+        return state["data"].get(key)
+
+    @server.tool
+    def get_home() -> str:
+        """An opaque per-session home id (the container tmpfs, in production)."""
+        return state["home"]
+
+    @server.tool
+    def env_dump() -> dict:
+        """The environment this session received."""
+        return dict(env)
+
+    @server.tool
+    async def slow(seconds: float = 5.0) -> str:
+        """Sleep, counting the invocation first: a timeout must not replay it."""
+        state["slow_calls"] += 1
+        await asyncio.sleep(seconds)
+        return "done"
+
+    return server
+
+
+class FakeRunnerTransport(ClientTransport):
+    """Stands in for ``RunnerStdioTransport``: in-memory, one state per instance."""
+
+    _counter = 0
+
+    def __init__(self, entry_name, env, **kwargs):
+        from fastmcp.client.transports.memory import FastMCPTransport
+
+        type(self)._counter += 1
+        self.target = entry_name
+        self.env = dict(env)
+        self.kwargs = kwargs
+        self.closed = False
+        self.state = {
+            "data": {},
+            "home": f"session-{self._counter}",
+            "slow_calls": 0,
+        }
+        self._inner = FastMCPTransport(_fake_server(self.state, self.env))
+
+    @contextlib.asynccontextmanager
+    async def connect_session(self, *, transport_options=None, **session_kwargs):
+        async with self._inner.connect_session(
+            transport_options=transport_options, **session_kwargs
+        ) as session:
+            try:
+                yield session
+            finally:
+                self.closed = True
 
 
 @pytest.fixture
-def live_clients(monkeypatch):
-    """Keep every client created alive, so closing it -- not GC -- must stop the server.
-
-    Without this, CPython's refcounting collects a retired client and its
-    ``__del__`` stops the subprocess, which would hide a ``keep_alive`` transport
-    that leaks the server until a garbage-collection cycle happens to run.
-    """
+def fake_sessions(monkeypatch):
+    """Fake the runner transport seam; returns every transport the manager built."""
     created = []
-    real = proxy_mcp._transport
 
-    def tracked(entry, *args, **kwargs):
-        client = real(entry, *args, **kwargs)
-        created.append(client)
-        return client
+    def factory(entry, env, **kwargs):
+        kwargs.setdefault("session_key", secrets.token_hex(16))
+        transport = FakeRunnerTransport(entry.name, env, **kwargs)
+        created.append(transport)
+        return transport
 
-    monkeypatch.setattr(proxy_mcp, "_transport", tracked)
+    monkeypatch.setattr(proxy_mcp, "_runner_transport", factory)
     return created
 
 
@@ -99,8 +156,8 @@ def write_mcp(root, name="stateful", **overrides):
     payload = {
         "name": name,
         "transport": "stdio",
-        "command": sys.executable,
-        "args": [str(FIXTURE)],
+        "command": "stateful-mcp",
+        "args": ["--serve"],
         "tools": SERVER_TOOLS,
     }
     payload.update(overrides)
@@ -156,58 +213,6 @@ class FakeClient:
         )
 
 
-def _pids(root, mcp="stateful"):
-    """The server pids recorded under each session dir (``$HOME/pid``)."""
-    return [
-        int(path.read_text(encoding="utf-8"))
-        for path in sorted((Path(root) / "mcp-sessions" / mcp).glob("*/pid"))
-    ]
-
-
-def _alive(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
-
-
-async def _assert_terminated(pid, timeout=5.0):
-    """Poll until the OS reports the process gone (a kill is not synchronous).
-
-    Called *inside* the event loop on purpose: the assertion must hold while the
-    edge is still running, not once ``asyncio.run`` tears the loop down (which
-    cancels every pending stdio client and would mask a leaked child).
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not _alive(pid):
-            return
-        await asyncio.sleep(0.05)
-    pytest.fail(f"server pid {pid} is still alive {timeout}s after its session was closed")
-
-
-def _assert_alive(pid):
-    assert _alive(pid), f"server pid {pid} never started"
-
-
-def _state_files(root, mcp="stateful"):
-    return sorted((Path(root) / "mcp-sessions" / mcp).glob("*/state.json"))
-
-
-def _wait_for_state(root, key, timeout=10.0, mcp="stateful"):
-    """Poll the session state files until ``key`` appears; return its value."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        for path in _state_files(root, mcp):
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            if key in data:
-                return data[key]
-        time.sleep(0.05)
-    raise AssertionError(f"{key!r} never appeared in {root}")
 
 
 class FakeWebSocket:
@@ -259,7 +264,7 @@ def call_frame(tool, args, *, call_id="1", mcp="stateful", identity=None, deadli
 # ---------------------------------------------------------------- sessions
 
 
-def test_same_user_sees_its_own_state_across_calls(tmp_path, fixture_server):
+def test_same_user_sees_its_own_state_across_calls(tmp_path, fake_sessions):
     write_mcp(tmp_path / "mcps")
     entries = load_one(tmp_path / "mcps")
     manager = proxy_mcp.McpSessionManager()
@@ -279,10 +284,10 @@ def test_same_user_sees_its_own_state_across_calls(tmp_path, fixture_server):
     result = asyncio.run(scenario())
 
     assert text(result) == "v1"
-    assert len(list((fixture_server / "mcp-sessions" / "stateful").iterdir())) == 1
+    assert len(fake_sessions) == 1
 
 
-def test_two_users_never_share_state_or_a_session_dir(tmp_path, fixture_server):
+def test_two_users_never_share_state_or_a_transport(tmp_path, fake_sessions, edge_env):
     write_mcp(tmp_path / "mcps")
     entries = load_one(tmp_path / "mcps")
     manager = proxy_mcp.McpSessionManager()
@@ -314,13 +319,15 @@ def test_two_users_never_share_state_or_a_session_dir(tmp_path, fixture_server):
     assert text(first) == "alpha"
     assert text(second) == "beta"
     assert text(homes["a@x"]) != text(homes["b@x"])
-    session_dirs = [p for p in (fixture_server / "mcp-sessions" / "stateful").iterdir() if p.is_dir()]
-    assert len(session_dirs) == 2
-    assert all(len(p.name) == 16 for p in session_dirs)
-    assert all(p.stat().st_mode & 0o777 == 0o700 for p in session_dirs)
+    # One container-backed transport per identity, with independent state.
+    assert len(fake_sessions) == 2
+    assert fake_sessions[0].state is not fake_sessions[1].state
+    assert all(len(t.kwargs["session_key"]) == 32 for t in fake_sessions)
+    # Session state lives in the container, never under the writable root.
+    assert not (edge_env / "mcp-sessions").exists()
 
 
-def test_sessions_survive_a_tunnel_reconnect(tmp_path, fixture_server):
+def test_sessions_survive_a_tunnel_reconnect(tmp_path, fake_sessions):
     """The manager owns sessions: a dropped socket must not reset a user's state."""
     root = tmp_path / "mcps"
     write_mcp(root)
@@ -341,8 +348,7 @@ def test_sessions_survive_a_tunnel_reconnect(tmp_path, fixture_server):
                     {"t": "welcome", "site": "plant-floor"},
                     call_frame("set_value", {"key": "k", "value": "kept"}, call_id="1"),
                 ],
-                # Long enough for the server process to boot and answer.
-                grace=3.0,
+                grace=1.0,
             )
             await proxy._serve(session, first)
             second = FakeWebSocket(
@@ -350,7 +356,7 @@ def test_sessions_survive_a_tunnel_reconnect(tmp_path, fixture_server):
                     {"t": "welcome", "site": "plant-floor"},
                     call_frame("get_value", {"key": "k"}, call_id="2"),
                 ],
-                grace=3.0,
+                grace=1.0,
             )
             await proxy._serve(session, second)
             return first, second
@@ -363,9 +369,10 @@ def test_sessions_survive_a_tunnel_reconnect(tmp_path, fixture_server):
     assert second.sent[0]["mcps"][0]["name"] == "stateful"
     assert second.sent[1]["ok"] is True
     assert text(second.sent[1]["result"]) == "kept"
+    assert len(fake_sessions) == 1
 
 
-def test_eviction_reports_once_then_starts_a_fresh_session(tmp_path, fixture_server):
+def test_eviction_reports_once_then_starts_a_fresh_session(tmp_path, fake_sessions):
     write_mcp(tmp_path / "mcps")
     entries = load_one(tmp_path / "mcps", max_sessions=1)
     manager = proxy_mcp.McpSessionManager()
@@ -387,24 +394,27 @@ def test_eviction_reports_once_then_starts_a_fresh_session(tmp_path, fixture_ser
             await manager.call(
                 "stateful", "set_value", {"key": "k", "value": "a2"}, {"user_email": "a@x"}, DEADLINE_MS
             )
-            return await manager.call(
+            result = await manager.call(
                 "stateful", "get_value", {"key": "k"}, {"user_email": "a@x"}, DEADLINE_MS
-            ), lost.value
+            )
+            return result, lost.value, [t.closed for t in fake_sessions]
         finally:
             await manager.kill_all()
 
-    result, error = asyncio.run(scenario())
+    result, error, closed = asyncio.run(scenario())
 
     assert error.code == "mcp_session_lost"
     assert "eviction" in error.message
     assert text(result) == "a2"
+    # Each identity's session was evicted once: A by B, then B by A's respawn.
+    assert closed == [True, True, False]
 
 
-# --- no retired session may leak its server process ---------------------------------
+# --- no retired session may leak its container --------------------------------------
 
 
-def test_an_evicted_session_terminates_its_server_process(tmp_path, fixture_server, live_clients):
-    """A session that is detached without closing its client leaks an OS process."""
+def test_an_evicted_session_closes_its_transport(tmp_path, fake_sessions):
+    """A session that is detached without closing its client leaks a runner container."""
     write_mcp(tmp_path / "mcps")
     entries = load_one(tmp_path / "mcps", max_sessions=1)
     manager = proxy_mcp.McpSessionManager()
@@ -415,21 +425,19 @@ def test_an_evicted_session_terminates_its_server_process(tmp_path, fixture_serv
             await manager.call(
                 "stateful", "set_value", {"key": "k", "value": "a"}, {"user_email": "a@x"}, DEADLINE_MS
             )
-            pids = _pids(fixture_server)
-            assert len(pids) == 1
-            _assert_alive(pids[0])
+            assert len(fake_sessions) == 1
             # B needs the only slot, so A's idle session is evicted and reaped.
             await manager.call(
                 "stateful", "set_value", {"key": "k", "value": "b"}, {"user_email": "b@x"}, DEADLINE_MS
             )
-            await _assert_terminated(pids[0])
+            return fake_sessions[0].closed
         finally:
             await manager.kill_all()
 
-    asyncio.run(scenario())
+    assert asyncio.run(scenario()) is True
 
 
-def test_kill_all_terminates_every_server_process(tmp_path, fixture_server, live_clients):
+def test_kill_all_closes_every_transport(tmp_path, fake_sessions):
     write_mcp(tmp_path / "mcps")
     entries = load_one(tmp_path / "mcps")
     manager = proxy_mcp.McpSessionManager()
@@ -440,20 +448,62 @@ def test_kill_all_terminates_every_server_process(tmp_path, fixture_server, live
             await manager.call(
                 "stateful", "set_value", {"key": "k", "value": user}, {"user_email": user}, DEADLINE_MS
             )
-        pids = _pids(fixture_server)
-        assert len(pids) == 2
-        for pid in pids:
-            _assert_alive(pid)
+        assert len(fake_sessions) == 2
+        assert not any(t.closed for t in fake_sessions)
         await manager.kill_all()
-        for pid in pids:
-            await _assert_terminated(pid)
-        return dict(manager._sessions)
+        return dict(manager._sessions), [t.closed for t in fake_sessions]
 
-    assert asyncio.run(scenario()) == {}
+    sessions, closed = asyncio.run(scenario())
+
+    assert sessions == {}
+    assert closed == [True, True]
 
 
-def test_a_changed_server_reload_terminates_the_old_process(tmp_path, fixture_server, live_clients):
-    """SIGHUP-for-changed-servers must kill the process, not just its session."""
+def test_a_lost_runner_session_maps_to_mcp_session_lost_and_respawns(
+    tmp_path, monkeypatch
+):
+    """A deleted runner container is reported for that call and retried on the next."""
+    from core.execution.client import RunnerCallError
+
+    created = []
+
+    class LostClient(FakeClient):
+        def __init__(self, name=""):
+            super().__init__(name)
+            created.append(self)
+
+        async def call_tool(self, tool, args, **kwargs):
+            if len(created) == 1:
+                # What the transport surfaces when the runner no longer knows the id.
+                raise RunnerCallError("session_not_found", "no such session")
+            return await super().call_tool(tool, args, **kwargs)
+
+    monkeypatch.setattr(proxy_mcp, "_transport", lambda *a, **k: LostClient())
+    write_mcp(tmp_path / "mcps")
+    entries = load_one(tmp_path / "mcps")
+    manager = proxy_mcp.McpSessionManager()
+
+    async def scenario():
+        try:
+            manager.set_entries(entries, await catalogs_for(entries))
+            with pytest.raises(proxy_mcp.McpCallError) as lost:
+                await manager.call("stateful", "get_value", {}, {"user_email": "a@x"}, DEADLINE_MS)
+            retried = await manager.call(
+                "stateful", "get_value", {}, {"user_email": "a@x"}, DEADLINE_MS
+            )
+            return lost.value, retried, len(created)
+        finally:
+            await manager.kill_all()
+
+    error, retried, sessions = asyncio.run(scenario())
+
+    assert error.code == "mcp_session_lost"
+    assert text(retried) == "ok"
+    assert sessions == 2
+
+
+def test_a_changed_server_reload_closes_the_old_session(tmp_path, fake_sessions):
+    """SIGHUP-for-changed-servers must tear the container down, not just its entry."""
     write_mcp(tmp_path / "mcps")
     entries = load_one(tmp_path / "mcps")
     manager = proxy_mcp.McpSessionManager()
@@ -465,9 +515,7 @@ def test_a_changed_server_reload_terminates_the_old_process(tmp_path, fixture_se
             await manager.call(
                 "stateful", "set_value", {"key": "k", "value": "v"}, {"user_email": "a@x"}, DEADLINE_MS
             )
-            pids = _pids(fixture_server)
-            assert len(pids) == 1
-            _assert_alive(pids[0])
+            assert len(fake_sessions) == 1
             changed = dict(entries)
             changed["stateful"] = replace(
                 entries["stateful"],
@@ -475,11 +523,11 @@ def test_a_changed_server_reload_terminates_the_old_process(tmp_path, fixture_se
             )
             manager.set_entries(changed, catalogs)
             await manager.reap()
-            await _assert_terminated(pids[0])
+            return fake_sessions[0].closed
         finally:
             await manager.kill_all()
 
-    asyncio.run(scenario())
+    assert asyncio.run(scenario()) is True
 
 
 def test_concurrent_first_calls_spawn_exactly_one_server(tmp_path, monkeypatch):
@@ -523,16 +571,16 @@ def test_concurrent_first_calls_spawn_exactly_one_server(tmp_path, monkeypatch):
 
 
 def test_the_session_env_is_scoped_and_carries_the_caller_identity(
-    tmp_path, fixture_server, monkeypatch
+    tmp_path, fake_sessions, monkeypatch
 ):
-    """The server process sees declared keys + identity, never the token or the host env."""
+    """Only declared keys + identity reach the runner; the host env never does."""
     monkeypatch.setenv("TRELLIS_EDGE_TOKEN", "edge_plant-floor_supersecret")
     monkeypatch.setenv("UNDECLARED_PROCESS_VAR", "should-not-leak")
     monkeypatch.setenv("DEVOPS_PASSWORD", "hunter2")
     write_mcp(
         tmp_path / "mcps",
         secrets=["DEVOPS_PASSWORD"],
-        tools=SERVER_TOOLS + [{"name": "env_dump", "description": "env", "inputSchema": {"type": "object"}}],
+        tools=SERVER_TOOLS + [ENV_DUMP_TOOL],
     )
     entries = load_one(tmp_path / "mcps")
     manager = proxy_mcp.McpSessionManager()
@@ -557,13 +605,22 @@ def test_the_session_env_is_scoped_and_carries_the_caller_identity(
     assert seen["DEVOPS_PASSWORD"] == "hunter2"
     assert seen["TRELLIS_USER_ID"] == "user-1"
     assert seen["TRELLIS_USER_EMAIL"] == "user-1@corp.example"
+    # The container's tmpfs owns HOME/TMPDIR: the edge must not set them.
+    for name in ("HOME", "TMPDIR", "TMP", "TEMP"):
+        assert name not in fake_sessions[0].env
+    # Exactly what the runner will accept: declared keys + the identity pair.
+    assert set(seen) == {
+        "DEVOPS_PASSWORD",
+        "TRELLIS_USER_ID",
+        "TRELLIS_USER_EMAIL",
+    }
 
 
-def test_a_call_past_its_deadline_is_reported_and_never_replayed(tmp_path, fixture_server):
+def test_a_call_past_its_deadline_is_reported_and_never_replayed(tmp_path, fake_sessions):
     """No MCP call is retried: a timed-out action may change state twice."""
     write_mcp(
         tmp_path / "mcps",
-        tools=SERVER_TOOLS + [{"name": "slow", "description": "sleep", "inputSchema": {"type": "object"}}],
+        tools=SERVER_TOOLS + [SLOW_TOOL],
     )
     entries = load_one(tmp_path / "mcps")
     manager = proxy_mcp.McpSessionManager()
@@ -588,7 +645,7 @@ def test_a_call_past_its_deadline_is_reported_and_never_replayed(tmp_path, fixtu
 
     assert error.code == "edge_timeout"
     assert elapsed < 5.0
-    assert _wait_for_state(fixture_server, "slow_calls") == 1
+    assert fake_sessions[0].state["slow_calls"] == 1
 
 
 def test_run_kills_the_sessions_and_the_sweeper_in_its_finally(tmp_path, monkeypatch):
@@ -660,7 +717,7 @@ def test_run_kills_the_sessions_and_the_sweeper_in_its_finally(tmp_path, monkeyp
     assert leftover == [], f"tasks outlived run(): {leftover}"
 
 
-def test_ttl_sweep_reports_once_then_starts_a_fresh_session(tmp_path, fixture_server):
+def test_ttl_sweep_reports_once_then_starts_a_fresh_session(tmp_path, fake_sessions):
     write_mcp(tmp_path / "mcps")
     entries = load_one(tmp_path / "mcps", session_ttl_minutes=1)
     manager = proxy_mcp.McpSessionManager()
@@ -945,21 +1002,14 @@ def test_a_large_root_one_of_schema_round_trips_verbatim(tmp_path):
     )
 
 
-def test_a_server_without_a_static_catalog_is_discovered_live(tmp_path, fixture_server, monkeypatch):
-    spawns = []
-
-    def counting_argv(entry, home_dir, backend=None):
-        spawns.append(entry.name)
-        return [sys.executable, str(FIXTURE)]
-
-    monkeypatch.setattr(proxy_mcp, "build_stdio_argv", counting_argv)
+def test_a_server_without_a_static_catalog_is_discovered_live(tmp_path, fake_sessions):
     proxy_mcp.clear_discovery_cache()
     write_mcp(tmp_path / "mcps", tools=[])
     entries = load_one(tmp_path / "mcps")
 
     try:
         catalog = asyncio.run(proxy_mcp.build_catalog(entries["stateful"]))
-        # Cached in memory: a second build must not spawn the server again.
+        # Cached in memory: a second build must not open another discovery session.
         again = asyncio.run(proxy_mcp.build_catalog(entries["stateful"]))
     finally:
         proxy_mcp.clear_discovery_cache()
@@ -973,7 +1023,11 @@ def test_a_server_without_a_static_catalog_is_discovered_live(tmp_path, fixture_
     ]
     assert catalog.tools[0].input_schema["type"] == "object"
     assert [tool.name for tool in again.tools] == [tool.name for tool in catalog.tools]
-    assert spawns == ["stateful"]
+    # A throwaway discovery container, not a warm mcp_session.
+    assert len(fake_sessions) == 1
+    assert fake_sessions[0].kwargs["kind"] == "discovery"
+    assert fake_sessions[0].kwargs["deadline_ms"] == proxy_mcp.DISCOVERY_DEADLINE_MS
+    assert fake_sessions[0].closed is True
 
 
 def test_include_tools_narrows_the_published_catalog(tmp_path):
@@ -1095,7 +1149,7 @@ def test_the_edge_passes_arguments_through_untouched(tmp_path, monkeypatch):
     assert type(seen[0][1]["value"]) is str
 
 
-def test_a_string_argument_reaches_the_server_as_a_string(tmp_path, fixture_server):
+def test_a_string_argument_reaches_the_server_as_a_string(tmp_path, fake_sessions):
     """No ``coerce_arg`` on the MCP path: the server, not the edge, validates args."""
     write_mcp(tmp_path / "mcps")
     entries = load_one(tmp_path / "mcps")
@@ -1112,16 +1166,15 @@ def test_a_string_argument_reaches_the_server_as_a_string(tmp_path, fixture_serv
                 DEADLINE_MS,
             )
             return await manager.call(
-                "stateful", "get_home", {}, {"user_email": "a@x"}, DEADLINE_MS
+                "stateful", "get_value", {"key": "n"}, {"user_email": "a@x"}, DEADLINE_MS
             )
         finally:
             await manager.kill_all()
 
-    home = Path(text(asyncio.run(scenario())))
-    state = json.loads((home / "state.json").read_text(encoding="utf-8"))
+    result = asyncio.run(scenario())
 
-    assert state["n"] == "5"
-    assert isinstance(state["n"], str)
+    assert text(result) == "5"
+    assert isinstance(fake_sessions[0].state["data"]["n"], str)
 
 
 # ---------------------------------------------------------------- loading
@@ -1514,13 +1567,16 @@ def test_a_failed_session_never_logs_the_endpoint(tmp_path, monkeypatch, caplog)
     assert "secret.internal" not in caplog.text
 
 
-def test_a_stdio_session_runs_in_the_server_directory_without_keep_alive(
+def test_a_stdio_session_is_a_runner_transport_with_declared_env_and_digest(
     tmp_path, monkeypatch
 ):
-    """cwd is the mcp.yaml directory (like a tool's tool_dir) and closing kills the child."""
+    """stdio is a runner session: target, random key, declared env, digest, no cwd."""
+    import core.execution.stdio_transport as stdio_transport
+    from core.execution.spec import manifest_digest
+
     captured = {}
 
-    class FakeTransport:
+    class FakeRunnerTransport:
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
@@ -1528,32 +1584,72 @@ def test_a_stdio_session_runs_in_the_server_directory_without_keep_alive(
         def __init__(self, transport):
             self.transport = transport
 
+    monkeypatch.setattr(stdio_transport, "RunnerStdioTransport", FakeRunnerTransport)
     monkeypatch.setattr(
-        proxy_mcp,
-        "_fastmcp",
-        lambda: (FakeClient, FakeTransport, FakeTransport, FakeTransport),
-    )
-    monkeypatch.setattr(
-        proxy_mcp, "build_stdio_argv", lambda entry, home_dir, backend=None: ["node", "server.js"]
+        proxy_mcp, "_fastmcp", lambda: (FakeClient, None, None)
     )
     entry = proxy_mcp.McpExport(
         name="devops-cli",
-        config=MCPConfig(name="devops-cli", command="node"),
+        config=MCPConfig(
+            name="devops-cli",
+            command="node",
+            args=["server.js"],
+            secrets=["DEVOPS_PASSWORD"],
+        ),
         directory=tmp_path,
     )
 
-    proxy_mcp._transport(entry, tmp_path, {"HOME": str(tmp_path)})
+    proxy_mcp._transport(
+        entry,
+        {"DEVOPS_PASSWORD": "s3cret", "TRELLIS_USER_ID": "u1"},
+        identity={"user": "u1", "user_email": "u1@corp.example"},
+    )
 
-    assert captured["cwd"] == str(tmp_path)
-    assert captured["keep_alive"] is False
+    assert captured["target"] == "devops-cli"
+    assert len(captured["session_key"]) == 32
+    assert captured["env"] == {"DEVOPS_PASSWORD": "s3cret", "TRELLIS_USER_ID": "u1"}
+    assert captured["manifest_digest"] == manifest_digest(entry.config)
+    assert captured["agent"] is None
+    assert captured["user_id"] == "u1"
+    assert captured["user_email"] == "u1@corp.example"
+    assert captured["kind"] == "mcp_session"
+    assert captured["deadline_ms"] == proxy_mcp.DEFAULT_SESSION_DEADLINE_MS
 
 
-def test_the_discovery_dir_is_private(tmp_path, edge_env):
-    """umask masks mkdir(mode=), so the mode has to be set explicitly."""
-    directory = proxy_mcp._discovery_dir("stateful")
+def test_a_stdio_session_never_creates_the_legacy_session_root(
+    tmp_path, fake_sessions, edge_env
+):
+    write_mcp(tmp_path / "mcps")
+    entries = load_one(tmp_path / "mcps")
+    manager = proxy_mcp.McpSessionManager()
 
-    assert directory.parent.parent == edge_env / "mcp-sessions"
-    assert directory.stat().st_mode & 0o777 == 0o700
+    async def scenario():
+        try:
+            manager.set_entries(entries, await catalogs_for(entries))
+            await manager.call(
+                "stateful", "get_value", {"key": "k"}, {"user_email": "a@x"}, DEADLINE_MS
+            )
+        finally:
+            await manager.kill_all()
+
+    asyncio.run(scenario())
+
+    # Nothing was ever written under the writable root; it need not even exist.
+    assert not (edge_env / "mcp-sessions").exists()
+
+
+def test_a_legacy_mcp_sessions_directory_is_reported_once(edge_env, caplog):
+    """v0.5 session HOMEs are dead state: warn once per process, never read them."""
+    legacy = edge_env / "mcp-sessions"
+    legacy.mkdir(parents=True)
+    proxy_mcp._DEAD_SESSION_STATE_WARNED = False
+
+    with caplog.at_level(logging.WARNING, logger="core.proxy_mcp"):
+        proxy_mcp.McpSessionManager()
+        proxy_mcp.McpSessionManager()
+
+    assert caplog.text.count("dead state from v0.5") == 1
+    assert str(legacy) in caplog.text
 
 
 def test_truncation_budgets_the_encoded_size_not_the_character_count():
@@ -1591,24 +1687,19 @@ def test_importing_the_edge_entrypoint_stays_light():
 # ---------------------------------------------------------------- credentials
 
 
-ENV_DUMP_TOOL = {"name": "env_dump", "description": "env", "inputSchema": {"type": "object"}}
-
-
 def credentials_at(tmp_path):
-    return edge_user_secrets.CredentialStore(
-        secrets_dir=tmp_path / "edge-secrets",
-        user_secrets_dir=tmp_path / "edge-user-secrets",
-    )
+    return edge_user_secrets.CredentialStore(secrets_dir=tmp_path / "edge-secrets")
 
 
 def test_per_user_required_with_passthrough_never_falls_back_to_the_process_env(
-    tmp_path, fixture_server, monkeypatch
+    tmp_path, fake_sessions, monkeypatch
 ):
-    """The blocking property: ``passthrough`` must not turn the mode into user -> env.
+    """The blocking property: ``passthrough`` must not fill a sealed set's gaps.
 
     ``scoped_env(passthrough=True)`` copies the sanitized container env, so a declared
-    key the caller's file omits would otherwise arrive from the container and the
-    "user file only" mode would silently degrade.
+    key the caller's sealed set omits would otherwise arrive from the container and the
+    "sealed only" mode would silently degrade. Everything not declared is dropped
+    before the request: the runner rejects it, and it is not the server's business.
     """
     monkeypatch.setenv("DEVOPS_PASSWORD", "leaked-from-the-container")
     monkeypatch.setenv("CORALOGIX_DOMAIN", "corp.example")
@@ -1618,18 +1709,21 @@ def test_per_user_required_with_passthrough_never_falls_back_to_the_process_env(
         tools=SERVER_TOOLS + [ENV_DUMP_TOOL],
     )
     entries = load_one(tmp_path / "mcps", credential_mode="per_user_required")
-    store = credentials_at(tmp_path)
-    edge_user_secrets.write_env_file(
-        store.user_file("ops@example.com"), {"DEVOPS_URL": "https://ops.internal"}
+    manager = proxy_mcp.McpSessionManager(
+        passthrough=True, credentials=credentials_at(tmp_path), site="plant-floor"
     )
-    manager = proxy_mcp.McpSessionManager(passthrough=True, credentials=store, site="plant-floor")
 
     async def scenario():
         try:
             manager.set_entries(entries, await catalogs_for(entries))
             return structured(
                 await manager.call(
-                    "stateful", "env_dump", {}, {"user_email": "ops@example.com"}, DEADLINE_MS
+                    "stateful",
+                    "env_dump",
+                    {},
+                    {"user_email": "ops@example.com"},
+                    DEADLINE_MS,
+                    sealed={"DEVOPS_URL": "https://ops.internal"},
                 )
             )
         finally:
@@ -1638,20 +1732,21 @@ def test_per_user_required_with_passthrough_never_falls_back_to_the_process_env(
     env = asyncio.run(scenario())
 
     assert env["DEVOPS_URL"] == "https://ops.internal"
-    # Declared, absent from the user's file: the container's value must NOT stand in.
+    # Declared, absent from the sealed set: the container's value must NOT stand in.
     assert "DEVOPS_PASSWORD" not in env
-    # Passthrough still restores everything that is not declared.
-    assert env["CORALOGIX_DOMAIN"] == "corp.example"
+    # Passthrough is not a licence to send undeclared names to the runner.
+    assert "CORALOGIX_DOMAIN" not in env
+    assert set(env) <= proxy_mcp.declared_env_keys(entries["stateful"].config)
 
 
 def test_a_literal_mcp_env_never_overrides_a_resolved_credential(tmp_path):
-    """```env: {DEVOPS_PASSWORD: old}`` in mcp.yaml must not defeat the credential file."""
+    """```env: {DEVOPS_PASSWORD: old}`` in mcp.yaml must not defeat the sealed set."""
     entry = proxy_mcp.McpExport(
         name="stateful",
         config=MCPConfig(
             name="stateful",
             transport="stdio",
-            command=sys.executable,
+            command="stateful-mcp",
             env={
                 "DEVOPS_PASSWORD": "stale-literal",
                 "DEVOPS_URL": "https://stale.internal",
@@ -1662,34 +1757,31 @@ def test_a_literal_mcp_env_never_overrides_a_resolved_credential(tmp_path):
         directory=tmp_path,
         credential_mode="per_user_required",
     )
-    store = credentials_at(tmp_path)
-    edge_user_secrets.write_env_file(
-        store.user_file("ops@example.com"), {"DEVOPS_PASSWORD": "fresh-from-the-file"}
-    )
     env = proxy_mcp._server_env(
         entry,
-        tmp_path,
         {"user_email": "ops@example.com"},
         passthrough=False,
         token_env=None,
-        credentials=store,
+        credentials=credentials_at(tmp_path),
         site="plant-floor",
+        sealed={"DEVOPS_PASSWORD": "fresh-from-the-browser"},
     )
 
-    assert env["DEVOPS_PASSWORD"] == "fresh-from-the-file"  # user file wins
-    # Declared but absent from the file: the literal must not fill it either.
+    assert env["DEVOPS_PASSWORD"] == "fresh-from-the-browser"  # sealed set wins
+    # Declared but absent from the set: the literal must not fill it either.
     assert "DEVOPS_URL" not in env
-    # A literal for a key the manifest does not declare still applies.
-    assert env["EXTRA_HEADER"] == "kept"
-    # Same rule for a remote transport: headers are the credentials, not the manifest.
+    # A literal for a key the manifest does not declare never reaches the runner...
+    assert "EXTRA_HEADER" not in env
+    # ...but a remote transport still gets it as a header (headers are not env).
     headers = proxy_mcp._http_headers(entry, env)
-    assert headers["DEVOPS_PASSWORD"] == "fresh-from-the-file"
+    assert headers["DEVOPS_PASSWORD"] == "fresh-from-the-browser"
     assert "DEVOPS_URL" not in headers
     assert headers["EXTRA_HEADER"] == "kept"
 
 
-def test_case_variants_of_one_email_share_one_session(tmp_path, fixture_server):
-    """A normalized key: two spellings must not become two sessions (or two servers)."""
+def test_case_variants_of_one_email_share_one_session(tmp_path, monkeypatch):
+    """A normalized key: two spellings must not become two sessions (or two containers)."""
+    monkeypatch.setattr(proxy_mcp, "_transport", lambda *a, **k: FakeClient())
     write_mcp(tmp_path / "mcps")
     entries = load_one(tmp_path / "mcps")
     manager = proxy_mcp.McpSessionManager()
@@ -1717,14 +1809,11 @@ def test_case_variants_of_one_email_share_one_session(tmp_path, fixture_server):
     assert sessions == [("stateful", edge_user_secrets.normalize_email("ops@example.com"))]
 
 
-def test_sighup_retires_live_sessions_so_a_new_credential_applies(tmp_path, fixture_server):
-    """``refresh_mcps`` is the operator's escape hatch: new value, new process, no tombstone."""
+def test_sighup_retires_live_sessions_so_a_new_credential_applies(tmp_path, fake_sessions):
+    """``refresh_mcps`` is the operator's escape hatch: new value, new container, no tombstone."""
     root = tmp_path / "mcps"
     write_mcp(root, secrets=["DEVOPS_PASSWORD"], tools=SERVER_TOOLS + [ENV_DUMP_TOOL])
     store = credentials_at(tmp_path)
-    edge_user_secrets.write_env_file(
-        store.user_file("ops@example.com"), {"DEVOPS_PASSWORD": "before"}
-    )
     config_path = tmp_path / "proxy.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -1733,7 +1822,6 @@ def test_sighup_retires_live_sessions_so_a_new_credential_applies(tmp_path, fixt
                 "server_url": "ws://relay.local/edge/v1/connect",
                 "mcps_dir": str(root),
                 "secrets_dir": str(store.secrets_dir),
-                "user_secrets_dir": str(store.user_secrets_dir),
                 "export_mcps": [
                     {"name": "stateful", "credential_mode": "per_user_required"}
                 ],
@@ -1749,31 +1837,32 @@ def test_sighup_retires_live_sessions_so_a_new_credential_applies(tmp_path, fixt
         try:
             await session.refresh_mcps()  # what run() does before the first connect
             before = structured(
-                await session.mcp.call("stateful", "env_dump", {}, identity, DEADLINE_MS)
+                await session.mcp.call(
+                    "stateful", "env_dump", {}, identity, DEADLINE_MS,
+                    sealed={"DEVOPS_PASSWORD": "before"},
+                )
             )
-            first_pid = _pids(fixture_server)[0]
-            _assert_alive(first_pid)
+            assert len(fake_sessions) == 1
 
-            edge_user_secrets.write_env_file(
-                store.user_file("ops@example.com"), {"DEVOPS_PASSWORD": "after"}
-            )
             # The SIGHUP path: reload the files, rebuild the catalogs, install them.
             session.reload()
             await session.refresh_mcps()
 
             after = structured(
-                await session.mcp.call("stateful", "env_dump", {}, identity, DEADLINE_MS)
+                await session.mcp.call(
+                    "stateful", "env_dump", {}, identity, DEADLINE_MS,
+                    sealed={"DEVOPS_PASSWORD": "after"},
+                )
             )
-            second_pid = _pids(fixture_server)[0]
-            await _assert_terminated(first_pid)
-            return before, after, first_pid, second_pid, list(session.mcp._tombs)
+            return before, after, [t.closed for t in fake_sessions], list(session.mcp._tombs)
         finally:
             await session.mcp.kill_all()
 
-    before, after, first_pid, second_pid, tombs = asyncio.run(scenario())
+    before, after, closed, tombs = asyncio.run(scenario())
 
     assert before["DEVOPS_PASSWORD"] == "before"
     assert after["DEVOPS_PASSWORD"] == "after"
-    assert second_pid != first_pid  # a new server process
+    # A new session container, and the old one was torn down.
+    assert len(closed) == 2 and closed == [True, False]
     # A SIGHUP is a requested reopen, not a lost session: nothing one-shot is armed.
     assert tombs == []

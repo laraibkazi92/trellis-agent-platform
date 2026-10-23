@@ -34,6 +34,9 @@ from services.edge_relay.app import (
     EdgeUnknownTool,
     Relay,
 )
+from core import agent_token as agent_token_module
+
+AGENT_SECRET = "test-agent-token-secret-0123456789abcdef"
 
 
 def _tool(name="echo", **inputs):
@@ -59,9 +62,25 @@ class FakeEdgeRegistry:
         self.tools = {}
         self.mcps = {}
         self.statuses = {}
+        # Site records: the relay merges the hello credential material into these.
+        self.edge_configs = {}
+        # Agent records the enforcement path resolves (name -> config dict).
+        self.agents = {}
 
     def get_edge_config(self, site):
-        return {"name": site, "enabled": True, "exports": [], "public": False, "public_tools": []}
+        return self.edge_configs.get(site) or {
+            "name": site,
+            "enabled": True,
+            "exports": [],
+            "public": False,
+            "public_tools": [],
+        }
+
+    def save_edge_config(self, site, config):
+        self.edge_configs[site] = dict(config)
+
+    def get_agent_config(self, name):
+        return self.agents.get(name)
 
     def save_tool_config(self, name, config):
         self.tools[name] = dict(config)
@@ -135,6 +154,17 @@ def _clean_relay():
     app_module.relay.sites.clear()
     yield
     app_module.relay.sites.clear()
+
+
+@pytest.fixture(autouse=True)
+def _agent_token_env(monkeypatch):
+    """Startup refuses to run without a key, so every test gets one.
+
+    ``ENFORCE_AGENT_TOKENS`` stays unset (``log``) here: the enforcement tests set
+    ``enforce`` explicitly, and the rest of the suite keeps its pre-v0.6 behaviour.
+    """
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", AGENT_SECRET)
+    monkeypatch.delenv("ENFORCE_AGENT_TOKENS", raising=False)
 
 
 def _install_conn(site="site-a", tools=None, mcps=None, caps=None):
@@ -405,8 +435,12 @@ def test_call_body_email_reaches_the_edge_connection():
     conn = _install_conn()
     seen = {}
 
-    async def _record(tool, args, deadline_ms, user=None, user_email=None):
-        seen.update(tool=tool, user=user, user_email=user_email)
+    async def _record(
+        tool, args, deadline_ms, user=None, user_email=None, agent_token=None, sealed=None
+    ):
+        seen.update(
+            tool=tool, user=user, user_email=user_email, agent_token=agent_token, sealed=sealed
+        )
         return {"id": "x", "ok": True, "result": {"echoed": args}}
 
     conn.request = _record
@@ -423,7 +457,13 @@ def test_call_body_email_reaches_the_edge_connection():
     )
 
     assert response.status_code == 200
-    assert seen == {"tool": "echo", "user": "u1", "user_email": "ann@example.com"}
+    assert seen == {
+        "tool": "echo",
+        "user": "u1",
+        "user_email": "ann@example.com",
+        "agent_token": None,
+        "sealed": None,
+    }
 
 
 def test_a_malformed_email_is_rejected_before_forwarding():
@@ -589,10 +629,12 @@ def test_mcp_endpoint_routes_to_the_edge_connection():
     seen = {}
     result = {"content": [{"type": "text", "text": "ok"}], "isError": False}
 
-    async def _record(mcp, tool, args, deadline_ms, user=None, user_email=None):
+    async def _record(
+        mcp, tool, args, deadline_ms, user=None, user_email=None, agent_token=None, sealed=None
+    ):
         seen.update(
             mcp=mcp, tool=tool, args=args, deadline_ms=deadline_ms, user=user,
-            user_email=user_email,
+            user_email=user_email, agent_token=agent_token, sealed=sealed,
         )
         return {"id": "x", "ok": True, "result": result}
 
@@ -619,6 +661,8 @@ def test_mcp_endpoint_routes_to_the_edge_connection():
         "deadline_ms": protocol.DEFAULT_DEADLINE_MS,
         "user": "u1",
         "user_email": "ann@example.com",
+        "agent_token": None,
+        "sealed": None,
     }
 
 
@@ -903,6 +947,65 @@ def test_connect_publishes_the_catalog_and_records_the_disconnect(monkeypatch, e
         time.sleep(0.01)
         time.sleep(0.01)
     assert app_module.relay.get("site-a") is None
+
+
+def test_connect_publishes_the_edge_key_and_declared_credential_names(
+    monkeypatch, edge_registry, tmp_path
+):
+    """The seal form reads the key/name material from the site record, not a tool config."""
+    from core import edge_keypair
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "workspace"))
+    key = edge_keypair.generate(tmp_path / "etc-trellis" / "edge-key")
+    monkeypatch.setattr(app_module, "resolve_token", lambda token: {"name": "site-a"})
+    credential_keys = {
+        "echo": {"secret_keys": ["DEVOPS_PASSWORD"], "variable_keys": ["DEVOPS_URL"]}
+    }
+    client = TestClient(app_module.app)
+
+    with _connect(client) as ws:
+        ws.send_json(
+            _hello(
+                edge_pubkey=key.spki_b64,
+                edge_key_fp=key.fingerprint,
+                prev_edge_key_fp=None,
+                credential_keys=credential_keys,
+            )
+        )
+        assert ws.receive_json()["t"] == "welcome"
+        _wait_until(
+            lambda: "site-a" in edge_registry.edge_configs,
+            "the credential material was never written to the site record",
+        )
+        record = edge_registry.edge_configs["site-a"]
+        assert record["edge_pubkey"] == key.spki_b64
+        assert record["edge_key_fp"] == key.fingerprint
+        assert record["edge_key_id"] == key.key_id
+        assert record["edge_key_fps"] == []
+        assert record["credential_keys"] == credential_keys
+        ws.close()
+
+
+def test_a_hello_with_a_bad_key_fingerprint_is_refused(monkeypatch, tmp_path):
+    """Bad key material must close the connection, never be pinned in the registry."""
+    from core import edge_keypair
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "workspace"))
+    key = edge_keypair.generate(tmp_path / "etc-trellis" / "edge-key")
+    monkeypatch.setattr(app_module, "resolve_token", lambda token: {"name": "site-a"})
+    client = TestClient(app_module.app)
+
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with _connect(client) as ws:
+            ws.send_json(
+                _hello(
+                    edge_pubkey=key.spki_b64,
+                    edge_key_fp="SHA256:" + "A" * 43,
+                )
+            )
+            ws.receive_json()
+
+    assert exc.value.code == protocol.CLOSE_MALFORMED
 
 
 @pytest.mark.parametrize(
@@ -1917,3 +2020,249 @@ def test_an_admin_edit_is_allowed_to_empty_the_mcp_catalog(monkeypatch):
 
     # The MCP publish must also be told an empty catalog is intent, not a bad edge.
     assert seen.get("allow_empty") is True
+
+
+# --- agent-token enforcement (phase 3) --------------------------------------
+#
+# The relay is the authority for edge calls: it verifies the token, resolves the
+# agent's effective allowlist from the registry itself, and only then forwards a
+# frame. These tests pin the denial paths (none of which may reach the edge) and
+# the one thing that must survive: the token rides the forwarded frame verbatim.
+
+
+def _agent(tools=None, mcps=None):
+    return {"name": "agent-a", "allowed_tools": tools or [], "allowed_mcps": mcps or []}
+
+
+@pytest.fixture
+def enforcing(monkeypatch, edge_registry):
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+    edge_registry.agents["agent-a"] = _agent(tools=["site-a__echo"])
+    return edge_registry
+
+
+def _mint(agent="agent-a", **kwargs):
+    return agent_token_module.mint(agent, **kwargs)
+
+
+def _capture(seen):
+    async def _record(*args, **kwargs):
+        seen.update(agent_token=kwargs.get("agent_token"), call=args)
+        return {"id": "x", "ok": True, "result": {}}
+
+    return _record
+
+
+def test_a_permitted_call_forwards_the_agent_token(enforcing):
+    conn = _install_conn()
+    seen = {}
+    conn.request = _capture(seen)
+    token = _mint()
+
+    response = TestClient(app_module.app).post(
+        "/v1/sites/site-a/call",
+        json={"tool": "echo", "args": {"q": "x"}, "agent_token": token},
+    )
+
+    assert response.status_code == 200
+    assert seen["agent_token"] == token
+
+
+def test_the_forwarded_frame_carries_the_agent_token():
+    """Not just the HTTP body: the wire frame the edge verifies must carry it too."""
+
+    async def _scenario():
+        ws = FakeWebSocket()
+        conn = EdgeConn(ws, "site-a", {"echo": _tool()})
+        task = asyncio.create_task(
+            conn.request("echo", {"q": "hi"}, 5000, "u1", agent_token="t1.payload.sig")
+        )
+        await _wait_for_frames(ws)
+
+        frame = ws.sent[0]
+        assert frame["agent_token"] == "t1.payload.sig"
+
+        conn.resolve(frame["id"], {"id": frame["id"], "ok": True, "result": {}})
+        await task
+
+    asyncio.run(_scenario())
+
+
+@pytest.mark.parametrize(
+    "token",
+    [None, "t1.forged.signature", ""],
+    ids=["missing", "bad_sig", "empty"],
+)
+def test_a_call_without_a_valid_token_is_refused(enforcing, token):
+    conn = _install_conn()
+    conn.request = pytest.fail
+    body = {"tool": "echo", "args": {"q": "x"}}
+    if token is not None:
+        body["agent_token"] = token
+
+    response = TestClient(app_module.app).post("/v1/sites/site-a/call", json=body)
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "access_denied"
+    assert conn.ws.sent == []
+
+
+def test_an_expired_token_is_refused(enforcing):
+    conn = _install_conn()
+    conn.request = pytest.fail
+    token = _mint(now=time.time() - 10_000, ttl_s=60)
+
+    response = TestClient(app_module.app).post(
+        "/v1/sites/site-a/call",
+        json={"tool": "echo", "args": {"q": "x"}, "agent_token": token},
+    )
+
+    assert response.status_code == 403
+    assert "expired" in response.json()["error"]["message"]
+
+
+def test_a_tool_outside_the_allowlist_is_refused(enforcing):
+    conn = _install_conn()
+    conn.request = pytest.fail
+    enforcing.agents["agent-a"] = _agent(tools=["site-a__other"])
+
+    response = TestClient(app_module.app).post(
+        "/v1/sites/site-a/call",
+        json={"tool": "echo", "args": {"q": "x"}, "agent_token": _mint()},
+    )
+
+    assert response.status_code == 403
+    body = response.json()["error"]
+    assert body["code"] == "access_denied"
+    assert "site-a__echo" in body["message"]
+    assert conn.ws.sent == []
+
+
+def test_an_unknown_agent_is_refused(enforcing):
+    conn = _install_conn()
+    conn.request = pytest.fail
+
+    response = TestClient(app_module.app).post(
+        "/v1/sites/site-a/call",
+        json={"tool": "echo", "args": {"q": "x"}, "agent_token": _mint("ghost")},
+    )
+
+    assert response.status_code == 403
+    assert "unknown agent" in response.json()["error"]["message"]
+
+
+def test_the_gateway_principal_needs_no_agent_record(enforcing):
+    """The gateway is authenticated by its own key; it has no allowlist to resolve."""
+    conn = _install_conn()
+    seen = {}
+    conn.request = _capture(seen)
+
+    response = TestClient(app_module.app).post(
+        "/v1/sites/site-a/call",
+        json={"tool": "echo", "args": {"q": "x"}, "agent_token": _mint("gateway")},
+    )
+
+    assert response.status_code == 200
+    assert seen["call"][0] == "echo"
+
+
+def test_an_mcp_call_accepts_a_server_grant_or_a_per_tool_grant(enforcing):
+    seen = {}
+    conn = _install_conn(mcps={"devops-cli": _mcp()})
+    conn.request_mcp = _capture(seen)
+    client = TestClient(app_module.app)
+    body = {"tool": "tenant_account_tools", "args": {"action": "list_actions"}}
+
+    # Granted as an edge MCP: permits_mcp and permits_tool both hold.
+    enforcing.agents["agent-a"] = _agent(mcps=["site-a__devops-cli"])
+    token = _mint()
+    permitted = client.post(
+        "/v1/sites/site-a/mcps/devops-cli/call",
+        json={**body, "agent_token": token},
+    )
+    assert permitted.status_code == 200
+    assert seen["agent_token"] == token
+
+    # Documented narrowing: a bare tool name grants just that tool, which is
+    # enough to open the session it needs (permits_tool folds in the server).
+    enforcing.agents["agent-a"] = _agent(tools=["tenant_account_tools"])
+    narrowed = client.post(
+        "/v1/sites/site-a/mcps/devops-cli/call",
+        json={**body, "agent_token": _mint()},
+    )
+    assert narrowed.status_code == 200
+
+    # Nothing granted: denied.
+    enforcing.agents["agent-a"] = _agent(tools=[], mcps=[])
+    denied = client.post(
+        "/v1/sites/site-a/mcps/devops-cli/call",
+        json={**body, "agent_token": _mint()},
+    )
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "access_denied"
+
+
+def test_log_mode_permits_but_warns(caplog):
+    conn = _install_conn()
+    seen = {}
+    conn.request = _capture(seen)
+
+    with caplog.at_level(logging.WARNING, logger="services.edge_relay.app"):
+        response = TestClient(app_module.app).post(
+            "/v1/sites/site-a/call",
+            json={"tool": "echo", "args": {"q": "x"}, "agent_token": "t1.forged.signature"},
+        )
+
+    assert response.status_code == 200
+    assert seen["call"][0] == "echo"
+    assert "would deny" in caplog.text
+
+
+def test_an_access_denial_is_audited_with_the_agent_and_no_args(monkeypatch, enforcing):
+    events = []
+    monkeypatch.setattr(
+        app_module.audit, "record", lambda event, **kw: events.append({"event": event, **kw})
+    )
+    conn = _install_conn()
+    conn.request = pytest.fail
+    enforcing.agents["agent-a"] = _agent(tools=[])
+
+    response = TestClient(app_module.app).post(
+        "/v1/sites/site-a/call",
+        json={"tool": "echo", "args": {"q": "do-not-log-me"}, "agent_token": _mint()},
+    )
+
+    assert response.status_code == 403
+    assert [event["outcome"] for event in events] == ["access_denied"]
+    entry = events[0]
+    assert entry["site"] == "site-a"
+    assert entry["tool"] == "echo"
+    assert entry["agent"] == "agent-a"
+    assert "args" not in entry
+    assert "do-not-log-me" not in str(events)
+
+
+def test_a_malformed_token_shape_is_a_400_in_log_mode():
+    """Shape checks stay a `invalid_arguments` 400, not a token verdict."""
+    conn = _install_conn()
+    conn.request = pytest.fail
+
+    response = TestClient(app_module.app).post(
+        "/v1/sites/site-a/call",
+        json={"tool": "echo", "args": {"q": "x"}, "agent_token": "a" * 5000},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_arguments"
+
+
+def test_a_token_with_control_characters_is_a_400():
+    conn = _install_conn()
+
+    response = TestClient(app_module.app).post(
+        "/v1/sites/site-a/call",
+        json={"tool": "echo", "args": {"q": "x"}, "agent_token": "t1.a\nb.c"},
+    )
+
+    assert response.status_code == 400
+    assert conn.ws.sent == []

@@ -64,9 +64,11 @@ def record(
     tool: Optional[str] = None,
     call_id: Optional[str] = None,
     user: Optional[str] = None,
+    agent: Optional[str] = None,
     ms: Optional[int] = None,
     args_bytes: Optional[int] = None,
     result_bytes: Optional[int] = None,
+    has_sealed: Optional[bool] = None,
 ) -> None:
     """Emit one audit line. Never pass payloads through here."""
     entry: dict[str, Any] = {
@@ -83,10 +85,15 @@ def record(
         entry["call_id"] = call_id
     if user is not None:
         entry["user"] = user
+    if agent is not None:
+        entry["agent"] = agent
     if ms is not None:
         entry["ms"] = ms
     if args_bytes is not None:
         entry["args_bytes"] = args_bytes
     if result_bytes is not None:
         entry["result_bytes"] = result_bytes
+    if has_sealed is not None:
+        # Presence only. The envelope itself is ciphertext and must never be logged.
+        entry["has_sealed"] = bool(has_sealed)
     logger.info(json.dumps(entry, separators=(",", ":")))

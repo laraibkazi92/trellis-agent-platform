@@ -2,8 +2,10 @@
 #
 # Runs on an INTERNAL VM that has outbound 443 to the central Trellis host and no
 # inbound reachability. It dials out over WSS, and executes only the tools listed in
-# proxy.yaml's `exports` allowlist, locally, with the same tool.yaml schema and the same
-# sandbox as the central hub.
+# proxy.yaml's `exports` allowlist, locally, with the same tool.yaml schema as central.
+# Since v0.6 those calls run in the edge `runner` service below (one gVisor container
+# per call, `sandbox: container` in proxy.yaml); the in-process bwrap/Landlock backends
+# remain for local development only.
 #
 # Deliberately standalone: no etcd, no redis, no shared network with the central stack,
 # and no service from the engine's docker-compose.yml. See docs/proxy.md.
@@ -22,16 +24,33 @@ services:
     command: python core/proxy.py --config /etc/trellis/proxy.yaml
     # Non-secret runtime settings only (HTTPS_PROXY, SANDBOX_RLIMIT_AS_MB=8192 for Node MCP
     # servers, ...). Credentials do NOT belong here: the shared store is
-    # `edge-secrets/<tool-or-mcp>.env` and per-user credentials are
-    # `edge-user-secrets/<normalized-email>.env` (both mounted below, mode 0600, written by
-    # `python core/proxy.py user-secrets set <email>`). The process env is only the last
-    # fallback in the resolution chain, for a legacy install that still carries a value
-    # here. The tunnel token is deliberately NOT here either -- Docker injects secrets as a
-    # mounted file, which keeps the token out of the process environment (and out of
-    # /proc/<pid>/environ).
+    # `edge-secrets/<tool-or-mcp>.env` and per-user credentials are sealed in the
+    # central UI and opened with the edge key mounted below (never plaintext files).
+    # The process env is only the last fallback for a shared install that still
+    # carries a value here. The tunnel token is deliberately NOT here either -- Docker
+    # injects secrets as a mounted file, which keeps the token out of the process
+    # environment (and out of /proc/<pid>/environ).
     env_file: .env
     secrets:
       - edge_token
+    environment:
+      # v0.6: `sandbox: container` (the default for new installs) executes tools in
+      # the edge runner below, over this shared socket. RUNNER_TOKEN must match the
+      # runner service; the proxy sends it as a bearer on every call.
+      RUNNER_SOCKET: ${RUNNER_SOCKET:-/run/trellis/runner.sock}
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-}
+      # The private half of the per-user credential key. Mounted read-only below and
+      # readable by this service ONLY: the runner never sees it, and no tool container
+      # is ever given the path. Generate it once on the host (docs/proxy.md ->
+      # "Per-user credentials and the edge key"); `trellis-proxy edge-keygen --show`
+      # prints the public fingerprint.
+      EDGE_PRIVATE_KEY_PATH: ${EDGE_PRIVATE_KEY_PATH:-/etc/trellis/edge-key}
+      # Phase 3: the edge verifies the agent token's signature and expiry on every
+      # call (it has no agent registry, so the allowlist decision stays central).
+      # Must be the same value (rotation list) as the central host's.
+      AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET in this edge's .env to the central value}
+      # off | log | enforce: enforce refuses a missing/invalid/expired token.
+      ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
     volumes:
       # The sandbox grants tools exactly one writable path, /app/workspace (override
       # with SANDBOX_RW_PATH). It must exist, and it must be writable if any exported
@@ -49,11 +68,15 @@ services:
       # inside it would hand every exported tool every other item's secrets.
       # Create it 0700 and owned by TRELLIS_UID on the host before starting.
       - ./edge-secrets:/etc/trellis/edge-secrets
-      # `user_secrets_dir`: one <normalized-email>.env per operator, written by
-      # `python core/proxy.py user-secrets set <email>` (mode 0600). Same reason it
-      # must not be inside the workspace.
-      - ./edge-user-secrets:/etc/trellis/edge-user-secrets
+      # The per-user credential key: `./edge-key` is a FILE on the host, mode 0400,
+      # owned by TRELLIS_UID. Mounted read-only into this service only -- the runner
+      # service below must never mount it, and the proxy propagates nothing about it
+      # into a tool container.
+      - ./edge-key:/etc/trellis/edge-key:ro
       - ./proxy.yaml:/etc/trellis/proxy.yaml:ro
+      # v0.6: the runner control socket. `sandbox: container` in proxy.yaml routes
+      # every tool call through it; the legacy backends do not touch it.
+      - proxy-runner:/run/trellis
     # PID 1 must reap tool children, same reason as the central hub: a tool that
     # daemonizes would otherwise leave zombies under a long-lived proxy.
     init: true
@@ -64,10 +87,14 @@ services:
     # host plus whatever the exported tools themselves call; that outbound path is the
     # whole point of the edge install.
 
-    # --- Shared sandbox (optional) -------------------------------------------------
-    # The default posture is the Landlock helper, which only ADDS restrictions and runs
+    # --- Shared sandbox (optional, DEV ONLY from v0.6) -----------------------------
+    # v0.6 production path: set `sandbox: container` in proxy.yaml (see the sample)
+    # and let the `runner` service below create one gVisor container per call. The
+    # notes here describe the LEGACY in-process backends, kept for local development
+    # on a machine without runsc.
+    # The legacy default posture is the Landlock helper, which only ADDS restrictions and runs
     # unprivileged, so `no-new-privileges` above is sufficient. If you want the *shared*
-    # sandbox -- bubblewrap, as the central hub uses it -- replace the security_opt list
+    # sandbox -- bubblewrap, as the central hub used to -- replace the security_opt list
     # above with the block below. bwrap needs these container-level exceptions to build
     # its root (mount + pivot_root); the rationale for each line, and why cap_add stays
     # empty, is documented on the `hub` service in this project's docker-compose.yml.
@@ -82,6 +109,75 @@ services:
     # Orgs that forbid unconfined profiles can install deploy/apparmor/trellis-hub on the
     # host and select it with `apparmor=trellis-hub` instead of `apparmor=unconfined`.
 
+  # Edge execution runner (v0.6) -- the only service on this host with the Docker
+  # socket. Same image and same contract as the central runner: one gVisor container
+  # per tool call, read-only suite + shared mounts, deny-by-default network profile.
+  # The control API is a Unix socket on the `proxy-runner` volume, never a port.
+  # Requires the edge host to have runsc registered with its Docker daemon and
+  # scripts/setup-network-profiles.sh run as root (see docs/proxy.md).
+  runner:
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:latest}
+    container_name: trellis-edge-runner
+    # Root only to open the Docker socket; tool containers run as TRELLIS_UID/GID.
+    user: "0:0"
+    group_add:
+      - "${DOCKER_GID:-999}"
+    command: python -m core.execution.runner
+    network_mode: "none"
+    read_only: true
+    tmpfs:
+      - /tmp:exec,mode=1777
+    cap_drop: [ALL]
+    # CHOWN + DAC_OVERRIDE: root chgrps the control socket to TRELLIS_GID, and writes
+    # the canary / agent output dirs into a workspace owned by TRELLIS_UID (see the
+    # central docker-compose.yml). Tool containers still run with CapDrop=ALL.
+    cap_add: [CHOWN, DAC_OVERRIDE]
+    security_opt:
+      - "no-new-privileges:true"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Read-write: the runner writes the host-path canary and creates the agent output
+      # directories it mounts into tool containers. Tools themselves only see the
+      # read-only suite/shared mounts.
+      - ./workspace:/app/workspace
+      - proxy-runner:/run/trellis
+    environment:
+      RUNNER_SOCKET: /run/trellis/runner.sock
+      # Must be identical to the value trellis-proxy uses. Required: an unauthenticated
+      # socket can create containers.
+      RUNNER_TOKEN: ${RUNNER_TOKEN:?set RUNNER_TOKEN in this edge's .env (openssl rand -hex 32)}
+      # The HOST path of ./workspace on THIS machine (not a path inside a container).
+      # Docker resolves every tool bind mount against it; a container path here makes
+      # every mount resolve to the wrong files and the startup canary refuses to serve.
+      TRELLIS_HOST_WORKSPACE: ${TRELLIS_HOST_WORKSPACE:?set TRELLIS_HOST_WORKSPACE to this host's absolute ./workspace path}
+      CONTAINER_DEFAULT_RUNTIME: ${CONTAINER_DEFAULT_RUNTIME:-runsc}
+      RUNNER_IMAGE: ${RUNNER_IMAGE:-${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:latest}}
+      TRELLIS_INSTALL_ID: ${TRELLIS_INSTALL_ID:-default}
+      # `internal` profile allowlist (comma-separated CIDRs the tools may reach).
+      TRELLIS_INTERNAL_CIDRS: ${TRELLIS_INTERNAL_CIDRS:-}
+      TRELLIS_ENGINE_SUBNETS: ${TRELLIS_ENGINE_SUBNETS:-}
+      TOOLS_NET_INTERNAL_SUBNET: ${TOOLS_NET_INTERNAL_SUBNET:-172.31.241.0/24}
+      TOOLS_NET_INTERNET_SUBNET: ${TOOLS_NET_INTERNET_SUBNET:-172.31.240.0/24}
+      # Resolvers gVisor can reach (Docker's embedded 127.0.0.11 is not). See the
+      # central docker-compose.yml / docs/deploy.md, "Name resolution".
+      TOOLS_INTERNET_DNS: ${TOOLS_INTERNET_DNS:-1.1.1.1,8.8.8.8}
+      TOOLS_INTERNAL_DNS: ${TOOLS_INTERNAL_DNS:-}
+      TRELLIS_UID: ${TRELLIS_UID:-1000}
+      TRELLIS_GID: ${TRELLIS_GID:-1000}
+      # The edge has no agent registry or agent manifests: the relay already made
+      # the allowlist decision. The edge runner verifies signature and expiry only.
+      AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET in this edge's .env to the central value}
+      ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
+      RUNNER_AUTHORIZATION: signature
+      PYTHONDONTWRITEBYTECODE: "1"
+    healthcheck:
+      test: ["CMD-SHELL", "python -m core.execution.runner --healthcheck"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
 secrets:
   # `edge-token` is the plaintext enrollment token, written here once:
   #   umask 077 && printf '%s' 'edge_<site>_<secret>' > edge-token
@@ -89,3 +185,8 @@ secrets:
   # `token_file:` in proxy.yaml. Never commit it; rotate it from Admin -> Edges if it leaks.
   edge_token:
     file: ./edge-token
+
+volumes:
+  # Control socket shared by trellis-proxy and the edge runner. A named volume (not a
+  # bind) so the socket's ownership never depends on a host directory.
+  proxy-runner:

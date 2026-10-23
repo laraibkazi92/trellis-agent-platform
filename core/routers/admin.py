@@ -13,6 +13,11 @@ from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import templates, CSRFRoute
 from core.auth import get_identity_manager
+from core import edge_secrets_central
+from core.edge_keypair import key_id as edge_key_id
+import logging
+
+logger = logging.getLogger(__name__)
 from core.health import HealthMonitor
 from core.llm_factory import ProviderConfigError, infer_provider
 from core.llm_providers import (
@@ -1051,6 +1056,40 @@ def _normalize_edge_caps(raw) -> list[str]:
     return ["tools"]
 
 
+def _edge_key_view(name: str, config: dict) -> dict:
+    """Fingerprint state for the Admin -> Edges card.
+
+    ``edge_key_fp`` / ``edge_key_fps`` are written by the relay from the edge's hello
+    frame. When no key has been published yet the card simply omits the block, and we
+    do not touch the sealed-credential store at all (a pre-phase-4 fixture has no
+    ``client`` surface either).
+    """
+    fp = config.get("edge_key_fp") if isinstance(config.get("edge_key_fp"), str) else ""
+    if not fp:
+        return {"edge_key_fp": "", "edge_key_id": "", "edge_key_rotated_at": "", "retired_credentials": 0}
+
+    key_id = config.get("edge_key_id")
+    if not isinstance(key_id, str) or not key_id:
+        key_id = edge_key_id(fp)
+
+    retired = 0
+    try:
+        retired = len(
+            edge_secrets_central.retired_blobs(
+                identity_mgr, name, edge_secrets_central.active_fingerprints(config)
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - the admin page must render without etcd
+        logger.warning("Edge %s: could not count retired credential records: %s", name, exc)
+
+    return {
+        "edge_key_fp": fp,
+        "edge_key_id": key_id,
+        "edge_key_rotated_at": edge_secrets_central.last_rotated_at(config),
+        "retired_credentials": retired,
+    }
+
+
 @router.get("/admin/edges", response_class=HTMLResponse)
 async def admin_edges_page(request: Request):
     if redirect := require_admin(request, '/admin'):
@@ -1088,6 +1127,7 @@ async def admin_edges_page(request: Request):
                 or config.get("last_seen") or ""
             ),
             "rate_limit_per_min": config.get("rate_limit_per_min"),
+            **_edge_key_view(name, config),
         })
 
     return templates.TemplateResponse(

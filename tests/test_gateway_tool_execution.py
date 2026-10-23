@@ -177,6 +177,8 @@ def test_use_tool_executes_local_hub_tool_and_returns_structured_output(monkeypa
     assert result == {"stdout": "{}", "stderr": "", "exit_code": 0}
     name, arguments, raise_on_error = fake_client.calls[0]
     assert name == "opsctl"
+    token = arguments.pop("__agent_token", None)
+    assert token is None or token.startswith("t1.")
     assert arguments == {"args": ["--help"], "__user_id": "user-42"}
     assert raise_on_error is False
 

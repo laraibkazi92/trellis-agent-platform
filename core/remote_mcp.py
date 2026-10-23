@@ -18,6 +18,7 @@ Arguments, results, and response bodies are never logged: they carry the
 customer's internal data.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ from typing import Any, Dict, Optional
 
 import httpx
 
+from core import edge_secrets_central
 from core.auth import get_identity_manager
 from core.caller_identity import resolve_user_email
 from core.tool_runtime import MAX_RESULT_CHARS
@@ -108,6 +110,7 @@ async def call_edge_mcp(
     user_id: Optional[str],
     *,
     timeout_seconds: Optional[float] = None,
+    agent_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Calls one tool on an MCP server exported by edge ``site``.
 
@@ -123,6 +126,10 @@ async def call_edge_mcp(
 
         timeout_seconds = resolve_tunable("tool_execution_timeout")
 
+    if agent_token:
+        from core.agent_token import refresh
+
+        agent_token = refresh(agent_token)
     label = f"{site}__{mcp}__{tool}"
     # The HTTP read timeout leads deadline_ms by 5 s so the edge's structured
     # timeout (or the relay's 504) wins the race and the caller sees a reason,
@@ -138,6 +145,21 @@ async def call_edge_mcp(
         logger.warning(f"Could not resolve the caller email for edge MCP tool {label}: {exc}")
         user_email = None
 
+    # The caller's browser-sealed set for this (site, mcp, user). Central only ever
+    # holds the ciphertext: it is forwarded verbatim and never logged.
+    sealed: Optional[Dict[str, Any]] = None
+    if user_id:
+        try:
+            sealed = await asyncio.to_thread(
+                edge_secrets_central.get, identity_mgr, site, user_id, "mcp", mcp
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not read sealed credentials for edge MCP tool %s (%s)",
+                label,
+                type(exc).__name__,
+            )
+
     try:
         async with _remote_client(timeout_seconds + 35) as client:
             response = await client.post(
@@ -148,6 +170,8 @@ async def call_edge_mcp(
                     "deadline_ms": deadline_ms,
                     "user": user_id,
                     "user_email": user_email,
+                    "agent_token": agent_token,
+                    "sealed": sealed,
                 },
             )
     except httpx.TimeoutException as exc:

@@ -46,9 +46,9 @@ EXPECTED_KEYS = {
     "mcps_dir",
     "export_mcps",
     "secrets_dir",
-    "user_secrets_dir",
     "env_passthrough",
     "sandbox",
+    "runner_socket",
 }
 
 
@@ -141,11 +141,13 @@ def test_example_values_parse_as_declared():
     assert config.tools_dir == Path("workspace/tools")
     assert config.mcps_dir == Path("workspace/mcps")
 
-    # Credential stores are mounted outside the tool-writable workspace.
+    # The shared credential store lives outside the tool-writable workspace. Per-user
+    # credentials are sealed in central, so there is no per-user directory.
     assert config.secrets_dir == Path("/etc/trellis/edge-secrets")
-    assert config.user_secrets_dir == Path("/etc/trellis/edge-user-secrets")
+    assert not hasattr(config, "user_secrets_dir")
 
-    assert config.sandbox == "auto"
+    assert config.sandbox == "container"
+    assert config.runner_socket == "/run/trellis/runner.sock"
     assert config.env_passthrough is False
     assert config.tls_ca_file is None
 
@@ -273,8 +275,10 @@ def test_broken_copy_is_rejected_at_load(tmp_path, old, new, match):
 def test_paths_are_inside_the_container_mounts():
     config = proxy.load_config(EXAMPLE)
 
-    for name in ("tools_dir", "mcps_dir", "secrets_dir", "user_secrets_dir"):
-        path = Path(getattr(config, name))
+    named = {name: Path(getattr(config, name)) for name in ("tools_dir", "mcps_dir", "secrets_dir")}
+    # The key path is env-only (EDGE_PRIVATE_KEY_PATH), not a ProxyConfig field.
+    named["edge_key"] = Path("/etc/trellis/edge-key")
+    for name, path in named.items():
         assert ".." not in path.parts, f"{name} escapes its mount: {path}"
         absolute = path if path.is_absolute() else CONTAINER_WORKDIR / path
         assert str(absolute).startswith(MOUNTED_ROOTS), f"{name} is not a mounted path: {path}"
@@ -285,8 +289,7 @@ def test_credential_stores_are_outside_the_tool_writable_workspace():
     config = proxy.load_config(EXAMPLE)
     workspace = CONTAINER_WORKDIR / "workspace"
 
-    for name in ("secrets_dir", "user_secrets_dir"):
-        path = Path(getattr(config, name))
+    for path in (Path(config.secrets_dir), Path("/etc/trellis/edge-key")):
         assert not str(path).startswith(str(workspace))
 
 
@@ -294,7 +297,8 @@ def test_compose_mounts_what_proxy_yaml_points_at():
     """The sample compose and the sample config must agree, or the install is dead."""
     config = proxy.load_config(EXAMPLE)
     compose = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
-    volumes = compose["services"]["trellis-proxy"]["volumes"]
+    proxy_service = compose["services"]["trellis-proxy"]
+    volumes = proxy_service["volumes"]
 
     targets = []
     for entry in volumes:
@@ -302,12 +306,24 @@ def test_compose_mounts_what_proxy_yaml_points_at():
         target = rest.split(":", 1)[0] if rest else source
         targets.append(Path(target))
 
-    for name in ("tools_dir", "mcps_dir", "secrets_dir", "user_secrets_dir"):
+    for name in ("tools_dir", "mcps_dir", "secrets_dir"):
         path = Path(getattr(config, name))
         absolute = path if path.is_absolute() else CONTAINER_WORKDIR / path
         assert any(
             absolute == target or str(absolute).startswith(f"{target}/") for target in targets
         ), f"{name} ({absolute}) is not mounted by {COMPOSE.name}"
+
+    # The seal key is a read-only file mount into the proxy ONLY.
+    assert Path("/etc/trellis/edge-key") in targets
+    assert "/etc/trellis/edge-key" in proxy_service["environment"]["EDGE_PRIVATE_KEY_PATH"]
+    runner_targets = {
+        str(entry).partition(":")[2].split(":", 1)[0]
+        for entry in compose["services"]["runner"]["volumes"]
+        if ":" in str(entry)
+    }
+    assert "/etc/trellis/edge-key" not in runner_targets
+    # No plaintext per-user store is mounted anywhere any more.
+    assert not any("edge-user-secrets" in str(entry) for entry in volumes)
 
 
 # ---------------------------------------------------------------- helpers

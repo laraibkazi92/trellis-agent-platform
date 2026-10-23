@@ -64,6 +64,22 @@ The host's `GET /health` endpoint also reports the operational status of every r
 
 ---
 
+## Server-Side Enforcement (v0.6)
+
+`allowed_tools` and `allowed_mcps` are no longer just a registration filter. At call
+time the hub, edge relay and runner verify the run's agent token and re-resolve the
+agent's allowlist before executing anything. The token is minted by the framework and is
+invisible to agent configs and prompts; nothing in `skills.md` needs to change.
+
+Practical consequences:
+
+- A tool name an agent may call must appear in `allowed_tools`, or its MCP server in
+  `allowed_mcps` (an edge wildcard `<site>__*` expands at call time).
+- Console tools (`execute`, `ls`, `read_file`, …) additionally require the name in
+  `allowed_tools`.
+- A background agent (`svc_agent_<name>`) is checked against `<name>`'s config.
+- `ENFORCE_AGENT_TOKENS=log` is the one-window escape hatch while upgrading.
+
 ## Building Agents
 
 ### Directory Structure

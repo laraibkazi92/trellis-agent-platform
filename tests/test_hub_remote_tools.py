@@ -57,11 +57,13 @@ def _no_real_identity_lookup(monkeypatch):
     """The email lookup is etcd I/O; each test pins its own profile instead.
 
     DEV_MODE is forced off so a developer's shell cannot turn a profile lookup into
-    the dev fallback email.
+    the dev fallback email. The sealed-credential read is etcd I/O too: tests that
+    care about it override this with their own fake.
     """
     monkeypatch.delenv("DEV_MODE", raising=False)
     monkeypatch.delenv("DEV_USER_EMAIL", raising=False)
     monkeypatch.setattr(hub.identity_mgr, "get_user", lambda user_id: None)
+    monkeypatch.setattr(hub.edge_secrets_central, "get", lambda *args, **kwargs: None)
 
 
 def make_remote_config(**kw):
@@ -224,10 +226,50 @@ def test_remote_dispatch_success_returns_result_and_records_health(monkeypatch):
         "user": "user-1",
         # No profile in the registry stub, so nothing is forwarded.
         "user_email": None,
+        # v0.6: the run's agent token rides the body (None outside a run).
+        "agent_token": None,
+        # No sealed per-user credential is registered for this caller.
+        "sealed": None,
     }
     # The tunable resolves to a float; the relay's strict schema rejects 330000.0.
     # Caught by the P1 end-to-end run, not by equality (float == int is True).
     assert isinstance(body["deadline_ms"], int)
+
+
+def test_remote_dispatch_forwards_the_callers_sealed_blob(monkeypatch):
+    """The ciphertext is fetched for this (site, tool, user) and rides the body verbatim."""
+    config = make_remote_config()
+    install_fake_health(monkeypatch)
+    blob = {"v": 1, "ciphertext": "opaque", "keys": ["NODE_SSH_USER"]}
+    asked = []
+
+    def fake_get(identity_mgr, site, user_id, kind, name):
+        asked.append((site, user_id, kind, name))
+        return dict(blob)
+
+    monkeypatch.setattr(hub.edge_secrets_central, "get", fake_get)
+    requests = install_transport(
+        monkeypatch, json_response(200, {"tool": TOOL, "result": {"temp": 1}})
+    )
+
+    assert run_remote(config, {"unit": "1"}, user_id="user-1") == {"temp": 1}
+    assert asked == [(SITE, "user-1", "tool", TOOL)]
+    assert json.loads(requests[0].content)["sealed"] == blob
+
+
+def test_remote_dispatch_without_a_user_never_reads_sealed_credentials(monkeypatch):
+    monkeypatch.setattr(
+        hub.edge_secrets_central,
+        "get",
+        lambda *args, **kwargs: pytest.fail("no user id, no blob lookup"),
+    )
+    install_fake_health(monkeypatch)
+    requests = install_transport(
+        monkeypatch, json_response(200, {"tool": TOOL, "result": {"temp": 1}})
+    )
+
+    assert run_remote(make_remote_config(), {"unit": "1"}, user_id=None) == {"temp": 1}
+    assert json.loads(requests[0].content)["sealed"] is None
 
 
 def test_remote_call_forwards_the_resolved_user_email(monkeypatch):

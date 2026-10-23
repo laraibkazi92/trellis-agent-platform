@@ -38,7 +38,7 @@ if not DEV_MODE:
 # Warn if this is an unauthenticated DEV_MODE instance (see core/devmode.py).
 enforce_dev_mode_safety("ui")
 
-from core.routers import auth, marketplace, profile, admin, configuration, docs, status, workflows, api, reports, mcp_oauth
+from core.routers import auth, marketplace, profile, admin, configuration, docs, status, workflows, api, reports, mcp_oauth, edge_secrets
 
 app = FastAPI(title="Marketplace UI", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
@@ -56,3 +56,4 @@ app.include_router(workflows.router)
 app.include_router(api.router)
 app.include_router(reports.router)
 app.include_router(mcp_oauth.router)
+app.include_router(edge_secrets.router)

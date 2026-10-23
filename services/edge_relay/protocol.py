@@ -15,10 +15,20 @@ identical on both sides.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hmac
 import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from cryptography.exceptions import UnsupportedAlgorithm
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
+
+from core import edge_crypto
+from core.edge_keypair import fingerprint as spki_fingerprint
 
 PROTO = 2
 # A proto-1 edge is the v0.4 tools-only edge: it degrades cleanly, never gets
@@ -48,6 +58,9 @@ MAX_MCP_SCHEMA_BYTES = 131_072
 MAX_MCP_DESC_CHARS = 8_192
 # RFC 5321 caps a forward path at 256 bytes including the angle brackets.
 MAX_USER_EMAIL_CHARS = 254
+# A t1 token is a few hundred bytes; the cap only bounds what the relay will
+# validate and forward to the edge.
+MAX_AGENT_TOKEN_CHARS = 4096
 # Slightly above the hub's default tool timeout (300 s) so the edge's own,
 # structured timeout wins the race and the caller gets the tool's error instead
 # of a bare relay 504.
@@ -65,6 +78,17 @@ EDGE_FRAMES = frozenset({"hello", "result", "ping"})
 RELAY_FRAMES = frozenset({"welcome", "call", "ping", "catalog", "drain"})
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# hello.credential_keys is a name -> {secret_keys, variable_keys} map for every
+# export. Both halves are bounded by the catalog caps, and one manifest with hundreds
+# of fields is a misconfiguration rather than a working tool.
+MAX_CREDENTIAL_TARGETS = MAX_TOOLS + MAX_MCPS
+MAX_DECLARED_KEYS = 256
+MAX_ENV_NAME_CHARS = 128
+# The seal format is RSA-OAEP; a different modulus size is not something central's
+# browser form can produce, so a hello claiming one is refused rather than pinned.
+EDGE_KEY_BITS = 3072
 
 # hello.caps: what the edge can serve. Tools-only is the v0.4 default.
 SUPPORTED_CAPS = frozenset({"tools", "mcp"})
@@ -131,6 +155,189 @@ def decode(raw: Any, allowed: Iterable[str]) -> Dict[str, Any]:
     if frame_type not in allowed:
         raise ProtocolError(f"unexpected frame type: {frame_type!r}", CLOSE_UNKNOWN_TYPE)
     return frame
+
+
+@dataclass(frozen=True)
+class EdgeCredentials:
+    """The credential key material an edge publishes in ``hello``.
+
+    ``credential_keys`` is ``{export_name: {secret_keys, variable_keys}}``: names only,
+    so central can render the browser seal form for a target whose relay-published
+    ``<site>__<name>`` config deliberately omits ``secrets``/``variables``. The
+    optional key fields are absent for a v0.5 edge (shared credentials only).
+    """
+
+    edge_pubkey: Optional[str] = None
+    edge_key_fp: Optional[str] = None
+    prev_edge_key_fp: Optional[str] = None
+    credential_keys: Dict[str, Dict[str, List[str]]] = field(default_factory=dict)
+
+    @property
+    def key_id(self) -> Optional[str]:
+        fp = self.edge_key_fp
+        return fp[7:23] if isinstance(fp, str) and fp else None
+
+    def as_record(self) -> Dict[str, Any]:
+        """The subset the relay pins in ``/registry/edges/<site>/config``."""
+        record: Dict[str, Any] = {}
+        if self.edge_pubkey is not None:
+            record["edge_pubkey"] = self.edge_pubkey
+        if self.edge_key_fp is not None:
+            record["edge_key_fp"] = self.edge_key_fp
+            record["edge_key_id"] = self.key_id
+        if self.prev_edge_key_fp is not None:
+            record["prev_edge_key_fp"] = self.prev_edge_key_fp
+        if self.credential_keys:
+            record["credential_keys"] = self.credential_keys
+        return record
+
+
+class HelloValidation(tuple):
+    """The v0.5 five-tuple, plus ``credentials`` on the side.
+
+    Existing unpackers (``proto, version, tools, mcps, caps = ...``) keep working
+    unchanged; the relay reads the new material from ``.credentials``.
+    """
+
+    def __new__(
+        cls,
+        proto: int,
+        version: str,
+        tools: List[EdgeTool],
+        mcps: List[EdgeMcp],
+        caps: List[str],
+        credentials: EdgeCredentials,
+    ) -> "HelloValidation":
+        instance = super().__new__(cls, (proto, version, tools, mcps, caps))
+        instance.credentials = credentials
+        return instance
+
+
+def _validate_edge_pubkey(raw: Any) -> str:
+    """Validate a hello ``edge_pubkey`` and return the fingerprint it must match."""
+    if not isinstance(raw, str) or not raw:
+        raise ProtocolError("hello.edge_pubkey must be a base64 SPKI string")
+    try:
+        der = base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError):
+        raise ProtocolError("hello.edge_pubkey is not valid base64") from None
+    try:
+        public_key = serialization.load_der_public_key(der)
+    except (ValueError, TypeError, UnsupportedAlgorithm):
+        raise ProtocolError("hello.edge_pubkey is not a DER SubjectPublicKeyInfo") from None
+    if not isinstance(public_key, RSAPublicKey):
+        raise ProtocolError("hello.edge_pubkey is not an RSA key")
+    if public_key.key_size != EDGE_KEY_BITS:
+        raise ProtocolError(
+            f"hello.edge_pubkey is {public_key.key_size}-bit; the seal format requires "
+            f"{EDGE_KEY_BITS}"
+        )
+    return spki_fingerprint(der)
+
+
+def _validate_fingerprint(raw: Any, field_name: str) -> str:
+    if not isinstance(raw, str) or not raw.startswith("SHA256:") or len(raw) < 10:
+        raise ProtocolError(f"hello.{field_name} must be a SHA256: fingerprint")
+    return raw
+
+
+def _validate_key_list(raw: Any, field_name: str) -> List[str]:
+    if not isinstance(raw, list):
+        raise ProtocolError(f"hello.credential_keys[].{field_name} must be a list")
+    if len(raw) > MAX_DECLARED_KEYS:
+        raise ProtocolError(
+            f"hello.credential_keys[].{field_name} exceeds {MAX_DECLARED_KEYS} names"
+        )
+    names: List[str] = []
+    for name in raw:
+        if (
+            not isinstance(name, str)
+            or len(name) > MAX_ENV_NAME_CHARS
+            or not ENV_NAME_RE.match(name)
+        ):
+            raise ProtocolError(
+                f"hello.credential_keys[].{field_name} has an invalid env name: {name!r}"
+            )
+        if name in names:
+            raise ProtocolError(
+                f"hello.credential_keys[].{field_name} lists {name!r} twice"
+            )
+        names.append(name)
+    return names
+
+
+def _validate_credential_keys(raw: Any) -> Dict[str, Dict[str, List[str]]]:
+    """Names only: every entry must be ``{secret_keys: [...], variable_keys: [...]}``."""
+    if raw in (None, {}):
+        return {}
+    if not isinstance(raw, dict):
+        raise ProtocolError("hello.credential_keys must be an object")
+    if len(raw) > MAX_CREDENTIAL_TARGETS:
+        raise ProtocolError(
+            f"hello.credential_keys exceeds {MAX_CREDENTIAL_TARGETS} targets"
+        )
+    cleaned: Dict[str, Dict[str, List[str]]] = {}
+    for name, entry in raw.items():
+        if not isinstance(name, str) or not NAME_RE.match(name):
+            raise ProtocolError(f"invalid hello.credential_keys target: {name!r}")
+        _check_namespace(name, "credential_keys target")
+        if not isinstance(entry, dict):
+            raise ProtocolError(
+                f"hello.credential_keys[{name!r}] must be an object"
+            )
+        unknown = set(entry) - {"secret_keys", "variable_keys"}
+        if unknown:
+            raise ProtocolError(
+                f"hello.credential_keys[{name!r}] has unknown key(s): "
+                f"{', '.join(sorted(map(str, unknown)))}"
+            )
+        secret = _validate_key_list(entry.get("secret_keys"), "secret_keys")
+        variable = _validate_key_list(entry.get("variable_keys"), "variable_keys")
+        # A name in both lists is ambiguous; the write gate treats it as a variable,
+        # so the edge must not advertise it as a sealable secret.
+        overlap = sorted(set(secret) & set(variable))
+        if overlap:
+            raise ProtocolError(
+                f"hello.credential_keys[{name!r}] lists {overlap[0]!r} as both a "
+                "secret and a variable"
+            )
+        cleaned[name] = {
+            "secret_keys": sorted(secret),
+            "variable_keys": sorted(variable),
+        }
+    return cleaned
+
+
+def _validate_edge_credentials(frame: Dict[str, Any]) -> EdgeCredentials:
+    """Parse the optional key/credential block; a v0.5 edge has none of it."""
+    raw_keys = frame.get("credential_keys")
+    credential_keys = _validate_credential_keys(raw_keys)
+
+    pubkey = frame.get("edge_pubkey")
+    fingerprint = frame.get("edge_key_fp")
+    previous = frame.get("prev_edge_key_fp")
+    if pubkey is None and fingerprint is None and previous is None:
+        return EdgeCredentials(credential_keys=credential_keys)
+
+    if pubkey is None or fingerprint is None:
+        raise ProtocolError(
+            "hello.edge_pubkey and hello.edge_key_fp must be present together"
+        )
+    fp = _validate_fingerprint(fingerprint, "edge_key_fp")
+    computed = _validate_edge_pubkey(pubkey)
+    if not hmac.compare_digest(computed.encode("utf-8"), fp.encode("utf-8")):
+        raise ProtocolError("hello.edge_key_fp does not match hello.edge_pubkey")
+    prev_fp: Optional[str] = None
+    if previous is not None:
+        prev_fp = _validate_fingerprint(previous, "prev_edge_key_fp")
+        if hmac.compare_digest(prev_fp.encode("utf-8"), fp.encode("utf-8")):
+            raise ProtocolError("hello.prev_edge_key_fp must differ from edge_key_fp")
+    return EdgeCredentials(
+        edge_pubkey=pubkey,
+        edge_key_fp=fp,
+        prev_edge_key_fp=prev_fp,
+        credential_keys=credential_keys,
+    )
 
 
 @dataclass(frozen=True)
@@ -363,6 +570,13 @@ def validate_hello(
     ``proto`` is the peer's actual version (1 or 2), not the module default, so
     callers can key behaviour on what the edge speaks rather than on what this
     relay prefers.
+
+    The returned object is that five-tuple with the validated credential material on
+    ``.credentials`` (``EdgeCredentials``): the edge's public key, its fingerprint,
+    the rotation-overlap fingerprint and the per-export declared key names. The key
+    block is optional (a v0.5 edge has none), but when present it is fully checked --
+    an unparsable SPKI, a non-3072-bit key or a fingerprint that does not match the
+    key closes the connection rather than pinning bad material in the registry.
     """
     proto = frame.get("proto")
     # bool is an int subclass: a JSON ``true`` must not read as proto 1.
@@ -384,7 +598,14 @@ def validate_hello(
         # this relay; refusing beats silently dropping them.
         raise ProtocolError("hello.mcps requires the 'mcp' capability")
     mcps = validate_mcps(raw_mcps) if "mcp" in caps else []
-    return proto, version[:64], validate_tools(frame.get("tools")), mcps, caps
+    return HelloValidation(
+        proto,
+        version[:64],
+        validate_tools(frame.get("tools")),
+        mcps,
+        caps,
+        _validate_edge_credentials(frame),
+    )
 
 
 def validate_call(frame: Dict[str, Any]) -> Dict[str, Any]:
@@ -439,6 +660,33 @@ def validate_call(frame: Dict[str, Any]) -> Dict[str, Any]:
         if any(ord(char) < 32 for char in user_email):
             raise ProtocolError("call.user_email must not contain control characters")
 
+    # The agent token is opaque to this module: it is verified by the relay and the
+    # edge, never parsed here. Only its shape is checked, because it crosses the
+    # tunnel verbatim.
+    agent_token = frame.get("agent_token")
+    if agent_token is not None:
+        if not isinstance(agent_token, str):
+            raise ProtocolError("call.agent_token must be a string or null")
+        if len(agent_token) > MAX_AGENT_TOKEN_CHARS:
+            raise ProtocolError(
+                f"call.agent_token exceeds {MAX_AGENT_TOKEN_CHARS} characters"
+            )
+        if any(ord(char) < 32 for char in agent_token):
+            raise ProtocolError(
+                "call.agent_token must not contain control characters"
+            )
+
+    # The sealed per-user credential envelope is opaque to the relay: shape and size
+    # only (``edge_crypto.validate_blob``), never decryptability. Central may have
+    # sealed it to a key the edge has since rotated, so requiring the *current* key id
+    # here would reject a blob the edge can still open during the overlap.
+    sealed = frame.get("sealed")
+    if sealed is not None:
+        try:
+            edge_crypto.validate_blob(sealed)
+        except edge_crypto.SealedError as exc:
+            raise ProtocolError(f"call.sealed is invalid: {exc}") from None
+
     return {
         "id": call_id,
         "kind": kind,
@@ -448,6 +696,8 @@ def validate_call(frame: Dict[str, Any]) -> Dict[str, Any]:
         "deadline_ms": deadline,
         "user": user,
         "user_email": user_email,
+        "agent_token": agent_token,
+        "sealed": sealed,
     }
 
 

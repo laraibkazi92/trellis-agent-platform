@@ -345,7 +345,12 @@ def test_use_tool_executes_resource_inspection_directly_tier1(monkeypatch):
     assert result == {"clusters": ["cluster-1", "cluster-2"]}
     name, arguments, raise_on_error = calls[0]
     assert name == "netctl"
-    assert arguments == {"environment": "preprod", "args": ["cluster", "list"], "__user_id": "user-42"}
+    token = arguments.pop("__agent_token", None)
+    assert token is None or token.startswith("t1.")
+    assert arguments == {
+        "environment": "preprod", "args": ["cluster", "list"],
+        "__user_id": "user-42",
+    }
     assert raise_on_error is False
 
 

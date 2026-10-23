@@ -427,19 +427,20 @@ class _RecordingTransports:
 
             return build
 
+        def runner_transport(entry, env, **kwargs):
+            calls["stdio"] = {"env": env, **kwargs}
+            return {"env": env, **kwargs}
+
         monkeypatch.setattr(
             proxy_mcp,
             "_fastmcp",
             lambda: (
                 FakeClient,
-                transport_class("stdio"),
                 transport_class("http"),
                 transport_class("sse"),
             ),
         )
-        monkeypatch.setattr(
-            proxy_mcp, "build_stdio_argv", lambda entry, home_dir, backend=None: ["node"]
-        )
+        monkeypatch.setattr(proxy_mcp, "_runner_transport", runner_transport)
         return self
 
 
@@ -467,30 +468,32 @@ def test_http_headers_carry_only_the_declared_credentials(tmp_path, process_env,
     monkeypatch.setenv("TRELLIS_USER_EMAIL", "user-1@corp.example")
     monkeypatch.setenv("CORALOGIX_DOMAIN", "corp.example")
     env = proxy_mcp._server_env(
-        entry, tmp_path, {"user": "user-1", "user_email": "user-1@corp.example"},
+        entry, {"user": "user-1", "user_email": "user-1@corp.example"},
         passthrough=False, token_env=None,
     )
 
-    proxy_mcp._transport(entry, tmp_path, env)
+    proxy_mcp._transport(entry, env)
 
     assert recorded.calls["http"]["headers"] == {
         "DEVOPS_PASSWORD": "hunter2",
         "CORALOGIX_DOMAIN": "corp.example",
         "LITERAL_HEADER": "literal-value",
     }
-    # The scoped env is still a subprocess env: identity, HOME, PATH are all there.
+    # The session env is what the runner accepts: declared keys + identity only.
     assert env["TRELLIS_USER_EMAIL"] == "user-1@corp.example"
     assert env["TRELLIS_USER_ID"] == "user-1"
-    assert "HOME" in env and "PATH" in env
     assert "TRELLIS_EDGE_TOKEN" not in env
+    # The container's tmpfs owns HOME/TMPDIR; PATH is the runner's to build.
+    for not_declared in ("HOME", "PATH", "LITERAL_HEADER"):
+        assert not_declared not in env
 
 
 def test_sse_headers_never_include_the_scoped_environment(tmp_path, process_env, monkeypatch):
     recorded = _RecordingTransports().install(monkeypatch)
     entry = mcp_export(tmp_path, transport="sse", secrets=["DEVOPS_PASSWORD"])
-    env = proxy_mcp._server_env(entry, tmp_path, {}, passthrough=False, token_env=None)
+    env = proxy_mcp._server_env(entry, {}, passthrough=False, token_env=None)
 
-    proxy_mcp._transport(entry, tmp_path, env)
+    proxy_mcp._transport(entry, env)
 
     headers = recorded.calls["sse"]["headers"]
     assert headers == {"DEVOPS_PASSWORD": "hunter2"}
@@ -506,28 +509,32 @@ def test_sse_headers_never_include_the_scoped_environment(tmp_path, process_env,
 
 
 def test_passthrough_does_not_widen_http_headers(tmp_path, process_env, monkeypatch):
-    """env_passthrough is a subprocess policy; it must not ship the operator env."""
+    """env_passthrough is a legacy subprocess policy; the runner request stays narrow."""
     recorded = _RecordingTransports().install(monkeypatch)
     entry = mcp_export(tmp_path, transport="http", secrets=["DEVOPS_PASSWORD"])
-    env = proxy_mcp._server_env(entry, tmp_path, {}, passthrough=True, token_env=None)
+    env = proxy_mcp._server_env(entry, {}, passthrough=True, token_env=None)
 
-    proxy_mcp._transport(entry, tmp_path, env)
+    proxy_mcp._transport(entry, env)
 
     assert recorded.calls["http"]["headers"] == {"DEVOPS_PASSWORD": "hunter2"}
-    # ... while the stdio env does get the passthrough treatment.
-    assert env["SUSPICIOUS"] == "1"
+    # Undeclared names are dropped before the request, passthrough or not.
+    assert "SUSPICIOUS" not in env
 
 
-def test_stdio_still_receives_the_full_scoped_environment(tmp_path, process_env, monkeypatch):
+def test_stdio_receives_the_declared_session_env(tmp_path, process_env, monkeypatch):
     recorded = _RecordingTransports().install(monkeypatch)
     entry = mcp_export(tmp_path, transport="stdio", secrets=["DEVOPS_PASSWORD"])
     env = proxy_mcp._server_env(
-        entry, tmp_path, {"user_email": "user-1@corp.example"}, passthrough=False, token_env=None
+        entry, {"user_email": "user-1@corp.example"}, passthrough=False, token_env=None
     )
 
-    proxy_mcp._transport(entry, tmp_path, env)
+    proxy_mcp._transport(entry, env)
 
     assert recorded.calls["stdio"]["env"] is env
+    assert recorded.calls["stdio"]["env"] == {
+        "DEVOPS_PASSWORD": "hunter2",
+        "TRELLIS_USER_EMAIL": "user-1@corp.example",
+    }
 
 
 def test_a_renamed_token_is_not_sent_as_a_header(tmp_path, process_env, monkeypatch):
@@ -536,10 +543,10 @@ def test_a_renamed_token_is_not_sent_as_a_header(tmp_path, process_env, monkeypa
     monkeypatch.setenv("CUSTOM_EDGE_TOKEN", TOKEN)
     entry = mcp_export(tmp_path, transport="http", secrets=["CUSTOM_EDGE_TOKEN"])
     env = proxy_mcp._server_env(
-        entry, tmp_path, {}, passthrough=False, token_env="CUSTOM_EDGE_TOKEN"
+        entry, {}, passthrough=False, token_env="CUSTOM_EDGE_TOKEN"
     )
 
-    proxy_mcp._transport(entry, tmp_path, env, "CUSTOM_EDGE_TOKEN")
+    proxy_mcp._transport(entry, env, "CUSTOM_EDGE_TOKEN")
 
     assert recorded.calls["http"]["headers"] == {}
     assert "CUSTOM_EDGE_TOKEN" not in env

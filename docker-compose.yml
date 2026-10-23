@@ -35,6 +35,104 @@ x-app-build: &app-build
 # container path, so a docker-compose.override.yml replacing /app/workspace keeps the
 # other mounts (e.g. health-data:/app/data) intact.
 services:
+  # Execution Runner (v0.6) -- the ONLY component with the Docker socket.
+  # Every tool call becomes its own gVisor (runsc) container, created from a spec the
+  # runner derives from the registered manifest: the suite is mounted read-only, the
+  # tmpfs is sized, the network profile is pinned (none|internal|internet). Callers name
+  # a tool, never an image, mount, capability or network.
+  # The control API is a Unix socket on the `runner-run` volume -- not a published port.
+  # `network_mode: none` means no tool network can reach it, and only the containers
+  # mounting that volume can drive it. Do not publish it.
+  # It has NO etcd dependency on purpose: tool execution must not stop when the
+  # registry does (the allowlist is resolved from the agent manifests on disk).
+  runner:
+    build: *app-build
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.5.1}
+    container_name: runner
+    # Root only to open /var/run/docker.sock; every container it starts runs as
+    # TRELLIS_UID/TRELLIS_GID from inside the spec, never as root.
+    user: "0:0"
+    # Match the host's docker group so a non-root daemon socket stays reachable if you
+    # ever drop `user: 0:0`.
+    group_add:
+      - "${DOCKER_GID:-999}"
+    command: python -m core.execution.runner
+    # The API is UDS-only: no listener can be reached from a tool network.
+    network_mode: "none"
+    read_only: true
+    # /tmp is tmpfs because the rootfs is read-only and the runner shells out
+    # (preflight, canary) to a few helpers. The socket directory is NOT a tmpfs:
+    # it must be the shared `runner-run` volume below, or no other service could
+    # dial the API (a tmpfs is private to this container).
+    tmpfs:
+      - /tmp:exec,mode=1777
+    cap_drop: [ALL]
+    # The only capabilities the runner needs. CHOWN: as root it chgrps the control
+    # socket to TRELLIS_GID so the app uid (not the world) can drive it. DAC_OVERRIDE:
+    # the workspace is owned by TRELLIS_UID, and the runner writes the host-path
+    # canary and creates the agents' report/output dirs there -- without it root is
+    # bound by the workspace's mode and every startup fails the canary. Both are
+    # already implied by the Docker socket it holds. Containers it starts still get
+    # CapDrop=ALL from the spec.
+    cap_add: [CHOWN, DAC_OVERRIDE]
+    security_opt:
+      - "no-new-privileges:true"
+    volumes:
+      # Docker socket: runner-only. Nothing else in this file may mount it.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Workspace is READ-WRITE here: the runner writes the host-path canary and
+      # creates reports/<agent> / output/<agent> before mounting them into a tool.
+      # Tool containers still get only read-only tools/<suite> + shared/ mounts and,
+      # when a manifest asks for it, a single rw output dir.
+      - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace
+      # The control socket, shared with host/hub/gateway/taskiq-worker.
+      - runner-run:/run/trellis
+    environment:
+      RUNNER_SOCKET: /run/trellis/runner.sock
+      # Required: an unauthenticated control socket can create containers. Generate
+      # with `openssl rand -hex 32`. Also set it on host/hub/gateway/taskiq-worker.
+      RUNNER_TOKEN: ${RUNNER_TOKEN:?set RUNNER_TOKEN in .env (openssl rand -hex 32)}
+      # The HOST path of the workspace directory (same files as /app/workspace here).
+      # Docker resolves every tool bind mount against this, so a container path here
+      # makes every mount point at the wrong files (the startup canary refuses to run).
+      TRELLIS_HOST_WORKSPACE: ${TRELLIS_HOST_WORKSPACE:?set TRELLIS_HOST_WORKSPACE to the HOST path of the workspace (e.g. /opt/trellis/workspace)}
+      CONTAINER_DEFAULT_RUNTIME: ${CONTAINER_DEFAULT_RUNTIME:-runsc}
+      RUNNER_IMAGE: ${RUNNER_IMAGE:-${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.5.1}}
+      RUNNER_MAX_CONTAINERS: ${RUNNER_MAX_CONTAINERS:-32}
+      RUNNER_MAX_CONTAINERS_PER_TOOL: ${RUNNER_MAX_CONTAINERS_PER_TOOL:-8}
+      RUNNER_REAP_INTERVAL_S: ${RUNNER_REAP_INTERVAL_S:-300}
+      # Network-profile inputs (see scripts/setup-network-profiles.sh). The runner
+      # verifies the pinned networks + DOCKER-USER rules at startup.
+      TOOLS_NET_INTERNAL_SUBNET: ${TOOLS_NET_INTERNAL_SUBNET:-172.31.241.0/24}
+      TOOLS_NET_INTERNET_SUBNET: ${TOOLS_NET_INTERNET_SUBNET:-172.31.240.0/24}
+      # Resolvers gVisor can actually reach (Docker's embedded 127.0.0.11 is not):
+      # the runner writes them to <workspace>/.runner-dns/<profile>.conf and binds
+      # it over /etc/resolv.conf. Empty = keep Docker's file (no working DNS).
+      TOOLS_INTERNET_DNS: ${TOOLS_INTERNET_DNS:-1.1.1.1,8.8.8.8}
+      TOOLS_INTERNAL_DNS: ${TOOLS_INTERNAL_DNS:-}
+      TRELLIS_INTERNAL_CIDRS: ${TRELLIS_INTERNAL_CIDRS:-}
+      TRELLIS_ENGINE_SUBNETS: ${TRELLIS_ENGINE_SUBNETS:-}
+      # uid/gid the tool containers run as (must own the workspace tree).
+      TRELLIS_UID: ${TRELLIS_UID:-1000}
+      TRELLIS_GID: ${TRELLIS_GID:-1000}
+      # Stamped on every container as `trellis.install` so a sweep can find them.
+      TRELLIS_INSTALL_ID: ${TRELLIS_INSTALL_ID:-default}
+      # Agent-token enforcement for sessions/console. The central runner owns the
+      # workspace agent manifests, so it resolves the allowlist itself.
+      AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET in .env (openssl rand -hex 32)}
+      ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
+      RUNNER_AUTHORIZATION: allowlist
+      PYTHONDONTWRITEBYTECODE: "1"
+    healthcheck:
+      test: ["CMD-SHELL", "python -m core.execution.runner --healthcheck"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      # Startup preflight starts a trivial container under the configured runtime and
+      # re-verifies the network rules; a cold host can take a while the first time.
+      start_period: 60s
+    restart: unless-stopped
+
   # DB Sync Init Container
   # Runs once at startup to sync agents/tools/workflows/mcps to etcd. Refuses to prune
   # when the workspace syncs nothing at all while the registry still has entries -- see
@@ -77,9 +175,18 @@ services:
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
       REDIS_URL: redis://redis:6379/0
       HINDSIGHT_URL: http://hindsight:8888
+      # v0.6: tool execution goes through the runner over this Unix socket (the
+      # `runner-run` volume). The token is defense-in-depth over the socket perms.
+      RUNNER_SOCKET: ${RUNNER_SOCKET:-/run/trellis/runner.sock}
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-}
+      # HMAC key for the server-side allowlist tokens (phase 3). Harmless until then.
+      AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET in .env (openssl rand -hex 32)}
+      # Server-side allowlist enforcement: off | log | enforce (phase 3).
+      ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
     volumes:
       - health-data:/app/data
       - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace
+      - runner-run:/run/trellis
     command: granian --interface asgi core.host:app --host 0.0.0.0 --port 8000 --workers 2 --runtime-threads 1 --workers-max-rss 256 --workers-lifetime 3600
     depends_on:
       hub:
@@ -88,6 +195,8 @@ services:
         condition: service_healthy
       db-sync:
         condition: service_completed_successfully
+      runner:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8000/health > /dev/null || exit 1"]
       interval: 5s
@@ -126,7 +235,13 @@ services:
       # Go tools are pre-compiled before uvicorn binds; a cold rebuild can take a
       # while. Do not report a slow-but-healthy hub as a sandbox failure.
       start_period: 60s
-    # Least-privilege sandbox: the hub wraps every tool execution in a sandbox —
+    # v0.6: production tool execution moved out of the hub entirely -- every call is
+    # a runner-managed gVisor container, so nothing here builds a sandbox root and
+    # the three `*=unconfined` options are no longer needed. They stay documented
+    # below as the LEGACY bwrap/Landlock path, which is DEV-ONLY from v0.6 on
+    # (`SANDBOX_BACKEND=auto|bwrap|landlock`, plus uncommenting those lines).
+    #
+    # Legacy rationale (kept for local development):
     # bubblewrap by default (core/hub.py: --ro-bind / /, --unshare-user/pid/ipc/uts,
     # --die-with-parent), with a Landlock helper (core/sandbox.py +
     # /usr/local/bin/trellis-sandbox) as the fallback when bwrap cannot run (no
@@ -169,9 +284,10 @@ services:
     # instead of this line.
     security_opt:
       - "no-new-privileges:true"
-      - "systempaths=unconfined"
-      - "seccomp=unconfined"
-      - "apparmor=unconfined"
+      # Legacy bwrap only, dev-only (see the note above):
+      # - "systempaths=unconfined"
+      # - "seccomp=unconfined"
+      # - "apparmor=unconfined"
     # NOTE: no `env_file: .env` here on purpose. The hub copies os.environ into every
     # tool subprocess it spawns (core/hub.py), so loading the whole .env would hand
     # tools every framework secret it holds (e.g. GEMINI_API_KEY, SESSION_SECRET).
@@ -189,8 +305,21 @@ services:
       TOOL_EXECUTION_TIMEOUT: ${TOOL_EXECUTION_TIMEOUT:-}
       HEALTH_FAILURE_THRESHOLD: ${HEALTH_FAILURE_THRESHOLD:-}
       HEALTH_COOLDOWN_SECONDS: ${HEALTH_COOLDOWN_SECONDS:-}
-      # Sandbox backend: auto | bwrap | landlock (see core/sandbox.py).
-      SANDBOX_BACKEND: ${SANDBOX_BACKEND:-auto}
+      # Sandbox backend: container (runner) | auto | bwrap | landlock.
+      # v0.6 default is `container`: core/tool_runtime.execute_tool sends the call to
+      # the runner over RUNNER_SOCKET. `auto`/`bwrap`/`landlock` are LOCAL-DEV ONLY
+      # (the in-process sandbox; the unconfined security_opt lines above must be
+      # uncommented for bwrap).
+      SANDBOX_BACKEND: ${SANDBOX_BACKEND:-container}
+      # Runner control API (the `runner-run` volume) and its bearer token.
+      # RUNNER_TOKEN must match the runner service and the other callers.
+      RUNNER_SOCKET: ${RUNNER_SOCKET:-/run/trellis/runner.sock}
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-}
+      # HMAC key for agent tokens (phase 3): the hub verifies them on every tool
+      # call and resolves the agent's effective allowlist itself.
+      AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET in .env (openssl rand -hex 32)}
+      # Server-side allowlist enforcement: off | log | enforce (phase 3).
+      ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
       # Target uid/gid for the Landlock backend; matches the operator-owned workspace.
       # Defaults to TRELLIS_UID/TRELLIS_GID, i.e. the hub's own identity, so the
       # helper has no identity to drop on the default deployment.
@@ -225,9 +354,13 @@ services:
         condition: service_healthy
       db-sync:
         condition: service_completed_successfully
+      runner:
+        condition: service_healthy
     volumes:
       - health-data:/app/data
       - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace
+      # Runner control socket (rw: the hub is a client).
+      - runner-run:/run/trellis
 
   # Edge Relay (trellis-proxy tunnel terminator)
   # Terminates outbound-initiated WSS tunnels from edge nodes -- internal VMs that can
@@ -264,6 +397,12 @@ services:
       # still works but ranks last in tool search. Same values as host/hub.
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
       SESSION_SECRET: ${SESSION_SECRET:-}
+      # HMAC key for agent tokens (phase 3 verifies them on both relay routes; the
+      # `;`-separated form is a rotation list).
+      AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET in .env (openssl rand -hex 32)}
+      # off | log | enforce. Enforce makes this relay the authority for edge tool and
+      # MCP calls: no/invalid token or an out-of-allowlist reference is a 403.
+      ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
     volumes:
       # Health events for remote tool calls. Deliberately no workspace mount: the relay
       # has no local tools and must not be able to read the content repo.
@@ -291,12 +430,26 @@ services:
       HOST_URL: http://host:8000
       HUB_URL: http://hub:8001/mcp
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      # v0.6: tool execution is runner-side; the gateway only forwards calls.
+      RUNNER_SOCKET: ${RUNNER_SOCKET:-/run/trellis/runner.sock}
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-}
+      # Phase 3: the gateway mints tokens for its own authenticated identity and the
+      # hub/relay verify them. `gateway` is a system principal, not an agent.
+      AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET in .env (openssl rand -hex 32)}
+      ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
     volumes:
-      - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace
+      # Read-only: the gateway never writes workspace content. Tool output dirs are
+      # created by the runner; tool containers get their own ro suite/shared mounts.
+      - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace:ro
+      - runner-run:/run/trellis
     command: python core/gateway.py
     depends_on:
-      - host
-      - hub
+      host:
+        condition: service_started
+      hub:
+        condition: service_started
+      runner:
+        condition: service_healthy
     restart: unless-stopped
 
   etcd:
@@ -347,8 +500,15 @@ services:
       # Decrypts identity-scoped secrets for background agents/scripts.
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
       SESSION_SECRET: ${SESSION_SECRET:-}
+      # v0.6: background agents that call local tools go through the runner socket.
+      RUNNER_SOCKET: ${RUNNER_SOCKET:-/run/trellis/runner.sock}
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-}
+      # Phase 3: the worker mints `svc_agent_<name>` tokens per background run.
+      AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET in .env (openssl rand -hex 32)}
+      ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
     volumes:
       - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace
+      - runner-run:/run/trellis
     command: taskiq worker core.tasks:broker --workers 2
     depends_on:
       etcd:
@@ -357,6 +517,8 @@ services:
         condition: service_healthy
       db-sync:
         condition: service_completed_successfully
+      runner:
+        condition: service_healthy
     restart: unless-stopped
 
   taskiq-scheduler:
@@ -490,8 +652,18 @@ services:
 networks:
   default:
     name: trellis-network
+  # The two tool networks (`trellis-tools-internal`, `trellis-tools-internet`) are
+  # deliberately NOT declared here. They are created out-of-band by
+  # scripts/setup-network-profiles.sh (`python -m core.execution.netprofiles
+  # --networks`) with pinned subnets and `enable_icc=false`, and the runner attaches
+  # tool containers to them by name. Declaring them here would let compose create
+  # them with the wrong subnet/options before the script ever ran.
 
 volumes:
   etcd-data:
   health-data:
   hindsight-data:
+  # Runner control socket: written by `runner`, mounted read-write by host, hub,
+  # gateway and taskiq-worker. Not a tmpfs -- the socket must outlive a container
+  # restart and be visible to every caller.
+  runner-run:

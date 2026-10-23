@@ -309,6 +309,10 @@ class TestGatewayDirectExecution:
 
         name, forwarded_arguments, raise_on_error = fake_client.calls[0]
         assert name == "opsctl"
+        # The gateway mints a `gateway` principal token when a secret is configured
+        # (another suite may leave DEV_MODE/AGENT_TOKEN_SECRET in the environment).
+        token = forwarded_arguments.pop("__agent_token", None)
+        assert token is None or token.startswith("t1.")
         assert forwarded_arguments == {**sent_args, "__user_id": "user-42"}
         assert raise_on_error is False
 
@@ -399,7 +403,12 @@ class TestSupervisorTwoTierRouting:
         assert result == {"clusters": ["cluster-preprod-1", "cluster-preprod-2"]}
         name, arguments, raise_on_error = calls[0]
         assert name == "netctl"
-        assert arguments == {"environment": "preprod", "args": ["cluster", "list"], "__user_id": "user-99"}
+        token = arguments.pop("__agent_token", None)
+        assert token is None or token.startswith("t1.")
+        assert arguments == {
+            "environment": "preprod", "args": ["cluster", "list"],
+            "__user_id": "user-99",
+        }
         assert raise_on_error is False
 
 

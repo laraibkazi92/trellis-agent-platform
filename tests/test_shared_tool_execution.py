@@ -194,7 +194,10 @@ def test_execute_whitelisted_tool_dispatches_and_threads_user_id(monkeypatch):
         get_external_mcp_client_fn=fake_get_external_mcp_client,
     ))
 
-    assert hub_client.calls == [("opsctl", {"a": 1, "__user_id": "user-1"}, False)]
+    name, kwargs, raise_on_error = hub_client.calls[0]
+    token = kwargs.pop("__agent_token", None)
+    assert token is None or token.startswith("t1.")
+    assert (name, kwargs, raise_on_error) == ("opsctl", {"a": 1, "__user_id": "user-1"}, False)
     assert hub_result == {"ok": 2}
 
 

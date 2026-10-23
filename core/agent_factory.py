@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import secrets
 import yaml
 import asyncio
 import copy
@@ -13,13 +14,12 @@ from urllib.parse import urlparse
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Union
 
-from asyncache import cached
-from cachetools import TTLCache
+from collections import OrderedDict
 
 from pydantic_ai import Agent, RunContext
 
 from fastmcp import Client as FastMCPClient
-from fastmcp.client import StdioTransport, SSETransport, StreamableHttpTransport
+from fastmcp.client import SSETransport, StreamableHttpTransport
 
 from subagents_pydantic_ai import SubAgentCapability, SubAgentConfig
 from subagents_pydantic_ai.registry import DynamicAgentRegistry
@@ -29,10 +29,18 @@ from pydantic_ai_backends import ConsoleCapability
 from pydantic_ai_shields import CostTracking, ToolGuard
 from pydantic_ai_rlm import create_rlm_toolset
 
-from core.auth import EtcdContentionError, IdentityManager, get_identity_manager, user_id_var
+from core.auth import (
+    EtcdContentionError,
+    IdentityManager,
+    agent_token_var,
+    get_identity_manager,
+    user_id_var,
+)
 from core import llm_defaults, llm_factory
-from core.console_backend import SanitizedLocalBackend
-from core.env_sanitize import sanitized_env
+from core.caller_identity import resolve_user_email
+from core.console_backend import RunnerConsoleBackend
+from core.execution.spec import declared_env_keys, manifest_digest
+from core.execution.stdio_transport import RunnerStdioTransport
 from core.llm_factory import build_model_settings, resolve_model
 from core.mcp_schema import normalize_schema_for_provider
 from core.models import AgentConfig, MCPConfig, EDGE_MCP_WILDCARD_RE, is_agent_external, is_agent_internal
@@ -55,7 +63,78 @@ _external_remote_mcps: Dict[str, tuple[str, str]] = {}
 _last_discovery_time: float = 0
 DISCOVERY_CACHE_TTL = 60 # Cache discovery for 60 seconds
 
-mcp_client_cache = TTLCache(maxsize=100, ttl=300)
+# The loop that owns cached clients. Eviction can be triggered from the etcd
+# watch thread (on_mcp_change), which cannot await a client's __aexit__ itself.
+_mcp_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _schedule_close(client: Any) -> None:
+    """Close an evicted MCP client, on its own loop when called from a thread.
+
+    Dropping the reference is not enough any more: a cached client owns a runner
+    session container and a capacity slot, so only __aexit__ releases them.
+    """
+    async def _close() -> None:
+        try:
+            await client.__aexit__(None, None, None)
+        except Exception:
+            logger.debug("Failed to close an evicted MCP client", exc_info=True)
+
+    loop = _mcp_loop
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is not None:
+        running.create_task(_close())
+    elif loop is not None and loop.is_running():
+        asyncio.run_coroutine_threadsafe(_close(), loop)
+    else:
+        logger.debug("No event loop to close an evicted MCP client; it will die with the process")
+
+
+class _McpClientCache:
+    """TTL + LRU cache that closes what it evicts (see ``_schedule_close``)."""
+
+    def __init__(self, maxsize: int = 100, ttl: float = 300.0) -> None:
+        self._maxsize = maxsize
+        self._ttl = ttl
+        self._data: "OrderedDict[Any, tuple[Any, float]]" = OrderedDict()
+
+    def get(self, key: Any) -> Any:
+        item = self._data.get(key)
+        if item is None:
+            return None
+        client, stamp = item
+        if time.monotonic() - stamp > self._ttl:
+            self.pop(key)
+            return None
+        self._data.move_to_end(key)
+        return client
+
+    def set(self, key: Any, client: Any) -> None:
+        while len(self._data) >= self._maxsize:
+            _, (old, _stamp) = self._data.popitem(last=False)
+            _schedule_close(old)
+        self._data[key] = (client, time.monotonic())
+
+    def pop(self, key: Any, default: Any = None) -> Any:
+        item = self._data.pop(key, None)
+        if item is None:
+            return default
+        _schedule_close(item[0])
+        return item[0]
+
+    def keys(self) -> list:
+        return list(self._data)
+
+    def clear(self) -> None:
+        for key in list(self._data):
+            self.pop(key)
+
+
+mcp_client_cache = _McpClientCache(maxsize=100, ttl=300)
+_mcp_client_locks: Dict[tuple, asyncio.Lock] = {}
 
 # Agent instance cache (Lever B). Built agents are user-agnostic — safe to share across users
 # and concurrent requests. Invalidated per-agent via etcd watch in host.py.
@@ -268,8 +347,44 @@ def _inject_config(
                 env_copy[req_key] = str(val)
     return env_copy
 
-@cached(cache=mcp_client_cache)
 async def get_external_mcp_client(mcp_name: str, user_id: str) -> FastMCPClient:
+    global _mcp_loop
+    _mcp_loop = asyncio.get_running_loop()
+    cache_key = (mcp_name, user_id)
+    cached_client = mcp_client_cache.get(cache_key)
+    if cached_client is not None:
+        return cached_client
+
+    # One lock per (mcp, user): two concurrent first calls would otherwise open
+    # two session containers, and only one of them would ever be reachable.
+    lock = _mcp_client_locks.setdefault(cache_key, asyncio.Lock())
+    async with lock:
+        cached_client = mcp_client_cache.get(cache_key)
+        if cached_client is not None:
+            return cached_client
+        client = await _open_external_mcp_client(mcp_name, user_id)
+        mcp_client_cache.set(cache_key, client)
+        return client
+
+
+def invalidate_mcp_client(mcp_name: str, user_id: str) -> None:
+    """Drop (and close) a cached client so the next call respawns its session."""
+    mcp_client_cache.pop((mcp_name, user_id), None)
+
+
+def _is_session_failure(exc: BaseException) -> bool:
+    """A dead transport/session, as opposed to an ordinary tool-level error.
+
+    Only a session failure should evict the cached client: evicting on a tool's
+    own error would throw away a warm login state for nothing.
+    """
+    name = type(exc).__name__
+    if name in {"RunnerCallError", "RunnerUnavailable", "ClosedResourceError", "BrokenResourceError"}:
+        return True
+    return "session" in str(exc).lower()
+
+
+async def _open_external_mcp_client(mcp_name: str, user_id: str) -> FastMCPClient:
     identity_mgr = get_identity_manager()
     config_data = await asyncio.to_thread(identity_mgr.get_mcp_config, mcp_name)
     if not config_data: raise Exception(f"MCP config '{mcp_name}' not found")
@@ -287,9 +402,28 @@ async def get_external_mcp_client(mcp_name: str, user_id: str) -> FastMCPClient:
     env = _inject_config(env, config.variables, identity_mgr, user_id, "variables", is_background)
 
     if config.transport == "stdio":
-        full_env = sanitized_env()
-        full_env.update(env)
-        transport = StdioTransport(command=config.command, args=config.args or [], env=full_env, keep_alive=True)
+        # The server runs in a runner session container: only the manifest's
+        # declared keys cross the socket (the runner rejects anything else), and
+        # the control plane's own environment stays here.
+        declared = declared_env_keys(config)
+        agent = user_id[len("svc_agent_"):] if is_background else None
+        user_email = await resolve_user_email(identity_mgr, user_id)
+        transport = RunnerStdioTransport(
+            target=config.name,
+            session_key=secrets.token_hex(16),
+            env={k: v for k, v in env.items() if k in declared},
+            manifest_digest=manifest_digest(config),
+            agent=agent,
+            user_id=user_id,
+            user_email=user_email,
+            agent_token=agent_token_var.get(),
+            # The runner's hard lifetime; the cache TTL is the primary freshness
+            # knob, so a session only outlives its useful life by the grace.
+            deadline_ms=min(
+                max(60, int(config.session_idle_ttl_minutes) * 60 + 300) * 1000,
+                24 * 3600 * 1000,
+            ),
+        )
     elif config.transport in ["http", "streamable-http"]:
         transport = StreamableHttpTransport(url=config.command, headers=env)
     else:
@@ -346,7 +480,22 @@ async def discover_external_mcps(force: bool = False):
             transport = None
             if config.transport == "stdio":
                 if not config.command: continue
-                transport = StdioTransport(command=config.command, args=config.args or [], env=config.env or {}, keep_alive=False)
+                # Discovery is a throwaway session container: declared keys only,
+                # 60 s deadline, no persisted state.
+                declared = declared_env_keys(config)
+                transport = RunnerStdioTransport(
+                    target=config.name,
+                    session_key=secrets.token_hex(16),
+                    env={
+                        k: v
+                        for k, v in (config.env or {}).items()
+                        if k in declared
+                    },
+                    manifest_digest=manifest_digest(config),
+                    deadline_ms=60_000,
+                    kind="discovery",
+                    agent_token=agent_token_var.get(),
+                )
             elif config.transport in ["http", "streamable-http"]:
                 if not config.command: continue
                 transport = StreamableHttpTransport(url=config.command, headers=config.env or {})
@@ -376,6 +525,7 @@ def _register_mcp_tool(agent: Agent, mcp_tool: Any):
         if (await asyncio.to_thread(health_monitor.get_status, "tool", safe_mcp_tool.name)).get("status") == "Offline":
             return "SYSTEM: Tool offline."
         kwargs["__user_id"] = user_id_var.get()
+        kwargs["__agent_token"] = agent_token_var.get()
         client = await get_hub_client()
         result = await client.call_tool(safe_mcp_tool.name, kwargs)
         return result.content
@@ -418,6 +568,14 @@ def _register_external_mcp_tool(
             result = await client.call_tool(safe_mcp_tool.name, kwargs)
             return result.content
         except Exception as e:
+            if _is_session_failure(e):
+                # Respawn lazily: the next call rebuilds the client and its
+                # session container instead of failing until the cache TTL.
+                invalidate_mcp_client(mcp_name, user_id)
+                return (
+                    f"Tool '{safe_mcp_tool.name}' returned an error: the MCP session "
+                    f"was lost and will restart on the next call ({e})"
+                )
             return f"Tool '{safe_mcp_tool.name}' returned an error: {e}"
 
     input_schema = getattr(safe_mcp_tool, "input_schema", None) or getattr(safe_mcp_tool, "inputSchema", None)
@@ -456,7 +614,10 @@ def _register_remote_mcp_tool(
     async def tool_wrapper(ctx: RunContext[None], **kwargs: Any) -> Any:
         user_id = user_id_var.get()
         if not user_id: raise Exception("No user_id found")
-        result = await call_edge_mcp(site, mcp, safe_mcp_tool.name, kwargs, user_id)
+        result = await call_edge_mcp(
+            site, mcp, safe_mcp_tool.name, kwargs, user_id,
+            agent_token=agent_token_var.get(),
+        )
         if isinstance(result, dict) and "error" in result:
             return f"Tool '{tool_name_for_agent}' returned an error: {result['error']}"
         return result.get("content") if isinstance(result, dict) else result
@@ -616,8 +777,18 @@ async def build_agent(agent_name: str) -> Agent:
         # list_shells) aren't part of the console tool allowlist and their spawn path
         # (BackgroundProcesses.start) has no env hook, so they can't be env-sanitized
         # -- disabled here.
+        #
+        # File tools are rooted at the agent's own report directory instead of the
+        # whole workspace (risk 9): framework code needs no view of every tool's
+        # source. `execute` leaves the process entirely (runner, network none).
+        reports_root = (
+            Path(os.getenv("WORKSPACE_ROOT", "/app/workspace")) / "reports" / agent_name
+        ).resolve()
         capabilities.append(ConsoleCapability(
-            backend=SanitizedLocalBackend(root_dir="/workspace", enable_execute=("execute" in allowed_console_tools)),
+            backend=RunnerConsoleBackend(
+                root_dir=reports_root,
+                enable_execute=("execute" in allowed_console_tools),
+            ),
             include_background=False,
         ))
         blocked_console_tools = [t for t in console_tool_names if t not in allowed_tools]

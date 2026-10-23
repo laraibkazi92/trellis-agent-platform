@@ -15,6 +15,9 @@ import typing
 from typing import Dict, Any, Optional
 from fastmcp import FastMCP
 from starlette.responses import JSONResponse
+from core import agent_token as agent_token_module
+from core import allowlist
+from core import edge_secrets_central
 from core.models import ToolConfig
 from core.auth import get_identity_manager
 from core.caller_identity import resolve_user_email
@@ -163,8 +166,79 @@ def load_tool_configs() -> Optional[Dict[str, tuple[ToolConfig, Optional[Path]]]
     return configs
 
 
+# Principals that are not agents: the gateway is an authenticated front door whose
+# tool visibility is enforced by its own whitelist search, so it is not subject to
+# an agent's `allowed_tools`.
+SYSTEM_PRINCIPALS = frozenset({"gateway"})
+
+
+async def _authorize_call(
+    config: ToolConfig, raw_token: Optional[str], user_id: Optional[str]
+) -> tuple[Optional[agent_token_module.Claims], Optional[Dict[str, Any]]]:
+    """Verify the agent token and the agent's effective allowlist.
+
+    Returns ``(claims, denial)``. ``denial`` is the result dict to send back, or
+    ``None`` when the call may proceed. In ``log`` mode a refusal is recorded and
+    the call still runs (one rollout window); ``off`` skips everything.
+    """
+    mode = agent_token_module.mode()
+    if mode == "off":
+        return None, None
+    try:
+        claims = agent_token_module.verify(raw_token)
+    except agent_token_module.AgentTokenError as exc:
+        if mode == "log" and exc.code in {"missing", "missing_secret"}:
+            # Rollout mode with no key/token: nothing to enforce yet, and warning
+            # on every call would drown the log.
+            return None, None
+        message = f"access_denied: agent token rejected ({exc.code})"
+        if mode == "log":
+            logger.warning("hub: would deny %r: %s", config.name, message)
+            return None, None
+        return None, {"error": message}
+
+    if claims.principal == "system" or claims.agent in SYSTEM_PRINCIPALS:
+        return claims, None
+
+    # The token is the authority for *who* the agent acts for: a caller may not
+    # borrow a valid token to read another user's injected secrets.
+    if claims.user_id and user_id and user_id not in (
+        claims.user_id,
+        f"svc_agent_{claims.agent}",
+    ):
+        message = "access_denied: token identity does not match the calling user"
+        if mode == "log":
+            logger.warning("hub: would deny %r: %s", config.name, message)
+            return claims, None
+        return claims, {"error": message}
+
+    config_data = await asyncio.to_thread(identity_mgr.get_agent_config, claims.agent)
+    if not config_data:
+        message = f"access_denied: unknown agent '{claims.agent}'"
+        if mode == "log":
+            logger.warning("hub: would deny %r: %s", config.name, message)
+            return claims, None
+        return claims, {"error": message}
+
+    allowed = allowlist.resolve(config_data)
+    if not allowlist.permits_tool(allowed, config.name):
+        message = agent_token_module.deny_message(claims.agent, config.name)
+        if mode == "log":
+            logger.warning("hub: would deny %r: %s", config.name, message)
+            return claims, None
+        return claims, {"error": message}
+    return claims, None
+
+
 @stamina.retry(on=TransientToolError, attempts=3)
-async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[str, Any], user_id: Optional[str]) -> Dict[str, Any]:
+async def _run_tool_attempt(
+    config: ToolConfig,
+    tool_dir: Path,
+    arguments: Dict[str, Any],
+    user_id: Optional[str],
+    claims: Optional[agent_token_module.Claims] = None,
+    agent_token: Optional[str] = None,
+) -> Dict[str, Any]:
     """Builds the tool's environment, then delegates execution to core.tool_runtime."""
     # Constructed per call (not at import) so tests and callers that swap
     # hub.health_monitor keep working.
@@ -178,7 +252,22 @@ async def _run_tool_attempt(config: ToolConfig, tool_dir: Path, arguments: Dict[
         await asyncio.to_thread(on_health, False, error_msg)
         return {"error": error_msg}
 
-    return await execute_tool(config, tool_dir, arguments, env=env, on_health=on_health)
+    agent = claims.agent if claims is not None else (
+        user_id[len("svc_agent_"):] if user_id and user_id.startswith("svc_agent_") else None
+    )
+    return await execute_tool(
+        config,
+        tool_dir,
+        arguments,
+        env=env,
+        on_health=on_health,
+        agent=agent,
+        user_id=user_id,
+        user_email=(claims.user_email if claims is not None else None)
+        or env.get("TRELLIS_USER_EMAIL"),
+        run_id=claims.run_id if claims is not None else None,
+        agent_token=agent_token,
+    )
 
 
 async def _build_tool_env(config: ToolConfig, tool_dir: Path, user_id: Optional[str]) -> Dict[str, str]:
@@ -217,11 +306,6 @@ async def _build_tool_env(config: ToolConfig, tool_dir: Path, user_id: Optional[
             variables = await asyncio.to_thread(identity_mgr.get_resolved_config, user_id, "variables", keys=variable_keys)
             safe_vars = {str(k): str(v) for k, v in variables.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
             env.update(safe_vars)
-
-        # Auto-inject framework loopback capabilities
-        env["FRAMEWORK_EXECUTION_TOKEN"] = await asyncio.to_thread(identity_mgr.generate_execution_token, user_id)
-        framework_url = await asyncio.to_thread(identity_mgr.get_config, "HOST_URL", os.getenv("HOST_URL", "http://localhost:8000"))
-        env["FRAMEWORK_API_URL"] = framework_url
 
         # Auto-inject user identity (email)
         user_email = await resolve_user_email(identity_mgr, user_id)
@@ -298,7 +382,14 @@ def _cap_remote_result(name: str, result: Any) -> Any:
 
 
 @stamina.retry(on=TransientToolError, attempts=3)
-async def _run_remote(config: ToolConfig, arguments: Dict[str, Any], user_id: Optional[str]) -> Dict[str, Any]:
+async def _run_remote(
+    config: ToolConfig,
+    arguments: Dict[str, Any],
+    user_id: Optional[str],
+    *,
+    agent_token: Optional[str] = None,
+    claims: Optional[agent_token_module.Claims] = None,
+) -> Dict[str, Any]:
     """Dispatches a remote (edge-hosted) tool through the edge relay's internal API.
 
     The relay owns the tunnel; this side only maps its HTTP contract onto the same
@@ -333,12 +424,33 @@ async def _run_remote(config: ToolConfig, arguments: Dict[str, Any], user_id: Op
 
     # Resolved before the request so a slow (or failing) registry read cannot eat
     # into the call's timeout budget. Fail-open: an identity lookup hiccup costs
-    # this call its email, not the call itself.
-    try:
-        user_email = await resolve_user_email(identity_mgr, user_id)
-    except Exception as exc:
-        logger.warning(f"Could not resolve the caller email for remote tool {config.name}: {exc}")
-        user_email = None
+    # this call its email, not the call itself. A verified token's claim wins.
+    user_email = claims.user_email if claims is not None else None
+    if user_email is None:
+        try:
+            user_email = await resolve_user_email(identity_mgr, user_id)
+        except Exception as exc:
+            logger.warning(f"Could not resolve the caller email for remote tool {config.name}: {exc}")
+            user_email = None
+
+    # The caller's browser-sealed credential set for exactly this (site, tool, user).
+    # It rides the relay body verbatim and is never logged here: central cannot open
+    # it, and the relay treats it as opaque bytes.
+    sealed: Optional[Dict[str, Any]] = None
+    if user_id:
+        try:
+            sealed = await asyncio.to_thread(
+                edge_secrets_central.get, identity_mgr, site, user_id, "tool", tool
+            )
+        except Exception as exc:
+            # A registry hiccup costs this call its per-user credentials, not the call;
+            # the edge then applies its credential_mode (which may fail closed).
+            logger.warning(
+                "Could not read sealed credentials for remote tool %s on edge %s (%s)",
+                config.name,
+                site,
+                type(exc).__name__,
+            )
 
     try:
         async with _remote_client(timeout_seconds + 35) as client:
@@ -350,6 +462,10 @@ async def _run_remote(config: ToolConfig, arguments: Dict[str, Any], user_id: Op
                     "deadline_ms": deadline_ms,
                     "user": user_id,
                     "user_email": user_email,
+                    # The relay verifies this and resolves the agent's allowlist
+                    # itself; the edge proxy verifies the signature again.
+                    "agent_token": agent_token,
+                    "sealed": sealed,
                 },
             )
     except httpx.TimeoutException as exc:
@@ -477,19 +593,24 @@ async def _run_remote(config: ToolConfig, arguments: Dict[str, Any], user_id: Op
 
 
 async def run_tool(config: ToolConfig, tool_dir: Optional[Path], arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """Executes a tool locally (subprocess) or remotely (edge relay)."""
+    """Executes a tool locally (container) or remotely (edge relay)."""
     # stamina re-invokes with the same dict — never mutate the caller's arguments.
     arguments = dict(arguments)
     user_id = arguments.pop("__user_id", None)
-    is_background = bool(user_id) and user_id.startswith("svc_agent_")
-    # The hub's local tools get the agent name as a stdin field; the edge has no
-    # agent-identity semantics, so a remote call carries the user id only.
-    if is_background and config.remote is None:
-        arguments["__agent_name"] = user_id[len("svc_agent_"):]
+    raw_token = agent_token_module.refresh(arguments.pop("__agent_token", None))
+    # The former `__agent_name`-in-arguments path is gone: the token's claims are
+    # the only source of agent identity (and they are verified, not asserted).
+    claims, denial = await _authorize_call(config, raw_token, user_id)
     try:
+        if denial is not None:
+            return denial
         if config.remote is not None:
-            return await _run_remote(config, arguments, user_id)
-        return await _run_tool_attempt(config, tool_dir, arguments, user_id)
+            return await _run_remote(
+                config, arguments, user_id, agent_token=raw_token, claims=claims
+            )
+        return await _run_tool_attempt(
+            config, tool_dir, arguments, user_id, claims, raw_token
+        )
     finally:
         # Usage is recorded once per invocation, not once per stamina retry attempt.
         if user_id:
@@ -497,6 +618,7 @@ async def run_tool(config: ToolConfig, tool_dir: Optional[Path], arguments: Dict
                 asyncio.to_thread(identity_mgr.record_tool_usage, user_id, config.name),
                 f"record_tool_usage:{config.name}",
             )
+
 
 def _tool_fingerprint(config: ToolConfig, tool_dir: Optional[Path]) -> str:
     """Stable identity for a registered tool: config + the directory it runs from.
@@ -566,6 +688,20 @@ def _create_tool_handler(c: ToolConfig, d: Optional[Path]) -> Any:
         )
     )
     annotations["__user_id"] = typing.Optional[str]
+
+    # Add __agent_token (reserved, like __user_id): verified before dispatch and
+    # stripped before the tool ever sees its arguments. A FastMCP handler arg is
+    # used rather than an HTTP header because the hub's MCP client is a
+    # process-wide singleton shared by concurrent runs.
+    params.append(
+        inspect.Parameter(
+            "__agent_token",
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            annotation=typing.Optional[str],
+            default=None
+        )
+    )
+    annotations["__agent_token"] = typing.Optional[str]
 
     async def handler(**kwargs):
         filtered_kwargs = {}
@@ -678,6 +814,11 @@ if __name__ == "__main__":
     # Startup gate: refuse to serve an unauthenticated DEV_MODE instance on a
     # remotely reachable bind host (see core/devmode.py).
     enforce_dev_mode_safety("hub")
+    from core.agent_token import require_secret
+    from core.log_redaction import install as install_redaction
+
+    install_redaction()
+    require_secret("hub")
     # Startup probes for /healthz. Never raises: a broken sandbox must not block
     # the hub from starting, it only flips the health payload to 503.
     sandbox_preflight.warmup()

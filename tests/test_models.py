@@ -33,9 +33,18 @@ def test_tool_config_retry_and_timeout_defaults():
     assert config.timeout_seconds is None
 
 
-def test_tool_config_network_defaults_to_allow():
+def test_tool_config_network_defaults_to_none():
+    """v0.6 flips the default: undeclared egress is none, not internet."""
     config = ToolConfig(**_tool_kwargs())
-    assert config.network == "allow"
+    assert config.network == "none"
+
+
+def test_tool_config_network_allow_maps_to_internet():
+    assert ToolConfig(**_tool_kwargs(network="allow")).network == "internet"
+
+
+def test_tool_config_network_internal_is_accepted():
+    assert ToolConfig(**_tool_kwargs(network="internal")).network == "internal"
 
 
 def test_tool_config_network_accepts_none():
@@ -50,12 +59,12 @@ def test_tool_config_network_normalizes_case_and_whitespace():
 def test_tool_config_network_typo_keeps_the_tool(caplog):
     """A typo must not raise: load_tool_configs drops any config that fails."""
     with caplog.at_level(logging.WARNING, logger="core.models"):
-        config = ToolConfig(**_tool_kwargs(network="deny"))
+        config = ToolConfig(**_tool_kwargs(network="denny"))
 
-    assert config.network == "allow"
+    assert config.network == "none"
     assert config.name == "opsctl"
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert any("deny" in message and "allow" in message for message in warnings)
+    assert any("denny" in message and "none" in message for message in warnings)
 
 
 def test_tool_config_egress_defaults_to_empty():

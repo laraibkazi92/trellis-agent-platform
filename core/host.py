@@ -3,6 +3,7 @@
 
 import json
 import asyncio
+import uuid
 import logging
 
 logger = logging.getLogger(__name__)
@@ -16,7 +17,8 @@ import httpx
 from contextlib import asynccontextmanager
 from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart, TextPart
 
-from core.auth import AuthMiddleware, user_id_var
+from core.auth import AuthMiddleware, agent_token_var, user_id_var
+from core.agent_token import mint_for_run
 from core.devmode import configure_cors, enforce_dev_mode_safety
 from core.models import is_agent_external, is_routable_agent_type
 from core.health import compute_agent_operational_status
@@ -31,6 +33,13 @@ from core.background.webhooks import router as webhooks_router
 async def lifespan(app: FastAPI):
     global _main_loop, _watch_id, _agent_watch_id, _memory_watch_id, _memory_isolation_watch_id
     enforce_dev_mode_safety("host")
+    # Enforcing deployments refuse to start without the token key; rollout/dev
+    # modes only warn, so a local run is not blocked.
+    from core.agent_token import require_secret
+    from core.log_redaction import install as install_redaction
+
+    install_redaction()
+    require_secret("host")
     logger.info("Worker starting up...")
     _main_loop = asyncio.get_running_loop()
     app.state.http_client = httpx.AsyncClient(timeout=30.0)
@@ -217,10 +226,19 @@ async def chat_completions(request: ChatRequest):
         elif msg.role == "system": history.append(ModelRequest(parts=[UserPromptPart(content=f"[System Note]: {msg.content}")]))
     
     async def execute_agent():
+        agent_token_var.set(run_token)
         run_deps = SupervisorDeps() if request.model == "supervisor" else None
         return await agent.run(request.messages[-1].content, message_history=history, deps=run_deps)
 
     captured_user_id = user_id_var.get()
+    # One token per run proves (agent, user, run) to the hub/relay/runner. Minting
+    # here (not in a wrapper) means every tool call in this run inherits it.
+    run_token = mint_for_run(
+        request.model,
+        captured_user_id,
+        run_id=uuid.uuid4().hex,
+        principal="system" if request.model == "supervisor" else None,
+    )
 
     async def handle_success(result, user_id):
         await asyncio.to_thread(health_monitor.record_event, "agent", request.model, True)
@@ -249,6 +267,7 @@ async def chat_completions(request: ChatRequest):
 
     if request.stream:
         async def event_generator():
+            agent_token_var.set(run_token)
             event_queue = asyncio.Queue()
             
             async def event_handler(*args, **kwargs):

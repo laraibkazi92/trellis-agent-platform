@@ -1,23 +1,19 @@
 # Copyright (C) 2026 Laraib Kazi
 # SPDX-License-Identifier: Apache-2.0
 
-"""Edge-local credential tests: normalization, the three modes, CLI, and no leaks.
+"""Edge credential rules: the shared store, sealed per-user sets, and no mixing.
 
-Credentials never leave the edge VM: they arrive in ``edge-secrets`` /
-``edge-user-secrets`` files and are handed to a child process only through the names
-its manifest declares. These tests pin the resolution chain per mode, the fail-closed
-refusal, and the two properties an operator is trusting: a user only ever sees their
-own file, and no value appears in a frame, a log line, or a config payload.
-
-The MCP session tests spawn ``tests/fixtures/mcp_stateful_server.py`` (the sandbox seam
-is monkeypatched) so an edited file can be shown not to touch a live session.
+Per-user credentials are no longer files on the edge: central stores a browser-sealed
+envelope and the edge opens it with the key in ``core.edge_keypair``. These tests pin
+the resolution rules around that (R8): a sealed set is all-or-nothing for secrets,
+``variables`` never come from it, and ``per_user_required`` fails closed when the caller
+has none. The MCP tests use an in-memory stand-in for the runner session transport.
 """
 
 import asyncio
-import io
+import contextlib
 import json
 import logging
-import stat
 import sys
 from pathlib import Path
 
@@ -33,7 +29,6 @@ FIXTURE = Path(__file__).parent / "fixtures" / "mcp_stateful_server.py"
 DEADLINE_MS = 60_000
 
 SECRET_VALUE = "s3cr3t-from-the-file"
-OTHER_VALUE = "other-users-secret"
 PROCESS_VALUE = "from-the-process-env"
 
 SERVER_TOOLS = [
@@ -51,6 +46,8 @@ ENV_VARS = (
     "TRELLIS_EDGE_SECRETS_DIR",
     "TRELLIS_EDGE_USER_SECRETS_DIR",
     "TRELLIS_EDGE_MCPS_DIR",
+    "EDGE_PRIVATE_KEY_PATH",
+    "WORKSPACE_ROOT",
     "SANDBOX_BACKEND",
     "SANDBOX_RW_PATH",
     "DEVOPS_PASSWORD",
@@ -72,10 +69,7 @@ def clean_env(monkeypatch):
 
 
 def make_store(tmp_path):
-    return secrets.CredentialStore(
-        secrets_dir=tmp_path / "edge-secrets",
-        user_secrets_dir=tmp_path / "edge-user-secrets",
-    )
+    return secrets.CredentialStore(secrets_dir=tmp_path / "edge-secrets")
 
 
 def write_shared(store, name="devops", **values):
@@ -83,12 +77,6 @@ def write_shared(store, name="devops", **values):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8")
     path.chmod(0o600)
-    return path
-
-
-def write_user(store, email, **values):
-    path = store.user_file(email)
-    secrets.write_env_file(path, {key: str(value) for key, value in values.items()})
     return path
 
 
@@ -115,7 +103,6 @@ def edge_config(tmp_path, **kw):
         "site": "plant-floor",
         "server_url": "ws://relay.local/edge/v1/connect",
         "secrets_dir": tmp_path / "edge-secrets",
-        "user_secrets_dir": tmp_path / "edge-user-secrets",
     }
     payload.update(kw)
     return proxy.ProxyConfig(**payload)
@@ -126,7 +113,6 @@ def write_config_file(tmp_path, **overrides):
         "site": "plant-floor",
         "server_url": "ws://relay.local/edge/v1/connect",
         "secrets_dir": str(tmp_path / "edge-secrets"),
-        "user_secrets_dir": str(tmp_path / "edge-user-secrets"),
     }
     data.update(overrides)
     path = tmp_path / "proxy.yaml"
@@ -141,7 +127,7 @@ def write_config_file(tmp_path, **overrides):
     "variant",
     ["ops@example.com", "OPS@Example.COM", "  Ops@Example.Com  ", "oPs@ExAmPlE.cOm"],
 )
-def test_case_variants_of_one_address_normalize_to_one_file(variant):
+def test_case_variants_of_one_address_normalize_to_one_stem(variant):
     assert secrets.normalize_email(variant) == secrets.normalize_email("ops@example.com")
 
 
@@ -151,57 +137,27 @@ def test_unicode_addresses_are_deterministic_and_ascii_only():
 
     assert first == second
     assert first.isascii()
-    assert first.endswith("_") or "_" in first
+    assert first[-9] == "_" and len(first.rsplit("_", 1)[1]) == 8
 
 
 def test_two_addresses_that_slugify_alike_stay_distinct():
-    """The hash suffix is what keeps `a.b@x` and `a-b@x` from sharing a file."""
     assert secrets.normalize_email("a.b@x.example") != secrets.normalize_email("a-b@x.example")
 
 
 def test_a_very_long_address_is_capped_and_still_unique():
     long_email = f"{'a' * 200}@example.com"
-
     stem = secrets.normalize_email(long_email)
 
-    slug, _, digest = stem.rpartition("_")
-    assert len(slug) <= secrets.MAX_SANITIZED_EMAIL
-    assert len(digest) == 8 and all(ch in "0123456789abcdef" for ch in digest)
     assert len(stem) <= secrets.MAX_SANITIZED_EMAIL + 9
+    assert stem != secrets.normalize_email(f"{'a' * 201}@example.com")
 
 
 def test_a_trailing_hyphen_after_capping_is_trimmed():
-    # 47 a's, then "-b": capping at 48 would end on the separator.
     stem = secrets.normalize_email(f"{'a' * 47}-b@example.com")
+    slug = stem.rsplit("_", 1)[0]
 
-    slug = stem.rpartition("_")[0]
     assert not slug.endswith("-")
     assert len(slug) <= secrets.MAX_SANITIZED_EMAIL
-
-
-@pytest.mark.parametrize(
-    "hostile",
-    [
-        "../../etc/passwd",
-        "/etc/passwd",
-        "..%2f..%2fetc%2fpasswd",
-        "a/b",
-        "..\\..\\windows",
-        "....//....//x",
-        "a@b/../../../root",
-    ],
-)
-def test_no_email_can_escape_the_user_secrets_dir(tmp_path, hostile):
-    store = make_store(tmp_path)
-
-    path = store.user_file(hostile)
-
-    assert path.parent == store.user_secrets_dir
-    assert "/" not in path.name and "\\" not in path.name
-    assert ".." not in path.name
-    # And it really lands inside the store when written.
-    secrets.write_env_file(path, {"DEVOPS_PASSWORD": "x"})
-    assert path.resolve().parent == store.user_secrets_dir.resolve()
 
 
 # ---------------------------------------------------------------- file format
@@ -257,38 +213,6 @@ def test_parse_env_text_accepts_an_export_prefix():
     }
 
 
-def test_write_env_file_keeps_the_mode_of_a_directory_it_did_not_create(tmp_path):
-    """A 0750 volume the operator mounted is theirs; only a directory we create is 0700."""
-    directory = tmp_path / "mounted"
-    directory.mkdir()
-    directory.chmod(0o750)
-
-    secrets.write_env_file(directory / "ops.env", {"K": "v"})
-
-    assert stat.S_IMODE(directory.stat().st_mode) == 0o750
-    assert stat.S_IMODE((directory / "ops.env").stat().st_mode) == 0o600
-
-
-def test_write_env_file_is_0600_atomic_and_round_trips(tmp_path):
-    path = tmp_path / "store" / "ops.env"
-
-    secrets.write_env_file(path, {"A": "1", "B": "two words"})
-
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert secrets.parse_env_file(path) == {"A": "1", "B": "two words"}
-    # Atomic: no temp file was left behind, and the directory is private.
-    assert [entry.name for entry in path.parent.iterdir()] == [path.name]
-    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
-
-
-def test_write_env_file_rejects_a_value_a_dotenv_cannot_represent(tmp_path):
-    with pytest.raises(ValueError, match="newline"):
-        secrets.write_env_file(tmp_path / "x.env", {"KEY": "one\ntwo"})
-
-    with pytest.raises(ValueError, match="invalid credential key"):
-        secrets.write_env_file(tmp_path / "x.env", {"BAD KEY": "x"})
-
-
 # ---------------------------------------------------------------- shared mode
 
 
@@ -318,22 +242,6 @@ def test_shared_mode_falls_back_to_the_process_env_per_key(tmp_path, monkeypatch
     assert resolved == {"DEVOPS_PASSWORD": PROCESS_VALUE, "CORALOGIX_DOMAIN": "corp.example"}
 
 
-def test_shared_mode_never_consults_a_per_user_file(tmp_path):
-    """A service account must not be shadowed by one user's file."""
-    store = make_store(tmp_path)
-    write_shared(store, DEVOPS_PASSWORD=SECRET_VALUE)
-    write_user(store, "ops@example.com", DEVOPS_PASSWORD=OTHER_VALUE)
-
-    resolved = store.resolve(
-        tool_config(secrets=["DEVOPS_PASSWORD"]),
-        name="devops",
-        email="ops@example.com",
-        site="dc1",
-    )
-
-    assert resolved["DEVOPS_PASSWORD"] == SECRET_VALUE
-
-
 def test_shared_mode_with_no_file_and_no_env_returns_nothing(tmp_path):
     store = make_store(tmp_path)
 
@@ -342,63 +250,7 @@ def test_shared_mode_with_no_file_and_no_env_returns_nothing(tmp_path):
     ) == {}
 
 
-# ---------------------------------------------------------------- per_user mode
-
-
-def test_per_user_mode_prefers_the_user_file(tmp_path, monkeypatch):
-    monkeypatch.setenv("DEVOPS_PASSWORD", PROCESS_VALUE)
-    store = make_store(tmp_path)
-    write_shared(store, DEVOPS_PASSWORD=SECRET_VALUE)
-    write_user(store, "ops@example.com", DEVOPS_PASSWORD=OTHER_VALUE)
-
-    resolved = store.resolve(
-        tool_config(secrets=["DEVOPS_PASSWORD"]),
-        name="devops",
-        email="ops@example.com",
-        site="dc1",
-        mode="per_user",
-    )
-
-    assert resolved["DEVOPS_PASSWORD"] == OTHER_VALUE
-
-
-def test_per_user_mode_falls_back_to_shared_then_the_process_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("CORALOGIX_DOMAIN", PROCESS_VALUE)
-    store = make_store(tmp_path)
-    write_shared(store, DEVOPS_PASSWORD=SECRET_VALUE)
-    write_user(store, "ops@example.com", DEVOPS_PASSWORD=OTHER_VALUE)
-
-    resolved = store.resolve(
-        tool_config(secrets=["DEVOPS_PASSWORD"], variables=["CORALOGIX_DOMAIN"]),
-        name="devops",
-        email="mallory@example.com",
-        site="dc1",
-        mode="per_user",
-    )
-
-    assert resolved == {"DEVOPS_PASSWORD": SECRET_VALUE, "CORALOGIX_DOMAIN": PROCESS_VALUE}
-
-
-def test_an_empty_user_value_does_not_mask_the_shared_file(tmp_path):
-    """Empty is unset: a blank value in the top layer must not shadow a real one."""
-    store = make_store(tmp_path)
-    write_shared(store, DEVOPS_PASSWORD=SECRET_VALUE)
-    path = store.user_file("ops@example.com")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("DEVOPS_PASSWORD=\n", encoding="utf-8")
-
-    resolved = store.resolve(
-        tool_config(secrets=["DEVOPS_PASSWORD"]),
-        name="devops",
-        email="ops@example.com",
-        site="dc1",
-        mode="per_user",
-    )
-
-    assert resolved == {"DEVOPS_PASSWORD": SECRET_VALUE}
-
-
-def test_an_empty_file_value_does_not_mask_the_process_env(tmp_path, monkeypatch):
+def test_an_empty_shared_file_value_does_not_mask_the_process_env(tmp_path, monkeypatch):
     monkeypatch.setenv("DEVOPS_PASSWORD", PROCESS_VALUE)
     store = make_store(tmp_path)
     shared = store.shared_file("devops")
@@ -415,43 +267,104 @@ def test_an_empty_file_value_does_not_mask_the_process_env(tmp_path, monkeypatch
     assert resolved == {"DEVOPS_PASSWORD": PROCESS_VALUE}
 
 
-# ---------------------------------------------------------------- fail closed
+# ---------------------------------------------------------------- sealed sets
 
 
-def test_per_user_required_resolves_the_users_own_file(tmp_path):
+def test_a_sealed_set_wins_over_the_shared_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVOPS_PASSWORD", PROCESS_VALUE)
     store = make_store(tmp_path)
-    write_shared(store, DEVOPS_PASSWORD=SECRET_VALUE)
-    write_user(store, "ops@example.com", DEVOPS_PASSWORD=OTHER_VALUE)
+    write_shared(store, DEVOPS_PASSWORD=SECRET_VALUE, DEVOPS_URL="https://shared.internal")
+
+    resolved = store.resolve(
+        tool_config(secrets=["DEVOPS_PASSWORD"], variables=["DEVOPS_URL"]),
+        name="devops",
+        email="ops@example.com",
+        site="dc1",
+        sealed={"DEVOPS_PASSWORD": "from-the-browser"},
+    )
+
+    # The secret comes from the blob; the variable stays the edge's configuration.
+    assert resolved == {
+        "DEVOPS_PASSWORD": "from-the-browser",
+        "DEVOPS_URL": "https://shared.internal",
+    }
+
+
+def test_a_partial_sealed_set_never_falls_back_to_the_shared_file(tmp_path):
+    store = make_store(tmp_path)
+    write_shared(store, DEVOPS_PASSWORD=SECRET_VALUE, DEVOPS_KEY="shared-key")
+
+    resolved = store.resolve(
+        tool_config(secrets=["DEVOPS_PASSWORD", "DEVOPS_KEY"]),
+        name="devops",
+        email="ops@example.com",
+        site="dc1",
+        sealed={"DEVOPS_PASSWORD": "only-one"},
+    )
+
+    assert resolved == {"DEVOPS_PASSWORD": "only-one"}
+    assert "DEVOPS_KEY" not in resolved
+
+
+def test_a_variable_in_a_sealed_set_is_ignored(tmp_path, monkeypatch):
+    """Write-time rejects it; if one slips through, the edge still cannot move an endpoint."""
+    monkeypatch.setenv("DEVOPS_URL", "https://corp.example")
+    store = make_store(tmp_path)
+
+    resolved = store.resolve(
+        tool_config(secrets=["DEVOPS_PASSWORD"], variables=["DEVOPS_URL"]),
+        name="devops",
+        email="ops@example.com",
+        site="dc1",
+        sealed={"DEVOPS_URL": "https://attacker.invalid", "DEVOPS_PASSWORD": "pw"},
+    )
+
+    assert resolved["DEVOPS_URL"] == "https://corp.example"
+    assert resolved["DEVOPS_PASSWORD"] == "pw"
+
+
+def test_an_undeclared_name_in_a_sealed_set_is_ignored(tmp_path):
+    store = make_store(tmp_path)
 
     resolved = store.resolve(
         tool_config(secrets=["DEVOPS_PASSWORD"]),
         name="devops",
         email="ops@example.com",
         site="dc1",
-        mode="per_user_required",
+        sealed={"DEVOPS_PASSWORD": "pw", "EXTRA_KEY": "nope"},
     )
 
-    assert resolved == {"DEVOPS_PASSWORD": OTHER_VALUE}
+    assert resolved == {"DEVOPS_PASSWORD": "pw"}
 
 
-@pytest.mark.parametrize(
-    "arrange",
-    [
-        pytest.param(lambda store: None, id="no-file"),
-        pytest.param(
-            lambda store: write_user(store, "mallory@example.com", DEVOPS_PASSWORD=OTHER_VALUE),
-            id="someone-else-file-only",
-        ),
-        pytest.param(
-            lambda store: write_user(store, "ops@example.com", UNRELATED="x"),
-            id="file-without-any-declared-key",
-        ),
-        pytest.param(lambda store: write_shared(store, DEVOPS_PASSWORD=SECRET_VALUE), id="shared-only"),
-    ],
-)
-def test_per_user_required_fails_closed_with_the_exact_message(tmp_path, arrange):
+def test_a_blank_sealed_value_counts_as_unset(tmp_path):
+    """A blank field must not satisfy per_user_required (or reach a tool as "")."""
     store = make_store(tmp_path)
-    arrange(store)
+
+    with pytest.raises(secrets.MissingCredentials):
+        store.resolve(
+            tool_config(secrets=["DEVOPS_PASSWORD"]),
+            name="devops",
+            email="ops@example.com",
+            site="dc1",
+            mode="per_user_required",
+            sealed={"DEVOPS_PASSWORD": ""},
+        )
+
+
+def test_an_unknown_mode_is_a_value_error(tmp_path):
+    with pytest.raises(ValueError, match="credential_mode"):
+        make_store(tmp_path).resolve(
+            tool_config(), name="devops", email="a@b", site="dc1", mode="everyone"
+        )
+
+
+# ---------------------------------------------------------------- fail closed
+
+
+def test_per_user_required_without_a_sealed_set_fails_closed(tmp_path):
+    store = make_store(tmp_path)
+    write_shared(store, DEVOPS_PASSWORD=SECRET_VALUE)
 
     with pytest.raises(secrets.MissingCredentials) as caught:
         store.resolve(
@@ -466,38 +379,34 @@ def test_per_user_required_fails_closed_with_the_exact_message(tmp_path, arrange
     assert caught.value.message == "no credentials for ops@example.com on edge dc1"
 
 
-def test_per_user_required_with_nothing_declared_also_fails_closed(tmp_path):
-    """A manifest that declares no key cannot satisfy a per-user requirement."""
+def test_per_user_required_with_a_sealed_set_runs(tmp_path):
     store = make_store(tmp_path)
-    write_user(store, "ops@example.com", DEVOPS_PASSWORD=OTHER_VALUE)
+    write_shared(store, DEVOPS_PASSWORD=SECRET_VALUE)
+
+    resolved = store.resolve(
+        tool_config(secrets=["DEVOPS_PASSWORD"]),
+        name="devops",
+        email="ops@example.com",
+        site="dc1",
+        mode="per_user_required",
+        sealed={"DEVOPS_PASSWORD": "mine"},
+    )
+
+    assert resolved == {"DEVOPS_PASSWORD": "mine"}
+
+
+def test_per_user_required_refuses_a_sealed_set_without_a_declared_name(tmp_path):
+    store = make_store(tmp_path)
 
     with pytest.raises(secrets.MissingCredentials):
         store.resolve(
-            tool_config(),
+            tool_config(secrets=["DEVOPS_PASSWORD"]),
             name="devops",
             email="ops@example.com",
             site="dc1",
             mode="per_user_required",
+            sealed={"SOMETHING_ELSE": "x"},
         )
-
-
-def test_an_empty_value_does_not_satisfy_per_user_required(tmp_path):
-    """Nothing to send is not a credential: ``KEY=`` must fail closed, not run."""
-    store = make_store(tmp_path)
-    path = store.user_file("ops@example.com")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("DEVOPS_PASSWORD=\nDEVOPS_URL=   \n", encoding="utf-8")
-
-    with pytest.raises(secrets.MissingCredentials) as caught:
-        store.resolve(
-            tool_config(secrets=["DEVOPS_PASSWORD", "DEVOPS_URL"]),
-            name="devops",
-            email="ops@example.com",
-            site="dc1",
-            mode="per_user_required",
-        )
-
-    assert caught.value.message == "no credentials for ops@example.com on edge dc1"
 
 
 def test_per_user_required_refuses_a_missing_identity_but_never_names_a_value(tmp_path):
@@ -515,13 +424,6 @@ def test_per_user_required_refuses_a_missing_identity_but_never_names_a_value(tm
     assert caught.value.message == "no credentials for anonymous on edge dc1"
 
 
-def test_an_unknown_mode_is_a_value_error(tmp_path):
-    with pytest.raises(ValueError, match="credential_mode"):
-        make_store(tmp_path).resolve(
-            tool_config(), name="devops", email="a@b", site="dc1", mode="everyone"
-        )
-
-
 # ---------------------------------------------------------------- hygiene
 
 
@@ -534,7 +436,6 @@ def test_resolve_never_creates_a_directory(tmp_path):
         store.resolve(config, name="devops", email="a@b", site="dc1", mode="per_user_required")
 
     assert not store.secrets_dir.exists()
-    assert not store.user_secrets_dir.exists()
 
 
 def test_a_permissive_shared_file_warns_once_and_never_leaks_the_value(tmp_path, caplog):
@@ -553,25 +454,6 @@ def test_a_permissive_shared_file_warns_once_and_never_leaks_the_value(tmp_path,
     assert SECRET_VALUE not in caplog.text
 
 
-def test_a_permissive_user_file_warns_but_is_still_read(tmp_path, caplog):
-    store = make_store(tmp_path)
-    path = write_user(store, "ops@example.com", DEVOPS_PASSWORD=OTHER_VALUE)
-    path.chmod(0o644)
-
-    with caplog.at_level(logging.WARNING, logger="core.edge_user_secrets"):
-        resolved = store.resolve(
-            tool_config(secrets=["DEVOPS_PASSWORD"]),
-            name="devops",
-            email="ops@example.com",
-            site="dc1",
-            mode="per_user",
-        )
-
-    assert resolved["DEVOPS_PASSWORD"] == OTHER_VALUE
-    assert "group/other" in caplog.text
-    assert OTHER_VALUE not in caplog.text
-
-
 def test_an_unsafe_manifest_name_cannot_escape_the_secrets_dir(tmp_path, caplog):
     store = make_store(tmp_path)
 
@@ -582,6 +464,21 @@ def test_an_unsafe_manifest_name_cannot_escape_the_secrets_dir(tmp_path, caplog)
 
     assert resolved == {}
     assert "invalid credential file name" in caplog.text
+
+
+def test_a_legacy_user_secrets_directory_warns_once(tmp_path, monkeypatch, caplog):
+    legacy = tmp_path / "edge-user-secrets"
+    legacy.mkdir()
+    monkeypatch.setenv("TRELLIS_EDGE_USER_SECRETS_DIR", str(legacy))
+    monkeypatch.setattr(secrets, "_LEGACY_WARNED", False)
+
+    with caplog.at_level(logging.WARNING, logger="core.edge_user_secrets"):
+        secrets.warn_about_legacy_user_secrets()
+        secrets.warn_about_legacy_user_secrets()
+
+    warnings = [record for record in caplog.records if "no longer read" in record.getMessage()]
+    assert len(warnings) == 1
+    assert str(legacy) in caplog.text
 
 
 # ---------------------------------------------------------------- build_env
@@ -601,19 +498,16 @@ def test_build_env_reads_the_shared_file_and_hides_extra_keys(tmp_path, monkeypa
 
 def test_build_env_keeps_the_token_out_even_when_a_file_carries_it(tmp_path):
     store = make_store(tmp_path)
-    secrets_dir = store.secrets_dir
-    secrets_dir.mkdir(parents=True)
-    (secrets_dir / "devops.env").write_text("TRELLIS_EDGE_TOKEN=from-a-file\n", encoding="utf-8")
-    config = tool_config()
+    store.secrets_dir.mkdir(parents=True)
+    (store.secrets_dir / "devops.env").write_text("TRELLIS_EDGE_TOKEN=from-a-file\n", encoding="utf-8")
 
-    env = proxy.build_env(tmp_path, config, credentials=store, site="dc1")
+    env = proxy.build_env(tmp_path, tool_config(), credentials=store, site="dc1")
 
     assert "TRELLIS_EDGE_TOKEN" not in env
 
 
-def test_build_env_raises_missing_credentials_for_an_unmapped_user(tmp_path):
+def test_build_env_raises_missing_credentials_without_a_sealed_set(tmp_path):
     store = make_store(tmp_path)
-    write_user(store, "someone@example.com", DEVOPS_PASSWORD=OTHER_VALUE)
 
     with pytest.raises(secrets.MissingCredentials) as caught:
         proxy.build_env(
@@ -628,44 +522,15 @@ def test_build_env_raises_missing_credentials_for_an_unmapped_user(tmp_path):
     assert caught.value.message == "no credentials for ops@example.com on edge dc1"
 
 
-def test_two_users_get_their_own_values_and_nothing_else(tmp_path):
-    """The whole L3 property, at the env level."""
-    store = make_store(tmp_path)
-    write_shared(store, DEVOPS_PASSWORD="shared-service-account")
-    write_user(store, "a@example.com", DEVOPS_PASSWORD="alpha")
-    write_user(store, "b@example.com", DEVOPS_PASSWORD="beta")
-    config = tool_config(secrets=["DEVOPS_PASSWORD"])
-
-    def env_for(email):
-        return proxy.build_env(
-            tmp_path,
-            config,
-            {"user_email": email},
-            credentials=store,
-            credential_mode="per_user",
-            site="dc1",
-        )
-
-    first, second = env_for("a@example.com"), env_for("b@example.com")
-
-    assert first["DEVOPS_PASSWORD"] == "alpha"
-    assert second["DEVOPS_PASSWORD"] == "beta"
-    assert "alpha" not in second.values() and "beta" not in first.values()
-    assert first["TRELLIS_USER_EMAIL"] == "a@example.com"
-
-
-def test_per_user_required_with_passthrough_ignores_the_process_env(tmp_path, monkeypatch):
-    """The blocking property: ``passthrough`` must not turn the mode into user -> env.
-
-    ``passthrough`` copies the sanitized container env *before* the credential overlay,
-    so a declared key the caller's file omits would otherwise arrive from the container
-    and a fail-closed mode would quietly execute with the wrong credentials.
-    """
+def test_build_env_with_a_partial_sealed_set_never_uses_the_process_env_gap(
+    tmp_path, monkeypatch
+):
+    """The blocking property: passthrough must not complete a partial sealed set."""
     monkeypatch.setenv("DEVOPS_PASSWORD", "leaked-from-the-container")
     monkeypatch.setenv("CORALOGIX_DOMAIN", "corp.example")
     store = make_store(tmp_path)
-    write_user(store, "ops@example.com", DEVOPS_URL="https://ops.internal")
-    config = tool_config(secrets=["DEVOPS_PASSWORD", "DEVOPS_URL"])
+    write_shared(store, DEVOPS_URL="https://shared.internal")
+    config = tool_config(secrets=["DEVOPS_PASSWORD", "DEVOPS_URL"], variables=["CORALOGIX_DOMAIN"])
 
     env = proxy.build_env(
         tmp_path,
@@ -675,12 +540,36 @@ def test_per_user_required_with_passthrough_ignores_the_process_env(tmp_path, mo
         credentials=store,
         credential_mode="per_user_required",
         site="dc1",
+        sealed={"DEVOPS_URL": "https://ops.internal"},
     )
 
     assert env["DEVOPS_URL"] == "https://ops.internal"
     assert "DEVOPS_PASSWORD" not in env
-    # Everything the manifest does not declare still comes through passthrough.
+    # Variables are edge configuration and still resolve.
     assert env["CORALOGIX_DOMAIN"] == "corp.example"
+
+
+def test_two_users_get_their_own_sealed_values_and_nothing_else(tmp_path):
+    store = make_store(tmp_path)
+    config = tool_config(secrets=["DEVOPS_PASSWORD"])
+
+    def env_for(email, value):
+        return proxy.build_env(
+            tmp_path,
+            config,
+            {"user_email": email},
+            credentials=store,
+            credential_mode="per_user_required",
+            site="dc1",
+            sealed={"DEVOPS_PASSWORD": value},
+        )
+
+    first, second = env_for("a@example.com", "alpha"), env_for("b@example.com", "beta")
+
+    assert first["DEVOPS_PASSWORD"] == "alpha"
+    assert second["DEVOPS_PASSWORD"] == "beta"
+    assert "alpha" not in second.values() and "beta" not in first.values()
+    assert first["TRELLIS_USER_EMAIL"] == "a@example.com"
 
 
 # ---------------------------------------------------------------- tool calls
@@ -690,10 +579,9 @@ def _never_called(*args, **kwargs):
     raise AssertionError("execute_tool must not run when credentials are missing")
 
 
-def test_handle_call_refuses_per_user_required_without_running_the_tool(tmp_path, monkeypatch):
+def test_handle_call_refuses_per_user_required_without_a_sealed_set(tmp_path, monkeypatch):
     monkeypatch.setattr(proxy.tool_runtime, "execute_tool", _never_called)
     store_config = edge_config(tmp_path)
-    write_user(make_store(tmp_path), "someone@example.com", DEVOPS_PASSWORD=OTHER_VALUE)
     frame = {
         "t": "call",
         "id": "c1",
@@ -717,39 +605,6 @@ def test_handle_call_refuses_per_user_required_without_running_the_tool(tmp_path
         "code": "missing_credentials",
         "message": "no credentials for ops@example.com on edge plant-floor",
     }
-
-
-def test_handle_call_runs_the_tool_with_the_users_own_value(tmp_path, monkeypatch):
-    store_config = edge_config(tmp_path)
-    write_user(make_store(tmp_path), "ops@example.com", DEVOPS_PASSWORD=OTHER_VALUE)
-    seen = {}
-
-    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None):
-        seen.update(env)
-        return {"ok": True}
-
-    monkeypatch.setattr(proxy.tool_runtime, "execute_tool", fake_execute)
-    frame = {
-        "t": "call",
-        "id": "c2",
-        "tool": "devops",
-        "args": {},
-        "deadline_ms": DEADLINE_MS,
-        "user_email": "ops@example.com",
-    }
-
-    result = asyncio.run(
-        proxy.handle_call(
-            {"devops": (tool_config(secrets=["DEVOPS_PASSWORD"]), tmp_path)},
-            frame,
-            proxy_config=store_config,
-            credential_modes={"devops": "per_user"},
-        )
-    )
-
-    assert result["ok"] is True
-    assert seen["DEVOPS_PASSWORD"] == OTHER_VALUE
-    assert seen["TRELLIS_USER_EMAIL"] == "ops@example.com"
 
 
 def test_the_credential_mode_travels_through_the_deadline_wrapper(tmp_path, monkeypatch):
@@ -838,7 +693,6 @@ def test_no_secret_value_reaches_a_frame_or_a_log_line(tmp_path, monkeypatch, ca
     store_config = edge_config(tmp_path)
     store = make_store(tmp_path)
     write_shared(store, DEVOPS_PASSWORD=SECRET_VALUE)
-    write_user(store, "someone@example.com", DEVOPS_PASSWORD=OTHER_VALUE)
     monkeypatch.setattr(proxy.tool_runtime, "execute_tool", _never_called)
     config_map = {"devops": (tool_config(secrets=["DEVOPS_PASSWORD"]), tmp_path)}
 
@@ -864,12 +718,8 @@ def test_no_secret_value_reaches_a_frame_or_a_log_line(tmp_path, monkeypatch, ca
 
     sent = json.dumps(ws.sent)
     assert "missing_credentials" in sent
-    for value in (SECRET_VALUE, OTHER_VALUE):
-        assert value not in sent
-        assert value not in caplog.text
-        # ... and not in the config payloads either.
-        assert value not in json.dumps(store_config.secrets_dir.as_posix())
-        assert value not in repr(store_config)
+    assert SECRET_VALUE not in sent
+    assert SECRET_VALUE not in caplog.text
     # The hello frame describes the catalog, never a credential.
     hello = proxy.hello_frame(config_map, {})
     assert SECRET_VALUE not in protocol.encode(hello)
@@ -879,17 +729,58 @@ def test_no_secret_value_reaches_a_frame_or_a_log_line(tmp_path, monkeypatch, ca
 
 
 @pytest.fixture
-def fixture_server(tmp_path, monkeypatch):
-    """The stateful server, unsandboxed, with a private writable root."""
-    pytest.importorskip("fastmcp", reason="the stateful fixture server needs fastmcp")
+def fake_sessions(tmp_path, monkeypatch):
+    """In-memory runner-session transport: a real FastMCP server, no process/dirs."""
+    pytest.importorskip("fastmcp", reason="the in-memory MCP server needs fastmcp")
+    from fastmcp import FastMCP
+    from fastmcp.client.transports.base import ClientTransport
+    from fastmcp.client.transports.memory import FastMCPTransport
+
     writable = tmp_path / "rw"
     monkeypatch.setenv("SANDBOX_RW_PATH", str(writable))
-    monkeypatch.setattr(
-        proxy_mcp,
-        "build_stdio_argv",
-        lambda entry, home_dir, backend=None: [sys.executable, str(FIXTURE)],
-    )
-    return writable
+    created = []
+
+    class FakeRunnerTransport(ClientTransport):
+        def __init__(self, entry, env, **kwargs):
+            self.env = dict(env)
+            self.kwargs = kwargs
+            state = {"data": {}, "home": f"session-{len(created)}"}
+            self.state = state
+            server = FastMCP("stateful")
+
+            @server.tool
+            def set_value(key: str, value: object) -> str:
+                state["data"][key] = value
+                return "ok"
+
+            @server.tool
+            def get_value(key: str) -> object:
+                return state["data"].get(key)
+
+            @server.tool
+            def get_home() -> str:
+                return state["home"]
+
+            @server.tool
+            def env_dump() -> dict:
+                return dict(self.env)
+
+            self._inner = FastMCPTransport(server)
+
+        @contextlib.asynccontextmanager
+        async def connect_session(self, *, transport_options=None, **session_kwargs):
+            async with self._inner.connect_session(
+                transport_options=transport_options, **session_kwargs
+            ) as session:
+                yield session
+
+    def factory(entry, env, **kwargs):
+        transport = FakeRunnerTransport(entry, env, **kwargs)
+        created.append(transport)
+        return transport
+
+    monkeypatch.setattr(proxy_mcp, "_runner_transport", factory)
+    return created
 
 
 def write_mcp(root, name="stateful", **overrides):
@@ -898,8 +789,8 @@ def write_mcp(root, name="stateful", **overrides):
     payload = {
         "name": name,
         "transport": "stdio",
-        "command": sys.executable,
-        "args": [str(FIXTURE)],
+        "command": "stateful-mcp",
+        "args": ["--serve"],
         "tools": SERVER_TOOLS,
         "secrets": ["DEVOPS_PASSWORD"],
     }
@@ -911,9 +802,7 @@ def write_mcp(root, name="stateful", **overrides):
 def mcp_entries(root, **export):
     entry = {"name": "stateful"}
     entry.update(export)
-    entries = proxy_mcp.load_mcps(root, [entry])
-    assert set(entries) == {"stateful"}, entries
-    return entries
+    return proxy_mcp.load_mcps(root, [entry])
 
 
 def text(result):
@@ -921,36 +810,39 @@ def text(result):
 
 
 def structured(result):
-    if result.get("structuredContent") is not None:
-        return result["structuredContent"]
-    return json.loads(text(result))
+    payload = result.get("structuredContent")
+    if payload is None:
+        payload = json.loads(text(result))
+    # FastMCP wraps a scalar/dict tool return under a single "result" key.
+    if isinstance(payload, dict) and set(payload) == {"result"}:
+        payload = payload["result"]
+    return payload
 
 
-def test_an_mcp_session_sees_only_the_callers_own_credentials(
-    tmp_path, fixture_server, monkeypatch
+def test_an_mcp_session_sees_only_the_callers_sealed_credentials(
+    tmp_path, fake_sessions, monkeypatch
 ):
     monkeypatch.setenv("DEVOPS_PASSWORD", PROCESS_VALUE)
     root = tmp_path / "mcps"
     write_mcp(root, secrets=["DEVOPS_PASSWORD"])
-    entries = mcp_entries(root, credential_mode="per_user")
-    store = make_store(tmp_path)
-    # A key the manifest does not declare must never reach the server process.
-    write_user(store, "a@example.com", DEVOPS_PASSWORD="alpha", EXTRA_KEY="nope")
-    write_user(store, "b@example.com", DEVOPS_PASSWORD="beta")
-    manager = proxy_mcp.McpSessionManager(credentials=store, site="plant-floor")
+    entries = mcp_entries(root, credential_mode="per_user_required")
+    manager = proxy_mcp.McpSessionManager(credentials=make_store(tmp_path), site="plant-floor")
 
     async def scenario():
         try:
-            manager.set_entries(
-                entries,
-                {name: await proxy_mcp.build_catalog(entry, credentials=store, site="plant-floor")
-                 for name, entry in entries.items()},
-            )
+            manager.set_entries(entries, await catalogs_for(entries, tmp_path))
             return {
                 email: structured(
-                    await manager.call("stateful", "env_dump", {}, {"user_email": email}, DEADLINE_MS)
+                    await manager.call(
+                        "stateful",
+                        "env_dump",
+                        {},
+                        {"user_email": email},
+                        DEADLINE_MS,
+                        sealed={"DEVOPS_PASSWORD": value, "EXTRA_KEY": "nope"},
+                    )
                 )
-                for email in ("a@example.com", "b@example.com")
+                for email, value in (("a@example.com", "alpha"), ("b@example.com", "beta"))
             }
         finally:
             await manager.kill_all()
@@ -961,26 +853,19 @@ def test_an_mcp_session_sees_only_the_callers_own_credentials(
     assert envs["b@example.com"]["DEVOPS_PASSWORD"] == "beta"
     assert "EXTRA_KEY" not in envs["a@example.com"]
     assert "beta" not in envs["a@example.com"].values()
-    # The declaration policy still applies: the tunnel token is never there.
     for env in envs.values():
         assert "TRELLIS_EDGE_TOKEN" not in env
 
 
-def test_per_user_required_mcp_spawns_nothing_for_an_unmapped_user(tmp_path, fixture_server):
+def test_per_user_required_mcp_spawns_nothing_without_a_sealed_set(tmp_path, fake_sessions):
     root = tmp_path / "mcps"
     write_mcp(root, secrets=["DEVOPS_PASSWORD"])
     entries = mcp_entries(root, credential_mode="per_user_required")
-    store = make_store(tmp_path)
-    write_user(store, "someone@example.com", DEVOPS_PASSWORD=OTHER_VALUE)
-    manager = proxy_mcp.McpSessionManager(credentials=store, site="plant-floor")
+    manager = proxy_mcp.McpSessionManager(credentials=make_store(tmp_path), site="plant-floor")
 
     async def scenario():
         try:
-            manager.set_entries(
-                entries,
-                {name: await proxy_mcp.build_catalog(entry, credentials=store, site="plant-floor")
-                 for name, entry in entries.items()},
-            )
+            manager.set_entries(entries, await catalogs_for(entries, tmp_path))
             with pytest.raises(proxy_mcp.McpCallError) as caught:
                 await manager.call(
                     "stateful", "env_dump", {}, {"user_email": "ops@example.com"}, DEADLINE_MS
@@ -993,39 +878,60 @@ def test_per_user_required_mcp_spawns_nothing_for_an_unmapped_user(tmp_path, fix
 
     assert error.code == "missing_credentials"
     assert error.message == "no credentials for ops@example.com on edge plant-floor"
-    # Fail closed means no process: no session dir, no pid file, no tracked session.
-    assert not (fixture_server / "mcp-sessions" / "stateful").exists()
+    # Fail closed means no container: no transport, no session, no host directory.
+    assert fake_sessions == []
+    assert not (tmp_path / "rw" / "mcp-sessions").exists()
     assert manager._sessions == {}
 
 
-def test_a_credential_change_does_not_touch_a_live_mcp_session(tmp_path, fixture_server):
+def test_a_new_sealed_set_reaches_a_reopened_session(tmp_path, fake_sessions):
+    """A live session keeps its env; a new container gets the new sealed set."""
     root = tmp_path / "mcps"
     write_mcp(root, secrets=["DEVOPS_PASSWORD"])
     entries = mcp_entries(root, credential_mode="per_user_required")
-    store = make_store(tmp_path)
-    write_user(store, "ops@example.com", DEVOPS_PASSWORD="before")
-    manager = proxy_mcp.McpSessionManager(credentials=store, site="plant-floor")
+    manager = proxy_mcp.McpSessionManager(credentials=make_store(tmp_path), site="plant-floor")
 
     async def scenario():
         try:
-            manager.set_entries(
-                entries,
-                {name: await proxy_mcp.build_catalog(entry, credentials=store, site="plant-floor")
-                 for name, entry in entries.items()},
-            )
+            manager.set_entries(entries, await catalogs_for(entries, tmp_path))
             identity = {"user_email": "ops@example.com"}
-            live = structured(await manager.call("stateful", "env_dump", {}, identity, DEADLINE_MS))
-            home = text(await manager.call("stateful", "get_home", {}, identity, DEADLINE_MS))
-            # Rotate the password while the session is up.
-            write_user(store, "ops@example.com", DEVOPS_PASSWORD="after")
-            still_live = structured(
-                await manager.call("stateful", "env_dump", {}, identity, DEADLINE_MS)
+            live = structured(
+                await manager.call(
+                    "stateful", "env_dump", {}, identity, DEADLINE_MS,
+                    sealed={"DEVOPS_PASSWORD": "before"},
+                )
             )
-            same_home = text(await manager.call("stateful", "get_home", {}, identity, DEADLINE_MS))
-            # A new session (what a TTL expiry/restart produces) re-reads the file.
+            home = text(
+                await manager.call(
+                    "stateful", "get_home", {}, identity, DEADLINE_MS,
+                    sealed={"DEVOPS_PASSWORD": "before"},
+                )
+            )
+            still_live = structured(
+                await manager.call(
+                    "stateful", "env_dump", {}, identity, DEADLINE_MS,
+                    sealed={"DEVOPS_PASSWORD": "after"},
+                )
+            )
+            same_home = text(
+                await manager.call(
+                    "stateful", "get_home", {}, identity, DEADLINE_MS,
+                    sealed={"DEVOPS_PASSWORD": "after"},
+                )
+            )
             await manager.kill_all()
-            fresh = structured(await manager.call("stateful", "env_dump", {}, identity, DEADLINE_MS))
-            fresh_home = text(await manager.call("stateful", "get_home", {}, identity, DEADLINE_MS))
+            fresh = structured(
+                await manager.call(
+                    "stateful", "env_dump", {}, identity, DEADLINE_MS,
+                    sealed={"DEVOPS_PASSWORD": "after"},
+                )
+            )
+            fresh_home = text(
+                await manager.call(
+                    "stateful", "get_home", {}, identity, DEADLINE_MS,
+                    sealed={"DEVOPS_PASSWORD": "after"},
+                )
+            )
             return live, home, still_live, same_home, fresh, fresh_home
         finally:
             await manager.kill_all()
@@ -1033,13 +939,16 @@ def test_a_credential_change_does_not_touch_a_live_mcp_session(tmp_path, fixture
     live, home, still_live, same_home, fresh, fresh_home = asyncio.run(scenario())
 
     assert live["DEVOPS_PASSWORD"] == "before"
-    assert still_live["DEVOPS_PASSWORD"] == "before"
-    assert same_home == home
+    # A changed sealed set reopens the session: "store credentials" takes effect
+    # on the next call instead of waiting for the TTL.
+    assert still_live["DEVOPS_PASSWORD"] == "after"
+    assert same_home != home
     assert fresh["DEVOPS_PASSWORD"] == "after"
-    assert fresh_home == home  # same per-(mcp, user) state dir, new process
+    # A new session is a new container, so its tmpfs HOME is fresh (no persisted state).
+    assert fresh_home != home
 
 
-def test_a_shared_file_is_used_for_an_mcp_session(tmp_path, fixture_server, monkeypatch):
+def test_a_shared_file_is_used_for_an_mcp_session(tmp_path, fake_sessions, monkeypatch):
     """``shared`` mode is the service-account path: file first, process env last."""
     monkeypatch.setenv("DEVOPS_PASSWORD", PROCESS_VALUE)
     root = tmp_path / "mcps"
@@ -1051,11 +960,7 @@ def test_a_shared_file_is_used_for_an_mcp_session(tmp_path, fixture_server, monk
 
     async def scenario():
         try:
-            manager.set_entries(
-                entries,
-                {name: await proxy_mcp.build_catalog(entry, credentials=store, site="plant-floor")
-                 for name, entry in entries.items()},
-            )
+            manager.set_entries(entries, await catalogs_for(entries, tmp_path))
             return structured(
                 await manager.call(
                     "stateful", "env_dump", {}, {"user_email": "anyone@example.com"}, DEADLINE_MS
@@ -1070,7 +975,7 @@ def test_a_shared_file_is_used_for_an_mcp_session(tmp_path, fixture_server, monk
 
 
 def test_discovery_of_a_per_user_required_server_says_to_declare_a_catalog(
-    tmp_path, fixture_server, monkeypatch
+    tmp_path, fake_sessions
 ):
     """No caller exists during discovery, so a live catalog cannot be resolved."""
     root = tmp_path / "mcps"
@@ -1088,9 +993,8 @@ def test_discovery_of_a_per_user_required_server_says_to_declare_a_catalog(
     assert "static 'tools:' catalog" in caught.value.message
 
 
-def test_http_headers_come_from_the_resolved_chain(tmp_path, monkeypatch):
-
-    """A declared credential from a per-user file must reach the endpoint, not the env."""
+def test_http_headers_come_from_the_sealed_set(tmp_path, monkeypatch):
+    """A declared credential from a sealed set must reach the endpoint, not the env."""
     recorded = {}
 
     class FakeClient:
@@ -1107,7 +1011,7 @@ def test_http_headers_come_from_the_resolved_chain(tmp_path, monkeypatch):
     monkeypatch.setattr(
         proxy_mcp,
         "_fastmcp",
-        lambda: (FakeClient, transport_class("stdio"), transport_class("http"), transport_class("sse")),
+        lambda: (FakeClient, transport_class("http"), transport_class("sse")),
     )
     entry = proxy_mcp.McpExport(
         name="stateful",
@@ -1120,199 +1024,85 @@ def test_http_headers_come_from_the_resolved_chain(tmp_path, monkeypatch):
         directory=tmp_path,
         credential_mode="per_user",
     )
-    store = make_store(tmp_path)
-    write_user(store, "ops@example.com", DEVOPS_PASSWORD=OTHER_VALUE)
     identity = {"user_email": "ops@example.com", "user": "u1"}
 
     env = proxy_mcp._server_env(
-        entry, tmp_path, identity, passthrough=False, token_env=None,
-        credentials=store, site="plant-floor",
+        entry, identity, passthrough=False, token_env=None,
+        credentials=make_store(tmp_path), site="plant-floor",
+        sealed={"DEVOPS_PASSWORD": "sealed-value"},
     )
-    proxy_mcp._transport(entry, tmp_path, env)
+    proxy_mcp._transport(entry, env)
 
-    assert recorded["http"]["headers"] == {"DEVOPS_PASSWORD": OTHER_VALUE}
+    assert recorded["http"]["headers"] == {"DEVOPS_PASSWORD": "sealed-value"}
     assert env["TRELLIS_USER_EMAIL"] == "ops@example.com"
+
+
+async def catalogs_for(entries, tmp_path):
+    return {
+        name: await proxy_mcp.build_catalog(entry, credentials=make_store(tmp_path), site="plant-floor")
+        for name, entry in entries.items()
+    }
 
 
 # ---------------------------------------------------------------- CLI
 
 
-@pytest.fixture
-def cli(tmp_path, monkeypatch):
-    """Run ``trellis-proxy user-secrets`` with stdin and a temp proxy.yaml."""
-
-    def run(argv, stdin=""):
-        monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
-        return proxy.main(["user-secrets", *argv])
-
-    config_path = write_config_file(tmp_path)
-    return run, config_path, make_store(tmp_path)
-
-
-def test_cli_set_writes_0600_and_merges(cli):
-    run, config_path, store = cli
-
-    assert run(["set", "Ops@Example.com", "--config", str(config_path)],
-               stdin="DEVOPS_PASSWORD=hunter2\nCORALOGIX_DOMAIN=corp.example\n") is None
-    assert run(["set", "ops@example.com", "--config", str(config_path)],
-               stdin="DEVOPS_PASSWORD=rotated\n") is None
-
-    path = store.user_file("ops@example.com")
-    assert secrets.parse_env_file(path) == {
-        "DEVOPS_PASSWORD": "rotated",
-        "CORALOGIX_DOMAIN": "corp.example",
-    }
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
-
-
-def test_cli_set_is_idempotent_for_case_variants(cli):
-    run, config_path, store = cli
-
-    run(["set", "Ops@Example.com", "--config=" + str(config_path)], stdin="K=v1\n")
-    run(["set", "ops@example.com", "--config", str(config_path)], stdin="J=v2\n")
-
-    files = sorted(store.user_secrets_dir.glob("*.env"))
-    assert len(files) == 1
-    assert secrets.parse_env_file(files[0]) == {"K": "v1", "J": "v2"}
-
-
-def test_cli_list_prints_key_names_never_values(cli, capsys):
-    run, config_path, store = cli
-    write_user(store, "ops@example.com", DEVOPS_PASSWORD=SECRET_VALUE, CORALOGIX_DOMAIN="corp")
-
-    run(["list", "--config", str(config_path)])
-
-    printed = capsys.readouterr().out
-    # A legacy file has no ``# email:`` header, so the hashed stem is the fallback.
-    assert secrets.normalize_email("ops@example.com") in printed
-    assert "DEVOPS_PASSWORD" in printed
-    assert "CORALOGIX_DOMAIN" in printed
-    assert SECRET_VALUE not in printed
-    assert "corp" not in printed
-
-
-def test_cli_set_then_list_shows_the_email_not_the_filename(cli, capsys):
-    run, config_path, store = cli
-
-    assert run(
-        ["set", "Ops@Example.com", "--config", str(config_path)],
-        stdin="DEVOPS_PASSWORD=hunter2\n",
-    ) is None
-    header = store.user_file("ops@example.com").read_text(encoding="utf-8").splitlines()[0]
-    assert header == "# email: Ops@Example.com"
-
-    capsys.readouterr()  # drop the ``set`` receipt, which names the file path
-    run(["list", "--config", str(config_path)])
-
-    printed = capsys.readouterr().out
-    assert "Ops@Example.com:" in printed
-    # Not the normalization stem an operator cannot map back to a person.
-    assert secrets.normalize_email("ops@example.com") not in printed
-    assert "DEVOPS_PASSWORD" in printed
-    assert "hunter2" not in printed
-
-
-def test_cli_set_refuses_to_overwrite_an_unreadable_file(cli, capsys):
-    """An unreadable file is not an empty one: merging from ``{}`` would drop its keys."""
-    run, config_path, store = cli
-    path = store.user_file("ops@example.com")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    original = b"\xff\xfeDEVOPS_PASSWORD=unreadable"
-    path.write_bytes(original)
-
+def test_user_secrets_is_an_unknown_command():
+    """The v0.5 plaintext CLI must be gone, not silently accepted."""
     with pytest.raises(SystemExit) as caught:
-        run(["set", "ops@example.com", "--config", str(config_path)], stdin="NEW_KEY=v\n")
-
-    assert caught.value.code == 1
-    err = capsys.readouterr().err
-    assert "cannot read" in err
-    assert "refusing to overwrite" in err
-    assert str(path) in err
-    # Untouched: no rewrite from {}.
-    assert path.read_bytes() == original
-
-
-def test_cli_list_on_a_missing_directory_is_quiet(cli, capsys):
-    run, config_path, _store = cli
-
-    assert run(["list", "--config", str(config_path)]) is None
-    assert capsys.readouterr().out == ""
-
-
-def test_cli_delete_removes_the_file_and_reports_an_unknown_email(cli, capsys):
-    run, config_path, store = cli
-    path = write_user(store, "ops@example.com", DEVOPS_PASSWORD=SECRET_VALUE)
-
-    assert run(["delete", "ops@example.com", "--config", str(config_path)]) is None
-    assert not path.exists()
-
-    with pytest.raises(SystemExit) as caught:
-        run(["delete", "ops@example.com", "--config", str(config_path)])
-
-    assert caught.value.code == 1
-    err = capsys.readouterr().err
-    assert "no stored credentials for ops@example.com" in err
-    assert SECRET_VALUE not in err
-
-
-def test_cli_rejects_a_non_email_without_a_traceback(cli, capsys):
-    run, config_path, _store = cli
-
-    with pytest.raises(SystemExit) as caught:
-        run(["set", "not-an-email", "--config", str(config_path)], stdin="K=v\n")
+        proxy.main(["user-secrets", "list"])
 
     assert caught.value.code == 2
-    assert "not an email address" in capsys.readouterr().err
 
 
-def test_cli_rejects_empty_stdin(cli, capsys):
-    run, config_path, store = cli
+def test_edge_keygen_delegates_to_the_keypair_module(tmp_path, monkeypatch, capsys):
+    from core import edge_keypair
 
-    with pytest.raises(SystemExit) as caught:
-        run(["set", "ops@example.com", "--config", str(config_path)], stdin="# nothing useful\n")
-
-    assert caught.value.code == 2
-    assert "no KEY=VALUE lines on stdin" in capsys.readouterr().err
-    assert not store.user_secrets_dir.exists()
-
-
-def test_cli_reports_a_missing_config_file(cli, tmp_path, capsys):
-    run, _config_path, _store = cli
+    path = tmp_path / "etc-trellis" / "edge-key"
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "workspace"))
+    key = edge_keypair.generate(path)
 
     with pytest.raises(SystemExit) as caught:
-        run(["list", "--config", str(tmp_path / "absent.yaml")])
+        proxy.main(["edge-keygen", "--show", "--path", str(path)])
 
-    assert caught.value.code == 2
-    assert "file not found" in capsys.readouterr().err
+    assert caught.value.code == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed == key.public_json()
 
 
-def test_cli_defaults_match_the_edge_defaults(tmp_path, monkeypatch, capsys):
-    """With no --config, the CLI uses the same env override the proxy reads."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("TRELLIS_EDGE_USER_SECRETS_DIR", str(tmp_path / "mounted"))
-    monkeypatch.setattr(sys, "stdin", io.StringIO("K=v\n"))
+def test_edge_keygen_rotate_and_drop_old(tmp_path, monkeypatch):
+    from core import edge_keypair
 
-    assert proxy.main(["user-secrets", "set", "ops@example.com"]) is None
-    assert (tmp_path / "mounted" / f"{secrets.normalize_email('ops@example.com')}.env").is_file()
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "workspace"))
+    path = tmp_path / "etc-trellis" / "edge-key"
+    edge_keypair.generate(path)
+    old_fp = edge_keypair.load(path).fingerprint
+
+    with pytest.raises(SystemExit) as caught:
+        proxy.main(["edge-keygen", "--rotate", "--path", str(path)])
+    assert caught.value.code == 0
+    assert edge_keypair.load(path).fingerprint != old_fp
+    assert edge_keypair.load_old(path) is not None
+
+    with pytest.raises(SystemExit) as caught:
+        proxy.main(["edge-keygen", "--drop-old-key", "--path", str(path)])
+    assert caught.value.code == 0
+    assert edge_keypair.load_old(path) is None
 
 
 # ---------------------------------------------------------------- proxy.yaml surface
 
 
-def test_load_config_reads_the_credential_dirs(tmp_path):
-    path = write_config_file(
-        tmp_path,
-        secrets_dir=str(tmp_path / "svc"),
-        user_secrets_dir=str(tmp_path / "users"),
-    )
+def test_load_config_reads_the_shared_credential_dir(tmp_path):
+    path = write_config_file(tmp_path, secrets_dir=str(tmp_path / "svc"))
 
     config = proxy.load_config(path)
 
     assert config.secrets_dir == tmp_path / "svc"
-    assert config.user_secrets_dir == tmp_path / "users"
+    assert not hasattr(config, "user_secrets_dir")
 
 
-def test_load_config_defaults_the_credential_dirs(tmp_path):
+def test_load_config_defaults_the_shared_credential_dir(tmp_path):
     path = tmp_path / "proxy.yaml"
     path.write_text(
         "site: plant-floor\nserver_url: ws://relay.local/edge/v1/connect\n", encoding="utf-8"
@@ -1321,18 +1111,23 @@ def test_load_config_defaults_the_credential_dirs(tmp_path):
     config = proxy.load_config(path)
 
     assert config.secrets_dir == Path("edge-secrets")
-    assert config.user_secrets_dir == Path("edge-user-secrets")
 
 
-def test_the_credential_dirs_can_be_overridden_from_the_environment(tmp_path, monkeypatch):
+def test_the_shared_credential_dir_can_be_overridden_from_the_environment(tmp_path, monkeypatch):
     path = write_config_file(tmp_path)
     monkeypatch.setenv("TRELLIS_EDGE_SECRETS_DIR", str(tmp_path / "env-svc"))
-    monkeypatch.setenv("TRELLIS_EDGE_USER_SECRETS_DIR", str(tmp_path / "env-users"))
 
     config = proxy.load_config(path)
 
     assert config.secrets_dir == tmp_path / "env-svc"
-    assert config.user_secrets_dir == tmp_path / "env-users"
+
+
+def test_a_legacy_user_secrets_dir_key_is_ignored(tmp_path):
+    path = write_config_file(tmp_path, user_secrets_dir=str(tmp_path / "users"))
+
+    config = proxy.load_config(path)
+
+    assert not hasattr(config, "user_secrets_dir")
 
 
 def test_exports_accept_the_mapping_form(tmp_path):
@@ -1369,12 +1164,12 @@ def test_sighup_reports_a_moved_credential_dir_as_needing_a_restart(tmp_path, ca
     session = proxy._Session(proxy.load_config(path), path)
     session.reload()
 
-    write_config_file(tmp_path, user_secrets_dir=str(tmp_path / "moved"))
+    write_config_file(tmp_path, secrets_dir=str(tmp_path / "moved"))
     with caplog.at_level(logging.WARNING):
         session.reload()
 
-    assert "user_secrets_dir changes need a restart" in caplog.text
-    assert session.config.user_secrets_dir == tmp_path / "edge-user-secrets"
+    assert "secrets_dir changes need a restart" in caplog.text
+    assert session.config.secrets_dir == tmp_path / "edge-secrets"
 
 
 def test_sighup_applies_a_changed_credential_mode(tmp_path):

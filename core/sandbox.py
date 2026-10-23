@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 BWRAP_ARGS = sandbox_preflight.BWRAP_BASE_ARGS
 writable_root = sandbox_preflight.writable_root
 
-_VALID_BACKENDS = frozenset({"auto", "bwrap", "landlock"})
+_VALID_BACKENDS = frozenset({"auto", "bwrap", "landlock", "container"})
 _VALID_NET_POLICIES = frozenset({"allow", "none"})
 _DEFAULT_NET_POLICY = "allow"
 _DEFAULT_TMP_ROOT = "/tmp/trellis"
@@ -47,6 +47,9 @@ _LOGGED_FAILURES: set[tuple[str, str]] = set()
 class Backend(str, Enum):
     BWRAP = "bwrap"
     LANDLOCK = "landlock"
+    # Not an in-process backend: tools run via the runner service. Kept in the enum
+    # so prepare_execution can fail closed instead of silently selecting bwrap.
+    CONTAINER = "container"
 
 
 class SandboxUnavailable(RuntimeError):
@@ -143,6 +146,16 @@ def select_backend(force: str | None = None) -> Backend:
     global _LOGGED_SELECTION
 
     requested = _normalize(force)
+    if requested == Backend.CONTAINER.value:
+        # Fail closed: the container path lives in core.execution, and a caller
+        # that reaches prepare_execution with it has a wiring bug, not a host
+        # without bwrap. Never degrade to the in-process sandbox.
+        raise SandboxUnavailable(
+            "container_requires_runner",
+            "SANDBOX_BACKEND=container executes tools through the runner service.",
+            "Use core.execution.client.RunnerClient; see core.tool_runtime.",
+            backend=Backend.CONTAINER.value,
+        )
     selected = _SELECTED.get(requested)
     if selected is not None:
         return selected

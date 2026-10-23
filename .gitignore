@@ -13,6 +13,9 @@ data/
 .git_local_credentials
 
 workspace/reports/
+# Generated per-profile resolv.conf files the runner bind-mounts into tool
+# containers (docs/deploy.md, "Name resolution").
+workspace/.runner-dns/
 *.playwright*
 
 # Host-installed CLI binaries — placed directly on the host into each tool's own

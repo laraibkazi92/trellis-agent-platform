@@ -10,6 +10,7 @@ from taskiq_redis import ListQueueBroker
 from pydantic_ai import Agent
 
 from core.auth import user_id_var
+from core.agent_token import mint_for_run
 from core.models import Identity, IdentityType
 from core.env_sanitize import sanitized_env
 from core.tunables import resolve as resolve_tunable
@@ -172,6 +173,9 @@ async def run_background_script(
     """Executes a script in the background as a Taskiq task."""
     token = user_id_var.set(user_id)
     task_id = context.message.task_id if (context and context.message) else "unknown"
+    # Background runs act as `svc_agent_<name>`; the token carries the agent name so
+    # every enforcement point maps it back to the agent record.
+    mint_for_run(agent_name, user_id, run_id=task_id)
     try:
         identity_mgr = get_identity_manager()
         
@@ -244,9 +248,8 @@ async def run_background_script(
             safe_vars = {str(k): str(v) for k, v in variables.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
             env.update(safe_vars)
 
-        env["FRAMEWORK_EXECUTION_TOKEN"] = await asyncio.to_thread(identity_mgr.generate_execution_token, user_id)
-        framework_url = await asyncio.to_thread(identity_mgr.get_config, "HOST_URL", os.getenv("HOST_URL", "http://localhost:8000"))
-        env["FRAMEWORK_API_URL"] = framework_url
+        # v0.6: no framework loopback credentials are injected into executed
+        # scripts. A script that needs the API must be given a declared secret.
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -343,6 +346,9 @@ async def run_background_agent(
     # Set context variables for thread/async safety with robust try...finally cleanup
     token = user_id_var.set(user_id)
     task_id = context.message.task_id if (context and context.message) else "unknown"
+    # Background runs act as `svc_agent_<name>`; the token carries the agent name so
+    # every enforcement point maps it back to the agent record.
+    mint_for_run(agent_name, user_id, run_id=task_id)
     try:
         identity_mgr = get_identity_manager()
         

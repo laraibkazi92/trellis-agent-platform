@@ -151,6 +151,29 @@
                     </div>
                 </dl>
 
+                {% if edge.edge_key_fp %}
+                <div class="border border-neutral-200 dark:border-neutral-800 bg-neutral-50/60 dark:bg-neutral-950/40 rounded p-3 space-y-2">
+                    <div class="flex flex-wrap items-center gap-x-3 gap-y-1">
+                        <span class="font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Credential key</span>
+                        <code class="font-mono text-[11px] break-all text-neutral-900 dark:text-neutral-100">{{ edge.edge_key_fp }}</code>
+                        {% if edge.edge_key_id %}
+                        <span class="font-mono text-[10px] font-bold border border-neutral-200 dark:border-neutral-700 text-neutral-500 dark:text-neutral-400 px-1.5 py-0.5 uppercase tracking-widest">id {{ edge.edge_key_id }}</span>
+                        {% endif %}
+                    </div>
+                    <p class="font-mono text-[10px] text-neutral-500 dark:text-neutral-400">
+                        Last rotation: {{ edge.edge_key_rotated_at or '—' }}
+                    </p>
+                    {% if edge.retired_credentials %}
+                    <div class="flex items-start gap-2 border border-amber-500/40 bg-amber-50 dark:bg-amber-950/20 px-2.5 py-1.5">
+                        <span class="text-amber-600 dark:text-amber-400 shrink-0"><i data-lucide="triangle-alert" class="w-3.5 h-3.5"></i></span>
+                        <p class="font-mono text-[10px] text-amber-700 dark:text-amber-300">
+                            {{ edge.retired_credentials }} credential record(s) encrypted to a retired key &mdash; affected users must re-enter them.
+                        </p>
+                    </div>
+                    {% endif %}
+                </div>
+                {% endif %}
+
                 {% if edge.tools %}
                 <div class="flex flex-wrap items-center gap-1.5">
                     {% for tool in edge.tools %}

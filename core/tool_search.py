@@ -261,6 +261,16 @@ def _edge_tool_output(result: Any) -> Any:
     return None
 
 
+def _current_agent_token():
+    """The run's agent token, when executing inside an agent turn."""
+    try:
+        from core.auth import agent_token_var
+
+        return agent_token_var.get()
+    except Exception:
+        return None
+
+
 async def execute_whitelisted_tool(
     tool_name: str,
     arguments: Dict[str, Any],
@@ -311,14 +321,25 @@ async def execute_whitelisted_tool(
                 logger.error("Edge MCP tool %r dispatched without an edge caller seam", tool_name)
                 return f"SYSTEM: Error executing tool '{tool_name}'. Please try again later."
             site, mcp_name, sub_tool_name = edge_parts
-            result = await call_edge_mcp_fn(site, mcp_name, sub_tool_name, arguments, user_id)
+            result = await call_edge_mcp_fn(
+                site, mcp_name, sub_tool_name, arguments, user_id,
+                agent_token=_current_agent_token(),
+            )
         elif tool_name.startswith("mcp__"):
             _, server_name, sub_tool_name = tool_name.split("__", 2)
             client = await get_external_mcp_client_fn(server_name, user_id)
             result = await client.call_tool(sub_tool_name, arguments, raise_on_error=False)
         else:
             client = await get_hub_client_fn()
-            result = await client.call_tool(tool_name, {**arguments, "__user_id": user_id}, raise_on_error=False)
+            result = await client.call_tool(
+                tool_name,
+                {
+                    **arguments,
+                    "__user_id": user_id,
+                    "__agent_token": _current_agent_token(),
+                },
+                raise_on_error=False,
+            )
     except Exception as e:
         logger.error("Error executing tool %r: %s", tool_name, e, exc_info=True)
         return f"SYSTEM: Error executing tool '{tool_name}'. Please try again later."

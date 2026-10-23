@@ -15,8 +15,10 @@ and ``core.tool_runtime``. Importing this module must stay side-effect free.
 
 MCP export (``export_mcps``) lives in ``core.proxy_mcp``; the MCP client stack is
 imported lazily there, so a tools-only edge never loads it. Credentials for both
-tools and MCP servers are resolved from edge-local files by
-``core.edge_user_secrets`` -- they never cross the tunnel and never reach etcd.
+tools and MCP servers are resolved by ``core.edge_user_secrets``: one shared,
+edge-local file per export, plus per-user sets that central stores only as
+ciphertext sealed to this edge's public key (``core.edge_crypto``). Nothing here
+sends a credential value to central, and the private key never leaves this VM.
 """
 
 from __future__ import annotations
@@ -37,7 +39,18 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import yaml
 
-from core import edge_env, edge_user_secrets, proxy_mcp, sandbox, tool_runtime
+from core import agent_token as agent_token_module
+from core import (
+    edge_crypto,
+    edge_env,
+    edge_keypair,
+    edge_secrets_central,
+    edge_user_secrets,
+    proxy_mcp,
+    sandbox,
+    tool_runtime,
+)
+from core.edge_keypair import EdgeKey, EdgeKeyError
 from core.models import ToolConfig
 from services.edge_relay import protocol
 
@@ -64,7 +77,7 @@ RESERVED_SITE_NAMES = frozenset({"mcp"})
 
 _SITE_RE = protocol.NAME_RE
 _WS_PREFIXES = ("ws://", "wss://")
-_VALID_SANDBOX_BACKENDS = frozenset({"auto", "bwrap", "landlock"})
+_VALID_SANDBOX_BACKENDS = frozenset({"auto", "bwrap", "landlock", "container"})
 
 # The default enrollment-token variable. Kept in ``core.edge_env`` so stripping it is
 # intrinsic to the env scoper; re-exported here because callers of this module name it.
@@ -138,14 +151,17 @@ class ProxyConfig:
     # mapping with include_tools/exclude_tools/credential_mode/session settings.
     mcps_dir: Path = Path("workspace/mcps")
     export_mcps: List[Any] = field(default_factory=list)
-    # Edge-local credential stores (never sent to central, never in etcd): one
-    # ``<tool-or-mcp>.env`` per exported item, one ``<normalized-email>.env`` per user.
+    # Edge-local shared credential store (never sent to central, never in etcd): one
+    # ``<tool-or-mcp>.env`` per exported item. Per-user credentials are sealed blobs
+    # fetched from central and opened with the edge key below.
     secrets_dir: Path = edge_user_secrets.DEFAULT_SECRETS_DIR
-    user_secrets_dir: Path = edge_user_secrets.DEFAULT_USER_SECRETS_DIR
     # Opt-out of the edge env allowlist: true restores the v0.4 denylist
     # (sanitized_env) for tools that cannot declare every key they read.
     env_passthrough: bool = False
-    sandbox: str = "auto"
+    sandbox: str = "container"
+    # Control socket of this edge's runner (the only component with a container
+    # daemon). Only read when sandbox is "container".
+    runner_socket: str = "/run/trellis/runner.sock"
     # Optional mutual TLS: the relay's CA plus this edge's client certificate.
     # Without these, a relay that enforces EDGE_MTLS_CA rejects every handshake.
     tls_ca_file: Optional[str] = None
@@ -326,7 +342,10 @@ def load_config(path: str | Path | None = None) -> ProxyConfig:
 
     export_mcps = proxy_mcp.validate_export_mcps(raw.get("export_mcps"))
 
-    sandbox = str(raw.get("sandbox") or "auto").strip().lower()
+    # v0.6: the safe default. A legacy in-process backend sees the whole
+    # filesystem (`--ro /`), including the mounted edge private key, so it is an
+    # explicit opt-in for local development only.
+    sandbox = str(raw.get("sandbox") or "container").strip().lower()
     if sandbox not in _VALID_SANDBOX_BACKENDS:
         raise ValueError(
             f"proxy config: sandbox must be one of {sorted(_VALID_SANDBOX_BACKENDS)} (got {sandbox!r})"
@@ -375,14 +394,13 @@ def load_config(path: str | Path | None = None) -> ProxyConfig:
         secrets_dir=_path_setting(
             raw, "secrets_dir", "TRELLIS_EDGE_SECRETS_DIR", edge_user_secrets.DEFAULT_SECRETS_DIR
         ),
-        user_secrets_dir=_path_setting(
-            raw,
-            "user_secrets_dir",
-            "TRELLIS_EDGE_USER_SECRETS_DIR",
-            edge_user_secrets.DEFAULT_USER_SECRETS_DIR,
-        ),
         env_passthrough=env_passthrough,
         sandbox=sandbox,
+        runner_socket=str(
+            os.getenv("RUNNER_SOCKET")
+            or raw.get("runner_socket")
+            or "/run/trellis/runner.sock"
+        ),
         tls_ca_file=str(tls_ca_file) if tls_ca_file else None,
         tls_cert_file=str(tls_cert_file) if tls_cert_file else None,
         tls_key_file=str(tls_key_file) if tls_key_file else None,
@@ -507,6 +525,89 @@ def _credential_store(config: Optional["ProxyConfig"]) -> edge_user_secrets.Cred
     return edge_user_secrets.CredentialStore.from_config(config)
 
 
+# One warning per process for a missing key: the edge still serves shared-credential
+# tools, so a reconnect loop must not repeat it.
+_NO_EDGE_KEY_WARNED = False
+
+
+def _load_edge_keys() -> Tuple[Optional[EdgeKey], Optional[EdgeKey]]:
+    """Load the current edge key plus the rotation overlap, if either exists.
+
+    A missing or unusable key does not stop the edge: tools with shared credentials
+    still work. It does mean every sealed per-user call is refused, with one warning
+    naming the fix (``trellis-proxy edge-keygen``).
+    """
+    global _NO_EDGE_KEY_WARNED
+    try:
+        current = edge_keypair.load()
+    except (EdgeKeyError, OSError) as exc:
+        if not _NO_EDGE_KEY_WARNED:
+            _NO_EDGE_KEY_WARNED = True
+            logger.warning(
+                "No usable edge credential key: browser-sealed per-user credentials "
+                "will be refused until one exists. Run `trellis-proxy edge-keygen` "
+                "(or set EDGE_PRIVATE_KEY_PATH). Reason: %s",
+                exc,
+            )
+        return None, None
+    try:
+        previous = edge_keypair.load_old()
+    except (EdgeKeyError, OSError) as exc:
+        logger.warning("Ignoring the retained edge key: %s", exc)
+        previous = None
+    return current, previous
+
+
+def _resolve_edge_keys(
+    edge_key: Optional[EdgeKey], prev_edge_key: Optional[EdgeKey]
+) -> Tuple[Optional[EdgeKey], Optional[EdgeKey]]:
+    """Prefer the caller-supplied keys; fall back to the files for the ones omitted."""
+    if edge_key is not None and prev_edge_key is not None:
+        return edge_key, prev_edge_key
+    current, previous = _load_edge_keys()
+    return edge_key or current, prev_edge_key or previous
+
+
+def _open_for_call(
+    call: Mapping[str, Any],
+    *,
+    site: str,
+    kind: str,
+    name: str,
+    edge_key: Optional[EdgeKey],
+    prev_edge_key: Optional[EdgeKey],
+) -> Optional[Dict[str, str]]:
+    """Open this call's sealed blob for exactly one ``(site, kind, name, identity)``.
+
+    ``None`` means the caller has no sealed blob (the shared/per-user-shared path).
+    A rotation keeps the previous key readable for the overlap window, so a blob the
+    browser sealed before the rotation still opens -- but only as that same target and
+    identity, which is what the AAD enforces. A refusal is never retried against a
+    different target.
+    """
+    blob = call.get("sealed")
+    if blob is None:
+        return None
+
+    identity = edge_secrets_central.sealed_identity(call.get("user"), call.get("user_email"))
+    if edge_key is None:
+        raise edge_crypto.SealedError(
+            edge_crypto.CREDENTIAL_REJECTED,
+            "this edge has no credential key configured; sealed credentials are unusable",
+        )
+    try:
+        return edge_crypto.open_sealed(
+            blob, edge_key, site=site, kind=kind, name=name, identity=identity
+        )
+    except edge_crypto.SealedError:
+        if prev_edge_key is None:
+            raise
+    # Only reached for a SealedError under the current key: the rotation overlap.
+    return edge_crypto.open_sealed(
+        blob, prev_edge_key, site=site, kind=kind, name=name, identity=identity
+    )
+
+
 def build_env(
     tool_dir: Path,
     config: Optional[ToolConfig] = None,
@@ -518,23 +619,28 @@ def build_env(
     credential_mode: str = edge_user_secrets.DEFAULT_MODE,
     email: Optional[str] = None,
     site: Optional[str] = None,
+    sealed: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, str]:
     """Scoped environment with this tool's own ``bin/`` prepended to PATH.
 
     Built per call, like the hub, so each tool only sees its own helper binaries and
     the env names its ``tool.yaml`` declares -- not whatever the edge container
     carries. Declared keys come from the credential chain
-    (``core.edge_user_secrets``): the shared/per-user file first, the process env last
-    in ``shared``/``per_user`` mode, and an empty/whitespace file value counts as unset
-    (so it cannot mask a real one). ``passthrough`` restores the v0.4 denylist for a
-    tool whose keys are not all declared; the tunnel credential is dropped in both
-    modes, even if something re-adds it to the process environment.
+    (``core.edge_user_secrets``): a caller's sealed blob when there is one, else the
+    shared file with the process env last, and an empty/whitespace file value counts
+    as unset (so it cannot mask a real one). ``passthrough`` restores the v0.4
+    denylist for a tool whose keys are not all declared; the tunnel credential is
+    dropped in both modes, even if something re-adds it to the process environment.
 
     ``credential_mode`` is the operator's policy for this tool and may raise
     ``MissingCredentials`` (``per_user_required``): callers must turn that into a
-    ``missing_credentials`` error result **without** running the tool. Under that mode
-    a declared key the caller's file does not define is removed from the env even with
-    ``passthrough``, so the container's value can never stand in for it.
+    ``missing_credentials`` error result **without** running the tool.
+
+    ``sealed`` is the decrypted per-user mapping (``None`` = no blob). When it is not
+    None the per-user branch is all-or-nothing: only the secret names it carries reach
+    the env, and any declared secret it omits is removed from the inherited env even
+    with ``passthrough`` -- the shared file and the container never fill the gap.
+    Declared ``variables`` keep coming from the shared file / process env.
 
     ``identity`` carries the caller the hub resolved centrally; an absent or empty
     value is dropped rather than exported as ``""`` so a tool can test presence.
@@ -547,6 +653,7 @@ def build_env(
         email=email if email is not None else (identity or {}).get("user_email"),
         site=site or "",
         mode=decided_mode,
+        sealed=sealed,
     )
 
     env = edge_env.scoped_env(
@@ -558,8 +665,12 @@ def build_env(
     # Declared credentials win over the process env (``shared`` mode's whole point);
     # only declared names are ever in ``resolved``.
     env.update(resolved)
-    # ... and under ``per_user_required`` nothing else may supply a declared key.
-    edge_user_secrets.enforce_per_user_required(env, config, resolved, decided_mode)
+    if sealed is not None:
+        # All-or-nothing: a declared secret the caller's blob omits must not survive
+        # from the process env (passthrough) or any other inherited layer.
+        for key in edge_user_secrets.declared_secret_keys(config):
+            if key not in resolved:
+                env.pop(key, None)
     # A credential file must not reintroduce a framework control-plane name.
     edge_env.strip_framework_names(env, token_env=token_env)
     # Caller identity is per frame: never inherit a stale one from ``TRELLIS_*``.
@@ -591,9 +702,46 @@ def _edge_tool(config: ToolConfig) -> protocol.EdgeTool:
     return protocol.validate_tools([_catalog_entry(config)])[0]
 
 
+def _credential_key_lists(config: Any) -> Dict[str, List[str]]:
+    """The names a manifest exposes to the browser's seal form.
+
+    ``secret_keys`` are the only names a user may seal; ``variable_keys`` are shown
+    read-only because endpoints come from the edge's own config (plan §6 invariant 10).
+    This is the same split the central write gate applies, so a blob accepted there
+    can always be resolved here.
+    """
+    return {
+        "secret_keys": sorted(edge_user_secrets.declared_secret_keys(config)),
+        "variable_keys": sorted(edge_user_secrets.declared_variable_keys(config)),
+    }
+
+
+def credential_keys(
+    config_map: Mapping[str, Tuple[ToolConfig, Path]],
+    mcp_entries: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Dict[str, List[str]]]:
+    """``{export_name: {secret_keys, variable_keys}}`` for every exported target.
+
+    The relay publishes ``<site>__<name>`` configs without ``secrets``/``variables``
+    (the edge owns them), so this hello field is what lets central's pubkey endpoint
+    render the right inputs. Names are the bare export names, not registry names.
+    """
+    keys = {
+        name: _credential_key_lists(config)
+        for name, (config, _dir) in config_map.items()
+    }
+    for name, entry in (mcp_entries or {}).items():
+        keys[name] = _credential_key_lists(getattr(entry, "config", entry))
+    return keys
+
+
 def hello_frame(
     config_map: Mapping[str, Tuple[ToolConfig, Path]],
     mcp_catalogs: Optional[Mapping[str, protocol.EdgeMcp]] = None,
+    *,
+    mcp_entries: Optional[Mapping[str, Any]] = None,
+    edge_key: Optional[EdgeKey] = None,
+    prev_edge_key: Optional[EdgeKey] = None,
 ) -> Dict[str, Any]:
     """The catalog frame. Entries go through the same cleaning the relay applies,
     so the schema the relay publishes is byte-for-byte what the edge validates
@@ -602,9 +750,16 @@ def hello_frame(
     ``caps`` always states what this edge can serve: a proto-1 relay has no ``caps``
     and reads the frame as tools-only, while any MCP catalog makes it ``["tools","mcp"]``.
     MCP ``inputSchema`` payloads are carried verbatim (L6).
+
+    ``edge_pubkey`` / ``edge_key_fp`` / ``prev_edge_key_fp`` are the public half of the
+    key central seals per-user credentials to; the relay pins them in the site record
+    so the browser form knows which key to encrypt to. They are omitted when this edge
+    has no key (a shared-credential-only install still publishes its catalog).
     """
     catalogs = mcp_catalogs or {}
-    return {
+    if edge_key is None and prev_edge_key is None:
+        edge_key, prev_edge_key = _load_edge_keys()
+    frame: Dict[str, Any] = {
         "t": "hello",
         "proto": PROTO_VERSION,
         "edge_version": EDGE_VERSION,
@@ -616,12 +771,22 @@ def hello_frame(
         "mcps": [
             catalog.as_dict() for _, catalog in sorted(catalogs.items())
         ],
+        "credential_keys": credential_keys(config_map, mcp_entries),
     }
+    if edge_key is not None:
+        frame["edge_pubkey"] = edge_key.spki_b64
+        frame["edge_key_fp"] = edge_key.fingerprint
+        frame["prev_edge_key_fp"] = prev_edge_key.fingerprint if prev_edge_key else None
+    return frame
 
 
 def _fit_hello_budget(
     config_map: Mapping[str, Tuple[ToolConfig, Path]],
     catalogs: Mapping[str, protocol.EdgeMcp],
+    *,
+    mcp_entries: Optional[Mapping[str, Any]] = None,
+    edge_key: Optional[EdgeKey] = None,
+    prev_edge_key: Optional[EdgeKey] = None,
 ) -> Dict[str, protocol.EdgeMcp]:
     """Drop MCP catalogs until the whole hello fits ``MAX_FRAME_BYTES`` (plan §2.3).
 
@@ -635,7 +800,17 @@ def _fit_hello_budget(
         return remaining
 
     def frame_size(present: Mapping[str, protocol.EdgeMcp]) -> int:
-        return len(protocol.encode(hello_frame(config_map, present)).encode("utf-8"))
+        return len(
+            protocol.encode(
+                hello_frame(
+                    config_map,
+                    present,
+                    mcp_entries=mcp_entries,
+                    edge_key=edge_key,
+                    prev_edge_key=prev_edge_key,
+                )
+            ).encode("utf-8")
+        )
 
     empty = frame_size({})
     marginal = {
@@ -703,12 +878,36 @@ def _timeout_frame(frame: Dict[str, Any], deadline_ms: int, started: float) -> D
     )
 
 
+def _token_denial(raw_token: Optional[str]) -> Optional[tuple[str, str]]:
+    """Signature and expiry only: an edge has no agent registry (plan §5 item 5).
+
+    The allowlist decision belongs to the relay, which owns the registry; this check
+    is defense in depth for a compromised relay and for the runner request that
+    follows. Returns the ``(code, message)`` error frame payload for an
+    ``enforce``-mode refusal, and only logs the would-be refusal in ``log`` mode.
+    """
+    mode = agent_token_module.mode()
+    if mode == "off":
+        return None
+    try:
+        agent_token_module.verify(raw_token)
+    except agent_token_module.AgentTokenError as exc:
+        message = f"access_denied: agent token rejected ({exc.code})"
+        if mode == "log":
+            logger.warning("Edge: would refuse a call: %s", message)
+            return None
+        return ("access_denied", message)
+    return None
+
+
 async def handle_call(
     config_map: Mapping[str, Tuple[ToolConfig, Path]],
     message: Dict[str, Any],
     *,
     proxy_config: Optional[ProxyConfig] = None,
     credential_modes: Optional[Mapping[str, str]] = None,
+    edge_key: Optional[EdgeKey] = None,
+    prev_edge_key: Optional[EdgeKey] = None,
 ) -> Dict[str, Any]:
     """Turn one ``call`` frame into a ``result`` frame.
 
@@ -717,17 +916,23 @@ async def handle_call(
     schema, independently of whatever the relay already checked.
 
     ``proxy_config`` supplies the edge's env policy (allowlist vs passthrough, the
-    token variable to strip, and where the credential stores live). Without it the
-    allowlist and the default token name still apply -- a caller cannot accidentally
-    widen the env.
+    token variable to strip, and where the shared credential store lives). Without it
+    the allowlist and the default token name still apply -- a caller cannot
+    accidentally widen the env.
 
     ``credential_modes`` carries the operator's per-tool ``credential_mode`` from the
     live ``_Session`` (default ``shared``); when it is omitted, the ``proxy_config``'s
     own ``export_modes`` is used. A caller that passes a ``proxy_config`` -- as the
     serve loop does -- therefore cannot silently downgrade a ``per_user_required`` tool
     to ``shared``; with no ``proxy_config`` at all there is nothing to read and the
-    default mode applies. Under ``per_user_required`` a missing file short-circuits to
-    a ``missing_credentials`` result: the tool is never executed.
+    default mode applies. Under ``per_user_required`` a caller with no sealed blob
+    short-circuits to a ``missing_credentials`` result: the tool is never executed.
+
+    ``message["sealed"]`` is the caller's ciphertext for exactly this
+    ``(site, tool, identity)``. It is opened here (current key, then the rotation
+    overlap) and the plaintext mapping travels only into the container env; a
+    ``SealedError`` -- another target, another user, another site, a retired key --
+    becomes ``credential_rejected`` and the tool never runs.
     """
     started = time.monotonic()
     raw_id = message.get("id")
@@ -737,6 +942,12 @@ async def handle_call(
         call = protocol.validate_call(message)
     except protocol.ProtocolError as exc:
         return _result_frame(fallback_id, _elapsed_ms(started), error=("invalid_arguments", str(exc)))
+
+    agent_token = call.get("agent_token")
+    denial = _token_denial(agent_token)
+    if denial is not None:
+        logger.warning("Refusing call %r: %s", call["id"], denial[1])
+        return _result_frame(call["id"], _elapsed_ms(started), error=denial)
 
     entry = config_map.get(call["tool"])
     if entry is None:
@@ -755,6 +966,38 @@ async def handle_call(
     if credential_modes is None:
         credential_modes = proxy_config.export_modes if proxy_config else {}
     identity = {"user": call.get("user"), "user_email": call.get("user_email")}
+    site = proxy_config.site if proxy_config else None
+    if call.get("sealed") is not None and (edge_key is None or prev_edge_key is None):
+        edge_key, prev_edge_key = _resolve_edge_keys(edge_key, prev_edge_key)
+    try:
+        sealed = _open_for_call(
+            call,
+            site=site or "",
+            kind="tool",
+            name=call["tool"],
+            edge_key=edge_key,
+            prev_edge_key=prev_edge_key,
+        )
+    except edge_crypto.SealedError as exc:
+        # Never retried against another target, and the message carries no value.
+        logger.warning("Refusing call %r: sealed credential rejected (%s)", call["id"], exc)
+        return _result_frame(
+            call["id"],
+            _elapsed_ms(started),
+            error=(edge_crypto.CREDENTIAL_REJECTED, str(exc) or "sealed credential rejected"),
+        )
+    if sealed is not None and proxy_config is not None and proxy_config.sandbox != "container":
+        # A legacy backend can read /etc/trellis/edge-key (the tool sees the whole
+        # filesystem), which would make the seal meaningless. Refuse instead.
+        return _result_frame(
+            call["id"],
+            _elapsed_ms(started),
+            error=(
+                edge_crypto.CREDENTIAL_REJECTED,
+                "sealed credentials require sandbox: container on this edge "
+                "(a legacy backend can read the edge private key)",
+            ),
+        )
     try:
         env = build_env(
             tool_dir,
@@ -767,7 +1010,8 @@ async def handle_call(
                 call["tool"], edge_user_secrets.DEFAULT_MODE
             ),
             email=identity["user_email"],
-            site=proxy_config.site if proxy_config else None,
+            site=site,
+            sealed=sealed,
         )
     except edge_user_secrets.MissingCredentials as exc:
         # Fail closed: nothing is spawned and no credential is invented. The message
@@ -777,13 +1021,16 @@ async def handle_call(
 
     try:
         # The tool's own timeout (core.tool_runtime) governs; the relay's
-        # deadline_ms only bounds its wait for this result.
+        # deadline_ms only bounds its wait for this result. The token is omitted
+        # when absent so a pre-v0.6 frame keeps the exact call shape.
+        token_kwargs = {"agent_token": agent_token} if agent_token else {}
         result = await tool_runtime.execute_tool(
             config,
             tool_dir,
             arguments,
             env=env,
             on_health=None,
+            **token_kwargs,
         )
     except Exception as exc:
         logger.exception("Tool %r failed on the edge", call["tool"])
@@ -797,13 +1044,21 @@ async def handle_call(
 
 
 async def handle_mcp_call(
-    manager: proxy_mcp.McpSessionManager, message: Dict[str, Any]
+    manager: proxy_mcp.McpSessionManager,
+    message: Dict[str, Any],
+    *,
+    edge_key: Optional[EdgeKey] = None,
+    prev_edge_key: Optional[EdgeKey] = None,
 ) -> Dict[str, Any]:
     """Turn one ``kind:"mcp"`` call frame into a ``result`` frame.
 
     Never raises, for the same reason ``handle_call`` does not: a refusal or a dead
     server must not take the receive loop down. ``args`` are passed through as-is --
     the target server owns their schema, and coercing would rewrite a union branch.
+
+    A sealed blob is opened here (kind ``mcp``, the server's name, the caller's
+    identity) and the decrypted mapping is handed to the session manager, which uses
+    it only when it opens (or reopens) the session.
     """
     started = time.monotonic()
     raw_id = message.get("id")
@@ -814,6 +1069,30 @@ async def handle_mcp_call(
     except protocol.ProtocolError as exc:
         return _result_frame(fallback_id, _elapsed_ms(started), error=("invalid_arguments", str(exc)))
 
+    denial = _token_denial(call.get("agent_token"))
+    if denial is not None:
+        logger.warning("Refusing MCP call %r: %s", call["id"], denial[1])
+        return _result_frame(call["id"], _elapsed_ms(started), error=denial)
+
+    if call.get("sealed") is not None and (edge_key is None or prev_edge_key is None):
+        edge_key, prev_edge_key = _resolve_edge_keys(edge_key, prev_edge_key)
+    try:
+        sealed = _open_for_call(
+            call,
+            site=getattr(manager, "site", "") or "",
+            kind="mcp",
+            name=call["mcp"],
+            edge_key=edge_key,
+            prev_edge_key=prev_edge_key,
+        )
+    except edge_crypto.SealedError as exc:
+        logger.warning("Refusing MCP call %r: sealed credential rejected (%s)", call["id"], exc)
+        return _result_frame(
+            call["id"],
+            _elapsed_ms(started),
+            error=(edge_crypto.CREDENTIAL_REJECTED, str(exc) or "sealed credential rejected"),
+        )
+
     try:
         result = await manager.call(
             call["mcp"],
@@ -821,6 +1100,8 @@ async def handle_mcp_call(
             call["args"],
             {"user": call.get("user"), "user_email": call.get("user_email")},
             call["deadline_ms"],
+            agent_token=call.get("agent_token"),
+            sealed=sealed,
         )
     except proxy_mcp.McpCallError as exc:
         return _result_frame(call["id"], _elapsed_ms(started), error=(exc.code, exc.message))
@@ -836,7 +1117,11 @@ async def handle_mcp_call(
 
 
 async def _call_mcp_with_deadline(
-    manager: proxy_mcp.McpSessionManager, frame: Dict[str, Any]
+    manager: proxy_mcp.McpSessionManager,
+    frame: Dict[str, Any],
+    *,
+    edge_key: Optional[EdgeKey] = None,
+    prev_edge_key: Optional[EdgeKey] = None,
 ) -> Dict[str, Any]:
     """``_call_with_deadline`` for MCP: same grace, same semaphore slot upstream.
 
@@ -847,11 +1132,16 @@ async def _call_mcp_with_deadline(
     try:
         deadline_ms = protocol.validate_call(frame)["deadline_ms"]
     except protocol.ProtocolError:
-        return await handle_mcp_call(manager, frame)
+        return await handle_mcp_call(
+            manager, frame, edge_key=edge_key, prev_edge_key=prev_edge_key
+        )
 
     timeout = max(0.0, deadline_ms / 1000.0 - _DEADLINE_GRACE_S)
     try:
-        return await asyncio.wait_for(handle_mcp_call(manager, frame), timeout=timeout)
+        return await asyncio.wait_for(
+            handle_mcp_call(manager, frame, edge_key=edge_key, prev_edge_key=prev_edge_key),
+            timeout=timeout,
+        )
     except asyncio.TimeoutError:
         return _timeout_frame(frame, deadline_ms, started)
 
@@ -862,6 +1152,8 @@ async def _call_with_deadline(
     *,
     proxy_config: Optional[ProxyConfig] = None,
     credential_modes: Optional[Mapping[str, str]] = None,
+    edge_key: Optional[EdgeKey] = None,
+    prev_edge_key: Optional[EdgeKey] = None,
 ) -> Dict[str, Any]:
     """Run one call, aborting it when the caller's ``deadline_ms`` expires.
 
@@ -879,7 +1171,12 @@ async def _call_with_deadline(
         # handle_call reports the malformed frame itself; no tool will run, so
         # there is nothing to bound.
         return await handle_call(
-            config_map, frame, proxy_config=proxy_config, credential_modes=credential_modes
+            config_map,
+            frame,
+            proxy_config=proxy_config,
+            credential_modes=credential_modes,
+            edge_key=edge_key,
+            prev_edge_key=prev_edge_key,
         )
 
     # The grace makes the edge lose the race on purpose: its error frame reaches
@@ -889,7 +1186,12 @@ async def _call_with_deadline(
     try:
         return await asyncio.wait_for(
             handle_call(
-                config_map, frame, proxy_config=proxy_config, credential_modes=credential_modes
+                config_map,
+                frame,
+                proxy_config=proxy_config,
+                credential_modes=credential_modes,
+                edge_key=edge_key,
+                prev_edge_key=prev_edge_key,
             ),
             timeout=timeout,
         )
@@ -922,6 +1224,10 @@ class _Session:
             credentials=edge_user_secrets.CredentialStore.from_config(config),
             site=config.site,
         )
+        # The edge keypair: the only copy of the private half, loaded once per process.
+        # ``prev`` is the rotation overlap (``edge-key.old``), used to open blobs the
+        # browser sealed before the rotation.
+        self.edge_key, self.prev_edge_key = _load_edge_keys()
         self.reconnect = asyncio.Event()
         self.connection: Any = None
         # Set once the relay answered our hello with a welcome: ``--once`` uses it to
@@ -944,13 +1250,13 @@ class _Session:
         (identity, destination, the token, the sandbox backend, the env policy and
         the credential store *locations*) are reported rather than half-applied.
 
-        Credential *content* needs no signal for tools: ``secrets_dir``/``user_secrets_dir``
-        are read per call, so a file edit applies to the next tool call. MCP sessions
-        are the exception -- they resolve credentials once, at creation (plan §7
-        Phase 5) -- so ``refresh_mcps`` retires every live session on SIGHUP; without
-        the signal a changed file would wait for the TTL or a restart. Moving either
-        directory needs a restart: the manager and the CLI must agree on where the
-        files live.
+        Credential *content* needs no signal for tools: ``secrets_dir`` is read per
+        call (and a sealed blob arrives with each call), so a change applies to the
+        next tool call. MCP sessions are the exception -- they resolve credentials
+        once, at creation -- so ``refresh_mcps`` retires every live session on SIGHUP;
+        without the signal a changed credential would wait for the TTL or a restart.
+        Moving the directory needs a restart: the manager and the proxy must agree on
+        where the files live.
 
         MCP *catalogs* are rebuilt asynchronously (``refresh_mcps``) because a server
         without a static ``tools:`` list is discovered live. The manager keeps
@@ -958,6 +1264,10 @@ class _Session:
         atomically, so an MCP call is never refused during the rebuild.
         """
         fresh: Optional[ProxyConfig] = None
+        # Re-read the keypair too: a rotation (`edge-keygen --rotate`) only becomes
+        # visible to central once hello publishes the new fingerprint, and SIGHUP is
+        # the republish path. Cheap: two 0400 PEM reads.
+        self.edge_key, self.prev_edge_key = _load_edge_keys()
         if self.config_path is not None and self.config_path.exists():
             try:
                 fresh = load_config(self.config_path)
@@ -981,7 +1291,6 @@ class _Session:
             "env_passthrough",
             "sandbox",
             "secrets_dir",
-            "user_secrets_dir",
             "tls_ca_file",
             "tls_cert_file",
             "tls_key_file",
@@ -1089,11 +1398,17 @@ class _Session:
                 "MCP catalog rebuild superseded by a newer reload; discarding it"
             )
             return
-        self.mcp_catalogs = _fit_hello_budget(self.tools, catalogs)
+        self.mcp_catalogs = _fit_hello_budget(
+            self.tools,
+            catalogs,
+            mcp_entries=entries,
+            edge_key=self.edge_key,
+            prev_edge_key=self.prev_edge_key,
+        )
         self.mcp.set_entries(entries, self.mcp_catalogs)
-        # A SIGHUP is the operator's escape hatch for credential files (plan §7
-        # Phase 5): sessions resolve credentials once at creation, so retiring them
-        # here is what makes an edited file reach the next call instead of waiting
+        # A SIGHUP is the operator's escape hatch for credentials: sessions resolve
+        # them once at creation, so retiring them here is what makes a new shared
+        # file -- or the next caller's sealed blob -- reach a session without waiting
         # out the TTL. No tombstone: this is a requested reopen, not a lost session,
         # so the next call starts a fresh server rather than answering
         # ``mcp_session_lost``. A tunnel reconnect never runs this (sessions survive).
@@ -1340,7 +1655,17 @@ def _terminal_close_message(close_code: int, site: str) -> str:
 
 async def _serve(session: _Session, ws) -> None:
     """Handshake, then pump frames until the connection closes."""
-    await ws.send(protocol.encode(hello_frame(session.tools, session.mcp_catalogs)))
+    await ws.send(
+        protocol.encode(
+            hello_frame(
+                session.tools,
+                session.mcp_catalogs,
+                mcp_entries=session.mcps,
+                edge_key=session.edge_key,
+                prev_edge_key=session.prev_edge_key,
+            )
+        )
+    )
 
     first = protocol.decode(await ws.recv(), protocol.RELAY_FRAMES)
     if first.get("t") != "welcome":
@@ -1367,13 +1692,20 @@ async def _serve(session: _Session, ws) -> None:
     async def _run_call(frame: Dict[str, Any]) -> None:
         try:
             if frame.get("kind") == "mcp":
-                result = await _call_mcp_with_deadline(session.mcp, frame)
+                result = await _call_mcp_with_deadline(
+                    session.mcp,
+                    frame,
+                    edge_key=session.edge_key,
+                    prev_edge_key=session.prev_edge_key,
+                )
             else:
                 result = await _call_with_deadline(
                     session.tools,
                     frame,
                     proxy_config=session.config,
                     credential_modes=session.credential_modes,
+                    edge_key=session.edge_key,
+                    prev_edge_key=session.prev_edge_key,
                 )
             await ws.send(protocol.encode(result))
         except asyncio.CancelledError:
@@ -1468,6 +1800,21 @@ async def _sweep_mcp_sessions(
             logger.debug("MCP idle sweep failed", exc_info=True)
 
 
+def _disable_core_dumps() -> None:
+    """PR_SET_DUMPABLE=0: a decrypted credential must not reach a core file.
+
+    Best effort and Linux-only; an edge on another platform simply keeps its
+    default. Called once, before the first key is loaded.
+    """
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE
+    except Exception:
+        logger.debug("Could not set PR_SET_DUMPABLE", exc_info=True)
+
+
 async def run(
     config: ProxyConfig, *, once: bool = False, config_path: Optional[Path] = None
 ) -> None:
@@ -1480,7 +1827,13 @@ async def run(
 
     if config.sandbox != "auto":
         os.environ.setdefault("SANDBOX_BACKEND", config.sandbox)
+    if config.sandbox == "container":
+        os.environ.setdefault("RUNNER_SOCKET", config.runner_socket)
 
+    from core.agent_token import require_secret
+
+    _disable_core_dumps()
+    require_secret("trellis-proxy")
     token = _resolve_and_forget_token(config)
     connect = _connect_factory()
 
@@ -1488,18 +1841,21 @@ async def run(
     # standalone install and the failed refresh would log forever.
     os.environ.setdefault("TRELLIS_EDGE_MODE", "1")
 
-    writable = sandbox.writable_root()
-    if not writable.exists():
-        # Every landlock-sandboxed call binds this path. A tools-only mount (or a
-        # read-only workspace) otherwise fails with an opaque "Sandbox unavailable".
-        logger.warning(
-            "sandbox writable root %s does not exist; mount the workspace at that path "
-            "(see deploy/proxy/docker-compose.yml)",
-            writable,
-        )
+    if config.sandbox != "container":
+        writable = sandbox.writable_root()
+        if not writable.exists():
+            # Every landlock-sandboxed call binds this path. A tools-only mount (or a
+            # read-only workspace) otherwise fails with an opaque "Sandbox unavailable".
+            logger.warning(
+                "sandbox writable root %s does not exist; mount the workspace at that path "
+                "(see deploy/proxy/docker-compose.yml)",
+                writable,
+            )
 
     session = _Session(config, config_path)
     session.reload()
+    # A v0.5 plaintext per-user store is inert now; say so once, with the migration.
+    edge_user_secrets.warn_about_legacy_user_secrets()
     await session.refresh_mcps()
     _active_session = session
     _active_loop = asyncio.get_running_loop()
@@ -1608,206 +1964,26 @@ async def run(
         await asyncio.gather(sweeper, return_exceptions=True)
 
 
-# ---------------------------------------------------------------- user-secrets CLI
+# ---------------------------------------------------------------- CLI
 
-
-def _user_secrets_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="trellis-proxy user-secrets",
-        description=(
-            "Manage per-user credential files on THIS edge. The files never leave the "
-            "VMs: nothing here talks to the relay or to central."
-        ),
-    )
-    commands = parser.add_subparsers(dest="command", required=True)
-    set_cmd = commands.add_parser(
-        "set",
-        help="read KEY=VALUE lines from stdin and store them for one user (merges)",
-    )
-    set_cmd.add_argument("email")
-    commands.add_parser(
-        "list", help="list stored users and their key names (never values)"
-    )
-    delete_cmd = commands.add_parser("delete", help="remove one user's credential file")
-    delete_cmd.add_argument("email")
-    return parser
-
-
-def _extract_config_flag(argv: List[str]) -> Tuple[List[str], Optional[str]]:
-    """Pull ``--config`` out of a ``user-secrets`` argv wherever it was written.
-
-    The flag belongs to the running edge, not to one subcommand, so accepting it
-    before or after ``set``/``list``/``delete`` avoids a silent surprise: the dirs
-    must match the proxy's or the next call reads nothing.
-    """
-    rest: List[str] = []
-    value: Optional[str] = None
-    index = 0
-    while index < len(argv):
-        item = argv[index]
-        if item == "--config" and index + 1 < len(argv):
-            value = argv[index + 1]
-            index += 2
-            continue
-        if item.startswith("--config="):
-            value = item.split("=", 1)[1]
-            index += 1
-            continue
-        rest.append(item)
-        index += 1
-    return rest, value
-
-
-def _credential_store_from_file(config_path: Optional[str]) -> edge_user_secrets.CredentialStore:
-    """The stores the running edge uses, from proxy.yaml plus the env overrides.
-
-    Deliberately *not* ``load_config``: a secrets-only invocation must not need
-    ``site``/``server_url``, and the two store locations are all this needs. The
-    resolution order is the same one ``load_config`` applies, so the CLI and the
-    proxy cannot disagree about where the files are.
-    """
-    path, explicit = _config_path(config_path)
-    raw: Dict[str, Any] = {}
-    if path.exists():
-        try:
-            loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError) as exc:
-            raise ValueError(f"cannot read {path}: {exc}") from exc
-        if loaded is not None and not isinstance(loaded, dict):
-            raise ValueError(f"{path} must contain a mapping")
-        raw = dict(loaded or {})
-    elif explicit:
-        raise ValueError(f"file not found: {path}")
-    return edge_user_secrets.CredentialStore(
-        secrets_dir=_path_setting(
-            raw, "secrets_dir", "TRELLIS_EDGE_SECRETS_DIR", edge_user_secrets.DEFAULT_SECRETS_DIR
-        ),
-        user_secrets_dir=_path_setting(
-            raw,
-            "user_secrets_dir",
-            "TRELLIS_EDGE_USER_SECRETS_DIR",
-            edge_user_secrets.DEFAULT_USER_SECRETS_DIR,
-        ),
-    )
-
-
-def _checked_email(email: str) -> str:
-    value = (email or "").strip()
-    local, _, domain = value.partition("@")
-    if not local or not domain or not any(ch.isalnum() for ch in local):
-        raise ValueError(f"not an email address: {email!r}")
-    return value
-
-
-def _user_secrets_set(store: edge_user_secrets.CredentialStore, email: str) -> int:
-    try:
-        address = _checked_email(email)
-        target = store.user_file(address)
-    except ValueError as exc:
-        print(f"trellis-proxy user-secrets: {exc}", file=sys.stderr)
-        return 2
-
-    provided = edge_user_secrets.parse_env_text(sys.stdin.read())
-    if not provided:
-        print(
-            "trellis-proxy user-secrets: no KEY=VALUE lines on stdin; nothing stored",
-            file=sys.stderr,
-        )
-        return 2
-
-    # Merge, so re-setting one rotated password does not drop the others. A missing
-    # file is empty; an unreadable one is an error -- rewriting it from ``{}`` would
-    # silently discard every key it holds.
-    try:
-        values = edge_user_secrets.load_env_file(target)
-    except edge_user_secrets.CredentialFileError as exc:
-        print(
-            f"trellis-proxy user-secrets: {exc}; refusing to overwrite it",
-            file=sys.stderr,
-        )
-        return 1
-    values.update(provided)
-    try:
-        edge_user_secrets.write_env_file(target, values, email=address)
-    except (OSError, ValueError) as exc:
-        print(f"trellis-proxy user-secrets: cannot write {target}: {exc}", file=sys.stderr)
-        return 1
-
-    print(f"stored {len(provided)} key(s) for {address} in {target}")
-    return 0
-
-
-def _user_secrets_list(store: edge_user_secrets.CredentialStore) -> int:
-    directory = Path(store.user_secrets_dir)
-    if not directory.is_dir():
-        return 0
-    for path in sorted(directory.glob("*.env")):
-        # Key names only: a `list` must be safe to paste into a ticket.
-        keys = sorted(edge_user_secrets.parse_env_file(path))
-        # The address `set` wrote; a legacy file only has its hashed stem.
-        label = edge_user_secrets.read_email_header(path) or path.stem
-        print(f"{label}: {', '.join(keys) if keys else '(no keys)'}")
-    return 0
-
-
-def _user_secrets_delete(store: edge_user_secrets.CredentialStore, email: str) -> int:
-    try:
-        target = store.user_file(_checked_email(email))
-    except ValueError as exc:
-        print(f"trellis-proxy user-secrets: {exc}", file=sys.stderr)
-        return 2
-    try:
-        target.unlink()
-    except FileNotFoundError:
-        print(
-            f"trellis-proxy user-secrets: no stored credentials for {email} ({target})",
-            file=sys.stderr,
-        )
-        return 1
-    except OSError as exc:
-        print(f"trellis-proxy user-secrets: cannot delete {target}: {exc}", file=sys.stderr)
-        return 1
-    print(f"deleted credentials for {email} ({target})")
-    return 0
-
-
-def _user_secrets_main(argv: List[str]) -> int:
-    """``user-secrets {set,list,delete}``; returns a process exit code.
-
-    Errors are one printed line and a non-zero code -- an operator provisioning a box
-    must never get a traceback (or a value) in their terminal scrollback.
-    """
-    args_list, config_arg = _extract_config_flag(list(argv))
-    args = _user_secrets_parser().parse_args(args_list)
-    try:
-        store = _credential_store_from_file(config_arg)
-    except ValueError as exc:
-        print(f"trellis-proxy user-secrets: {exc}", file=sys.stderr)
-        return 2
-
-    if args.command == "set":
-        return _user_secrets_set(store, args.email)
-    if args.command == "delete":
-        return _user_secrets_delete(store, args.email)
-    return _user_secrets_list(store)
+_EDGE_KEYGEN = "edge-keygen"
 
 
 def main(argv: Optional[List[str]] = None) -> None:
     args_list = list(sys.argv[1:] if argv is None else argv)
     # Subcommand first: the default (no subcommand) behaviour is the serve loop, and
-    # the argparse below has no positionals.
-    if args_list and args_list[0] == "user-secrets":
-        code = _user_secrets_main(args_list[1:])
-        if code:
-            raise SystemExit(code)
-        return
+    # the argparse below has no positionals. `edge-keygen` delegates wholesale so the
+    # keypair module owns its own flags (--rotate/--drop-old-key/--show/--path).
+    if args_list and args_list[0] == _EDGE_KEYGEN:
+        raise SystemExit(edge_keypair.main(args_list[1:]))
 
     parser = argparse.ArgumentParser(
         prog="trellis-proxy",
         description="Expose local Trellis tools to the central relay over an outbound WebSocket.",
         epilog=(
-            "Per-user credentials: 'trellis-proxy user-secrets {set,list,delete} "
-            "--config proxy.yaml' (files stay on this edge)."
+            "Per-user credentials are sealed in the central UI and opened here with the "
+            "edge key. Manage that key with 'trellis-proxy edge-keygen "
+            "{--keygen,--rotate,--drop-old-key,--show} [--path PATH]'."
         ),
     )
     parser.add_argument("--config", help=f"path to proxy.yaml (default: ${CONFIG_ENV} or ./proxy.yaml)")

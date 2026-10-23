@@ -31,7 +31,7 @@ INTERNAL VM -- outbound 443 only, no public IP
 │  proxy.yaml          (site, server_url, exports, │
 │                       export_mcps)               │
 │  edge-secrets/       (shared credentials)        │
-│  edge-user-secrets/  (per-user credentials)      │
+│  edge-key            (0400 private seal key)     │
 │  sandbox (bwrap | Landlock)                      │
 └──────────────────┬───────────────────────────────┘
                    │ wss://central/edge/v1/connect
@@ -54,6 +54,56 @@ nginx :443 ── location /edge ──► edge-relay:8100      (compose service
 The relay is a tunnel terminator, not an MCP server: it speaks plain internal HTTP to the
 hub and one WebSocket per site to the edges. It runs as a single replica because the
 site → connection map lives in process memory.
+
+## Edge runner (v0.6)
+
+Since v0.6 an edge executes tool calls in a **local `runner` service**, not as a child
+process of `trellis-proxy`. The sample `deploy/proxy/docker-compose.yml` ships both
+services:
+
+- **`runner`** — the only container on the edge with `/var/run/docker.sock`. It creates
+  one gVisor (`runsc`) container per tool call, gives it a read-only suite mount plus
+  `shared/`, a sized tmpfs, and the deny-by-default network profile from the tool's
+  manifest. It has `network_mode: "none"` and serves a Unix socket at
+  `/run/trellis/runner.sock`, never a port.
+- **`trellis-proxy`** — unchanged in role (dial out over WSS, one tunnel per edge), but
+  with `sandbox: container` (the default for new installs) it forwards execution over
+  the shared `proxy-runner` volume instead of forking tools.
+
+Set in `proxy.yaml`:
+
+```yaml
+sandbox: container
+runner_socket: /run/trellis/runner.sock
+```
+
+and in the edge's `.env`:
+
+```bash
+RUNNER_TOKEN=<openssl rand -hex 32>            # identical on proxy and runner
+TRELLIS_HOST_WORKSPACE=/srv/trellis/workspace  # HOST path of ./workspace on this VM
+MAX_SESSIONS_EDGE=4                            # warm MCP session containers (default 32)
+```
+
+`TRELLIS_HOST_WORKSPACE` must be the absolute **host** path of the directory mounted as
+`/app/workspace`. Docker resolves tool bind mounts against it; a wrong value fails the
+runner's startup canary and it refuses to serve. The `runner` also mounts the workspace
+read-write (it writes the canary and creates output directories) while tool containers
+still see only their read-only mounts.
+
+Prerequisites on the edge host are the same as central: `runsc` registered with Docker
+(proved with `docker run --runtime=runsc hello-world`) and the network profiles created
+by `sudo scripts/setup-network-profiles.sh`. Both are covered in
+[deploy.md → Execution isolation](deploy.md#execution-isolation-v06).
+
+Legacy note: `sandbox: auto | bwrap | landlock` still works so an edge can be run from a
+laptop without `runsc`, but it is development-only from v0.6. `edge-secrets/` (the shared
+service account) is unchanged by phase 4; the plaintext `edge-user-secrets/` directory and
+its `user-secrets` CLI were **removed** -- per-user credentials are now browser-sealed
+ciphertext opened with `edge-key` (see [Per-user credentials and the edge
+key](#per-user-credentials-and-the-edge-key)). **MCP sessions and `execute` console calls
+also run as runner containers** (phase 2), so an edge's session state is never on its host
+disk.
 
 ## Enrollment
 
@@ -224,54 +274,70 @@ the allowlist. A corporate base image that sets only those will see TLS failures
 exported tool or MCP server until the keys are declared in `tool.yaml`/`mcp.yaml` (or
 passthrough is enabled). `SSL_CERT_FILE` is always present.
 
-## Edge-local credentials
+## Edge credentials
 
-Credentials live in files on the edge VM only. They never cross the tunnel and never touch
-etcd — the relay forwards an identity, not a secret.
+There are two credential sources, and neither one is a plaintext per-user file:
 
-> **Trust boundary.** The edge trusts central's identity assertion. The `user_email` in a
-> call frame was resolved centrally from the authenticated user and arrives over the
-> authenticated tunnel; the edge does not re-authenticate the caller, and it has no way
-> to. Anyone able to submit a call frame with an arbitrary `user_email` can act as that
-> user on the edge. Keep the tunnel token and the relay's internal API inside the trust
-> perimeter you already give the central install.
+- a **shared store** on the edge — one dotenv file per exported item, for a service
+  account everybody uses;
+- **browser-sealed per-user sets** — entered in the central UI, stored there only as
+  ciphertext, decrypted on this edge with the private key that never leaves it.
 
-### Stores
+Nothing a user types ever crosses the tunnel or reaches etcd in the clear, and the relay
+(which sees the sealed envelope in transit) has no key to open it.
+
+> **Trust boundary.** The edge trusts central's identity assertion. The `user` / `user_email`
+> in a call frame were resolved centrally from the authenticated user and arrive over the
+> authenticated tunnel. They are also part of the sealed envelope's AAD, so a blob stored
+> for one person cannot be replayed for another, for a different tool/MCP, or for another
+> site: the GCM tag fails and the call returns `credential_rejected` without running.
+> Keep the tunnel token and the relay's internal API inside the trust perimeter you
+> already give the central install.
+
+### Shared store
 
 | Setting | Default | Env override | Holds |
 |---|---|---|---|
 | `secrets_dir` | `edge-secrets` | `TRELLIS_EDGE_SECRETS_DIR` | `<tool-or-mcp>.env`, one service account per exported item |
-| `user_secrets_dir` | `edge-user-secrets` | `TRELLIS_EDGE_USER_SECRETS_DIR` | `<normalized-email>.env`, one file per person |
 
-Both must live **outside** the sandbox-writable workspace, and both need an edge volume:
-the workspace is the only path a tool can write, so a credential store inside it would be
-readable (and writable) by every exported tool. The sample compose mounts them at
-`/etc/trellis/edge-secrets` and `/etc/trellis/edge-user-secrets`; if you maintain your own
-compose file, add the mounts
-([upgrading.md](upgrading.md#compose-and-volume-changes)). The *paths* need a restart;
-their *contents* do not (tool calls re-read them, MCP sessions re-read them at creation or
-on `SIGHUP`).
+It must live **outside** the sandbox-writable workspace: the workspace is the only path a
+tool can write, so a credential store inside it would be readable (and writable) by every
+exported tool. The sample compose mounts it at `/etc/trellis/edge-secrets`; if you maintain
+your own compose file, add the mount
+([upgrading.md](upgrading.md#compose-and-volume-changes)). The *path* needs a restart; the
+*contents* do not (tool calls re-read them, MCP sessions re-read them at creation or on
+`SIGHUP`).
 
-### Modes and resolution order
+### Modes and resolution order (R8)
 
 `credential_mode` is edge policy in `proxy.yaml` — set per entry in `exports` or
 `export_mcps`, default `shared`. It is not a `tool.yaml` field.
 
-| Mode | Per declared key, first match wins |
+| Mode | What the call sees |
 |---|---|
-| `shared` (default) | `<secrets_dir>/<name>.env` → process environment → unset |
-| `per_user` | `<user_secrets_dir>/<email>.env` → shared file → process environment → unset |
-| `per_user_required` | the user's file **only**; if none of the declared keys is there the call fails closed with `missing_credentials` and **nothing executes** |
+| `shared` (default) | the caller's sealed set when one exists (it always wins); otherwise the shared file → process environment → unset |
+| `per_user` | the caller's sealed set if they have one; otherwise the shared file → process environment |
+| `per_user_required` | the caller's sealed set **only**; with no blob for them the call fails closed with `missing_credentials` and **nothing executes** |
 
-`shared` never reads per-user files. Only keys the manifest declares are read out of a
-file, so an extra key in someone's `.env` cannot reach a child process. An anonymous
-caller (no `user_email`) has no per-user file, so `per_user` falls back to the shared
-file and `per_user_required` fails closed. For MCP sessions, credentials are resolved once
-at session creation (see [MCP sessions](#mcp-sessions)).
+A sealed set is **all-or-nothing** for secrets. Once it exists for
+`(site, kind, target, identity)`, only the declared secret names it carries reach the
+container; a declared secret it omits stays missing and is never filled from the shared
+file or the process environment. Partial sets are a user error with a safe result, not a
+silent fallback to the service account.
 
-### File format
+`variables` (endpoints) are never per-user material: they come from `proxy.yaml`/the
+manifest/process env in every mode. The write endpoint rejects a blob that names one, and
+the edge ignores it anyway because it is not in the declared secret set.
 
-Plain `KEY=VALUE`, one per line — the same dotenv subset in both stores:
+Only keys the manifest declares are read out of any source, so an extra key in a file
+cannot reach a child process. An anonymous caller (no `user_email`) has no sealed setup,
+so `per_user` falls back to the shared file and `per_user_required` fails closed. For MCP
+sessions, credentials are resolved once at session creation (see
+[MCP sessions](#mcp-sessions)).
+
+### Shared file format
+
+Plain `KEY=VALUE`, one per line:
 
 ```bash
 # /etc/trellis/edge-secrets/devops-cli.env   (mode 0600)
@@ -285,88 +351,149 @@ CORALOGIX_API_KEY=...
 
 No interpolation, no quoting shell semantics beyond one layer of matching quotes, no
 `${VAR}` expansion, and no trailing comments — a `#` must be the first non-space
-character. `KEY=` (empty or whitespace-only) counts as **unset** in every layer, so a
-blank template line can neither satisfy `per_user_required` nor blank a working value.
-Later duplicates win. An unparseable line is ignored rather than failing the file.
+character. `KEY=` (empty or whitespace-only) counts as **unset**, so a blank template line
+cannot blank a working value. Later duplicates win. An unparseable line is ignored rather
+than failing the file.
 
 ### Permissions
 
-Files written by `user-secrets set` are atomic and `0600`; directories it creates are
-`0700` (the parent is only chmod-ed when it creates it, so an operator-mounted `0750`
-directory stays theirs). A permissive **shared** file logs a warning and is still read —
+A shared file is read as-is; the proxy never writes it. Make it `0600` and its directory
+`0700`, owned by `TRELLIS_UID`. A permissive file logs one warning and is still read —
 the shared account is the operator's call, and refusing to run would turn a permission nit
-into an outage. A permissive per-user file also warns.
+into an outage.
 
-### `user-secrets` CLI
+## Per-user credentials and the edge key
 
-Run it inside the edge container, against the same `proxy.yaml` the proxy uses:
-
-```bash
-# write or merge one operator's keys (reads KEY=VALUE from stdin)
-docker compose exec -T trellis-proxy \
-  python core/proxy.py user-secrets set ops@example.com \
-  --config /etc/trellis/proxy.yaml <<'EOF'
-DEVOPS_USERNAME=ops
-DEVOPS_PASSWORD=...
-EOF
-
-# key names only — safe to paste into a ticket
-python core/proxy.py user-secrets list --config /etc/trellis/proxy.yaml
-
-# revoke (removes the file; the next call fails under per_user_required)
-python core/proxy.py user-secrets delete ops@example.com --config /etc/trellis/proxy.yaml
+```text
+browser (central UI)                    edge VM
+  AES-256-GCM key ──┐
+  RSA-OAEP wrap ──► envelope ──etcd──► relay ──call frame──► trellis-proxy
+                     (central holds ciphertext only)             │ open with edge-key (0400)
+                                                                 └─► container env (declared secrets)
 ```
 
-`set` merges into an existing file (so rotating one password does not drop the others),
-writes a leading `# email: <address>` comment used by `list` for display only, and
-refuses to overwrite a file it cannot read (exit 1) rather than silently discarding its
-keys. The address is normalized into the filename — lowercased, non-alphanumerics
-collapsed to `-`, plus an 8-character hash suffix, e.g.
-`ops-example-com_1a2b3c4d.env` — so case variants of one address share one file.
+1. The edge publishes its public key in `hello` (`edge_pubkey`, `edge_key_fp`,
+   `prev_edge_key_fp`). The relay pins them in `/registry/edges/<site>/config`, and the
+   configured **declared key names** for every export (`credential_keys`), because the
+   relay-published `<site>__<name>` tool configs deliberately omit `secrets`/`variables`.
+2. The user opens **Configuration → Edge credentials**, picks a target, and the browser
+   encrypts `{"KEY": "VALUE", ...}` to that key. Only `secret_keys` are rendered; the
+   `variable_keys` are shown read-only as "configured on the edge". The AAD is
+   `v1|<site>|<kind>|<name>|<identity>|<key_id>`, so the envelope is useless anywhere else.
+3. Central stores the envelope (plus `created_at` / `created_by`) at
+   `/registry/edge_user_secrets/<site>/<user_id>/<kind>/<name>` and forwards it verbatim
+   with each call. The relay audits only `has_sealed: true|false` — never the bytes.
+4. The proxy opens it with the current key (or `edge-key.old` during a rotation overlap),
+   computes the identity the same way central did, and hands the plaintext only to the
+   container env. A failed open is `credential_rejected`; the tool never runs and the blob
+   is never retried against a different target.
+
+### `edge-keygen`
+
+The private key is the one credential that cannot be recovered. It must be a regular file,
+mode `0400`, owned by `TRELLIS_UID`, **outside the workspace** (the loader refuses a wider
+mode or a path inside the workspace).
+
+```bash
+# create it (Docker sample: run the published image so cryptography matches the proxy)
+docker run --rm -v "$PWD":/w \
+  -e EDGE_PRIVATE_KEY_PATH=/w/edge-key \
+  ghcr.io/laraibkazi92/trellis-agent-platform:latest \
+  python core/proxy.py edge-keygen --path /w/edge-key
+
+trellis-proxy edge-keygen --show     # public material only: {key_id, fingerprint, spki}
+```
+
+`EDGE_PRIVATE_KEY_PATH` (default `/etc/trellis/edge-key`) selects the file. The sample
+compose mounts it read-only into `trellis-proxy` **only**; the runner and tool containers
+never see it.
+
+### Rotation
+
+```bash
+trellis-proxy edge-keygen --rotate          # current -> edge-key.old (0600), new key written
+trellis-proxy edge-keygen --show            # the new fingerprint
+# ... the relay re-publishes on the next hello; users re-enter sets sealed to a retired key
+trellis-proxy edge-keygen --drop-old-key    # ends the overlap
+```
+
+During the overlap the proxy opens with the current key first, then `edge-key.old`; the
+relay records both fingerprints so the UI accepts blobs sealed to either. A blob sealed to
+a key that is neither current nor the retained previous one is inert: central flags the
+record as `retired_key`, the UI asks the user to re-enter the set, and a call that still
+presents it gets `credential_rejected`.
+
+**Losing the key** (deleted, or rotated away without the old file) means every sealed set
+must be re-entered in the UI. There is no recovery path, by design: central never has the
+private key. Keep `/etc/trellis/edge-key` in the host backup.
+
+### Removals in v0.6.0
+
+- `edge-user-secrets/` and `proxy.yaml`'s `user_secrets_dir` are gone. A leftover directory
+  is ignored and logs one startup warning; delete it after users have re-entered their
+  sets.
+- `trellis-proxy user-secrets` is gone (`set`, `list`, `delete`). The command is unknown,
+  not deprecated.
+- A per-user credential cannot be a `variable`; the write endpoint rejects the blob and the
+  edge would ignore the name.
 
 ## MCP sessions
 
-One long-lived session per `(mcp, user identity)`. The identity key is the normalized
-`user_email`, else `user`, else `"anonymous"`; each session gets its own `HOME`/`TMPDIR`
-under the sandbox writable root, which is what isolates two users' login state even when
-they share credentials.
+One long-lived session per `(mcp, user identity)`, and **each session is its own runner
+container**. The identity key is the normalized `user_email`, else `user`, else
+`"anonymous"`. Two identities get two containers with disjoint tmpfs `HOME`/`TMPDIR` and
+no shared filesystem at all — that is what isolates two users' logins even when they share
+credentials.
 
+- **Home and login state die with the session.** The server's `$HOME` is the container
+  tmpfs, so tokens/cookies/keys it stores there are gone on TTL expiry, eviction, `SIGHUP`,
+  a runner restart, or process death. Nothing is written under the edge's workspace, and
+  `writable_root()/mcp-sessions/` is no longer used — if an upgraded edge still has one, it
+  is dead v0.5 state: delete it. The proxy logs one warning at startup when it exists.
 - **Idle TTL** 30 minutes, overridable per `export_mcps` entry (`session_ttl_minutes`). A
   periodic sweep retires idle sessions; a call in progress is never swept.
-- **Caps:** 8 sessions per MCP (`max_sessions`), 32 per edge. At the cap the least
-  recently used **idle** session is evicted.
+- **Caps:** 8 sessions per MCP (`max_sessions`), `MAX_SESSIONS_EDGE` per edge (default 32,
+  read from the environment). At the cap the least recently used **idle** session is
+  evicted. These are containers now: size `MAX_SESSIONS_EDGE × limits.memory_mb` against
+  the host (≤ 60 % of RAM — see [mcp.md](mcp.md#memory-sizing-sessions--limitsmemory_mb--60--of-host-ram)).
 - **Survives a tunnel reconnect.** Sessions are edge-local, so a relay restart or a
   network blip does not cost a user their login.
-- **A `SIGHUP` retires every session** (no error to the next caller — the server is simply
-  reopened). That is the operator's way to make an edited credential file apply without
+- **A `SIGHUP` retires every session** (no error to the next caller — a fresh container is
+  started). That is the operator's way to make an edited credential file apply without
   waiting out the 30-minute TTL.
-- **A crash is reported, not hidden:** that call's result carries `mcp_session_lost` and
-  the server is restarted lazily on the *next* call. TTL expiry and LRU eviction produce
-  the same one-shot marker. **No MCP call is ever replayed automatically** — a
-  state-changing action must not run twice.
+- **A crash or a lost container is reported, not hidden:** that call's result carries
+  `mcp_session_lost` and a new container starts lazily on the *next* call. TTL expiry and
+  LRU eviction produce the same one-shot marker. **No MCP call is ever replayed
+  automatically** — a state-changing action must not run twice.
 - **A deadline is not a crash.** When the call's `edge_timeout` expires the session is
   kept (the login state stays intact) and only that call fails.
 - **Per-session serialization:** calls to one session are serialized; `kind:"mcp"` frames
   share the tunnel-wide in-flight semaphore (`MAX_INFLIGHT`) with tool calls.
 
-stdio servers are spawned under the same sandbox backend as tools, with the server
-directory as `cwd` — the layout `npx`-style servers expect. `http`/`streamable-http`/`sse`
-servers spawn no process and run no sandbox; the declared credentials are sent as headers
-only. `mcp.yaml`'s `network:` (`allow`/`none`, default `allow`) controls the stdio
-process's network namespace.
+stdio servers run in a runner session container built from `mcp.yaml`: the server directory
+is mounted read-only, `network:` selects the profile (`none` by default), and the
+`credential_mode` env is resolved once at session creation. `http`/`streamable-http`/`sse`
+servers spawn no container; the declared credentials are sent as headers only.
+
+### Discovery containers
+
+A server with no static `tools:` catalog is discovered by opening a throwaway session with
+`kind="discovery"` and a 60 s deadline, listing its tools, and tearing the container down.
+The result is cached per export signature (dropped on `SIGHUP`), so a reload does not
+re-spawn for an unchanged server. Discovery leaves no container and no directory behind.
 
 ### Sandbox limits for Node MCP servers
 
 A stdio MCP server lives for the whole session rather than one call, so size the limits
-for a long-lived Node process:
+for a long-lived Node process. Under the container backend these are `limits:` in
+`mcp.yaml` (defaults: `memory_mb: 2048`, `cpus: 2.0`, `pids: 512`, `tmpfs_mb: 512`) — a
+`tmpfs_mb` at or near `memory_mb` OOM-kills the session, and the manifest validator
+requires `tmpfs_mb * 2 <= memory_mb`. See
+[mcp.md → Memory sizing](mcp.md#memory-sizing-sessions--limitsmemory_mb--60--of-host-ram).
 
-- `SANDBOX_RLIMIT_AS_MB=8192` is the recommended value; the `4096` default is tight for
-  Node and produces an `ENOMEM` that looks like a server crash.
-- `SANDBOX_RLIMIT_CPU_S` is consumed CPU, not wall clock, so the 600 s default does not
-  retire an idle session.
-- These are `setrlimit` calls made by the **Landlock** helper before `exec`; under bwrap
-  they do not apply and the container's own limits are the backstop. See
-  [deploy.md → Sandbox settings and rollback](deploy.md#sandbox-settings-and-rollback).
+The legacy bwrap/Landlock path (`sandbox: auto | bwrap | landlock`, development only) still
+uses `SANDBOX_RLIMIT_AS_MB` / `SANDBOX_RLIMIT_CPU_S`; those are inert under the container
+backend. See [deploy.md → Sandbox settings and rollback](deploy.md#sandbox-settings-and-rollback).
 
 ## Protocol v2 and compatibility
 
@@ -566,16 +693,16 @@ Live (applied on the next publish):
 - the catalogs themselves — MCP discovery is concurrent and bounded at 20 s per server,
   and the previous entries/catalogs keep serving until the new ones are installed
   atomically, so an MCP call is never refused during the rebuild;
-- **credential file contents.** Tool calls re-read the files every time; MCP sessions
-  resolve credentials once at creation, so `SIGHUP` also retires every live MCP session
-  (the next call reopens it with the edited file, without an error).
+- **credential content.** Tool calls read the shared file and the sealed set on every
+  call; MCP sessions resolve credentials once at creation, so `SIGHUP` also retires every
+  live MCP session (the next call reopens it with the current set, without an error).
 
 Restart-required (the proxy logs a warning and keeps the current value if you try):
 
 - `site`, `server_url`, the token (`token_env`/`token_file`), the `tls_*` files;
 - `sandbox` (backend selection) and `env_passthrough`;
-- the `secrets_dir` / `user_secrets_dir` **paths** — the running proxy and the
-  `user-secrets` CLI must agree on where the files live.
+- the `secrets_dir` **path**. The edge key is re-read on `SIGHUP`, so a rotation takes
+  effect on the next hello without a restart.
 
 ### Relay shutdown
 

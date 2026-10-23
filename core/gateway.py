@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import uuid
 import os
 import logging
 import httpx
@@ -14,7 +15,16 @@ from asyncache import cached
 from cachetools import TTLCache
 from fastmcp import FastMCP, Context
 from mcp.types import ToolAnnotations
-from core.auth import AuthMiddleware, get_identity_manager, auth_token_var, user_id_var, DEV_MODE_AUTH_TOKEN
+from core.auth import (
+    AuthMiddleware,
+    agent_token_var,
+    auth_token_var,
+    get_identity_manager,
+    user_id_var,
+    DEV_MODE_AUTH_TOKEN,
+)
+from core import agent_token
+from core.agent_token import mint_for_run
 from core.devmode import configure_cors, enforce_dev_mode_safety
 from core.discovery import discover_agents, is_agent_configured, is_tool_configured
 from core.agent_search import search_agents as _search_agents_ranked
@@ -539,6 +549,10 @@ async def use_tool(ctx: Context, tool_name: str, arguments: Dict[str, Any]) -> A
         arguments: Dictionary of arguments matching the tool's input schema.
     """
     user_id = user_id_var.get()
+    if agent_token.verify_or_none(agent_token_var.get()) is None:
+        # Direct tool use is a gateway capability, not an agent's: mint a token for
+        # the `gateway` system principal so the hub/relay can still verify origin.
+        mint_for_run("gateway", user_id, run_id=uuid.uuid4().hex, principal="system")
 
     await ctx.report_progress(0, 3, message=f"Checking access for: {tool_name}")
     await ctx.report_progress(1, 3, message=f"Checking configuration for: {tool_name}")
@@ -559,6 +573,11 @@ async def use_tool(ctx: Context, tool_name: str, arguments: Dict[str, Any]) -> A
 
 
 if __name__ == "__main__":
+    from core.agent_token import require_secret
+    from core.log_redaction import install as install_redaction
+
+    install_redaction()
+    require_secret("gateway")
     app = mcp.http_app()
     app.add_middleware(AuthMiddleware, identity_mgr=identity_mgr)
     uvicorn.run(app, host=os.getenv("BIND_HOST", "0.0.0.0"), port=8002)

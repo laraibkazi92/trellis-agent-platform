@@ -153,10 +153,15 @@ def call_edge(tool=TOOL, args=None, user_id="user-1", timeout_seconds=120):
 
 @pytest.fixture(autouse=True)
 def _no_real_identity_lookup(monkeypatch):
-    """DEV_MODE is off by default so a developer's shell cannot leak the dev email."""
+    """DEV_MODE is off by default so a developer's shell cannot leak the dev email.
+
+    The sealed-credential read is etcd I/O as well; tests that assert forwarding
+    override this with their own fake.
+    """
     monkeypatch.delenv("DEV_MODE", raising=False)
     monkeypatch.delenv("DEV_USER_EMAIL", raising=False)
     monkeypatch.setattr(remote_mcp.identity_mgr, "get_user", lambda user_id: None)
+    monkeypatch.setattr(remote_mcp.edge_secrets_central, "get", lambda *args, **kwargs: None)
 
 
 # --- 1. call_edge_mcp: request shape and response mapping -----------------------
@@ -194,6 +199,8 @@ def test_call_edge_mcp_posts_relay_mcp_endpoint_with_identity(monkeypatch):
         "deadline_ms": (120 + 30) * 1000,
         "user": "user-1",
         "user_email": "ops@example.com",
+        "agent_token": None,
+        "sealed": None,
     }
     # Same dict shape hub._run_remote returns for a remote tool.
     assert result == {
@@ -203,6 +210,31 @@ def test_call_edge_mcp_posts_relay_mcp_endpoint_with_identity(monkeypatch):
     }
     # The read timeout leads deadline_ms by 5 s so the edge's own timeout wins.
     assert timeouts == [155]
+
+
+def test_call_edge_mcp_forwards_the_callers_sealed_blob(monkeypatch):
+    seen = {}
+    blob = {"v": 1, "ciphertext": "opaque", "keys": ["DEVOPS_PASSWORD"]}
+    asked = []
+
+    def fake_get(identity_mgr, site, user_id, kind, name):
+        asked.append((site, user_id, kind, name))
+        return dict(blob)
+
+    monkeypatch.setattr(remote_mcp.edge_secrets_central, "get", fake_get)
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200, json={"ok": True, "result": {"content": [], "isError": False}}
+        )
+
+    install_transport(monkeypatch, handler)
+
+    call_edge(args={}, user_id="user-1", timeout_seconds=120)
+
+    assert asked == [(SITE, "user-1", "mcp", MCP)]
+    assert seen["body"]["sealed"] == blob
 
 
 def test_call_edge_mcp_dev_mode_email(monkeypatch):

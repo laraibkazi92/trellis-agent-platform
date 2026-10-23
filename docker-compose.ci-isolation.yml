@@ -1,0 +1,94 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+#
+# Minimal stack for the live isolation tests (plan section 7, "runsc job"):
+# one runner with the Docker socket, and a pytest sidecar on the same control
+# socket and workspace. No etcd, no redis, no registry -- the runner resolves
+# agents and tools from the workspace files, which is what these tests exercise.
+#
+# Usage on a host with runsc registered and the profile rules installed:
+#   sudo scripts/setup-network-profiles.sh
+#   RUNNER_TOKEN=$(openssl rand -hex 32) AGENT_TOKEN_SECRET=$(openssl rand -hex 32) \
+#   TRELLIS_HOST_WORKSPACE=$PWD/workspace TRELLIS_UID=$(id -u) TRELLIS_GID=$(id -g) \
+#   DOCKER_GID=$(getent group docker | cut -d: -f3) \
+#     docker compose -f docker-compose.ci-isolation.yml up --abort-on-container-exit \
+#       --exit-code-from tests
+#
+# The tests install and remove their own tool suite / agent manifest in
+# ./workspace, so the registry is not affected.
+
+x-image: &image ${TRELLIS_IMAGE:-trellis-ci-isolation:local}
+
+services:
+  runner:
+    build: .
+    image: *image
+    container_name: ci-isolation-runner
+    user: "0:0"
+    group_add:
+      - "${DOCKER_GID:-999}"
+    command: python -m core.execution.runner
+    network_mode: "none"
+    read_only: true
+    tmpfs:
+      - /tmp:exec,mode=1777
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE]
+    security_opt:
+      - "no-new-privileges:true"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./workspace:/app/workspace
+      - ci-runner:/run/trellis
+    environment:
+      RUNNER_SOCKET: /run/trellis/runner.sock
+      RUNNER_TOKEN: ${RUNNER_TOKEN:?set RUNNER_TOKEN}
+      AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET}
+      TRELLIS_HOST_WORKSPACE: ${TRELLIS_HOST_WORKSPACE:?set TRELLIS_HOST_WORKSPACE to the host path of ./workspace}
+      TRELLIS_UID: ${TRELLIS_UID:-1000}
+      TRELLIS_GID: ${TRELLIS_GID:-1000}
+      TRELLIS_INSTALL_ID: ci-isolation
+      CONTAINER_DEFAULT_RUNTIME: ${CONTAINER_DEFAULT_RUNTIME:-runsc}
+      RUNNER_IMAGE: *image
+      ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
+      TOOLS_INTERNET_DNS: ${TOOLS_INTERNET_DNS:-1.1.1.1,8.8.8.8}
+      TOOLS_INTERNAL_DNS: ${TOOLS_INTERNAL_DNS:-}
+      PYTHONDONTWRITEBYTECODE: "1"
+    healthcheck:
+      test: ["CMD-SHELL", "python -m core.execution.runner --healthcheck"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 60s
+    restart: "no"
+
+  tests:
+    image: *image
+    container_name: ci-isolation-tests
+    depends_on:
+      runner:
+        condition: service_healthy
+    # Needs the network for the one-time pytest install and for the
+    # internet-profile probes; the containers under test are still isolated.
+    volumes:
+      - ./workspace:/app/workspace
+      - ./tests:/app/tests:ro
+      - ci-runner:/run/trellis
+    environment:
+      RUNNER_SOCKET: /run/trellis/runner.sock
+      RUNNER_TOKEN: ${RUNNER_TOKEN:?set RUNNER_TOKEN}
+      AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET}
+      WORKSPACE_ROOT: /app/workspace
+      TRELLIS_UID: ${TRELLIS_UID:-1000}
+      TRELLIS_GID: ${TRELLIS_GID:-1000}
+      TOOLS_INTERNET_DNS: ${TOOLS_INTERNET_DNS:-1.1.1.1,8.8.8.8}
+      TOOLS_INTERNAL_DNS: ${TOOLS_INTERNAL_DNS:-}
+      PYTHONDONTWRITEBYTECODE: "1"
+    entrypoint:
+      - sh
+      - -c
+      - python -m pip install -q pytest && python -m pytest tests/live -m "runsc or netprofiles" -p no:cacheprovider
+    restart: "no"
+
+volumes:
+  ci-runner:
