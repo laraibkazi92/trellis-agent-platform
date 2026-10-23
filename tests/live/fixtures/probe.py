@@ -1,8 +1,9 @@
 """Live probe tool: what is visible from inside a v0.6 tool container.
 
-Reads one JSON object from stdin (``targets``: ip:port strings to try), writes a
-JSON report to stdout. Deliberately does not raise: a probe that crashes tells
-us less than one that records the failure.
+Reads one JSON object from stdin (``targets``: ip:port strings to try, optional
+``sleep`` to hold the container open), writes a JSON report to stdout.
+Deliberately does not raise: a probe that crashes tells us less than one that
+records the failure.
 """
 
 import json
@@ -45,6 +46,13 @@ def write_file(path: str) -> str:
         return f"{type(exc).__name__}: {exc.strerror}"
 
 
+def listing(path: str):
+    try:
+        return sorted(os.listdir(path))
+    except OSError as exc:
+        return f"{type(exc).__name__}: {exc.strerror}"
+
+
 def main() -> None:
     try:
         args = json.load(sys.stdin)
@@ -56,17 +64,24 @@ def main() -> None:
     targets = args.get("targets") or {}
 
     workspace = "/app/workspace"
+    suite_dir = os.path.dirname(os.path.abspath(__file__))
+    output_root = os.path.join(workspace, "output")
+    output_agents = []
+    try:
+        output_agents = sorted(os.listdir(output_root))
+    except OSError:
+        pass
+
     report = {
+        "suite_dir": suite_dir,
         "uid_gid": [os.getuid(), os.getgid()],
         "cwd": os.getcwd(),
         "hostname": socket.gethostname(),
-        "workspace_exists": os.path.isdir(workspace),
-        "workspace_listing": sorted(os.listdir(workspace)) if os.path.isdir(workspace) else None,
-        "suite_listing": (
-            sorted(os.listdir(os.path.join(workspace, "tools", "zz-live-probe")))
-            if os.path.isdir(os.path.join(workspace, "tools", "zz-live-probe"))
-            else None
-        ),
+        "workspace_listing": listing(workspace),
+        "tools_listing": listing(os.path.join(workspace, "tools")),
+        "agents_listing": listing(os.path.join(workspace, "agents")),
+        "suite_listing": listing(suite_dir),
+        "output_agents": output_agents,
         "reads": {
             path: read_file(path)
             for path in (
@@ -74,22 +89,22 @@ def main() -> None:
                 "/app/workspace/agents/demo-assistant/skills.md",
                 "/app/workspace/tools/demo/tool.yaml",
                 "/app/workspace/tools/demo/text_stats.py",
+                "/app/workspace/shared",
                 "/app/workspace/.env",
                 "/app/.env",
-                "/app/workspace/reports",
-                "/app/workspace/output",
             )
         },
         "writes": {
-            path: write_file(path)
-            for path in (
-                "/app/workspace/pwned",
-                "/app/workspace/tools/zz-live-probe/pwned",
-                "/app/workspace/tools/zz-live-probe/../pwned",
-                "/app/workspace/reports/pwned",
-                "/app/workspace/output/demo-assistant/pwned",
-                "/tmp/pwned",
-            )
+            "workspace": write_file(os.path.join(workspace, "pwned")),
+            "tools_parent": write_file(os.path.join(workspace, "tools", "pwned")),
+            "own_suite": write_file(os.path.join(suite_dir, "pwned")),
+            "parent_of_suite": write_file(os.path.join(suite_dir, "..", "pwned")),
+            "output": (
+                write_file(os.path.join(output_root, output_agents[0], "pwned"))
+                if output_agents
+                else "no output mount"
+            ),
+            "tmp": write_file("/tmp/pwned"),
         },
         "resolv_conf": read_text("/etc/resolv.conf"),
         "hosts_conf": read_text("/etc/hosts"),

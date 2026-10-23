@@ -16,6 +16,12 @@
 #
 # The tests install and remove their own tool suite / agent manifest in
 # ./workspace, so the registry is not affected.
+#
+# The project name is pinned so this file can run from the same checkout as a
+# live deployment without compose adopting (and trying to remove) its networks.
+# Without it, compose derives "trellis-agent-platform" from the directory and
+# treats the running stack's network as a stale orphan.
+name: trellis-ci-isolation
 
 x-image: &image ${TRELLIS_IMAGE:-trellis-ci-isolation:local}
 
