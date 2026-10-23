@@ -79,6 +79,9 @@ services:
     volumes:
       - ./workspace:/app/workspace
       - ./tests:/app/tests:ro
+      # Marker registration lives at the repo root; without it pytest warns and
+      # `-m runsc` would silently match nothing.
+      - ./pytest.ini:/app/pytest.ini:ro
       - ci-runner:/run/trellis
     environment:
       RUNNER_SOCKET: /run/trellis/runner.sock
