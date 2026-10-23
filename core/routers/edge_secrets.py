@@ -32,6 +32,9 @@ from fastapi.responses import JSONResponse
 from core import edge_crypto, edge_keypair, edge_secrets_central
 from core.auth import is_admin
 from core.dependencies import CSRFRoute, identity_mgr
+# The flattening rules are shared with the edge (core/edge_env.py) so central can
+# never accept a key the edge would not export, or vice versa.
+from core.manifest_keys import declared_keys
 
 router = APIRouter(route_class=CSRFRoute)
 
@@ -77,44 +80,10 @@ def _csrf_ok(request: Request) -> bool:
 
 
 # --- manifest → declared keys ------------------------------------------------
-
-
-def _flatten_keys(value: Any) -> List[str]:
-    """``secrets:`` is a list or ``{general: [...], user: [...]}`` (plan G5)."""
-    if isinstance(value, dict):
-        keys: List[str] = []
-        for group in ("general", "user", "background"):
-            keys.extend(value.get(group) or [])
-        return [key for key in keys if isinstance(key, str) and key]
-    if isinstance(value, (list, tuple)):
-        return [key for key in value if isinstance(key, str) and key]
-    return []
-
-
-def declared_keys(config: Optional[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
-    """``(secret_keys, variable_keys)`` from one registry manifest.
-
-    Secret-group field keys count as secrets: they are credentials the user types, and
-    the edge's manifest check intersects them like any other declared key. A name that
-    appears in both lists is treated as a variable -- the stricter reading.
-    """
-    config = config or {}
-    secret_keys = _flatten_keys(config.get("secrets"))
-    secret_keys += _flatten_keys(config.get("optional_secrets"))
-    for group in config.get("secret_groups") or []:
-        if not isinstance(group, dict):
-            continue
-        for option in group.get("options") or []:
-            if not isinstance(option, dict):
-                continue
-            for field in option.get("fields") or []:
-                if isinstance(field, dict) and isinstance(field.get("key"), str):
-                    secret_keys.append(field["key"])
-
-    variable_keys = _flatten_keys(config.get("variables"))
-    variables = set(variable_keys)
-    secrets = sorted({key for key in secret_keys if key not in variables})
-    return secrets, sorted(variables)
+#
+# ``declared_keys(config) -> (secret_keys, variable_keys)`` lives in
+# ``core/manifest_keys`` because the edge applies the same rules to the same
+# manifest. It is imported above and re-exported here for the configuration page.
 
 
 def _target_manifest(
@@ -324,5 +293,11 @@ async def list_site_secrets(request: Request, site: str):
     if not is_admin(request):
         return _error(403, "forbidden", "admin access is required")
 
+    record = await asyncio.to_thread(_site_record, site)
+    active = edge_secrets_central.active_fingerprints(record)
     records = await asyncio.to_thread(edge_secrets_central.list_for_site, identity_mgr, site)
+    # ``active`` lets the admin page distinguish a usable blob from one sealed to a
+    # retired key (the user must re-enter it) without shipping the key state again.
+    for item in records:
+        item["active"] = bool(item.get("key_fp")) and item["key_fp"] in active
     return _json(200, {"site": site, "records": records})

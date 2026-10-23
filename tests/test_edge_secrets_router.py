@@ -443,10 +443,33 @@ def test_admin_site_list_is_names_only(_patched, manager, monkeypatch, keys):
     assert {record["user_id"] for record in body["records"]} == {"alice-id", "bob-id"}
     for record in body["records"]:
         assert set(record) == {
-            "site", "user_id", "kind", "name", "key_fp", "created_at", "created_by"
+            "site", "user_id", "kind", "name", "key_fp", "created_at", "created_by",
+            "active",
         }
+        assert record["active"] is True
     dump = json.dumps(body)
     assert "ciphertext" not in dump and "wrapped_key" not in dump
+
+
+def test_admin_site_list_marks_a_blob_sealed_to_an_inactive_key(_patched, manager, monkeypatch, keys):
+    """The admin page shows which records the edge can still open (rotation UX)."""
+    import asyncio
+
+    current, previous = keys
+    monkeypatch.setenv("ADMIN_USERS", "admin@example.com")
+    edge_secrets_central.put(manager, SITE, "alice-id", "tool", TOOL, _seal(current))
+    edge_secrets_central.put(manager, SITE, "bob-id", "tool", TOOL, _seal(previous))
+
+    response = asyncio.run(
+        edge_secrets.list_site_secrets(
+            FakeRequest(session={"user": {"sub": "admin-id", "email": "admin@example.com"}}),
+            SITE,
+        )
+    )
+    body = json.loads(response.body)
+    active = {record["user_id"]: record["active"] for record in body["records"]}
+
+    assert active == {"alice-id": True, "bob-id": False}
 
 
 def test_site_list_is_admin_only(_patched, manager):

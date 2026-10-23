@@ -171,6 +171,21 @@
                         </p>
                     </div>
                     {% endif %}
+
+                    <details data-edge-secrets="{{ edge.name }}" class="border-t border-neutral-200 dark:border-neutral-800 pt-2">
+                        <summary class="cursor-pointer font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark transition-colors select-none">
+                            Per-user credentials
+                        </summary>
+                        <div class="mt-3">
+                            <p class="font-mono text-[10px] text-neutral-500 dark:text-neutral-400 mb-2">
+                                Who has sealed a credential set for which export. Names only &mdash;
+                                values are encrypted in the browser and cannot be read here.
+                            </p>
+                            <div data-edge-secrets-body class="text-neutral-500 dark:text-neutral-400">
+                                <p class="font-mono text-xs">Loading&hellip;</p>
+                            </div>
+                        </div>
+                    </details>
                 </div>
                 {% endif %}
 
@@ -290,4 +305,106 @@
     </div>
     {% endif %}
 </div>
+
+<script>
+(function () {
+    "use strict";
+
+    function cell(text, extraClass) {
+        const td = document.createElement("td");
+        td.className = "px-3 py-2 " + (extraClass || "text-neutral-700 dark:text-neutral-300");
+        td.textContent = text;
+        return td;
+    }
+
+    function renderRecords(records) {
+        const table = document.createElement("table");
+        table.className = "w-full text-left font-mono text-xs border border-neutral-200 dark:border-neutral-800 rounded overflow-hidden";
+        const head = document.createElement("thead");
+        head.className = "bg-neutral-50 dark:bg-neutral-950 text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400";
+        const headRow = document.createElement("tr");
+        ["User", "Export", "Stored", "Key"].forEach((label) => {
+            const th = document.createElement("th");
+            th.scope = "col";
+            th.className = "px-3 py-2 font-normal";
+            th.textContent = label;
+            headRow.appendChild(th);
+        });
+        head.appendChild(headRow);
+
+        const body = document.createElement("tbody");
+        body.className = "divide-y divide-neutral-200 dark:divide-neutral-800";
+        records.forEach((record) => {
+            const row = document.createElement("tr");
+            const user = document.createElement("td");
+            user.className = "px-3 py-2 text-neutral-900 dark:text-neutral-100 break-all";
+            user.textContent = record.user_id || "—";
+            row.appendChild(user);
+            row.appendChild(cell((record.kind || "") + " · " + (record.name || "")));
+            row.appendChild(cell(record.created_at || "—"));
+
+            const keyCell = document.createElement("td");
+            keyCell.className = "px-3 py-2";
+            const fp = document.createElement("code");
+            fp.className = "text-[10px] break-all text-neutral-700 dark:text-neutral-300";
+            fp.textContent = record.key_fp ? record.key_fp.slice(0, 19) + "…" : "—";
+            keyCell.appendChild(fp);
+            if (!record.active) {
+                const badge = document.createElement("span");
+                badge.className = "ml-2 font-mono text-[10px] font-bold uppercase tracking-widest border border-amber-500/50 text-amber-700 dark:text-amber-300 px-1.5 py-0.5";
+                badge.textContent = "re-entry";
+                keyCell.appendChild(badge);
+            }
+            row.appendChild(keyCell);
+            body.appendChild(row);
+        });
+
+        table.appendChild(head);
+        table.appendChild(body);
+        return table;
+    }
+
+    document.addEventListener("DOMContentLoaded", function () {
+        document.querySelectorAll("details[data-edge-secrets]").forEach(function (details) {
+            details.addEventListener("toggle", async function () {
+                if (!details.open) {
+                    return;
+                }
+                const body = details.querySelector("[data-edge-secrets-body]");
+                if (!body || body.dataset.loaded === "1") {
+                    return;
+                }
+                const site = details.dataset.edgeSecrets;
+                try {
+                    const response = await fetch(
+                        "/configuration/edge-secrets/" + encodeURIComponent(site),
+                        { headers: { "Accept": "application/json" } }
+                    );
+                    const payload = await response.json().catch(function () { return {}; });
+                    if (!response.ok) {
+                        throw new Error(payload.detail || "Could not load credential records");
+                    }
+                    body.textContent = "";
+                    const records = payload.records || [];
+                    if (!records.length) {
+                        const empty = document.createElement("p");
+                        empty.className = "font-mono text-xs text-neutral-400 dark:text-neutral-500";
+                        empty.textContent = "No per-user credentials stored for this site.";
+                        body.appendChild(empty);
+                    } else {
+                        body.appendChild(renderRecords(records));
+                    }
+                    body.dataset.loaded = "1";
+                } catch (err) {
+                    body.textContent = "";
+                    const message = document.createElement("p");
+                    message.className = "font-mono text-xs text-red-600 dark:text-red-400";
+                    message.textContent = err.message || "Could not load credential records.";
+                    body.appendChild(message);
+                }
+            });
+        });
+    });
+})();
+</script>
 {% endblock %}

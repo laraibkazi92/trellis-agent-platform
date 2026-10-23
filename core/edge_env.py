@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
 from core.env_sanitize import FRAMEWORK_SECRET_ENV, sanitized_env
 from core.llm_providers import FRAMEWORK_PROVIDER_KEY_ENV
+from core.manifest_keys import all_declared
 
 # The default enrollment-token variable. Named here (not in the proxy) so the
 # stripping below is intrinsic: a caller that forgets to pass ``secret_env_names``
@@ -138,46 +139,8 @@ def declared_keys_for(config: Any) -> set[str]:
     this manifest is allowed to read here. ``secret_groups`` are flattened to their
     underlying keys so an operator's chosen option is visible whatever it is called.
 
-    The two helpers below mirror ``core/discovery`` (``_resolve_requirements`` and
-    ``flatten_secret_group_keys``) instead of importing it: that module builds the
-    etcd-backed ``IdentityManager`` at import time, which an edge process must never
-    do -- the same reason this module duplicates rather than imports across the
-    central/edge boundary.
+    The rules live in ``core.manifest_keys`` and are shared with central's
+    write-time validator, so the two cannot drift. That module is dependency-free
+    on purpose: an edge process must never import the etcd-backed registry.
     """
-    if config is None:
-        return set()
-
-    def declared(attr: str) -> Any:
-        if isinstance(config, Mapping):
-            return config.get(attr)
-        return getattr(config, attr, None)
-
-    keys: set[str] = set()
-    for attr in ("secrets", "optional_secrets", "variables"):
-        value = declared(attr)
-        if not value:
-            continue
-        keys.update(_declared(value))
-
-    for group in declared("secret_groups") or []:
-        for option in group.get("options", []):
-            for field in option.get("fields", []):
-                if isinstance(field, dict):
-                    keys.add(field.get("key"))
-
-    return {key for key in keys if isinstance(key, str) and key}
-
-
-def _declared(requirement: Any) -> set[str]:
-    """One declaration's key names: a list is literal, a dict spans every context."""
-    if isinstance(requirement, list):
-        return {key for key in requirement if isinstance(key, str)}
-    if isinstance(requirement, dict):
-        contexts = ("general", "user", "background")
-        return {
-            key
-            for context in contexts
-            for key in (requirement.get(context) or [])
-            if isinstance(key, str)
-        }
-    return set()
+    return all_declared(config)

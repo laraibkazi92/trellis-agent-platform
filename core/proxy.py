@@ -595,16 +595,30 @@ def _open_for_call(
             edge_crypto.CREDENTIAL_REJECTED,
             "this edge has no credential key configured; sealed credentials are unusable",
         )
-    try:
-        return edge_crypto.open_sealed(
-            blob, edge_key, site=site, kind=kind, name=name, identity=identity
+
+    # Pick the key that actually owns the blob instead of trying the current key and
+    # falling back on any failure. The fingerprint is public; comparing it first keeps
+    # the rotation overlap working, gives a retired key a message the user can act on
+    # ("re-enter the credentials"), and never runs an RSA unwrap against a key that
+    # cannot own the ciphertext.
+    edge_crypto.validate_blob(blob)
+    key_fp = blob["key_fp"]
+    owner = next(
+        (
+            candidate
+            for candidate in (edge_key, prev_edge_key)
+            if candidate is not None and candidate.fingerprint == key_fp
+        ),
+        None,
+    )
+    if owner is None:
+        raise edge_crypto.SealedError(
+            edge_crypto.CREDENTIAL_REJECTED,
+            "sealed credential belongs to an edge key this edge no longer holds; "
+            "re-enter the credential set",
         )
-    except edge_crypto.SealedError:
-        if prev_edge_key is None:
-            raise
-    # Only reached for a SealedError under the current key: the rotation overlap.
     return edge_crypto.open_sealed(
-        blob, prev_edge_key, site=site, kind=kind, name=name, identity=identity
+        blob, owner, site=site, kind=kind, name=name, identity=identity
     )
 
 

@@ -1321,3 +1321,92 @@ def test_the_runner_stdio_transport_receives_the_agent_token(tmp_path, monkeypat
     proxy_mcp._runner_transport(entry, {}, agent_token="t1.payload.signature")
 
     assert seen["agent_token"] == "t1.payload.signature"
+
+
+# --- sealed credential ownership ---------------------------------------------
+
+
+def _sealed_owner_keys(tmp_path, monkeypatch):
+    from core import edge_keypair
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "workspace"))
+    return [
+        edge_keypair.generate(tmp_path / "keys" / f"edge-key-{index}", bits=2048)
+        for index in range(3)
+    ]
+
+
+def _sealed_blob(key, *, site="plant-floor", name="boiler_status"):
+    from core import edge_crypto
+
+    return edge_crypto.seal(
+        key.spki_b64,
+        {"NODE_SSH_PASSWORD": "correct horse battery"},
+        site=site,
+        kind="tool",
+        name=name,
+        identity="alice@example.com",
+        key_id=key.key_id,
+    )
+
+
+def _sealed_call(blob):
+    return {
+        "sealed": blob,
+        "user": "alice-id",
+        "user_email": "Alice@Example.com",
+    }
+
+
+def test_open_for_call_opens_a_blob_with_the_key_that_owns_it(tmp_path, monkeypatch):
+    from core import edge_keypair
+
+    current, previous, _retired = _sealed_owner_keys(tmp_path, monkeypatch)
+    call = _sealed_call(_sealed_blob(previous))
+
+    opened = proxy._open_for_call(
+        call,
+        site="plant-floor",
+        kind="tool",
+        name="boiler_status",
+        edge_key=current,
+        prev_edge_key=previous,
+    )
+
+    assert opened == {"NODE_SSH_PASSWORD": "correct horse battery"}
+
+
+def test_open_for_call_reports_a_retired_key_instead_of_retrying(tmp_path, monkeypatch):
+    current, previous, retired = _sealed_owner_keys(tmp_path, monkeypatch)
+    call = _sealed_call(_sealed_blob(retired))
+
+    with pytest.raises(proxy.edge_crypto.SealedError) as excinfo:
+        proxy._open_for_call(
+            call,
+            site="plant-floor",
+            kind="tool",
+            name="boiler_status",
+            edge_key=current,
+            prev_edge_key=previous,
+        )
+
+    assert "no longer holds" in str(excinfo.value)
+    assert "re-enter" in str(excinfo.value)
+
+
+def test_open_for_call_still_rejects_a_blob_for_another_user(tmp_path, monkeypatch):
+    current, previous, _retired = _sealed_owner_keys(tmp_path, monkeypatch)
+    call = _sealed_call(_sealed_blob(current))
+    call["user_email"] = "bob@example.com"
+
+    with pytest.raises(proxy.edge_crypto.SealedError) as excinfo:
+        proxy._open_for_call(
+            call,
+            site="plant-floor",
+            kind="tool",
+            name="boiler_status",
+            edge_key=current,
+            prev_edge_key=previous,
+        )
+
+    assert "another site, target or user" in str(excinfo.value)
