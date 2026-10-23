@@ -993,19 +993,21 @@ key that never leaves the VM. Consequences for an existing install:
 3. **Generate the edge key and mount it.** On each edge host:
 
    ```bash
-   docker run --rm -v "$PWD":/w -e EDGE_PRIVATE_KEY_PATH=/w/edge-key \
+   install -d -m 0700 edge-keys
+   docker run --rm -v "$PWD":/w -e EDGE_PRIVATE_KEY_PATH=/w/edge-keys/edge-key \
      ghcr.io/laraibkazi92/trellis-agent-platform:v0.6.0 \
-     python core/proxy.py edge-keygen --path /w/edge-key
-   sudo chown "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}" edge-key
+     python core/proxy.py edge-keygen --path /w/edge-keys/edge-key
+   sudo chown -R "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}" edge-keys
    ```
 
    then add to `deploy/proxy/docker-compose.yml` (the shipped file already has it):
 
    ```yaml
        environment:
-         EDGE_PRIVATE_KEY_PATH: /etc/trellis/edge-key
+         EDGE_PRIVATE_KEY_PATH: /etc/trellis/keys/edge-key
        volumes:
-         - ./edge-key:/etc/trellis/edge-key:ro   # trellis-proxy ONLY, never runner
+         # The DIRECTORY: the rotation overlap needs edge-key.old beside edge-key.
+         - ./edge-keys:/etc/trellis/keys:ro   # trellis-proxy ONLY, never runner
    ```
 
    The proxy must run `sandbox: container` (the v0.6 default). A legacy backend
@@ -1013,7 +1015,7 @@ key that never leaves the VM. Consequences for an existing install:
    expose this key; sealed calls are refused while one is configured.
 
    The loader refuses a file with a mode wider than `0400`, a non-RSA key, or a path
-   inside the workspace. **Keep `/etc/trellis/edge-key` in the host backup**: losing it
+   inside the workspace. **Keep `/etc/trellis/keys/edge-key` in the host backup**: losing it
    means every user re-enters their set.
 4. **Re-enter per-user credentials.** After the key is mounted and the new proxy has
    connected (its fingerprint appears in Admin → Edges), each user opens the target's

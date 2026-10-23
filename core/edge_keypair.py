@@ -39,7 +39,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 
-DEFAULT_KEY_PATH = "/etc/trellis/edge-key"
+DEFAULT_KEY_PATH = "/etc/trellis/keys/edge-key"
 EDGE_KEY_ENV = "EDGE_PRIVATE_KEY_PATH"
 WORKSPACE_ENV = "WORKSPACE_ROOT"
 DEFAULT_WORKSPACE_ROOT = "/app/workspace"

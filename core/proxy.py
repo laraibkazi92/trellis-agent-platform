@@ -1001,7 +1001,7 @@ async def handle_call(
             error=(edge_crypto.CREDENTIAL_REJECTED, str(exc) or "sealed credential rejected"),
         )
     if sealed is not None and proxy_config is not None and proxy_config.sandbox != "container":
-        # A legacy backend can read /etc/trellis/edge-key (the tool sees the whole
+        # A legacy backend can read /etc/trellis/keys/edge-key (the tool sees the whole
         # filesystem), which would make the seal meaningless. Refuse instead.
         return _result_frame(
             call["id"],

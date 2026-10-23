@@ -61,11 +61,15 @@ sudo chown -R "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}" edge-secrets
 # 6. Generate the per-user credential key OUTSIDE the workspace, mode 0400. The private
 #    half never leaves this host; central and the relay only ever see the public key.
 #    Use the published image so the `cryptography` version matches the proxy.
+#    Keep it in edge-keys/ (mounted as a DIRECTORY): `edge-keygen --rotate` writes the
+#    retained `edge-key.old` beside it, and the proxy can only read that sibling if the
+#    whole directory is mounted.
+install -d -m 0700 edge-keys
 docker run --rm -v "$PWD":/w \
-  -e EDGE_PRIVATE_KEY_PATH=/w/edge-key \
+  -e EDGE_PRIVATE_KEY_PATH=/w/edge-keys/edge-key \
   ghcr.io/laraibkazi92/trellis-agent-platform:latest \
-  python core/proxy.py edge-keygen --path /w/edge-key
-sudo chown "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}" edge-key
+  python core/proxy.py edge-keygen --path /w/edge-keys/edge-key
+sudo chown -R "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}" edge-keys
 
 # 7. .env holds non-secret edge settings (proxy URL knobs, sandbox limits). It is NOT
 #    the credential store (mode 0600, never the tunnel token). Shared credentials are

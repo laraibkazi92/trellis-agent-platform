@@ -396,23 +396,27 @@ mode or a path inside the workspace).
 
 ```bash
 # create it (Docker sample: run the published image so cryptography matches the proxy)
+install -d -m 0700 edge-keys
 docker run --rm -v "$PWD":/w \
-  -e EDGE_PRIVATE_KEY_PATH=/w/edge-key \
+  -e EDGE_PRIVATE_KEY_PATH=/w/edge-keys/edge-key \
   ghcr.io/laraibkazi92/trellis-agent-platform:latest \
-  python core/proxy.py edge-keygen --path /w/edge-key
+  python core/proxy.py edge-keygen --path /w/edge-keys/edge-key
 
 trellis-proxy edge-keygen --show     # public material only: {key_id, fingerprint, spki}
 ```
 
-`EDGE_PRIVATE_KEY_PATH` (default `/etc/trellis/edge-key`) selects the file. The sample
-compose mounts it read-only into `trellis-proxy` **only**; the runner and tool containers
-never see it.
+`EDGE_PRIVATE_KEY_PATH` (default `/etc/trellis/keys/edge-key`) selects the file. The
+sample compose mounts its **directory** (`./edge-keys`) read-only into `trellis-proxy`
+only; the runner and tool containers never see it. Mount the directory, not the file:
+`--rotate` writes the retained `edge-key.old` beside the current key, and a single-file
+bind pins one inode, so the overlap would silently have no previous key.
 
 ### Rotation
 
 ```bash
 trellis-proxy edge-keygen --rotate          # current -> edge-key.old (0600), new key written
 trellis-proxy edge-keygen --show            # the new fingerprint
+docker kill -s HUP trellis-proxy            # reload the pair and republish the hello
 # ... the relay re-publishes on the next hello; users re-enter sets sealed to a retired key
 trellis-proxy edge-keygen --drop-old-key    # ends the overlap
 ```
@@ -425,7 +429,7 @@ presents it gets `credential_rejected`.
 
 **Losing the key** (deleted, or rotated away without the old file) means every sealed set
 must be re-entered in the UI. There is no recovery path, by design: central never has the
-private key. Keep `/etc/trellis/edge-key` in the host backup.
+private key. Keep `/etc/trellis/keys/edge-key` in the host backup.
 
 ### Removals in v0.6.0
 

@@ -44,7 +44,7 @@ services:
       # is ever given the path. Generate it once on the host (docs/proxy.md ->
       # "Per-user credentials and the edge key"); `trellis-proxy edge-keygen --show`
       # prints the public fingerprint.
-      EDGE_PRIVATE_KEY_PATH: ${EDGE_PRIVATE_KEY_PATH:-/etc/trellis/edge-key}
+      EDGE_PRIVATE_KEY_PATH: ${EDGE_PRIVATE_KEY_PATH:-/etc/trellis/keys/edge-key}
       # Phase 3: the edge verifies the agent token's signature and expiry on every
       # call (it has no agent registry, so the allowlist decision stays central).
       # Must be the same value (rotation list) as the central host's.
@@ -68,11 +68,13 @@ services:
       # inside it would hand every exported tool every other item's secrets.
       # Create it 0700 and owned by TRELLIS_UID on the host before starting.
       - ./edge-secrets:/etc/trellis/edge-secrets
-      # The per-user credential key: `./edge-key` is a FILE on the host, mode 0400,
-      # owned by TRELLIS_UID. Mounted read-only into this service only -- the runner
-      # service below must never mount it, and the proxy propagates nothing about it
-      # into a tool container.
-      - ./edge-key:/etc/trellis/edge-key:ro
+      # The per-user credential key DIRECTORY: `./edge-keys/edge-key` is mode 0400 and
+      # `edge-key.old` (the rotation overlap) lives beside it. Mount the directory, not
+      # the file -- a single-file bind pins one inode, so a rotated key (and the .old
+      # sibling) would be invisible to this process and the overlap would fail closed.
+      # Mounted read-only into this service only: the runner below never mounts it, and
+      # the proxy propagates nothing about it into a tool container.
+      - ./edge-keys:/etc/trellis/keys:ro
       - ./proxy.yaml:/etc/trellis/proxy.yaml:ro
       # v0.6: the runner control socket. `sandbox: container` in proxy.yaml routes
       # every tool call through it; the legacy backends do not touch it.
