@@ -91,7 +91,7 @@ document.addEventListener('DOMContentLoaded', function() {
     }
     
     function renderPagination(totalPages) {
-        // The controls live inside the template's `{% if items %}` block, so a
+        // The controls live inside the template's items-conditional block, so a
         // page with no configuration keys has no #pagination-controls at all.
         if (!paginationControls) return;
         paginationControls.innerHTML = '';
