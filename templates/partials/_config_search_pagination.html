@@ -5,12 +5,23 @@
 document.addEventListener('DOMContentLoaded', function() {
     const searchInput = document.getElementById('config-search');
     const itemsContainer = document.getElementById('config-items-container');
-    if (!itemsContainer) return;
+    if (!searchInput || !itemsContainer) return;
     
     const items = Array.from(itemsContainer.querySelectorAll('.config-item'));
     const paginationSummary = document.getElementById('pagination-summary');
     const paginationControls = document.getElementById('pagination-controls');
     const noResultsMsg = document.getElementById('no-results-msg');
+    
+    // #pagination-controls, #pagination-summary and #no-results-msg are optional:
+    // an empty page (no keys at all) renders the template's own "nothing to
+    // configure" message instead of the search/pagination block.
+    function setText(element, text) {
+        if (element) element.textContent = text;
+    }
+    
+    function toggleHidden(element, hidden) {
+        if (element) element.classList.toggle('hidden', hidden);
+    }
     
     let currentPage = 1;
     const itemsPerPage = 10;
@@ -61,11 +72,15 @@ document.addEventListener('DOMContentLoaded', function() {
         });
         
         if (totalItems === 0) {
-            noResultsMsg.classList.remove('hidden');
-            paginationSummary.textContent = "No entries found";
+            // A page with no keys at all is not a search miss. Showing the
+            // "no match" message there would contradict the template's own
+            // empty state ("No tools currently require configuration...").
+            const filteredOut = items.length > 0;
+            toggleHidden(noResultsMsg, !filteredOut);
+            setText(paginationSummary, filteredOut ? "No entries found" : "0 entries");
         } else {
-            noResultsMsg.classList.add('hidden');
-            paginationSummary.textContent = `Showing ${startIndex + 1}-${endIndex} of ${totalItems} entries`;
+            toggleHidden(noResultsMsg, true);
+            setText(paginationSummary, `Showing ${startIndex + 1}-${endIndex} of ${totalItems} entries`);
             filteredItems.slice(startIndex, endIndex).forEach(item => {
                 item.classList.remove('hidden');
             });
@@ -76,6 +91,9 @@ document.addEventListener('DOMContentLoaded', function() {
     }
     
     function renderPagination(totalPages) {
+        // The controls live inside the template's `{% if items %}` block, so a
+        // page with no configuration keys has no #pagination-controls at all.
+        if (!paginationControls) return;
         paginationControls.innerHTML = '';
         if (totalPages <= 1) return;
         
