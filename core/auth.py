@@ -250,6 +250,12 @@ def _latency_summary(doc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     count = _latency_counter(doc.get("count"))
     error_count = _latency_counter(doc.get("error_count"))
     samples = doc.get("samples")
+    raw_hits = doc.get("guardrail_hits")
+    guardrail_hits = {}
+    if isinstance(raw_hits, dict):
+        for rule, hits in raw_hits.items():
+            if isinstance(rule, str) and _latency_is_number(hits):
+                guardrail_hits[rule] = _latency_counter(hits)
     return {
         "count": count,
         "error_count": error_count,
@@ -259,6 +265,7 @@ def _latency_summary(doc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "ttft_p95_ms": _latency_percentile(_latency_values(samples, "ttft_ms"), 95),
         "total_p50_ms": _latency_percentile(_latency_values(samples, "total_ms"), 50),
         "total_p95_ms": _latency_percentile(_latency_values(samples, "total_ms"), 95),
+        "guardrail_hits": guardrail_hits,
     }
 
 
@@ -486,6 +493,20 @@ class IdentityManager:
         ~200+s) instead of adding to it -- see get_agent_memory_enabled above for the
         same pattern."""
         return self.get_config("disabled_workflows", [])
+
+    def get_guardrails_defaults(self) -> Dict[str, Any]:
+        """Retrieve the framework-wide guardrail rules applied to every agent.
+
+        Not itself @retry_etcd()-decorated: get_config() already retries -- see
+        get_disabled_standard_agents above for the single-retry-layer rationale."""
+        value = self.get_config("guardrails_defaults", {})
+        return value if isinstance(value, dict) else {}
+
+    def set_guardrails_defaults(self, rules: Dict[str, Any]) -> None:
+        """Persist the framework-wide guardrail rules.
+
+        Not itself @retry_etcd()-decorated -- see get_guardrails_defaults above."""
+        self.set_config("guardrails_defaults", rules if isinstance(rules, dict) else {})
 
     def _atomic_update_config_list(self, key: str, update_fn) -> List[str]:
         """Atomically update a JSON list in /config/framework/{key} using Compare-And-Swap (CAS).
@@ -1475,6 +1496,33 @@ class IdentityManager:
                 # The provider doc is a shared hot key: contention there must not lose
                 # the agent sample that already landed.
                 logger.warning(f"Failed to record provider latency for '{provider}': {e}")
+
+    def record_guardrail_hits(self, agent_name: str, hits: Dict[str, int]) -> None:
+        """Merge guardrail rule hit counts into the agent's metrics doc.
+
+        Not ``@retry_etcd``-wrapped: this is a single CAS write and
+        ``_atomic_update_usage_json`` already loops through contention.
+        """
+        if not agent_name or not isinstance(hits, dict) or not hits:
+            return
+        valid = {
+            rule: int(count)
+            for rule, count in hits.items()
+            if isinstance(rule, str) and rule and _latency_is_number(count)
+        }
+        if not valid:
+            return
+
+        def update(current: Dict[str, Any]) -> Dict[str, Any]:
+            doc = current if isinstance(current, dict) else {}
+            counts = doc.get("guardrail_hits")
+            counts = dict(counts) if isinstance(counts, dict) else {}
+            for rule, count in valid.items():
+                counts[rule] = _latency_counter(counts.get(rule)) + count
+            doc["guardrail_hits"] = counts
+            return doc
+
+        self._atomic_update_usage_json(f"/metrics/agents/{agent_name}", update)
 
     @retry_etcd()
     def get_agent_latency(self, agent_name: str) -> Dict[str, Any]:

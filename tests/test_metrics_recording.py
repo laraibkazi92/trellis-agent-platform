@@ -241,6 +241,7 @@ def test_absent_and_malformed_documents_read_as_zeroed_summary():
         "ttft_p95_ms": None,
         "total_p50_ms": None,
         "total_p95_ms": None,
+        "guardrail_hits": {},
     }
     assert mgr.get_provider_latency("never-recorded") == absent
     assert _latency_summary(None) == absent

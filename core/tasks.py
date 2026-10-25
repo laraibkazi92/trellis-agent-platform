@@ -742,11 +742,57 @@ async def run_background_agent(
         disabled_workflows = await asyncio.to_thread(identity_mgr.get_disabled_workflows)
         if agent_name in disabled_workflows:
             raise ValueError(f"Agent '{agent_name}' is currently disabled.")
-        
-        # 2. Build the PydanticAI Agent with full parity (Hub, MCP, A2A)
+
+        # 2. Guardrail check on the input. Fail-open: any evaluation failure leaves the
+        # prompt untouched, and only an explicit "block" stops the run before the LLM call.
+        input_action, checked_prompt, input_hits = "allow", prompt, []
+        try:
+            from core import guardrails
+            input_action, checked_prompt, input_hits = await asyncio.to_thread(
+                guardrails.evaluate_agent_input, prompt, config_data)
+        except Exception as err:
+            print(f"Guardrail input evaluation failed for {agent_name} run {task_id}: {err}")
+            input_action, checked_prompt, input_hits = "allow", prompt, []
+
+        input_hit_counts: Dict[str, int] = {}
+        if input_hits:
+            try:
+                from core import guardrails
+                input_hit_counts = dict(await asyncio.to_thread(guardrails.hit_counts, input_hits))
+            except Exception as err:
+                print(f"Failed to count guardrail hits for {agent_name} run {task_id}: {err}")
+            try:
+                await asyncio.to_thread(
+                    identity_mgr.record_guardrail_hits, agent_name, input_hit_counts)
+            except Exception as err:
+                print(f"Failed to record guardrail hits for {agent_name} run {task_id}: {err}")
+
+        if input_action == "block":
+            failed = await _record_run_state(
+                identity_mgr,
+                agent_name,
+                task_id,
+                "failed",
+                {
+                    "prompt": _truncate_output(prompt, max_chars=8192),
+                    "user_id": user_id,
+                    "error": "guardrail blocked input",
+                    "guardrail_hits": input_hit_counts,
+                },
+            )
+            if failed:
+                await _append_run_event(
+                    identity_mgr, agent_name, task_id, "run_failed",
+                    {"error_type": "GuardrailBlocked", "error_chars": 0},
+                )
+            return "SYSTEM: Input blocked by guardrail policy."
+
+        prompt = checked_prompt
+
+        # 3. Build the PydanticAI Agent with full parity (Hub, MCP, A2A)
         agent = await build_agent(agent_name)
 
-        # 3. Execute the run with a concurrent cancellation monitor
+        # 4. Execute the run with a concurrent cancellation monitor
         async def _poll_for_agent_cancellation(agent_task_ref, check_interval: int = 15):
             if task_id == "unknown":
                 return
@@ -781,13 +827,44 @@ async def run_background_agent(
         # the run itself, not etcd retries from the side effects.
         total_ms = (time.monotonic() - t0) * 1000
 
+        # Guardrail check on the model output. Fail-open: an evaluation failure leaves
+        # the text untouched; only an explicit "block"/"redact" rewrites it. Runs before
+        # memory retention so a withheld output is never retained.
+        result_output = str(result.output or "")
+        output_action, safe_output, output_hits = "allow", result_output, []
+        try:
+            from core import guardrails
+            output_action, safe_output, output_hits = await asyncio.to_thread(
+                guardrails.evaluate_agent_output, result_output, config_data)
+        except Exception as err:
+            print(f"Guardrail output evaluation failed for {agent_name} run {task_id}: {err}")
+            output_action, safe_output, output_hits = "allow", result_output, []
+
+        output_hit_counts: Dict[str, int] = {}
+        if output_hits:
+            try:
+                from core import guardrails
+                output_hit_counts = dict(await asyncio.to_thread(guardrails.hit_counts, output_hits))
+            except Exception as err:
+                print(f"Failed to count guardrail hits for {agent_name} run {task_id}: {err}")
+            try:
+                await asyncio.to_thread(
+                    identity_mgr.record_guardrail_hits, agent_name, output_hit_counts)
+            except Exception as err:
+                print(f"Failed to record guardrail hits for {agent_name} run {task_id}: {err}")
+
+        if output_action == "block":
+            safe_output = "SYSTEM: Response blocked by guardrail policy. The agent output was withheld."
+        elif not isinstance(safe_output, str):
+            safe_output = result_output
+
         # Agent memory: retain this exchange (awaited so it completes within the worker
         # task lifetime; gated by feature flag + agent config, and fail-open internally).
         from core.memory import get_memory_manager
         memory_mgr = get_memory_manager()
         if await asyncio.to_thread(memory_mgr.active_for, config_data):
             bank = await asyncio.to_thread(memory_mgr.bank_for, agent_name, user_id)
-            await memory_mgr.retain(bank=bank, user_msg=prompt, agent_output=result.output)
+            await memory_mgr.retain(bank=bank, user_msg=prompt, agent_output=safe_output)
 
         # Log usage
         usage_data = {}
@@ -848,7 +925,7 @@ async def run_background_agent(
             {
                 "prompt": _truncate_output(prompt, max_chars=8192),
                 "user_id": user_id,
-                "output": _truncate_output(str(result.output) if result.output else ""),
+                "output": _truncate_output(safe_output),
                 "usage": usage_data,
                 "latency_ms": int(round(total_ms))
             }
@@ -860,10 +937,10 @@ async def run_background_agent(
                 agent_name,
                 task_id,
                 "run_completed",
-                {"output_chars": len(str(result.output) if result.output else "")},
+                {"output_chars": len(safe_output)},
             )
 
-        return result.output
+        return safe_output
 
     except Exception as e:
         print(f"Error running background agent '{agent_name}': {e}")

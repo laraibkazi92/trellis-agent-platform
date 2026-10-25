@@ -141,6 +141,17 @@ tags:                             # Optional. Labels for UI filtering and discov
   - support
   - tickets
 agent_memory: false               # Optional. Opt into per-agent persistent memory (Hindsight).
+guardrails:                       # Optional. Declarative regex guardrails (see below).
+  on_input:
+    - type: deny_patterns
+      name: no_secrets
+      patterns: ["AKIA[0-9A-Z]{16}"]
+      action: block
+  on_output:
+    - type: deny_patterns
+      name: pii_email
+      patterns: ["[\\w.+-]+@[\\w-]+\\.[\\w.]+"]
+      action: redact
 rules:                            # Optional. Deterministic routing rules — see rules_engine.md.
   - use_when:
       - "User asks about X"
@@ -166,6 +177,24 @@ independent of the agent's own `model`.
 > data unless isolation is on or that sharing is acceptable.
 
 **`thinking_level`**: Controls reasoning depth and token cost. `none` is fastest; `high` enables deep chain-of-thought. Match to task complexity.
+
+**`guardrails`**: Regex rules evaluated before a run (`on_input`) and on the final assembled
+output (`on_output`). Rule types: `deny_patterns` (`patterns` accepts one regex or a list;
+`action: block` refuses the turn, `action: redact` replaces matches with `[REDACTED]`) and
+`max_chars` (`value`; input over the limit is blocked, output over the limit is truncated with a
+marker). Framework-wide rules can be added by an admin at
+`/config/framework/guardrails_defaults` (same `on_input` / `on_output` shape); they are merged
+**first**, then the agent's own rules, and are cached for 30 seconds.
+
+- Interactive input block ⇒ HTTP `400` naming the rule(s); background input block ⇒ the run is
+  recorded `failed` (`guardrail blocked input`) with **no** model call.
+- Output block ⇒ the reply is replaced by a `SYSTEM:` notice; output redaction rewrites the text
+  before it is stored or returned. Hits are counted in the agent's metrics doc and shown as a
+  `GUARDRAIL` badge on the Agents page.
+- Rules are admin-authored regexes with no runtime timeout — keep them simple (catastrophic
+  backtracking blocks the worker). A malformed rule is skipped and logged (fail-open).
+- Known gaps in v1: streaming replies are checked only after the full output is assembled;
+  `background_script` workflows and supervisor-delegated sub-agent turns are not checked.
 
 **`provider` / `base_url`**: Which LLM vendor serves `model`. Provider credentials are configured in **Admin → LLM Providers** — one card per provider, stored Fernet-encrypted in etcd, never read from the environment. Fifteen providers are selectable:
 
