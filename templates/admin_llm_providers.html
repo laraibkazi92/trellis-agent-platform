@@ -8,6 +8,7 @@
 {% block title %}LLM Providers{% endblock %}
 
 {% block content %}
+{% macro ms(v) -%}{{ '%.0fms' % v if v is not none else '—' }}{%- endmacro %}
 <div class="max-w-5xl mx-auto">
     <a href="/admin" class="font-mono text-xs uppercase tracking-widest text-neutral-500 dark:text-neutral-400 hover:text-accent dark:hover:text-accent-dark transition-colors mb-6 inline-flex items-center gap-2">
         <i data-lucide="arrow-left" class="w-4 h-4"></i> BACK TO ADMIN DASHBOARD
@@ -153,6 +154,19 @@
                     <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-mono font-bold uppercase border border-blue-500/30 bg-blue-50 text-blue-600 dark:bg-blue-950/20 dark:text-blue-400 rounded">
                         KEYLESS
                     </span>
+                    {% endif %}
+                </div>
+
+                <!-- Latency/TTFT rollup from the etcd metrics docs; em dash for a
+                     percentile with no samples (e.g. non-streaming calls have no TTFT). -->
+                {% set lat = p.latency or {} %}
+                <div class="font-mono text-[11px] text-neutral-500 dark:text-neutral-400 border-t border-neutral-200 dark:border-neutral-800 pt-2 flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                    {% if lat.count %}
+                    <span>TTFT p50 {{ ms(lat.ttft_p50_ms) }} / p95 {{ ms(lat.ttft_p95_ms) }}</span>
+                    <span>Total p50 {{ ms(lat.total_p50_ms) }} / p95 {{ ms(lat.total_p95_ms) }}</span>
+                    <span>Error rate {{ '%.1f%%' % (lat.error_rate * 100) }}</span>
+                    {% else %}
+                    <span>No calls recorded yet</span>
                     {% endif %}
                 </div>
 

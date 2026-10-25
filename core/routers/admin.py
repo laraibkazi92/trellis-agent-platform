@@ -723,6 +723,18 @@ async def delete_admin_configuration_key(request: Request, secret_key: str = For
         
     return RedirectResponse(url='/admin/configuration', status_code=303)
 
+def _provider_latency(provider_id: str) -> dict:
+    """Best-effort latency summary for one provider (worker-thread etcd read).
+
+    Metrics are supplementary: a failing read blanks only that provider's card.
+    """
+    try:
+        return identity_mgr.get_provider_latency(provider_id) or {}
+    except Exception as e:
+        logger.debug("Provider latency read failed for '%s': %s", provider_id, e)
+        return {}
+
+
 @router.get("/admin/llm-providers", response_class=HTMLResponse)
 async def admin_llm_providers_page(request: Request):
     if redirect := require_admin(request, '/admin'):
@@ -744,6 +756,14 @@ async def admin_llm_providers_page(request: Request):
             "base_url_value": base_url_value,
             "value_preview": None,
         })
+
+    # Latency strips are fetched concurrently (one etcd read per provider) rather than
+    # sequentially; _provider_latency() already degrades a failed read to {}.
+    latencies = await asyncio.gather(
+        *(asyncio.to_thread(_provider_latency, card["id"]) for card in cards)
+    )
+    for card, latency in zip(cards, latencies):
+        card["latency"] = latency or {}
 
     # Framework defaults view: the provider select offers only providers that could
     # actually serve traffic (provider_is_usable); the model select is that provider's

@@ -12,7 +12,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Dict, Literal, Optional
 
 from core.llm_factory import infer_provider
 from core.llm_providers import (
@@ -274,3 +274,23 @@ def resolve_effective_llm_config(
         url = None
 
     return EffectiveLLMConfig(provider=eff_provider, model=eff_model, base_url=url, source=source)
+
+
+def provider_for_config(config: Dict[str, Any]) -> Optional[str]:
+    """Best-effort effective provider for metrics attribution; None when unresolvable."""
+    try:
+        provider = config.get("provider")
+        model = config.get("model")
+        base_url = config.get("base_url")
+        if needs_framework_defaults(provider, model):
+            defaults = get_framework_defaults()
+        else:
+            defaults = FrameworkDefaults()
+        resolved = resolve_effective_llm_config(provider, model, base_url, defaults)
+        get_spec(resolved.provider)  # unknown provider id => no attribution
+        return resolved.provider
+    except Exception as e:
+        # Attribution is a nice-to-have: a broken config or a cold etcd must never
+        # turn a recorded latency sample into a failed agent turn.
+        logger.debug("Could not resolve provider for metrics attribution: %s", e)
+        return None

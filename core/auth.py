@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import math
 import secrets
 import logging
 import time
@@ -186,6 +187,79 @@ def _run_event_digest(prev_digest: str, seq: int, event_type: str, ts: str, payl
         ensure_ascii=False,
     )
     return hashlib.sha256(prev_digest.encode() + canonical.encode("utf-8")).hexdigest()
+
+
+# --- LLM latency / TTFT metrics ---
+#
+# `/metrics/agents/<agent>` and `/metrics/providers/<provider>` hold one rolling
+# document per entity: cumulative counters plus a bounded window of raw samples.
+# Aggregates (p50/p95/error rate) are derived on read, never stored, so a cap change
+# or a new percentile needs no migration.
+
+LATENCY_SAMPLE_CAP = 200
+
+
+def _latency_is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _latency_counter(value: Any) -> int:
+    """Read a stored counter; anything malformed counts as 0."""
+    if not _latency_is_number(value):
+        return 0
+    return int(value)
+
+
+def _latency_values(samples: Any, field: str) -> List[float]:
+    """Numeric ``field`` values across samples; missing/None/non-numeric are skipped."""
+    if not isinstance(samples, list):
+        return []
+    values = []
+    for sample in samples:
+        if not isinstance(sample, dict):
+            continue
+        value = sample.get(field)
+        if _latency_is_number(value):
+            values.append(float(value))
+    return values
+
+
+def _latency_percentile(values: List[float], pct: float) -> Optional[float]:
+    """Nearest-rank percentile over a sorted copy (None for an empty list)."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(1, math.ceil(pct / 100 * len(ordered)))
+    return round(ordered[min(rank, len(ordered)) - 1], 1)
+
+
+def _latency_doc(raw: Optional[bytes]) -> Optional[Dict[str, Any]]:
+    """Decode a stored latency document; absent or malformed bytes read as absent."""
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _latency_summary(doc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Percentile/error summary of a latency doc, tolerating missing or malformed fields."""
+    doc = doc if isinstance(doc, dict) else {}
+    count = _latency_counter(doc.get("count"))
+    error_count = _latency_counter(doc.get("error_count"))
+    samples = doc.get("samples")
+    return {
+        "count": count,
+        "error_count": error_count,
+        "error_rate": (error_count / count) if count else 0.0,
+        # Non-streaming calls store ttft_ms=None and so contribute to total only.
+        "ttft_p50_ms": _latency_percentile(_latency_values(samples, "ttft_ms"), 50),
+        "ttft_p95_ms": _latency_percentile(_latency_values(samples, "ttft_ms"), 95),
+        "total_p50_ms": _latency_percentile(_latency_values(samples, "total_ms"), 50),
+        "total_p95_ms": _latency_percentile(_latency_values(samples, "total_ms"), 95),
+    }
 
 
 class IdentityManager:
@@ -1263,7 +1337,12 @@ class IdentityManager:
         return {"input_tokens": 0, "output_tokens": 0, "total_requests": 0}
 
     def _atomic_update_usage_json(self, key: str, update_fn) -> Dict[str, Any]:
-        """Atomically update a JSON record in etcd using Compare-And-Swap (CAS)."""
+        """Atomically update a JSON record in etcd using Compare-And-Swap (CAS).
+
+        Raises ``EtcdContentionError`` when the CAS budget is exhausted. A blind
+        last-write `put` here would overwrite concurrent updates with stale data
+        (silently losing samples/counters), so the write is dropped and reported.
+        """
         for _ in range(20):
             raw_val, _ = self.client.get(key)
             if raw_val is None:
@@ -1280,12 +1359,9 @@ class IdentityManager:
                 new_bytes = json.dumps(updated_data).encode('utf-8')
                 if self.client.replace(key, raw_val, new_bytes):
                     return updated_data
-        # Fallback if max retries reached
-        raw_val, _ = self.client.get(key)
-        current_data = json.loads(raw_val.decode('utf-8')) if raw_val else {}
-        final_data = update_fn(current_data)
-        self.client.put(key, json.dumps(final_data))
-        return final_data
+        raise EtcdContentionError(
+            f"Could not update {key} after 20 compare-and-swap attempts; the update was dropped."
+        )
 
     @retry_etcd()
     def record_usage(self, user_id: str, input_tokens: int, output_tokens: int) -> None:
@@ -1356,6 +1432,61 @@ class IdentityManager:
         current = int(value.decode('utf-8')) if value else 0
         
         self.client.put(key, str(current + 1))
+
+    def record_agent_latency(
+        self,
+        user_id: str,
+        agent_name: str,
+        provider: Optional[str],
+        ttft_ms: Optional[float],
+        total_ms: float,
+        ok: bool = True,
+    ) -> None:
+        """Append one LLM latency sample to the agent doc and, if known, the provider doc.
+
+        Not ``@retry_etcd``-wrapped: this performs two independent writes, and a retry
+        after the first succeeded would record a duplicate sample. ``user_id`` is
+        accepted for call-site symmetry with the usage helpers but is never persisted.
+        """
+        if not agent_name:
+            return
+
+        sample = {
+            "ts": _now_iso(),
+            "ttft_ms": float(ttft_ms) if ttft_ms is not None else None,
+            "total_ms": float(total_ms or 0.0),
+        }
+
+        def update(current: Dict[str, Any]) -> Dict[str, Any]:
+            doc = current if isinstance(current, dict) else {}
+            doc["count"] = _latency_counter(doc.get("count")) + 1
+            doc["error_count"] = _latency_counter(doc.get("error_count")) + (0 if ok else 1)
+            samples = doc.get("samples")
+            samples = list(samples) if isinstance(samples, list) else []
+            samples.append(dict(sample))
+            doc["samples"] = samples[-LATENCY_SAMPLE_CAP:]
+            return doc
+
+        self._atomic_update_usage_json(f"/metrics/agents/{agent_name}", update)
+        if provider:
+            try:
+                self._atomic_update_usage_json(f"/metrics/providers/{provider}", update)
+            except Exception as e:
+                # The provider doc is a shared hot key: contention there must not lose
+                # the agent sample that already landed.
+                logger.warning(f"Failed to record provider latency for '{provider}': {e}")
+
+    @retry_etcd()
+    def get_agent_latency(self, agent_name: str) -> Dict[str, Any]:
+        """Summarized LLM latency for one agent."""
+        value, _ = self.client.get(f"/metrics/agents/{agent_name}")
+        return _latency_summary(_latency_doc(value))
+
+    @retry_etcd()
+    def get_provider_latency(self, provider: str) -> Dict[str, Any]:
+        """Summarized LLM latency for one provider."""
+        value, _ = self.client.get(f"/metrics/providers/{provider}")
+        return _latency_summary(_latency_doc(value))
 
     @retry_etcd()
     def list_all_users(self) -> List[Dict]:

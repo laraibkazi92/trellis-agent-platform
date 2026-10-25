@@ -3,6 +3,7 @@
 
 import json
 import asyncio
+import time
 import uuid
 import logging
 
@@ -108,6 +109,18 @@ identity_mgr = get_identity_manager()
 app.add_middleware(AuthMiddleware, identity_mgr=identity_mgr)
 health_monitor = get_health_monitor()
 
+
+async def _record_latency(provider, agent_name, user_id, ttft_ms, total_ms, ok):
+    """Record one call's latency; metrics failures never affect the response."""
+    try:
+        await asyncio.to_thread(
+            identity_mgr.record_agent_latency,
+            user_id, agent_name, provider, ttft_ms, total_ms, ok,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to record LLM latency for {agent_name}: {e}")
+
+
 BASE_DIR = Path(__file__).parent.parent
 
 class ChatMessage(BaseModel):
@@ -190,6 +203,7 @@ async def health():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatRequest):
+    t0 = time.monotonic()
     if not request.messages or request.messages[-1].role != "user":
         raise HTTPException(status_code=400, detail="Invalid messages")
 
@@ -206,6 +220,14 @@ async def chat_completions(request: ChatRequest):
         raise HTTPException(status_code=403, detail="Background agents cannot be called directly.")
     if request.model != "supervisor" and not is_agent_external(cfg_data):
         raise HTTPException(status_code=403, detail=f"Access denied: Agent '{request.model}' is internal and cannot be called directly.")
+
+    metric_provider = None
+    try:
+        from core.llm_defaults import provider_for_config
+
+        metric_provider = await asyncio.to_thread(provider_for_config, cfg_data)
+    except Exception as e:
+        logger.warning(f"Failed to resolve provider for '{request.model}' latency metric: {e}")
 
     agent_health = await asyncio.to_thread(health_monitor.get_status, "agent", request.model)
     if agent_health.get("status") == "Offline":
@@ -240,7 +262,10 @@ async def chat_completions(request: ChatRequest):
         principal="system" if request.model == "supervisor" else None,
     )
 
-    async def handle_success(result, user_id):
+    async def handle_success(result, user_id, ttft_ms=None):
+        # Measure before usage/memory side effects so p95 reflects the model call,
+        # not etcd retries from the bookkeeping that follows.
+        total_ms = (time.monotonic() - t0) * 1000
         await asyncio.to_thread(health_monitor.record_event, "agent", request.model, True)
         if user_id and hasattr(result, 'usage'):
             u = result.usage
@@ -265,15 +290,23 @@ async def chat_completions(request: ChatRequest):
             except Exception as e:
                 logger.error(f"Failed to retain memory for {request.model}: {e}")
 
+        _spawn_background(
+            _record_latency(metric_provider, request.model, user_id, ttft_ms, total_ms, True),
+            f"latency:{request.model}",
+        )
     if request.stream:
         async def event_generator():
             agent_token_var.set(run_token)
             event_queue = asyncio.Queue()
+            first_event_at = None
             
             async def event_handler(*args, **kwargs):
+                nonlocal first_event_at
                 # PydanticAI streams events natively via event_stream_handler passing (run_ctx, event)
                 event = args[1] if len(args) > 1 else (args[0] if args else None)
                 if event and type(event).__name__ == "ToolCallEvent":
+                    if first_event_at is None:
+                        first_event_at = time.monotonic()
                     try:
                         # Extract tool name based on the event structure
                         if hasattr(event, "part") and hasattr(event.part, "tool_name"):
@@ -309,7 +342,10 @@ async def chat_completions(request: ChatRequest):
                         self.usage = usage
                 
                 result = MockResult(final_text, usage)
-                await handle_success(result, captured_user_id)
+                if first_event_at is None:
+                    first_event_at = time.monotonic()
+                ttft_ms = (first_event_at - t0) * 1000
+                await handle_success(result, captured_user_id, ttft_ms=ttft_ms)
                 yield json.dumps({"choices": [{"message": {"role": "assistant", "content": final_text}}]}) + "\n"
             except asyncio.CancelledError:
                 if not task.done():
@@ -319,6 +355,10 @@ async def chat_completions(request: ChatRequest):
                 if not task.done():
                     task.cancel()
                 await asyncio.to_thread(health_monitor.record_event, "agent", request.model, False, str(e))
+                _spawn_background(
+                    _record_latency(metric_provider, request.model, captured_user_id, None, (time.monotonic() - t0) * 1000, False),
+                    f"latency:{request.model}",
+                )
                 yield json.dumps({"error": "Internal error while running the agent."}) + "\n"
             finally:
                 if not task.done():
@@ -333,4 +373,8 @@ async def chat_completions(request: ChatRequest):
     except Exception as e:
         await asyncio.to_thread(health_monitor.record_event, "agent", request.model, False, str(e))
         logger.exception("Agent '%s' execution failed", request.model)
+        _spawn_background(
+            _record_latency(metric_provider, request.model, captured_user_id, None, (time.monotonic() - t0) * 1000, False),
+            f"latency:{request.model}",
+        )
         raise HTTPException(status_code=500, detail="Internal error while running the agent.")

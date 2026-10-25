@@ -22,7 +22,7 @@ from core.agent_factory import (
     install_llm_key_watch,
     install_llm_defaults_watch,
 )
-from core.llm_defaults import warm_defaults_cache
+from core.llm_defaults import provider_for_config, warm_defaults_cache
 from core.llm_factory import warm_key_cache
 
 RESTRICTED_ENV_VARS = {"PATH", "PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "BASH_ENV", "ENV", "HOSTALIASES"}
@@ -706,6 +706,8 @@ async def run_background_agent(
     # Set context variables for thread/async safety with robust try...finally cleanup
     token = user_id_var.set(user_id)
     task_id = context.message.task_id if (context and context.message) else "unknown"
+    t0 = time.monotonic()
+    config_data: Optional[Dict] = None
     # Background runs act as `svc_agent_<name>`; the token carries the agent name so
     # every enforcement point maps it back to the agent record.
     mint_for_run(agent_name, user_id, run_id=task_id)
@@ -775,6 +777,10 @@ async def run_background_agent(
             except asyncio.CancelledError:
                 pass
 
+        # Measure the model call before memory/usage bookkeeping so latency reflects
+        # the run itself, not etcd retries from the side effects.
+        total_ms = (time.monotonic() - t0) * 1000
+
         # Agent memory: retain this exchange (awaited so it completes within the worker
         # task lifetime; gated by feature flag + agent config, and fail-open internally).
         from core.memory import get_memory_manager
@@ -813,6 +819,26 @@ async def run_background_agent(
                 except Exception as e:
                     print(f"Failed to record token usage for {user_id}: {e}")
                     
+        # Record end-to-end latency next to the terminal state write. Metrics are
+        # strictly best-effort: a failure here must never fail the run.
+        provider = None
+        try:
+            provider = await asyncio.to_thread(provider_for_config, config_data)
+        except Exception as e:
+            print(f"Failed to resolve provider for {agent_name} run {task_id}: {e}")
+        try:
+            await asyncio.to_thread(
+                identity_mgr.record_agent_latency,
+                user_id,
+                agent_name,
+                provider,
+                None,
+                total_ms,
+                True,
+            )
+        except Exception as e:
+            print(f"Failed to record latency for {agent_name} run {task_id}: {e}")
+
         # Record completed state (auth.py state machine guards against overwriting cancelled)
         completed = await _record_run_state(
             identity_mgr,
@@ -823,7 +849,8 @@ async def run_background_agent(
                 "prompt": _truncate_output(prompt, max_chars=8192),
                 "user_id": user_id,
                 "output": _truncate_output(str(result.output) if result.output else ""),
-                "usage": usage_data
+                "usage": usage_data,
+                "latency_ms": int(round(total_ms))
             }
         )
 
@@ -840,6 +867,25 @@ async def run_background_agent(
 
     except Exception as e:
         print(f"Error running background agent '{agent_name}': {e}")
+        # Latency metric for the failed run; print-only so metrics never mask the error.
+        provider = None
+        if config_data:
+            try:
+                provider = await asyncio.to_thread(provider_for_config, config_data)
+            except Exception:
+                provider = None
+        try:
+            await asyncio.to_thread(
+                identity_mgr.record_agent_latency,
+                user_id,
+                agent_name,
+                provider,
+                None,
+                (time.monotonic() - t0) * 1000,
+                False,
+            )
+        except Exception as latency_err:
+            print(f"Failed to record latency for {agent_name} run {task_id}: {latency_err}")
         # Record failed state (auth.py state machine guards against overwriting cancelled)
         failed = await _record_run_state(
             identity_mgr,

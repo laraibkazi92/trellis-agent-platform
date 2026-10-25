@@ -582,6 +582,9 @@
                                 {% else %}
                                     {{ run.metadata.get('output', 'No output')[:100] }}...
                                 {% endif %}
+                                {% if run.metadata.get('latency_ms') is not none %}
+                                <span class="text-neutral-400 dark:text-neutral-600">&middot; {{ run.metadata.get('latency_ms') }} ms</span>
+                                {% endif %}
                             </td>
                             <td class="p-3 text-right">
                                 <button type="button" class="run-events-toggle border border-neutral-400 dark:border-neutral-600 text-neutral-600 dark:text-neutral-300 hover:bg-neutral-900 hover:text-white dark:hover:bg-white dark:hover:text-neutral-900 px-3 py-1 uppercase text-xs font-bold transition-colors" data-agent="{{ agent.name }}" data-run="{{ run.run_id }}">Events</button>
