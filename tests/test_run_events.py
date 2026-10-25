@@ -258,6 +258,22 @@ def test_state_transition_after_appends_preserves_chain_head():
     }
 
 
+def test_state_transition_merges_metadata():
+    # Attempt accounting written at enqueue must survive the worker's generic
+    # processing/completed metadata writes, or retries never observe the attempt.
+    mgr = _mgr()
+    mgr.record_agent_run_state(
+        _AGENT, _RUN, "pending", {"prompt": "p", "attempt": 2, "prior_run_id": "r0"}
+    )
+    mgr.record_agent_run_state(_AGENT, _RUN, "processing", {"prompt": "p2", "user_id": "u"})
+
+    metadata = _state(mgr)["metadata"]
+    assert metadata["attempt"] == 2
+    assert metadata["prior_run_id"] == "r0"
+    assert metadata["prompt"] == "p2"
+    assert metadata["user_id"] == "u"
+
+
 def test_appends_serialize_with_state_transitions():
     mgr = _mgr()
     mgr.record_agent_run_state(_AGENT, _RUN, "pending", {})

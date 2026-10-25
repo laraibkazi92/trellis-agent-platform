@@ -1457,6 +1457,13 @@ class IdentityManager:
                     _TERMINAL = {"completed", "failed", "cancelled"}
                     if existing.get("state") in _TERMINAL:
                         return False
+                    # Merge metadata instead of replacing it: a state transition must not
+                    # drop retry accounting (attempt/prior_run_id) written at enqueue.
+                    previous_metadata = existing.get("metadata")
+                    if isinstance(previous_metadata, dict) and isinstance(record.get("metadata"), dict):
+                        merged = dict(previous_metadata)
+                        merged.update(record["metadata"])
+                        record["metadata"] = merged
                     existing.update(record)
                     if "created_at" not in existing:
                         existing["created_at"] = existing.get("timestamp")
@@ -1560,6 +1567,109 @@ class IdentityManager:
             f"/runs/{agent_name}/{run_id}/heartbeat",
             datetime.now(timezone.utc).isoformat(),
         )
+
+    @retry_etcd()
+    def mark_run_retry_due(self, agent_name: str, run_id: str, retry_at: str) -> bool:
+        """Schedule a retry for a failed run; idempotent once a retry is already queued."""
+        key = f"/runs/{agent_name}/{run_id}"
+        # pyetcd's Lock.__enter__ ignores a failed acquire; acquire explicitly and let
+        # @retry_etcd retry instead.
+        lock = self.client.lock(f"{key}_lock")
+        if not lock.acquire():
+            raise RuntimeError(f"Could not acquire run lock for {key}")
+        try:
+            record = self._read_run_record(key)
+            if record is None or record.get("state") != "failed":
+                return False
+            metadata = record.setdefault("metadata", {})
+            # Never push an existing deadline out, and never re-queue a run that was
+            # already retried (or whose retry enqueue died mid-flight).
+            if metadata.get("retried_run_id") or metadata.get("retry_at"):
+                return False
+            metadata["retry_at"] = retry_at
+            record["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self.client.put(key, json.dumps(record))
+            return True
+        finally:
+            lock.release()
+
+    @retry_etcd()
+    def claim_run_retry(self, agent_name: str, run_id: str) -> bool:
+        """Claim a due retry; only the first caller wins (sentinel ``retried_run_id``)."""
+        key = f"/runs/{agent_name}/{run_id}"
+        lock = self.client.lock(f"{key}_lock")
+        if not lock.acquire():
+            raise RuntimeError(f"Could not acquire run lock for {key}")
+        try:
+            record = self._read_run_record(key)
+            if record is None or record.get("state") != "failed":
+                return False
+            metadata = record.setdefault("metadata", {})
+            if metadata.get("retried_run_id"):
+                return False
+            # Sentinel, not a real id: an enqueue that dies after the claim is
+            # deliberately not retried again.
+            metadata["retried_run_id"] = "claimed"
+            record["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self.client.put(key, json.dumps(record))
+            return True
+        finally:
+            lock.release()
+
+    @retry_etcd()
+    def complete_run_retry(self, agent_name: str, run_id: str, new_run_id: str) -> bool:
+        """Attach the new run's id to a claimed retry, replacing the sentinel."""
+        key = f"/runs/{agent_name}/{run_id}"
+        lock = self.client.lock(f"{key}_lock")
+        if not lock.acquire():
+            raise RuntimeError(f"Could not acquire run lock for {key}")
+        try:
+            record = self._read_run_record(key)
+            if record is None:
+                return False
+            metadata = record.setdefault("metadata", {})
+            if metadata.get("retried_run_id") != "claimed":
+                return False
+            metadata["retried_run_id"] = new_run_id
+            record["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self.client.put(key, json.dumps(record))
+            return True
+        finally:
+            lock.release()
+
+    @retry_etcd()
+    def clear_run_retry(self, agent_name: str, run_id: str, reason: str) -> bool:
+        """Abandon a scheduled retry (e.g. max_attempts was lowered under it)."""
+        key = f"/runs/{agent_name}/{run_id}"
+        lock = self.client.lock(f"{key}_lock")
+        if not lock.acquire():
+            raise RuntimeError(f"Could not acquire run lock for {key}")
+        try:
+            record = self._read_run_record(key)
+            if record is None or record.get("state") != "failed":
+                return False
+            metadata = record.setdefault("metadata", {})
+            if metadata.get("retried_run_id") or not metadata.get("retry_at"):
+                return False
+            metadata.pop("retry_at", None)
+            metadata["retry_abandoned"] = reason
+            record["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self.client.put(key, json.dumps(record))
+            return True
+        finally:
+            lock.release()
+
+    def _read_run_record(self, key: str) -> Optional[Dict[str, Any]]:
+        """Decode a run record under the caller's lock; None when absent or unreadable."""
+        value, _ = self.client.get(key)
+        if not value:
+            return None
+        try:
+            parsed = json.loads(value.decode("utf-8"))
+        except Exception as e:
+            logger.warning(f"Failed to decode agent run record for {key}: {e}")
+            return None
+        return parsed if isinstance(parsed, dict) else None
 
     @retry_etcd()
     def get_run_heartbeat(self, agent_name: str, run_id: str) -> Optional[str]:

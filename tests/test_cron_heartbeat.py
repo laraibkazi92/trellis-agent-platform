@@ -157,8 +157,10 @@ def test_disabled_workflow_is_skipped_entirely(monkeypatch):
 
     assert agent_task.calls == []
     assert script_task.calls == []
-    assert mgr.config_fetches == []  # short-circuits before the config fetch
-    assert mgr.pruned == []
+    # The config is still fetched: pruning must cover disabled workflows too, and
+    # the background-type check needs the config before the trigger is evaluated.
+    assert mgr.config_fetches == [_AGENT]
+    assert mgr.pruned == [(_AGENT, 100)]
     assert pycron_fake.seen == []
 
 
@@ -198,7 +200,7 @@ def test_prune_runs_at_minute_zero_with_keep_100(monkeypatch):
     )
     _run_heartbeat(monkeypatch, mgr, matching={"0 5 * * *"}, minute_zero=True)
 
-    # Every non-disabled background agent/script is pruned, cron or not.
+    # Every background agent/script is pruned, cron or not (disabled ones included).
     assert mgr.pruned == [(_AGENT, 100), ("no-trigger", 100)]
 
 
