@@ -1070,6 +1070,26 @@ Changes to declare:
 - **Image pins:** `TRELLIS_IMAGE` default → `v0.6.0` in `docker-compose.yml`,
   `.env.example` and both egress compose files.
 
+### v0.6.1 — 2026-10-25
+
+**Fix:** `/configuration` and `/admin/configuration` no longer throw
+`TypeError: Cannot set properties of null (setting 'innerHTML')` on a page with no
+configuration keys. The shared search/pagination script dereferenced
+`#pagination-controls`, which both templates render only when there are items. The same
+empty page also claimed "No configuration keys match your search" when nothing had been
+searched; that message now appears only when a filter removes every item, and typing in
+the search box on an empty page no longer re-throws.
+
+The release also adds a parse-only test that compiles every template
+(`tests/test_templates.py`), after a literal Jinja tag inside a JavaScript comment 500'd
+the page in the first attempt at this fix.
+
+Changes to declare:
+
+- **Compose services / `.env` keys / registry / data:** none.
+- **Image pins:** `TRELLIS_IMAGE` default → `v0.6.1` in `docker-compose.yml`,
+  `.env.example` and both egress compose files.
+
 ---
 
 ## Release checklist (maintainer template)
