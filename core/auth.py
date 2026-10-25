@@ -172,6 +172,22 @@ def retry_etcd(max_retries=10, delay=2):
         return wrapper
     return decorator
 
+# --- Agent run records & hash-chained event history ---
+
+RUN_EVENT_GENESIS_DIGEST = "0" * 64
+
+
+def _run_event_digest(prev_digest: str, seq: int, event_type: str, ts: str, payload: Dict[str, Any]) -> str:
+    """sha256(prev_digest || canonical_json({seq,type,ts,payload})) hex digest."""
+    canonical = json.dumps(
+        {"seq": seq, "type": event_type, "ts": ts, "payload": payload},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(prev_digest.encode() + canonical.encode("utf-8")).hexdigest()
+
+
 class IdentityManager:
     def __init__(self, host: str = "127.0.0.1", port: int = 2379):
         self.client = pyetcd.client(host=host, port=port)
@@ -1455,6 +1471,160 @@ class IdentityManager:
             self.client.put(key, json.dumps(record))
             return True
 
+    def _read_run_events(self, agent_name: str, run_id: str) -> List[Dict[str, Any]]:
+        """Read every decodable event of a run, sorted by seq ascending (undecorated: callers retry)."""
+        prefix = f"/runs/{agent_name}/{run_id}/events/"
+        events = []
+        for value, metadata in self.client.get_prefix(prefix):
+            key_str = metadata.key.decode("utf-8")
+            if not value:
+                continue
+            try:
+                parsed = json.loads(value.decode("utf-8"))
+            except Exception as e:
+                logger.warning(f"Failed to decode run event {key_str}: {e}")
+                continue
+            if isinstance(parsed, dict):
+                events.append(parsed)
+        events.sort(key=lambda event: int(event.get("seq") or 0))
+        return events
+
+    @retry_etcd()
+    def append_run_event(
+        self,
+        agent_name: str,
+        run_id: str,
+        event_type: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Append one hash-chained event to a run's log and advance its chain head.
+
+        Takes the same lock as ``record_agent_run_state`` so appends serialize with
+        state transitions. Returns the event's sequence number.
+        """
+        key = f"/runs/{agent_name}/{run_id}"
+        events_prefix = f"{key}/events/"
+        # pyetcd's Lock.__enter__ ignores a failed acquire, which would let two
+        # writers pick the same seq and silently drop an event. Acquire explicitly
+        # and let @retry_etcd retry instead.
+        lock = self.client.lock(f"{key}_lock")
+        if not lock.acquire():
+            raise RuntimeError(f"Could not acquire run lock for {key}")
+        try:
+            value, _ = self.client.get(key)
+            state: Optional[Dict[str, Any]] = None
+            if value:
+                try:
+                    parsed = json.loads(value.decode("utf-8"))
+                    state = parsed if isinstance(parsed, dict) else None
+                except Exception:
+                    state = None
+
+            last_seq = int((state or {}).get("last_seq") or 0)
+            prev_digest = (state or {}).get("history_digest")
+            if state is None or (last_seq == 0 and not prev_digest):
+                # No chain head on the run record (missing, unreadable, or written
+                # before the first append). Recover it from the stored events under
+                # the same lock so a second append cannot overwrite seq 1.
+                existing_events = self._read_run_events(agent_name, run_id)
+                if existing_events:
+                    last_seq = int(existing_events[-1].get("seq") or 0)
+                    prev_digest = existing_events[-1].get("digest")
+            prev_digest = prev_digest or RUN_EVENT_GENESIS_DIGEST
+            seq = last_seq + 1
+            ts = datetime.now(timezone.utc).isoformat()
+            digest = _run_event_digest(prev_digest, seq, event_type, ts, payload or {})
+            event = {
+                "seq": seq,
+                "type": event_type,
+                "ts": ts,
+                "payload": payload or {},
+                "prev_digest": prev_digest,
+                "digest": digest,
+            }
+            # Zero-padded so prefix readback order equals numeric order.
+            self.client.put(f"{events_prefix}{seq:08d}", json.dumps(event, sort_keys=True))
+
+            if state is not None:
+                state["last_seq"] = seq
+                state["history_digest"] = digest
+                self.client.put(key, json.dumps(state))
+            return seq
+        finally:
+            lock.release()
+
+    @retry_etcd()
+    def record_run_heartbeat(self, agent_name: str, run_id: str) -> None:
+        """Write the run's liveness timestamp. No lock: the runner is the single writer."""
+        self.client.put(
+            f"/runs/{agent_name}/{run_id}/heartbeat",
+            datetime.now(timezone.utc).isoformat(),
+        )
+
+    @retry_etcd()
+    def get_run_heartbeat(self, agent_name: str, run_id: str) -> Optional[str]:
+        """Return the run's last heartbeat timestamp, or None when never written."""
+        value, _ = self.client.get(f"/runs/{agent_name}/{run_id}/heartbeat")
+        if value:
+            return value.decode("utf-8")
+        return None
+
+    @retry_etcd()
+    def get_run_events(self, agent_name: str, run_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Return the newest ``limit`` events of a run, still in ascending seq order."""
+        events = self._read_run_events(agent_name, run_id)
+        if limit and limit > 0:
+            return events[-limit:]
+        return events
+
+    @retry_etcd()
+    def verify_run_history(self, agent_name: str, run_id: str) -> Dict[str, Any]:
+        """Recompute the event hash chain and report the first break, if any.
+
+        Also checks the run record's chain head, so deleting the newest event(s)
+        (tail truncation) is detected even though the remaining chain is internally
+        consistent.
+        """
+        events = self._read_run_events(agent_name, run_id)
+        expected_prev = RUN_EVENT_GENESIS_DIGEST
+        for expected_seq, event in enumerate(events, start=1):
+            seq = event.get("seq")
+            if seq != expected_seq:
+                return {"ok": False, "count": len(events), "broken_at_seq": expected_seq}
+            if event.get("prev_digest") != expected_prev:
+                return {"ok": False, "count": len(events), "broken_at_seq": seq}
+            digest = _run_event_digest(
+                expected_prev,
+                seq,
+                event.get("type") or "",
+                event.get("ts") or "",
+                event.get("payload") or {},
+            )
+            if digest != event.get("digest"):
+                return {"ok": False, "count": len(events), "broken_at_seq": seq}
+            expected_prev = digest
+
+        value, _ = self.client.get(f"/runs/{agent_name}/{run_id}")
+        if value:
+            try:
+                state = json.loads(value.decode("utf-8"))
+            except Exception:
+                state = None
+            if isinstance(state, dict):
+                head_seq = state.get("last_seq")
+                head_digest = state.get("history_digest")
+                if isinstance(head_seq, int) and head_seq > len(events):
+                    # The record remembers more events than are stored: tail truncated.
+                    return {"ok": False, "count": len(events), "broken_at_seq": len(events) + 1}
+                if (
+                    isinstance(head_seq, int)
+                    and head_seq == len(events)
+                    and head_digest
+                    and head_digest != expected_prev
+                ):
+                    return {"ok": False, "count": len(events), "broken_at_seq": len(events)}
+        return {"ok": True, "count": len(events), "broken_at_seq": None}
+
     @retry_etcd()
     def get_agent_run(self, agent_name: str, run_id: str) -> Optional[Dict]:
         """Retrieve a specific run by agent name and run_id without scanning the full prefix."""
@@ -1470,10 +1640,16 @@ class IdentityManager:
 
     @retry_etcd()
     def get_agent_runs(self, agent_name: str, limit: Optional[int] = None) -> List[Dict]:
-        """Retrieve runs for a specific agent, sorted by timestamp descending, with optional limit."""
+        """Retrieve runs for a specific agent, sorted by timestamp descending, with optional limit.
+
+        Only exact run records are returned; event/heartbeat sub-keys are skipped.
+        """
         runs = []
         prefix = f"/runs/{agent_name}/"
         for value, metadata in self.client.get_prefix(prefix):
+            key_str = metadata.key.decode('utf-8')
+            if "/" in key_str[len(prefix):]:
+                continue
             if value:
                 try:
                     runs.append(json.loads(value.decode('utf-8')))
@@ -1487,23 +1663,25 @@ class IdentityManager:
     @retry_etcd()
     def prune_agent_runs(self, agent_name: str, keep_last: int = 50) -> int:
         """Prune historical runs for an agent, retaining only the latest `keep_last` records.
-        
-        Returns the number of deleted records.
+
+        Deletes each pruned run's whole subtree. Returns the number of run records
+        pruned (sub-keys are not counted).
         """
         prefix = f"/runs/{agent_name}/"
         records = []
         for value, metadata in self.client.get_prefix(prefix):
             key_str = metadata.key.decode('utf-8')
+            if "/" in key_str[len(prefix):]:
+                continue
+            ts = ""
             if value:
                 try:
                     parsed = json.loads(value.decode('utf-8'))
                     ts = parsed.get("updated_at", parsed.get("timestamp", ""))
-                    records.append((key_str, ts))
                 except Exception:
                     # If corrupted, mark for deletion
-                    records.append((key_str, ""))
-            else:
-                records.append((key_str, ""))
+                    ts = ""
+            records.append((key_str, ts))
 
         if len(records) <= keep_last:
             return 0
@@ -1515,6 +1693,9 @@ class IdentityManager:
         for key_str, _ in to_delete:
             try:
                 self.client.delete(key_str)
+                # The trailing slash matters: a bare prefix delete would also hit
+                # sibling runs whose id starts with this one's.
+                self.client.delete_prefix(f"{key_str}/")
                 deleted_count += 1
             except Exception as e:
                 logger.warning(f"Failed to delete old run key {key_str}: {e}")

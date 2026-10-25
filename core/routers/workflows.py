@@ -3,13 +3,14 @@
 
 import json
 import os
+import re
 import asyncio
 import logging
 import secrets as secrets_module
 import yaml
 from typing import List, Optional, Literal
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, ValidationError
 from core.auth import EtcdContentionError, get_current_user, is_admin
 from core.dependencies import templates, identity_mgr, CSRFRoute
@@ -344,6 +345,42 @@ async def cancel_background_run(request: Request, agent_name: str, run_id: str):
         request.session["flash_msg"] = f"Failed to cancel run: {str(e)}"
 
     return RedirectResponse(url='/workflows', status_code=303)
+
+@router.get("/workflows/{agent_name}/runs/{run_id}/events")
+async def get_background_run_events(request: Request, agent_name: str, run_id: str, limit: int = 50):
+    """Return the append-only run event timeline plus chain verification for one run."""
+    user = await get_current_user(request)
+    if not user:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    safe_name = sanitize_name(agent_name)
+    if not safe_name:
+        return JSONResponse({"error": "invalid agent name"}, status_code=400)
+
+    # Run IDs are rendered in client-side views: keep the charset tight.
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", run_id):
+        return JSONResponse({"error": "invalid run id"}, status_code=400)
+
+    limit = max(1, min(limit, 200))
+
+    try:
+        events = await asyncio.to_thread(identity_mgr.get_run_events, safe_name, run_id, limit)
+        verification = await asyncio.to_thread(identity_mgr.verify_run_history, safe_name, run_id)
+    except Exception as e:
+        logger.error(f"Failed to load run events for {safe_name}/{run_id}: {e}")
+        return JSONResponse({"error": "failed to load run events"}, status_code=500)
+
+    verification = verification or {}
+    return {
+        "agent_name": safe_name,
+        "run_id": run_id,
+        "events": events or [],
+        "history": {
+            "ok": bool(verification.get("ok")),
+            "count": verification.get("count", 0),
+            "broken_at_seq": verification.get("broken_at_seq"),
+        },
+    }
 
 @router.post("/workflows/{agent_name}/runs/clear-active")
 async def clear_agent_active_runs(request: Request, agent_name: str):

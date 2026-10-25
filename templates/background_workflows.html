@@ -505,6 +505,7 @@
                             <th class="p-3">State</th>
                             <th class="p-3">Started At</th>
                             <th class="p-3 text-right">Actions</th>
+                            <th class="p-3 text-right">Events</th>
                         </tr>
                     </thead>
                     <tbody class="text-sm font-mono divide-y divide-neutral-200 dark:divide-neutral-800">
@@ -524,6 +525,9 @@
                                     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                                     <button type="submit" class="text-red-500 hover:text-white border border-red-500 hover:bg-red-500 px-3 py-1 uppercase text-xs font-bold transition-colors">Cancel</button>
                                 </form>
+                            </td>
+                            <td class="p-3 text-right">
+                                <button type="button" class="run-events-toggle border border-neutral-400 dark:border-neutral-600 text-neutral-600 dark:text-neutral-300 hover:bg-neutral-900 hover:text-white dark:hover:bg-white dark:hover:text-neutral-900 px-3 py-1 uppercase text-xs font-bold transition-colors" data-agent="{{ agent.name }}" data-run="{{ run.run_id }}">Events</button>
                             </td>
                         </tr>
                         {% endfor %}
@@ -555,6 +559,7 @@
                             <th class="p-3">State</th>
                             <th class="p-3">Timestamp</th>
                             <th class="p-3">Details</th>
+                            <th class="p-3 text-right">Events</th>
                         </tr>
                     </thead>
                     <tbody class="text-sm font-mono divide-y divide-neutral-200 dark:divide-neutral-800">
@@ -577,6 +582,9 @@
                                 {% else %}
                                     {{ run.metadata.get('output', 'No output')[:100] }}...
                                 {% endif %}
+                            </td>
+                            <td class="p-3 text-right">
+                                <button type="button" class="run-events-toggle border border-neutral-400 dark:border-neutral-600 text-neutral-600 dark:text-neutral-300 hover:bg-neutral-900 hover:text-white dark:hover:bg-white dark:hover:text-neutral-900 px-3 py-1 uppercase text-xs font-bold transition-colors" data-agent="{{ agent.name }}" data-run="{{ run.run_id }}">Events</button>
                             </td>
                         </tr>
                         {% endfor %}
@@ -716,6 +724,173 @@
             modal.classList.add('hidden');
         }
     }
+
+    // ---- Run event timeline (lazy, one detail row per run) ----
+    var RUN_EVENT_BADGE_CLASSES = {
+        enqueued: 'text-neutral-600 dark:text-neutral-300 bg-neutral-100 dark:bg-neutral-800 border-neutral-400/30',
+        started: 'text-neutral-600 dark:text-neutral-300 bg-neutral-100 dark:bg-neutral-800 border-neutral-400/30',
+        completed: 'text-green-500 bg-green-50 dark:bg-green-900/20 border-green-500/30',
+        failed: 'text-red-500 bg-red-50 dark:bg-red-900/20 border-red-500/30',
+        cancelled: 'text-neutral-500 bg-neutral-100 dark:bg-neutral-800 border-neutral-500/30',
+        orphaned: 'text-amber-500 bg-amber-50 dark:bg-amber-900/20 border-amber-500/30',
+        retried: 'text-amber-500 bg-amber-50 dark:bg-amber-900/20 border-amber-500/30'
+    };
+    var RUN_EVENT_NEUTRAL_BADGE = 'text-neutral-500 bg-neutral-100 dark:bg-neutral-800 border-neutral-500/30';
+
+    function runEventBadgeClass(type) {
+        // Event types are stored as `run_completed` etc.; the palette keys drop the prefix.
+        var key = String(type || '').replace(/^run_/, '');
+        return RUN_EVENT_BADGE_CLASSES[key] || RUN_EVENT_NEUTRAL_BADGE;
+    }
+
+    function runEventPayloadPreview(payload) {
+        var text;
+        try {
+            text = JSON.stringify(payload === undefined ? null : payload);
+        } catch (err) {
+            text = String(payload);
+        }
+        if (text === undefined) text = 'null';
+        return text.length > 200 ? text.slice(0, 200) + '...' : text;
+    }
+
+    function renderRunEventItem(ev) {
+        var row = document.createElement('div');
+        row.className = 'flex flex-wrap items-baseline gap-2 border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 px-3 py-2 text-xs font-mono';
+
+        var type = String(ev.type || 'unknown');
+        var badge = document.createElement('span');
+        badge.className = 'px-2 py-0.5 rounded border font-bold uppercase tracking-wider ' + runEventBadgeClass(type);
+        badge.textContent = type;
+        row.appendChild(badge);
+
+        var seq = document.createElement('span');
+        seq.className = 'text-neutral-400';
+        seq.textContent = '#' + (ev.seq === undefined || ev.seq === null ? '?' : ev.seq);
+        row.appendChild(seq);
+
+        var ts = document.createElement('span');
+        ts.className = 'text-neutral-500';
+        ts.textContent = ev.ts || '';
+        row.appendChild(ts);
+
+        var payload = document.createElement('span');
+        payload.className = 'text-neutral-600 dark:text-neutral-300 break-all';
+        payload.textContent = runEventPayloadPreview(ev.payload);
+        row.appendChild(payload);
+
+        return row;
+    }
+
+    function renderRunEvents(panel, data) {
+        panel.textContent = '';
+        var history = data.history || {};
+        var events = Array.isArray(data.events) ? data.events.slice() : [];
+        events.sort(function (a, b) { return (b.seq || 0) - (a.seq || 0); });
+
+        var header = document.createElement('div');
+        header.className = 'flex flex-wrap items-center gap-3 mb-3 font-mono text-xs uppercase tracking-wider';
+
+        var chain = document.createElement('span');
+        chain.className = 'px-2 py-0.5 rounded border font-bold';
+        if (history.ok) {
+            chain.textContent = 'CHAIN OK';
+            chain.className += ' text-green-500 bg-green-50 dark:bg-green-900/20 border-green-500/30';
+        } else {
+            var brokenAt = history.broken_at_seq;
+            chain.textContent = (brokenAt === undefined || brokenAt === null)
+                ? 'CHAIN BROKEN'
+                : 'CHAIN BROKEN @ seq ' + brokenAt;
+            chain.className += ' text-red-500 bg-red-50 dark:bg-red-900/20 border-red-500/30';
+        }
+        header.appendChild(chain);
+
+        var count = document.createElement('span');
+        count.className = 'text-neutral-500';
+        var total = (typeof history.count === 'number') ? history.count : events.length;
+        count.textContent = (events.length === total)
+            ? total + ' event' + (total === 1 ? '' : 's')
+            : events.length + ' of ' + total + ' events';
+        header.appendChild(count);
+
+        var runLabel = document.createElement('span');
+        runLabel.className = 'text-neutral-400 truncate max-w-[240px]';
+        runLabel.textContent = data.run_id || '';
+        header.appendChild(runLabel);
+
+        panel.appendChild(header);
+
+        if (!events.length) {
+            var empty = document.createElement('div');
+            empty.className = 'text-xs font-mono uppercase tracking-wider text-neutral-500';
+            empty.textContent = 'No events recorded for this run.';
+            panel.appendChild(empty);
+            return;
+        }
+
+        var list = document.createElement('div');
+        list.className = 'space-y-1';
+        events.forEach(function (ev) {
+            list.appendChild(renderRunEventItem(ev));
+        });
+        panel.appendChild(list);
+    }
+
+    async function toggleRunEvents(button) {
+        var row = button.closest('tr');
+        if (!row) return;
+
+        var next = row.nextElementSibling;
+        if (next && next.classList.contains('run-events-detail')) {
+            // Second click collapses; the already-fetched timeline stays cached.
+            next.classList.toggle('hidden');
+            return;
+        }
+
+        var agentName = button.dataset.agent;
+        var runId = button.dataset.run;
+        if (!agentName || !runId) return;
+
+        var detailRow = document.createElement('tr');
+        detailRow.className = 'run-events-detail';
+        var cell = document.createElement('td');
+        cell.colSpan = row.children.length;
+        cell.className = 'p-0 bg-neutral-100/60 dark:bg-neutral-950/60';
+        var panel = document.createElement('div');
+        panel.className = 'p-4';
+        var loading = document.createElement('div');
+        loading.className = 'text-xs font-mono uppercase tracking-wider text-neutral-500';
+        loading.textContent = 'Loading events...';
+        panel.appendChild(loading);
+        cell.appendChild(panel);
+        detailRow.appendChild(cell);
+        row.after(detailRow);
+
+        button.disabled = true;
+        try {
+            var url = '/workflows/' + encodeURIComponent(agentName) + '/runs/' + encodeURIComponent(runId) + '/events';
+            var response = await fetch(url, { headers: { 'Accept': 'application/json' } });
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            var data = await response.json();
+            renderRunEvents(panel, data);
+        } catch (err) {
+            console.error('Failed to load run events:', err);
+            panel.textContent = '';
+            var errorEl = document.createElement('div');
+            errorEl.className = 'text-xs font-mono uppercase tracking-wider text-red-500';
+            errorEl.textContent = 'Failed to load run events.';
+            panel.appendChild(errorEl);
+        } finally {
+            button.disabled = false;
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        document.addEventListener('click', (event) => {
+            var button = event.target.closest('.run-events-toggle');
+            if (button) toggleRunEvents(button);
+        });
+    });
 
     function toggleTriggerFields(agentName) {
         const type = document.getElementById('modal-trigger-type-' + agentName).value;

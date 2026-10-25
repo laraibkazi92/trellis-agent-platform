@@ -40,18 +40,46 @@ def _truncate_output(text: Optional[str], max_chars: Optional[int] = None) -> st
     return f"{text[:half]}\n\n[... Truncated {omitted} characters ...]\n\n{text[-half:]}"
 
 
-async def _record_run_state(identity_mgr, agent_name: str, task_id: str, state: str, metadata: Dict[str, Any]) -> None:
-    """Persist a workflow run's state, logging (never raising) on failure."""
+async def _record_run_state(identity_mgr, agent_name: str, task_id: str, state: str, metadata: Dict[str, Any]) -> bool:
+    """Persist a workflow run's state, logging (never raising) on failure.
+
+    Returns True when the transition was accepted. False means the terminal-state
+    guard rejected it (or the write failed) — callers must not record a matching
+    event in that case.
+    """
     try:
-        await asyncio.to_thread(
-            identity_mgr.record_agent_run_state,
-            agent_name,
-            task_id,
-            state,
-            metadata,
+        return bool(
+            await asyncio.to_thread(
+                identity_mgr.record_agent_run_state,
+                agent_name,
+                task_id,
+                state,
+                metadata,
+            )
         )
     except Exception as err:
         print(f"Failed to record {state} state for {agent_name} run {task_id}: {err}")
+        return False
+
+
+async def _append_run_event(identity_mgr, agent_name: str, task_id: str, event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    """Append one run event, logging (never raising) on failure."""
+    if task_id == "unknown":
+        return
+    try:
+        await asyncio.to_thread(identity_mgr.append_run_event, agent_name, task_id, event_type, payload)
+    except Exception as err:
+        print(f"Failed to append {event_type} event for {agent_name} run {task_id}: {err}")
+
+
+async def _write_heartbeat(identity_mgr, agent_name: str, task_id: str) -> None:
+    """Refresh a run's heartbeat, logging (never raising) on failure."""
+    if task_id == "unknown":
+        return
+    try:
+        await asyncio.to_thread(identity_mgr.record_run_heartbeat, agent_name, task_id)
+    except Exception as err:
+        print(f"Failed to write heartbeat for {agent_name} run {task_id}: {err}")
 
 
 async def _abort_if_cancelled(identity_mgr, agent_name: str, task_id: str) -> bool:
@@ -59,6 +87,7 @@ async def _abort_if_cancelled(identity_mgr, agent_name: str, task_id: str) -> bo
     run_record = await asyncio.to_thread(identity_mgr.get_agent_run, agent_name, task_id)
     if run_record and run_record.get("state") == "cancelled":
         print(f"Task {task_id} for {agent_name} was cancelled before processing. Aborting.")
+        await _append_run_event(identity_mgr, agent_name, task_id, "run_cancelled", {"reason": "cancelled_before_start"})
         return True
     return False
 
@@ -91,6 +120,8 @@ async def enqueue_workflow_run(name: str, config: Dict, xml_payload: str) -> Non
         )
     except Exception as e:
         print(f"Failed to record pending state for {name}: {e}")
+
+    await _append_run_event(identity_mgr, name, task.task_id, "run_enqueued", {"user_id": agent_identity.to_legacy_string()})
 
 # Redis broker configuration
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -184,13 +215,16 @@ async def run_background_script(
             if await _abort_if_cancelled(identity_mgr, agent_name, task_id):
                 return "Cancelled before execution."
 
-            await _record_run_state(
+            started = await _record_run_state(
                 identity_mgr,
                 agent_name,
                 task_id,
                 "processing",
                 {"prompt": _truncate_output(prompt, max_chars=8192), "user_id": user_id}
             )
+            if started:
+                await _append_run_event(identity_mgr, agent_name, task_id, "run_started", {"user_id": user_id})
+                await _write_heartbeat(identity_mgr, agent_name, task_id)
         except Exception as err:
             print(f"Failed to record processing state for {agent_name} run {task_id}: {err}")
             
@@ -268,6 +302,7 @@ async def run_background_script(
                 return
             while True:
                 try:
+                    await _write_heartbeat(identity_mgr, agent_name, task_id)
                     rec = await asyncio.to_thread(identity_mgr.get_agent_run, agent_name, task_id)
                     if rec and rec.get("state") == "cancelled":
                         print(f"Task {task_id} for {agent_name} cancelled mid-execution. Killing subprocess.")
@@ -300,10 +335,11 @@ async def run_background_script(
 
         if process.returncode != 0:
             if cancelled_by_poller:
+                await _append_run_event(identity_mgr, agent_name, task_id, "run_cancelled", {"reason": "cancelled_mid_run"})
                 return "Cancelled."
             raise RuntimeError(f"Script exited with status {process.returncode}:\n{output_str}")
 
-        await _record_run_state(
+        completed = await _record_run_state(
             identity_mgr,
             agent_name,
             task_id,
@@ -315,11 +351,14 @@ async def run_background_script(
             }
         )
 
+        if completed:
+            await _append_run_event(identity_mgr, agent_name, task_id, "run_completed", {"output_chars": len(output_str or "")})
+
         return output_str.strip()
 
     except Exception as e:
         print(f"Error running background script '{agent_name}': {e}")
-        await _record_run_state(
+        failed = await _record_run_state(
             identity_mgr,
             agent_name,
             task_id,
@@ -330,6 +369,11 @@ async def run_background_script(
                 "error": str(e)[:resolve_tunable("max_run_error_chars")]
             }
         )
+        if failed:
+            await _append_run_event(
+                identity_mgr, agent_name, task_id, "run_failed",
+                {"error_type": type(e).__name__, "error_chars": len(str(e))},
+            )
         raise
     finally:
         user_id_var.reset(token)
@@ -358,13 +402,16 @@ async def run_background_agent(
             if await _abort_if_cancelled(identity_mgr, agent_name, task_id):
                 return "Cancelled before execution."
 
-            await _record_run_state(
+            started = await _record_run_state(
                 identity_mgr,
                 agent_name,
                 task_id,
                 "processing",
                 {"prompt": _truncate_output(prompt, max_chars=8192), "user_id": user_id}
             )
+            if started:
+                await _append_run_event(identity_mgr, agent_name, task_id, "run_started", {"user_id": user_id})
+                await _write_heartbeat(identity_mgr, agent_name, task_id)
         except Exception as err:
             print(f"Failed to record processing state for {agent_name} run {task_id}: {err}")
             
@@ -387,6 +434,7 @@ async def run_background_agent(
                 return
             while True:
                 try:
+                    await _write_heartbeat(identity_mgr, agent_name, task_id)
                     rec = await asyncio.to_thread(identity_mgr.get_agent_run, agent_name, task_id)
                     if rec and rec.get("state") == "cancelled":
                         print(f"Task {task_id} for {agent_name} cancelled mid-execution. Cancelling agent task.")
@@ -402,6 +450,7 @@ async def run_background_agent(
             result = await agent_run_task
         except asyncio.CancelledError:
             print(f"Task {task_id} for {agent_name} agent execution was cancelled.")
+            await _append_run_event(identity_mgr, agent_name, task_id, "run_cancelled", {"reason": "cancelled_mid_run"})
             return "Cancelled."
         finally:
             cancel_monitor.cancel()
@@ -449,7 +498,7 @@ async def run_background_agent(
                     print(f"Failed to record token usage for {user_id}: {e}")
                     
         # Record completed state (auth.py state machine guards against overwriting cancelled)
-        await _record_run_state(
+        completed = await _record_run_state(
             identity_mgr,
             agent_name,
             task_id,
@@ -462,12 +511,21 @@ async def run_background_agent(
             }
         )
 
+        if completed:
+            await _append_run_event(
+                identity_mgr,
+                agent_name,
+                task_id,
+                "run_completed",
+                {"output_chars": len(str(result.output) if result.output else "")},
+            )
+
         return result.output
 
     except Exception as e:
         print(f"Error running background agent '{agent_name}': {e}")
         # Record failed state (auth.py state machine guards against overwriting cancelled)
-        await _record_run_state(
+        failed = await _record_run_state(
             identity_mgr,
             agent_name,
             task_id,
@@ -478,6 +536,11 @@ async def run_background_agent(
                 "error": str(e)[:resolve_tunable("max_run_error_chars")]
             }
         )
+        if failed:
+            await _append_run_event(
+                identity_mgr, agent_name, task_id, "run_failed",
+                {"error_type": type(e).__name__, "error_chars": len(str(e))},
+            )
         raise
     finally:
         # Guarantee ContextVar state cleanup
