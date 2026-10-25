@@ -382,3 +382,49 @@ The hub reloads tool configs dynamically, so no restart is needed for most chang
 - [ ] Secrets/variables declared in `tool.yaml` and accessible via `os.getenv()`
 - [ ] Tool tested locally with `echo '{...}' | ENV_VAR=val python script.py`
 - [ ] `docker compose up -d --build` run after changes
+
+---
+
+## Tool Authorization (Default-Deny Boundary)
+
+Admin → **Tool Authorization** (`/admin/tool-authz`) gates tool discovery and direct tool
+calls through `use_tool`. A call is allowed only when an ordered policy rule matches its
+principal, tool name and scope — **no matching rule means deny**. The gate ships dark and is
+rolled out in stages:
+
+| Mode | Behavior |
+| --- | --- |
+| `off` (default) | No-op. Identical to running without a policy. |
+| `shadow` | Evaluates and records would-be denials, still allows. Use this to build the policy. |
+| `enforcing` | Denies unmatched tools at both `tools:call` and `tools:read`. |
+
+1. Click **Bootstrap** to generate one explicit rule per currently-public tool with
+   `allow_principals: ["*"]` and both scopes — day-one compatibility, tightened by deleting
+   lines.
+2. Switch to `shadow` and let normal traffic run. Review the denial table (shared across
+   services, sampled, capped at 200) and reconcile every entry.
+3. Switch to `enforcing`. Rollback is immediate: set the mode back to `shadow`/`off` — the etcd
+   watch invalidates every process's cache without a restart.
+
+Policy document (`/registry/tool_policies`):
+
+```yaml
+default_action: deny            # the only accepted value
+rules:
+  - tools: [opsctl, "mcp__srv__*"]        # fnmatch globs over local / mcp__server__tool /
+                                          # mcp__site__mcp__tool names
+    allow_principals: [user:alice, group:ops, "agent:supervisor"]
+    scopes: [tools:read, tools:call]
+    rate_limit_per_min: 60                # schema-only in v1 (not enforced)
+```
+
+Principals are `user:<sub>`, `agent:<name>`, `workflow:<name>`, `group:<name>` or `*`.
+`group:` membership comes from `/config/framework/principal_groups` (a
+`principal: [group, ...]` map); OIDC group claims are not propagated to tool calls yet.
+Agent-driven calls resolve to `agent:<name>`/`workflow:<name>`, so user-scoped rules only
+apply to direct gateway calls.
+
+**Scope:** the boundary covers `use_tool` (gateway and supervisor/agent) and `search_tools`.
+Tools bound directly to an agent, and direct hub `/tools/call` traffic, are not gated yet.
+Denials are logged as structured JSON (`event: tool_authz_deny`) with the principal, tool,
+scope and mode — never tool arguments.

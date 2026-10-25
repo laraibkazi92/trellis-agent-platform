@@ -50,6 +50,12 @@ async def lifespan(app: FastAPI):
     _memory_isolation_watch_id = identity_mgr.client.add_watch_prefix_callback("/config/framework/agent_memory_isolated_per_user", on_memory_flag_change)
     install_llm_key_watch()
     install_llm_defaults_watch()
+    try:
+        from core.tool_authz import install_tool_authz_watch
+
+        install_tool_authz_watch()
+    except Exception:
+        logger.exception("Failed to install tool-authorization watch; continuing startup")
     # Warm the LLM provider-key cache off the event loop so the first request-path
     # lookup is a cache hit instead of a (possibly ~20s) etcd round-trip.
     await asyncio.to_thread(warm_key_cache)
@@ -73,6 +79,12 @@ async def lifespan(app: FastAPI):
         identity_mgr.client.cancel_watch(_memory_isolation_watch_id)
     cancel_llm_key_watch()
     cancel_llm_defaults_watch()
+    try:
+        from core.tool_authz import cancel_tool_authz_watch
+
+        cancel_tool_authz_watch()
+    except Exception:
+        logger.exception("Failed to cancel tool-authorization watch")
     hub_client = await get_hub_client()
     if hub_client:
         await hub_client.__aexit__(None, None, None)

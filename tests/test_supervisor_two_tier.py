@@ -244,7 +244,7 @@ def test_search_tools_tool_delegates_to_ranked_search_with_caller_user_id(monkey
         {"name": "netctl", "description": "Inspect cluster nodes.", "parameters": {}, "configured": True, "status": "Online", "source": "local"},
     ]
 
-    async def fake_ranked(query, limit=8, user_id=None):
+    async def fake_ranked(query, limit=8, user_id=None, principal=None):
         assert query == "list all clusters in preprod"
         assert user_id == "user-1"
         return cards

@@ -1069,6 +1069,21 @@ async def prewarm_agents() -> None:
 def _register_admin_tools(agent: Agent):
     identity_mgr = get_identity_manager()
 
+    def _current_authz_principal() -> Optional[str]:
+        """Best-effort authorization principal for the tool seams below.
+
+        Taskiq/host turns resolve from the caller's token via the tool-authz
+        engine; when that is unavailable we pass None and let the callee resolve
+        (or fail closed) on its own rather than breaking the agent turn.
+        """
+        try:
+            from core import tool_authz
+
+            return tool_authz.resolve_current_principal()
+        except Exception:
+            logger.debug("Could not resolve tool-authorization principal", exc_info=True)
+            return None
+
     @agent.tool_plain(
         name="search_agents",
         description=(
@@ -1141,7 +1156,12 @@ def _register_admin_tools(agent: Agent):
     async def search_tools(query: str, limit: Optional[int] = None) -> List[Dict]:
         from core.tool_search import search_tools as _search_tools_ranked
         user_id = user_id_var.get()
-        return await _search_tools_ranked(query, limit=limit, user_id=user_id)
+        return await _search_tools_ranked(
+            query,
+            limit=limit,
+            user_id=user_id,
+            principal=_current_authz_principal(),
+        )
 
     @agent.tool_plain(
         name="use_tool",
@@ -1165,6 +1185,7 @@ def _register_admin_tools(agent: Agent):
             get_hub_client_fn=get_hub_client,
             get_external_mcp_client_fn=get_external_mcp_client,
             call_edge_mcp_fn=call_edge_mcp,
+            principal=_current_authz_principal(),
         )
 
     @agent.tool_plain(name="manage_agent", description="Enable, disable or reload an agent.")

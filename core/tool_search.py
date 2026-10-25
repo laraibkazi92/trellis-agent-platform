@@ -86,7 +86,12 @@ def _missing_configuration_labels(status: Dict[str, Any]) -> List[str]:
     return labels
 
 
-async def search_tools(query: str, limit: Optional[int] = None, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+async def search_tools(
+    query: str,
+    limit: Optional[int] = None,
+    user_id: Optional[str] = None,
+    principal: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Return up to ``limit`` publicly-whitelisted tools most relevant to ``query``.
 
     Each result is a Tool Card: ``{"name", "description", "parameters", "configured",
@@ -100,6 +105,11 @@ async def search_tools(query: str, limit: Optional[int] = None, user_id: Optiona
     If ``user_id`` is provided, each result's configuration status is resolved via
     ``is_tool_configured``; unconfigured tools get ``configured: False`` and their
     description gains a trailing note naming the missing secrets/variables.
+
+    When the tool-authorization engine is enforced (any mode but ``off``), candidates
+    the principal may not read are dropped before ranking; ``shadow`` mode logs the
+    would-be denial and keeps the tool. ``principal`` defaults to the caller's
+    context principal, resolved once via ``tool_authz.resolve_current_principal``.
 
     Pass ``limit <= 0`` to get the full ranked list (mirrors ``search_agents``).
     ``limit=None`` (the default) resolves to the admin-tunable ``tool_search_limit``
@@ -154,6 +164,29 @@ async def search_tools(query: str, limit: Optional[int] = None, user_id: Optiona
                 # cosine like local tools; a missing/stale vector degrades to 0.0.
                 "_vec": embeddings.get(prefixed_name),
             })
+
+    if not candidates:
+        return []
+
+    # Default-deny read filter. `off` bypasses the engine entirely; in `shadow` the
+    # engine logs the would-be denial and still returns True, so one comprehension
+    # covers both enforce modes. A failure here is fail-closed: no tools at all.
+    try:
+        from core import tool_authz
+
+        def _filter_readable(cands: List[Dict]) -> List[Dict]:
+            if tool_authz.get_mode() == "off":
+                return cands
+            authz_principal = principal or tool_authz.resolve_current_principal()
+            return [
+                c for c in cands
+                if tool_authz.allowed(authz_principal, c["name"], "tools:read")
+            ]
+
+        candidates = await asyncio.to_thread(_filter_readable, candidates)
+    except Exception:
+        logger.exception("Tool authorization filter failed; returning no tools")
+        return []
 
     if not candidates:
         return []
@@ -281,14 +314,19 @@ async def execute_whitelisted_tool(
     get_hub_client_fn=None,
     get_external_mcp_client_fn=None,
     call_edge_mcp_fn=None,
+    principal: Optional[str] = None,
 ) -> Any:
-    """Shared use_tool execution flow: whitelist check -> configuration check -> dispatch -> output extraction.
+    """Shared use_tool execution flow: whitelist check -> authorization check -> configuration check -> dispatch -> output extraction.
 
     Returns the raw structured tool output, or a 'SYSTEM: ...' error string. Callers inject
     their own module-level seams (`is_configured`, hub/external client getters, the edge
     MCP caller) so existing monkeypatch targets keep working; `identity_manager` defaults
     to this module's `identity_mgr` (the `is_configured` default binds this module's name
     at def time).
+
+    `principal` is the authorization principal for `tools:call`; when omitted it is
+    resolved from the caller's context. Any failure of the authorization engine fails
+    closed (the call is denied) because this is a security boundary, not observability.
     """
     mgr = identity_manager or identity_mgr
 
@@ -299,6 +337,20 @@ async def execute_whitelisted_tool(
         return f"SYSTEM: Error checking tool access for '{tool_name}'. Please try again later."
     if not whitelisted:
         return f"SYSTEM: Access denied. Tool '{tool_name}' is internal and not exposed for direct execution."
+
+    try:
+        from core import tool_authz
+
+        def _authorized_call() -> bool:
+            authz_principal = principal or tool_authz.resolve_current_principal()
+            return tool_authz.allowed(authz_principal, tool_name, "tools:call")
+
+        permitted = await asyncio.to_thread(_authorized_call)
+    except Exception:
+        logger.exception("Tool authorization check failed for %r", tool_name)
+        return f"SYSTEM: Error checking tool access for '{tool_name}'. Please try again later."
+    if not permitted:
+        return f"SYSTEM: Access denied. Tool '{tool_name}' is not permitted for this principal."
 
     try:
         status = await is_configured(tool_name, user_id)

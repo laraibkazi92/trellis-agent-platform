@@ -364,7 +364,7 @@ class TestSupervisorTwoTierRouting:
 
         card = {"name": "netctl", "description": "Inspect cluster nodes.", "parameters": {}, "configured": True, "status": "Online", "source": "local"}
 
-        async def fake_ranked_search(query, limit=8, user_id=None):
+        async def fake_ranked_search(query, limit=8, user_id=None, principal=None):
             return [card]
 
         monkeypatch.setattr(tool_search_module, "search_tools", fake_ranked_search)
