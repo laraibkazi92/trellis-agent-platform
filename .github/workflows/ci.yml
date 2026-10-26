@@ -9,8 +9,7 @@
 # Image publishing is automated in .github/workflows/publish-images.yml (triggered
 # by a v* tag push): it publishes the multi-arch engine image to GHCR, which is the
 # compose / `docker compose pull` install path. scripts/publish_images.sh stays the
-# manual path for pushing both the app AND gateway images to your own registry, which
-# is what the Helm chart under charts/trellis consumes.
+# manual path for pushing both the app AND gateway images to your own registry.
 
 name: CI
 

@@ -7,8 +7,7 @@
 # This is NOT the path that publishes the official public image: that is
 # .github/workflows/publish-images.yml, triggered by a v* tag, which also attests
 # build provenance (this script cannot). Use this script to push the app and
-# gateway images to your own registry — what the Helm chart under charts/trellis
-# consumes, and what air-gapped installs mirror.
+# gateway images to your own registry — what air-gapped installs mirror.
 #
 # Usage:
 #   REGISTRY=ghcr.io/your-org [TAG=sha] [PLATFORMS=linux/amd64] ./scripts/publish_images.sh

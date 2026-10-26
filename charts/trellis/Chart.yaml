@@ -1,7 +1,0 @@
-apiVersion: v2
-name: trellis
-description: Starter community Helm chart for the Trellis agent platform (host, hub, UI, MCP gateway, nginx edge)
-type: application
-version: 0.1.0
-# Matches the image tag used by docker-compose.yml (trellis-agent-platform:v2).
-appVersion: "v2"
