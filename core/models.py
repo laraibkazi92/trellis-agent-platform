@@ -3,6 +3,7 @@
 
 import logging
 import re
+import threading
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Optional, Literal, Dict, Any, Union
@@ -299,6 +300,86 @@ def mcp_limits() -> "ContainerLimits":
     return ContainerLimits(memory_mb=2048, cpus=2.0, pids=512, tmpfs_mb=512)
 
 
+# Manifest network policy. Exactly two values: ``none`` (no network at all) and
+# ``egress`` (ordinary Docker egress on the default bridge).
+DEFAULT_NETWORK_POLICY = "egress"
+
+# The v0.6 profile names, kept only so an existing manifest loads instead of
+# being dropped by its validator. All three meant "this container may use the
+# network", which is now plain egress.
+_LEGACY_NETWORK_ALIASES: dict[str, str] = {
+    "allow": "egress",
+    "internet": "egress",
+    "internal": "egress",
+    "deny": "none",
+    "off": "none",
+}
+_DEPRECATED_NETWORK_VALUES = frozenset({"allow", "internet", "internal"})
+
+# One entry per distinct value already reported (never per manifest): a workspace
+# with fifty `network: internal` tools logs one line, not fifty. Manifests are
+# normalized from several threads (registry sync, a hub warm-up, an edge reloading
+# its catalog), so the check-and-add is guarded or two threads both log "the first".
+_WARNED_NETWORK_POLICIES: set[str] = set()
+_WARNED_NETWORK_POLICY_LOCK = threading.Lock()
+
+
+def reset_network_policy_warnings() -> None:
+    """Forget which deprecations were already logged (tests only)."""
+    with _WARNED_NETWORK_POLICY_LOCK:
+        _WARNED_NETWORK_POLICIES.clear()
+
+
+def _warn_once(value: str, message: str, *args: Any) -> None:
+    """Log ``message`` unless ``value`` was already reported in this process."""
+    with _WARNED_NETWORK_POLICY_LOCK:
+        if value in _WARNED_NETWORK_POLICIES:
+            return
+        _WARNED_NETWORK_POLICIES.add(value)
+    logger.warning(message, *args)
+
+
+def normalize_network_policy(value: Any, what: str) -> str:
+    """Normalize a manifest's ``network`` field onto ``none`` | ``egress``.
+
+    ``none`` keeps its meaning (no network access at all). Absent or blank means
+    ``egress`` -- the default flipped from ``none`` in v0.7.1: a tool, MCP
+    session or workflow now gets ordinary Docker egress unless it explicitly
+    asks for ``none`` (``execute``/console is always ``none`` and never passes
+    through here).
+
+    The v0.6 profile names ``allow``/``internet``/``internal`` all collapse onto
+    ``egress`` and log ONE deprecation warning per distinct value per process;
+    ``deny``/``off`` still mean ``none``. An unrecognized value is a manifest
+    bug: the loaders drop any config that fails to parse, so a typo must not drop
+    the tool -- it falls back to the restrictive ``none`` with a warning.
+    Shared by ToolConfig, MCPConfig and the workflow loader so they cannot drift.
+    """
+    normalized = str(value if value is not None else "").strip().lower()
+    if normalized in ("", "egress"):
+        return "egress"
+    if normalized == "none":
+        return "none"
+    if normalized in _LEGACY_NETWORK_ALIASES:
+        policy = _LEGACY_NETWORK_ALIASES[normalized]
+        if normalized in _DEPRECATED_NETWORK_VALUES:
+            _warn_once(
+                normalized,
+                "Deprecated %s network value %r: network profiles are gone, this now "
+                "means plain egress on Docker's default bridge. Use 'egress' (or "
+                "'none'); logged once per value.",
+                what,
+                value,
+            )
+        return policy
+    _warn_once(
+        normalized,
+        "Invalid %s network policy %r; falling back to 'none'. Use 'none' or 'egress'.",
+        what,
+        value,
+    )
+    return "none"
+
 
 class MCPConfig(BaseModel):
     """Configuration for an external MCP server, parsed from mcp.yaml or DB."""
@@ -313,7 +394,7 @@ class MCPConfig(BaseModel):
     optional_secrets: Optional[List[str]] = Field(default_factory=list, description="Secrets injected when present but not required for the MCP to start.")
     variables: Optional[Union[List[str], Dict[str, List[str]]]] = Field(default_factory=list, description="List of non-sensitive configuration variables required by this MCP.")
     tools: Optional[List[MCPToolDefinition]] = Field(default_factory=list, description="Optional statically defined tools to bypass dynamic discovery.")
-    network: str = Field(default="none", description="Network profile for this MCP server's stdio container: 'none' (default), 'internal' or 'internet'. Legacy 'allow' maps to 'internet'. Only stdio servers spawn a process; http/sse transports ignore it.")
+    network: str = Field(default=DEFAULT_NETWORK_POLICY, description="Network for this MCP server's stdio container: 'egress' (default -- ordinary Docker egress on the default bridge) or 'none' (no network). Legacy 'allow'/'internet'/'internal' are accepted as 'egress' with a deprecation warning. Only stdio servers spawn a process; http/sse transports ignore it.")
     remote: Optional[RemoteMcpSpec] = Field(default=None, description="Set for edge-hosted MCP servers: the site and the server name inside that site's catalog. Written only by the edge relay, never parsed from an mcp.yaml. Remote servers are never connected from central: calls are POSTed to the relay, and their tools come from the static `tools` catalog.")
     container_runtime: Optional[str] = Field(default=None, description="OCI runtime for this server's session container: runsc (default), runsc-variant or runc. None uses CONTAINER_DEFAULT_RUNTIME.")
     limits: ContainerLimits = Field(default_factory=mcp_limits, description="Container limits. Defaults are sized for Node-based stdio servers.")
@@ -337,43 +418,6 @@ class RemoteToolSpec(BaseModel):
     tool: str = Field(..., pattern=_EDGE_REF_NAME_PATTERN, max_length=64)
 
 
-_WARNED_NETWORK_POLICIES: set[str] = set()
-
-
-def normalize_network_policy(value: Any, what: str) -> str:
-    """Normalize a manifest's network field onto the v0.6 profile enum.
-
-    ``allow`` keeps its old meaning (``internet``); everything else is
-    deny-by-default. As a Literal a typo (`network: deny`) raised
-    ValidationError, and the loaders drop any config that fails to parse. The
-    safer failure is the *most restrictive* profile plus a visible warning --
-    note the flip from v0.5, where an unknown value fell back to `allow`.
-    Shared by ToolConfig and MCPConfig so the two cannot drift.
-    """
-    normalized = str(value if value is not None else "").strip().lower()
-    aliases = {
-        "allow": "internet",
-        "internet": "internet",
-        "internal": "internal",
-        "none": "none",
-        "deny": "none",
-        "off": "none",
-        "": "none",
-    }
-    if normalized in aliases:
-        return aliases[normalized]
-    key = f"{what}:{normalized}"
-    if key not in _WARNED_NETWORK_POLICIES:
-        _WARNED_NETWORK_POLICIES.add(key)
-        logger.warning(
-            "Invalid %s network policy %r; falling back to 'none'. "
-            "Use 'none', 'internal' or 'internet'.",
-            what,
-            value,
-        )
-    return "none"
-
-
 class ToolConfig(BaseModel):
     """Configuration for a Tool, parsed from tool.yaml."""
     name: str
@@ -391,9 +435,9 @@ class ToolConfig(BaseModel):
     secret_groups: Optional[List[Dict[str, Any]]] = Field(default_factory=list, description="UI hint for /configuration: renders a set of optional_secrets as a single card with a selector (e.g. an environment dropdown) instead of flat rows. Each group: {label, select_label, options: [{value, label, fields: [{key, label, type}]}]}.")
     timeout_seconds: Optional[int] = Field(default=None, description="Per-tool subprocess execution timeout in seconds. Overrides the TOOL_EXECUTION_TIMEOUT env default (300s) when set. Timeouts are immediately fatal (never retried).")
     retry_on_transient: bool = Field(default=True, description="Allow automatic retry (up to 3 attempts) when the tool fails fast with a transient network error. Set false for tools with non-idempotent side effects (creates/updates/writes) so a transient failure surfaces to the caller instead of re-executing.")
-    network: str = Field(default="none", description="Network profile for this tool's container: 'none' (default), 'internal' or 'internet'. Legacy 'allow' maps to 'internet'. Use 'none' for tools that never call external APIs.")
-    egress: List[str] = Field(default_factory=list, description="External domains this tool may reach when egress mode is enabled. v1 enforcement is the union across all tools; see docs/deploy.md.")
-    container_runtime: Optional[str] = Field(default=None, description="OCI runtime for this tool's container: runsc (default), runsc-variant or runc. None uses CONTAINER_DEFAULT_RUNTIME. `runc` forfeits kernel-syscall isolation and must be justified per tool.")
+    network: str = Field(default=DEFAULT_NETWORK_POLICY, description="Network for this tool's container: 'egress' (default -- ordinary Docker egress on the default bridge) or 'none' (no network at all). Legacy 'allow'/'internet'/'internal' are accepted as 'egress' with a deprecation warning. Use 'none' for tools that never call external APIs.")
+    egress: List[str] = Field(default_factory=list, description="Deprecated and inert: the egress allowlist proxy was removed in v0.7.1. Kept only so existing manifests still parse.")
+    container_runtime: Optional[str] = Field(default=None, description="OCI runtime for this tool's container: runsc (default), runsc-variant or runc. None uses CONTAINER_DEFAULT_RUNTIME (set it to runc on a dev machine). runc forfeits kernel-syscall isolation.")
     limits: ContainerLimits = Field(default_factory=ContainerLimits, description="cgroup v2 limits for one tool container (memory/cpus/pids/tmpfs).")
     output_dirs: List[str] = Field(default_factory=list, description="Subset of [reports, output]. Declaring one grants a read-write mount of that directory for the calling agent only.")
     image: Optional[str] = Field(default=None, description="Reserved. Per-tool images are not implemented in v0.6 and this field is ignored.")

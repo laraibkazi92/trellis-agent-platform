@@ -1,12 +1,12 @@
 # Copyright (C) 2026 Laraib Kazi
 # SPDX-License-Identifier: Apache-2.0
 
-"""``core.tool_runtime.execute_tool`` with ``SANDBOX_BACKEND=container``.
+"""``core.tool_runtime.execute_tool`` -- container per call, the only path.
 
 The runner client is monkeypatched (no socket, no Docker). What is pinned is the
-contract between the hub and the runner -- declared env keys only, the manifest
-digest, deadline, target -- and that every runner failure lands on the same
-result shapes the legacy path already produces.
+contract between the hub/edge and the runner -- declared env keys only, the
+manifest digest, deadline, target -- and that every runner failure lands on the
+result shapes callers already handle.
 """
 
 import asyncio
@@ -49,7 +49,6 @@ class FakeRunnerClient:
 
 @pytest.fixture(autouse=True)
 def container_env(monkeypatch):
-    monkeypatch.setenv("SANDBOX_BACKEND", "container")
     # An edge has no etcd; keeps the tunable lookup from probing one.
     monkeypatch.setenv("TRELLIS_EDGE_MODE", "1")
     monkeypatch.setenv("TOOL_EXECUTION_TIMEOUT", "300")
@@ -262,31 +261,53 @@ def test_transient_stderr_with_retry_disabled_returns_an_error(tmp_path, monkeyp
 
 
 # --------------------------------------------------------------------------- #
-# legacy path
+# the runner is the only execution path
 # --------------------------------------------------------------------------- #
 
 
-def test_legacy_backend_never_calls_the_runner(tmp_path, monkeypatch):
-    from core import sandbox
+def test_runner_failure_is_the_only_failure_mode(tmp_path, monkeypatch):
+    """There is no local fallback: a dead runner is reported, nothing is forked.
 
-    monkeypatch.setenv("SANDBOX_BACKEND", "auto")
-    constructed = []
+    The legacy in-process backends are gone, so a runner that cannot start the
+    container must surface as a sandbox failure -- never as a tool that quietly ran
+    on the hub/edge host instead.
+    """
+    install_runner(monkeypatch, error=RunnerUnavailable("socket /run/trellis/runner.sock missing"))
 
-    def factory(*args, **kwargs):
-        constructed.append((args, kwargs))
-        return FakeRunnerClient()
+    spawned = []
 
-    monkeypatch.setattr(client_module, "RunnerClient", factory)
+    async def fake_create_subprocess_exec(*cmd, **kwargs):
+        spawned.append(cmd)
+        raise AssertionError("execute_tool must not spawn the tool itself")
 
-    def unavailable(*args, **kwargs):
-        raise sandbox.SandboxUnavailable(
-            "bwrap_missing", "bwrap not installed", "install bubblewrap", backend="none"
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result, health = run_tool(tmp_path, make_config())
+
+    assert spawned == []
+    assert result["sandbox"]["backend"] == "container"
+    assert result["sandbox"]["code"] == "runner_unavailable"
+    assert "Sandbox unavailable (runner_unavailable)" in result["error"]
+    assert health and health[0][0] is False
+
+
+def test_no_host_side_sandbox_exists_to_fall_back_to():
+    """Structural guard: the in-process backends must be gone, not just unreachable.
+
+    Monkeypatching ``asyncio.create_subprocess_exec`` only proves one code path does
+    not spawn; a re-introduced bwrap/Landlock fallback could fork through another
+    entry point (``os.posix_spawn``, a helper binary, a re-imported module). Pin the
+    structure instead: ``core.tool_runtime`` has no sandbox or subprocess machinery,
+    and ``core.sandbox`` no longer imports.
+    """
+    import importlib
+
+    assert importlib.import_module("core.tool_runtime") is tool_runtime
+    for attribute in ("subprocess", "sandbox"):
+        assert not hasattr(tool_runtime, attribute), (
+            f"core.tool_runtime.{attribute} is back: a host-side execution path "
+            "must not exist -- every tool call goes to the runner"
         )
 
-    monkeypatch.setattr(sandbox, "prepare_execution", unavailable)
-
-    result, _health = run_tool(tmp_path, make_config())
-
-    assert constructed == []
-    assert tool_runtime.container_backend_selected() is False
-    assert result["error"] == "Sandbox unavailable (bwrap_missing): bwrap not installed"
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("core.sandbox")

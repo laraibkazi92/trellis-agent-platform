@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from core.execution.spec import (
     CONTAINER_WORKSPACE,
+    DEFAULT_NETWORK_MODE,
     InvalidRequest,
     build_console_spec,
     build_spec,
@@ -24,7 +25,7 @@ from core.execution.spec import (
     manifest_digest,
     runtime_for,
 )
-from core.models import ContainerLimits, ToolConfig
+from core.models import ContainerLimits, ToolConfig, reset_network_policy_warnings
 
 
 @pytest.fixture
@@ -41,12 +42,7 @@ def workspace(tmp_path, monkeypatch):
     # A tool container is never allowed to fall back to the image's default user.
     monkeypatch.setenv("TRELLIS_UID", "1000")
     monkeypatch.setenv("TRELLIS_GID", "1000")
-    for name in (
-        "TRELLIS_ENGINE_SUBNETS",
-        "TOOLS_NET_INTERNAL_SUBNET",
-        "TOOLS_NET_INTERNET_SUBNET",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    reset_network_policy_warnings()
     return SimpleNamespace(root=root, suite=suite)
 
 
@@ -296,71 +292,53 @@ def test_the_same_limit_is_rejected_at_manifest_load():
 
 
 # --------------------------------------------------------------------------- #
-# network profile
+# network
 # --------------------------------------------------------------------------- #
 
 
-def test_undeclared_network_is_none(workspace):
+def test_undeclared_network_is_egress(workspace):
+    """v0.7.1 flips the default: a tool gets ordinary Docker egress."""
     spec = build(workspace, make_config())
+
+    assert spec.network_mode == DEFAULT_NETWORK_MODE
+    assert DEFAULT_NETWORK_MODE == "bridge"
+
+
+def test_network_none_is_the_only_override(workspace):
+    spec = build(workspace, make_config(network="none"))
 
     assert spec.network_mode == "none"
 
 
-@pytest.mark.parametrize(
-    "declared,expected",
-    [
-        ("allow", "trellis-tools-internet"),
-        ("internet", "trellis-tools-internet"),
-        ("internal", "trellis-tools-internal"),
-        ("none", "none"),
-        ("deny", "none"),
-        ("nonsense", "none"),
-    ],
-)
-def test_network_profiles_map_onto_docker_networks(workspace, declared, expected):
+@pytest.mark.parametrize("declared", ["allow", "internet", "internal"])
+def test_legacy_network_values_become_egress(workspace, declared):
+    """Every v0.6 profile meant "may use the network" -- that is exactly egress."""
     spec = build(workspace, make_config(network=declared))
 
-    assert spec.network_mode == expected
+    assert spec.network_mode == DEFAULT_NETWORK_MODE
 
 
-def _resolv_mount(spec):
-    return next((m for m in spec.mounts if m.target == "/etc/resolv.conf"), None)
+@pytest.mark.parametrize("declared", ["deny", "off"])
+def test_legacy_deny_values_become_none(workspace, declared):
+    spec = build(workspace, make_config(network=declared))
+
+    assert spec.network_mode == "none"
 
 
-def test_internet_profile_mounts_public_resolvers(workspace):
-    """gVisor cannot reach Docker's embedded resolver, so the profile ships one."""
-    spec = build(workspace, make_config(network="internet"))
+def test_unknown_network_value_falls_back_to_none(workspace):
+    """A typo must not drop the tool, and the fallback is the restrictive one."""
+    spec = build(workspace, make_config(network="nonsense"))
 
-    mount = _resolv_mount(spec)
-    assert mount is not None and mount.read_only
-    assert mount.source == str(workspace.root / ".runner-dns" / "internet.conf")
-    body = (workspace.root / ".runner-dns" / "internet.conf").read_text()
-    assert body == "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+    assert spec.network_mode == "none"
 
 
-def test_dns_servers_are_configurable_and_validated(workspace, monkeypatch):
-    monkeypatch.setenv("TOOLS_INTERNET_DNS", "9.9.9.9, not-an-ip 149.112.112.112")
+@pytest.mark.parametrize("declared", ["egress", "internal"])
+def test_egress_containers_get_no_resolv_conf_mount(workspace, declared):
+    """Docker supplies the resolver; the generated-file machinery is gone."""
+    spec = build(workspace, make_config(network=declared))
 
-    spec = build(workspace, make_config(network="internet"))
-
-    assert _resolv_mount(spec) is not None
-    body = (workspace.root / ".runner-dns" / "internet.conf").read_text()
-    assert body == "nameserver 9.9.9.9\nnameserver 149.112.112.112\n"
-
-
-@pytest.mark.parametrize("profile", ["none", "internal"])
-def test_profiles_without_configured_dns_keep_dockers_file(workspace, profile):
-    spec = build(workspace, make_config(network=profile))
-
-    assert _resolv_mount(spec) is None
-
-
-def test_empty_dns_setting_disables_the_mount(workspace, monkeypatch):
-    monkeypatch.setenv("TOOLS_INTERNET_DNS", "")
-
-    spec = build(workspace, make_config(network="internet"))
-
-    assert _resolv_mount(spec) is None
+    assert all(mount.target != "/etc/resolv.conf" for mount in spec.mounts)
+    assert not (workspace.root / ".runner-dns").exists()
 
 
 # --------------------------------------------------------------------------- #
@@ -460,7 +438,7 @@ def test_digest_is_stable_across_key_order():
 def test_digest_changes_when_a_field_changes():
     base = make_config()
 
-    assert manifest_digest(base) != manifest_digest(make_config(network="internet"))
+    assert manifest_digest(base) != manifest_digest(make_config(network="none"))
     assert manifest_digest(base) != manifest_digest(
         make_config(limits=ContainerLimits(memory_mb=1024, tmpfs_mb=256))
     )

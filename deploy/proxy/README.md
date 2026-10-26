@@ -45,7 +45,7 @@ cp -a /path/to/your/mcps/. workspace/mcps/
 # 3. Configure the node.
 cp proxy.yaml.example proxy.yaml
 $EDITOR proxy.yaml          # site, server_url, tools_dir, exports, mcps_dir, export_mcps,
-                            # secrets_dir, sandbox
+                            # secrets_dir
 
 # 4. Provide the enrollment token. It is mounted as a docker secret (never an env var,
 #    which a tool could read from /proc/<pid>/environ) and referenced by token_file:.
@@ -71,11 +71,11 @@ docker run --rm -v "$PWD":/w \
   python core/proxy.py edge-keygen --path /w/edge-keys/edge-key
 sudo chown -R "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}" edge-keys
 
-# 7. .env holds non-secret edge settings (proxy URL knobs, sandbox limits). It is NOT
+# 7. .env holds non-secret edge settings (proxy URL knobs). It is NOT
 #    the credential store (mode 0600, never the tunnel token). Shared credentials are
 #    one file per exported tool/MCP:
 install -m 0600 /dev/null .env
-$EDITOR .env                # HTTPS_PROXY=..., SANDBOX_RLIMIT_AS_MB=8192 for Node MCPs
+$EDITOR .env                # HTTPS_PROXY=...
 install -m 0600 /dev/null edge-secrets/devops-cli.env
 $EDITOR edge-secrets/devops-cli.env      # DEVOPS_URL=..., DEVOPS_PASSWORD=..., ...
 sudo chown "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}" edge-secrets/devops-cli.env
@@ -98,9 +98,9 @@ declare every key it reads, `env_passthrough: true` restores the v0.4 whole-envi
 behaviour (the tunnel token and framework secrets are still stripped).
 
 `proxy.yaml` is mounted read-only at `/etc/trellis/proxy.yaml`. The sample compose mounts
-the workspace at `/app/workspace` read-write, because the sandbox grants tools exactly that
-one writable path; mount it `:ro` only when every exported item is read-only (writes then
-fail with a sandbox error). `workspace/mcps` sits inside the workspace tree, `edge-secrets`
+the workspace at `/app/workspace` read-write, because exported tools may write there (the
+runner mounts one writable output dir when a manifest asks for it); mount it `:ro` only
+when every exported item is read-only (writes then fail inside the tool container). `workspace/mcps` sits inside the workspace tree, `edge-secrets`
 outside it, and the edge key is a read-only file mount into `trellis-proxy` only (never
 into `runner`). Tool/MCP edits are a content change plus a `SIGHUP` to re-publish the
 catalog (the proxy reconnects, so an in-flight call fails rather than being replayed), or a
@@ -174,10 +174,9 @@ mapping form adds per-server policy (`include_tools`, `exclude_tools`, `credenti
   survive to the registry and to external MCP clients. A description longer than 8 KiB is
   truncated (the schema never is), so the published description can be shorter than
   `mcp.yaml`.
-- **Node servers need more address space** than the 4 GiB default: put
-  `SANDBOX_RLIMIT_AS_MB=8192` in `.env` (applied by the Landlock helper; under bwrap the
-  container's own limits are the backstop, as on central). `RLIMIT_CPU` counts consumed
-  CPU, so a 600 s default does not evict an idle session.
+- **Node servers may need more address space** than the default: raise the manifest's
+  `limits:` block (`memory`, `cpus`) in `mcp.yaml` / `tool.yaml` -- the runner applies it
+  as cgroup v2 limits on the session container. There is no env knob for it.
 
 ## Verify
 
@@ -216,12 +215,12 @@ tool and one exported MCP tool is the end-to-end proof.
 | **`credential_rejected`** on a tool/MCP call | The sealed blob is for another target/user/site, or it was sealed to a key the edge retired | Reload the credential form (it re-fetches the current key) and re-enter the set |
 | Sealed credentials never reach a container | The edge has no key (`No usable edge credential key` at startup), or a rotation dropped the old key too early | Run `edge-keygen --show` and compare the fingerprint with Admin → Edges; generate one if missing |
 | Tool runs but a variable the manifest declares is missing | The key is in the file but **not declared** in `tool.yaml` / `mcp.yaml`, or `KEY=` is empty | Declare it (`secrets`/`optional_secrets`/`variables`/`secret_groups`) and give it a value; `env_passthrough: true` only as a last resort |
-| Node MCP server is killed / fails to start | `SANDBOX_RLIMIT_AS_MB` still at the 4096 default | Put `SANDBOX_RLIMIT_AS_MB=8192` in `.env` and recreate the container |
+| Node MCP server is killed / fails to start | The manifest's `limits:` block is at or below the default memory | Raise `limits: {memory: ...}` in `mcp.yaml` and reopen the session |
 | **`503 edge_offline`** on a tool call | The site is not connected: tunnel down, wrong token, or relay restarted | `docker compose logs -f trellis-proxy` for the reconnect reason; edges retry with jittered backoff (1 s → 60 s) |
 | `CERTIFICATE_VERIFY_FAILED` / `certificate is not valid for '<name>'` | The edge does not trust the relay's CA, or the URL does not match the cert SAN | [docs/proxy-tls.md](../../docs/proxy-tls.md) §5–6 |
 | **No outbound connection at all** | Egress firewall, or a proxy that needs `HTTPS_PROXY`/`NO_PROXY` | Test from inside the container: `docker compose exec trellis-proxy curl -sI https://trellis.example.com/`. `wss://` needs 443 and, if a proxy is enforced, `HTTPS_PROXY` set in `.env` |
 | **`token_file … is empty`** on restart | The token file was a writable copy, and the proxy removed it after the first read (it logs `token file … was removed after reading`) | Re-provision `edge-token`, or use the sample compose secret (mounted read-only, so it survives restarts) |
-| Tool calls fail with a sandbox error | `sandbox: auto` picked a backend this kernel cannot run (no user namespaces, restrictive AppArmor) | Check the mentioned backend in the log, then pin `sandbox: landlock`; for bwrap, enable the shared-sandbox block in `docker-compose.yml` |
+| Tool calls fail with a runner/container error | The edge `runner` is down, its `RUNNER_TOKEN` does not match, `TRELLIS_HOST_WORKSPACE` is wrong, or the configured `CONTAINER_DEFAULT_RUNTIME` is not registered (e.g. `runsc` on a dev machine) | `docker compose logs runner` for the specific check; fix the env value or set `CONTAINER_DEFAULT_RUNTIME=runc` on a host without gVisor |
 | Tool works on the edge but not through the central agent | Tool not in `exports`, name collision with an existing central tool (registration refused), or invalid schema | The relay logs the rejected tool and keeps the rest; fix `exports`/name/schema and restart |
 
 ## Upgrade order

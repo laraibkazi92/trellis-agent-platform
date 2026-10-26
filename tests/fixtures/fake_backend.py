@@ -83,8 +83,6 @@ class FakeBackend:
         self.removed: list[str] = []
         self.runtimes = {"runsc", "runc"}
         self.images = {"trellis-agent-platform:test"}
-        self.networks = {"trellis-tools-internal", "trellis-tools-internet"}
-        self.network_details: dict[str, dict] = {}
         self.fail_run: Optional[Exception] = None
         self._next = 0
         self.closed = False
@@ -162,14 +160,6 @@ class FakeBackend:
 
     async def has_image(self, image: str) -> bool:
         return image in self.images
-
-    async def has_network(self, name: str) -> bool:
-        return name in self.networks
-
-    async def network_info(self, name: str) -> Optional[dict]:
-        if name not in self.networks:
-            return None
-        return self.network_details.get(name, {"subnet": None, "icc": "false"})
 
     async def close(self) -> None:
         self.closed = True

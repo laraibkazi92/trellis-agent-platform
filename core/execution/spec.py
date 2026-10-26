@@ -11,21 +11,21 @@ declare is rejected here rather than trusted.
 Container paths are identical to the pre-container layout
 (``/app/workspace/tools/<suite>``, ``/app/workspace/shared``, ...) so tool
 wrappers and the stdin/stdout protocol are unchanged.
+
+Network: there are no network profiles. A manifest either denies the network
+(``network: none``) or gets ordinary Docker egress on the **default bridge**,
+which is Docker's own default NetworkMode -- so an egress container carries no
+network override in its create payload at all.
 """
 
 import hashlib
-import ipaddress
 import json
-import logging
 import os
 import shlex
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
-from core.execution import netprofiles
 from core.models import MCPConfig, ToolConfig, normalize_network_policy
-
-logger = logging.getLogger(__name__)
 
 CONTAINER_WORKSPACE = "/app/workspace"
 CONTAINER_TMP = "/tmp"
@@ -67,6 +67,13 @@ RESTRICTED_ENV_VARS = frozenset(
 OUTPUT_DIRS = ("reports", "output")
 KNOWN_RUNTIMES = ("runsc", "runsc-variant", "runc")
 
+# Manifest network policies. ``none`` means no network at all; ``egress`` means
+# normal Docker egress. Docker's default bridge is the only network whose DNS
+# works under gVisor (the embedded resolver on a user-defined network is
+# unreachable), and it is also Docker's default -- hence the mapping below.
+POLICY_NONE = "none"
+DEFAULT_NETWORK_MODE = "bridge"
+
 # Per-stream caps for one-shot runs. Sessions cap separately in the runner.
 MAX_STDOUT_BYTES = 8 * 1024 * 1024
 MAX_STDERR_BYTES = 256 * 1024
@@ -104,7 +111,7 @@ class ContainerSpec:
     memory_mb: int = 512
     cpus: float = 1.0
     pids: int = 256
-    network_mode: str = "none"
+    network_mode: str = DEFAULT_NETWORK_MODE
     labels: dict[str, str] = field(default_factory=dict)
     user: Optional[str] = None
     init: bool = True
@@ -161,15 +168,23 @@ def manifest_digest(config: Any) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def network_profile_for(config: Any, *, force_none: bool = False) -> str:
-    """Manifest network, mapped onto a profile. ``allow`` -> ``internet``."""
-    if force_none:
-        return netprofiles.PROFILE_NONE
-    declared = getattr(config, "network", None)
-    return normalize_network_policy(declared, "manifest")
+def network_mode_for(config: Any) -> str:
+    """Docker ``NetworkMode`` for a manifest: ``none`` or the default bridge.
+
+    ``DEFAULT_NETWORK_MODE`` is what Docker already does when no NetworkMode is
+    sent, so the create payload only ever names a network to take it away.
+    """
+    policy = normalize_network_policy(getattr(config, "network", None), "manifest")
+    return POLICY_NONE if policy == POLICY_NONE else DEFAULT_NETWORK_MODE
 
 
 def runtime_for(config: Any, default: Optional[str] = None) -> str:
+    """OCI runtime for a container: per-manifest, else the deployment default.
+
+    ``runsc`` is the documented default (``CONTAINER_DEFAULT_RUNTIME`` overrides
+    it for the whole deployment, e.g. ``runc`` on a dev machine); a manifest may
+    also pin one with ``container_runtime:``.
+    """
     runtime = str(
         getattr(config, "container_runtime", None)
         or default
@@ -324,75 +339,6 @@ def _append_mount(
     return mount
 
 
-# --------------------------------------------------------------------------- #
-# name resolution for network profiles
-# --------------------------------------------------------------------------- #
-
-DNS_ENV = {
-    netprofiles.PROFILE_INTERNAL: "TOOLS_INTERNAL_DNS",
-    netprofiles.PROFILE_INTERNET: "TOOLS_INTERNET_DNS",
-}
-# gVisor cannot use Docker's embedded resolver (127.0.0.11) on a user-defined
-# network, so a container that needs DNS gets a mounted resolv.conf instead. The
-# internet profile defaults to public resolvers because its whole purpose is
-# public egress; an internal resolver has to be named explicitly (and its CIDR
-# allowlisted in TRELLIS_INTERNAL_CIDRS, or the profile's blanket deny drops it).
-DEFAULT_DNS = {
-    netprofiles.PROFILE_INTERNAL: (),
-    netprofiles.PROFILE_INTERNET: ("1.1.1.1", "8.8.8.8"),
-}
-RESOLV_DIR = ".runner-dns"
-RESOLV_TARGET = "/etc/resolv.conf"
-
-
-def dns_servers(profile: str) -> tuple[str, ...]:
-    """Nameservers for a network profile (``()`` = leave Docker's file alone)."""
-    profile = netprofiles.normalize_profile(profile)
-    name = DNS_ENV.get(profile)
-    if name is None:
-        return ()
-    raw = os.getenv(name)
-    if raw is None:
-        return DEFAULT_DNS[profile]
-    servers: list[str] = []
-    for part in raw.replace(",", " ").split():
-        try:
-            servers.append(str(ipaddress.ip_address(part)))
-        except ValueError:
-            logger.warning("ignoring invalid nameserver %r in %s", part, name)
-    return tuple(servers)
-
-
-def _mount_resolv_conf(
-    mounts: list[Mount],
-    profile: str,
-    workspace_root: str,
-    host_workspace: str,
-) -> None:
-    """Bind a generated resolv.conf over the container's, when DNS is configured.
-
-    Docker writes 127.0.0.11 (its embedded resolver) into every container on a
-    user-defined network, and gVisor's netstack cannot reach it: name resolution
-    fails in every profile that has a network. The file is written once per
-    profile under the workspace -- which is mounted read-write into the runner
-    and is the only path Docker can use as a bind source -- and mounted
-    read-only. It holds resolver addresses only, never anything secret.
-    """
-    servers = dns_servers(profile)
-    if not servers:
-        return
-    rel = os.path.join(RESOLV_DIR, f"{profile}.conf")
-    local = os.path.join(workspace_root, rel)
-    os.makedirs(os.path.dirname(local), exist_ok=True)
-    body = "".join(f"nameserver {server}\n" for server in servers)
-    tmp = f"{local}.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        handle.write(body)
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, local)
-    mounts.append(Mount(os.path.join(host_workspace, rel), RESOLV_TARGET, True))
-
-
 def _uid_gid() -> tuple[Optional[int], Optional[int]]:
     raw_uid = os.getenv("TRELLIS_UID")
     raw_gid = os.getenv("TRELLIS_GID")
@@ -498,8 +444,6 @@ def build_spec(
     )
 
     memory, cpus, pids, tmpfs_mb = _limits(config)
-    profile = network_profile_for(config)
-    _mount_resolv_conf(mounts, profile, workspace_root, host_workspace)
     user = _require_user()
 
     if kind in ("mcp_session", "discovery"):
@@ -518,7 +462,7 @@ def build_spec(
         memory_mb=memory,
         cpus=cpus,
         pids=pids,
-        network_mode=netprofiles.network_mode(profile),
+        network_mode=network_mode_for(config),
         labels=_labels(kind, target, session=session_key, run=run_id),
         user=user,
         kind=kind,
@@ -564,7 +508,7 @@ def build_console_spec(
         memory_mb=1024,
         cpus=1.0,
         pids=256,
-        network_mode="none",
+        network_mode=POLICY_NONE,
         labels=_labels("console", "console", run=run_id),
         user=_require_user(),
         kind="console",

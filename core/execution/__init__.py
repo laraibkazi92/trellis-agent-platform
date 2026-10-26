@@ -13,8 +13,8 @@ __all__ = ["RunnerClient", "RunnerUnavailable"]
 
 
 def __getattr__(name: str):
-    # Lazy, so importing a dependency-free submodule (``netprofiles``, used by the
-    # host-side ``scripts/setup-network-profiles.sh``) does not pull in httpx.
+    # Lazy, so importing a dependency-free submodule (``core.execution.spec``)
+    # does not pull in httpx.
     if name in __all__:
         from core.execution import client
 

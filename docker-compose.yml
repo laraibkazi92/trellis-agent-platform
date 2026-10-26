@@ -38,8 +38,9 @@ services:
   # Execution Runner (v0.6) -- the ONLY component with the Docker socket.
   # Every tool call becomes its own gVisor (runsc) container, created from a spec the
   # runner derives from the registered manifest: the suite is mounted read-only, the
-  # tmpfs is sized, the network profile is pinned (none|internal|internet). Callers name
-  # a tool, never an image, mount, capability or network.
+  # tmpfs is sized, and the network is either Docker's default bridge (`egress`) or
+  # none at all (`network: none`). Callers name a tool, never an image, mount,
+  # capability or network.
   # The control API is a Unix socket on the `runner-run` volume -- not a published port.
   # `network_mode: none` means no tool network can reach it, and only the containers
   # mounting that volume can drive it. Do not publish it.
@@ -96,22 +97,14 @@ services:
       # Docker resolves every tool bind mount against this, so a container path here
       # makes every mount point at the wrong files (the startup canary refuses to run).
       TRELLIS_HOST_WORKSPACE: ${TRELLIS_HOST_WORKSPACE:?set TRELLIS_HOST_WORKSPACE to the HOST path of the workspace (e.g. /opt/trellis/workspace)}
+      # Runtime for manifests that omit `container_runtime`. runsc (gVisor) is the
+      # isolation boundary in production; dev machines without gVisor set this to
+      # runc. A per-tool `container_runtime` overrides it.
       CONTAINER_DEFAULT_RUNTIME: ${CONTAINER_DEFAULT_RUNTIME:-runsc}
       RUNNER_IMAGE: ${RUNNER_IMAGE:-${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.0}}
       RUNNER_MAX_CONTAINERS: ${RUNNER_MAX_CONTAINERS:-32}
       RUNNER_MAX_CONTAINERS_PER_TOOL: ${RUNNER_MAX_CONTAINERS_PER_TOOL:-8}
       RUNNER_REAP_INTERVAL_S: ${RUNNER_REAP_INTERVAL_S:-300}
-      # Network-profile inputs (see scripts/setup-network-profiles.sh). The runner
-      # verifies the pinned networks + DOCKER-USER rules at startup.
-      TOOLS_NET_INTERNAL_SUBNET: ${TOOLS_NET_INTERNAL_SUBNET:-172.31.241.0/24}
-      TOOLS_NET_INTERNET_SUBNET: ${TOOLS_NET_INTERNET_SUBNET:-172.31.240.0/24}
-      # Resolvers gVisor can actually reach (Docker's embedded 127.0.0.11 is not):
-      # the runner writes them to <workspace>/.runner-dns/<profile>.conf and binds
-      # it over /etc/resolv.conf. Empty = keep Docker's file (no working DNS).
-      TOOLS_INTERNET_DNS: ${TOOLS_INTERNET_DNS:-1.1.1.1,8.8.8.8}
-      TOOLS_INTERNAL_DNS: ${TOOLS_INTERNAL_DNS:-}
-      TRELLIS_INTERNAL_CIDRS: ${TRELLIS_INTERNAL_CIDRS:-}
-      TRELLIS_ENGINE_SUBNETS: ${TRELLIS_ENGINE_SUBNETS:-}
       # uid/gid the tool containers run as (must own the workspace tree).
       TRELLIS_UID: ${TRELLIS_UID:-1000}
       TRELLIS_GID: ${TRELLIS_GID:-1000}
@@ -128,8 +121,8 @@ services:
       interval: 10s
       timeout: 10s
       retries: 5
-      # Startup preflight starts a trivial container under the configured runtime and
-      # re-verifies the network rules; a cold host can take a while the first time.
+      # Startup preflight starts a trivial container under the configured runtime; a
+      # cold host can take a while the first time.
       start_period: 60s
     restart: unless-stopped
 
@@ -212,85 +205,36 @@ services:
     image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.0}
     container_name: tool-hub
     # Runs as the operator uid -- the same identity that owns the bind-mounted
-    # workspace, so tools run as the workspace owner and no capabilities are
-    # needed. The sandbox helper only performs a uid drop when it starts as root;
-    # at this identity it runs tools directly as this uid.
+    # workspace. Tool processes do NOT run here (every call is a runner-managed
+    # container), so the hub needs no capabilities and no identity drop.
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
-    # PID 1 must reap orphaned tool children: the Landlock backend runs tools as
-    # direct children, so a tool that daemonizes would otherwise leave zombies.
-    # With `init: true` tini is PID 1 and does the reaping (the hub is not).
+    # PID 1 must reap orphaned children (auxiliary probes and short-lived helper
+    # processes); with `init: true` tini is PID 1 and does the reaping.
     init: true
     command: python core/hub.py
     restart: unless-stopped
-    # /healthz serves the verdict cached by the startup probes (no per-request
-    # bwrap fork) and returns 503 when the sandbox cannot execute tools. After a
-    # classified tool failure the cache is re-probed once (single-flight, one
-    # probe set of up to ~20 s), so the timeout must outlast that probe: a slow
-    # host then answers 503 *with* a diagnosis instead of a bare curl timeout.
+    # /healthz is a liveness probe only: the hub owns no sandbox, so it answers 200
+    # while the process serves. Executable health belongs to the runner
+    # (`GET /v1/healthz` over its socket).
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8001/healthz > /dev/null"]
       interval: 30s
       timeout: 25s
       retries: 3
       # Go tools are pre-compiled before uvicorn binds; a cold rebuild can take a
-      # while. Do not report a slow-but-healthy hub as a sandbox failure.
+      # while. Do not report a slow-but-healthy hub as a failure.
       start_period: 60s
-    # v0.6: production tool execution moved out of the hub entirely -- every call is
-    # a runner-managed gVisor container, so nothing here builds a sandbox root and
-    # the three `*=unconfined` options are no longer needed. They stay documented
-    # below as the LEGACY bwrap/Landlock path, which is DEV-ONLY from v0.6 on
-    # (`SANDBOX_BACKEND=auto|bwrap|landlock`, plus uncommenting those lines).
-    #
-    # Legacy rationale (kept for local development):
-    # bubblewrap by default (core/hub.py: --ro-bind / /, --unshare-user/pid/ipc/uts,
-    # --die-with-parent), with a Landlock helper (core/sandbox.py +
-    # /usr/local/bin/trellis-sandbox) as the fallback when bwrap cannot run (no
-    # AppArmor profile, no user namespaces). Landlock confines filesystem writes and
-    # runs the tool at the hub's own identity; it does not create namespaces.
-    # Posture: the hub runs as TRELLIS_UID, the uid that owns the workspace. Every
-    # tool therefore runs as the workspace owner -- bwrap maps that uid 1:1 inside
-    # the user namespace it creates and drops every capability; Landlock needs no
-    # setuid/chown because there is no identity to drop. That is why cap_add is
-    # empty: as the target uid the hub needs no capabilities at all.
-    # What bwrap still needs inside a container, and nothing more (empirically
-    # verified with the exact syscall sequence bwrap uses under this Docker daemon):
-    #   - systempaths=unconfined: docker's masked /proc submounts (/proc/sys,
-    #     /proc/bus, ...) leave /proc not "fully visible", so the kernel rejects
-    #     bwrap's fresh proc mount with "Operation not permitted". This only
-    #     skips path masking — it grants no capabilities.
-    #   - seccomp=unconfined: docker's default seccomp profile blocks
-    #     pivot_root(2), which bwrap calls to build the sandbox root; without it
-    #     EVERY tool invocation dies with "bwrap: pivot_root: Operation not
-    #     permitted". Disabling the filter is the standard requirement for
-    #     running bwrap (itself a sandbox) inside a container — bwrap's own
-    #     ro-bind/namespace isolation is what confines the tool.
-    #   - no-new-privileges: tools cannot regain privileges via setuid/file caps.
-    #   - bwrap itself receives CAP_SYS_ADMIN inside its own user namespace,
-    #     which is what allows its mounts; the container's capability set stays
-    #     empty (cap_drop ALL, no cap_add).
-    # Fallback: if tool execution still fails with bwrap/userns errors on an
-    # exotic host, the ONLY capability to re-add is SYS_ADMIN. Never add
-    # SETUID/SETGID/CHOWN: the hub is not root, so they would hand a normal
-    # process privilege escalation instead of enabling a uid drop.
+    # Every tool call is a runner-managed container, so the hub builds no sandbox
+    # root and needs no capability and no relaxed LSM profile: cap_drop is [ALL]
+    # with an empty cap_add, and `no-new-privileges` stops setuid/file-cap
+    # privilege gain in the hub process itself.
     cap_drop: [ALL]
-    # Docker's docker-default AppArmor profile contains `deny mount,`. AppArmor is an
-    # LSM independent of seccomp, so unconfining seccomp is not enough: it still blocks
-    # bwrap's bind/proc/tmpfs mounts and its pivot_root. `apparmor=unconfined` is the
-    # AppArmor analogue of `seccomp=unconfined`.
-    # Residual risk: seccomp was already unconfined above, so mount was already
-    # permitted for hub processes running outside bwrap. Containment rests on bwrap's
-    # own namespace isolation and the empty capability set. Orgs that forbid
-    # unconfined profiles should ship the custom profile in deploy/apparmor/trellis-hub
-    # instead of this line.
     security_opt:
       - "no-new-privileges:true"
-      # Legacy bwrap only, dev-only (see the note above):
-      # - "systempaths=unconfined"
-      # - "seccomp=unconfined"
-      # - "apparmor=unconfined"
-    # NOTE: no `env_file: .env` here on purpose. The hub copies os.environ into every
-    # tool subprocess it spawns (core/hub.py), so loading the whole .env would hand
-    # tools every framework secret it holds (e.g. GEMINI_API_KEY, SESSION_SECRET).
+    # NOTE: no `env_file: .env` here on purpose. The hub keeps only the variables it
+    # needs: tool environments are built per call from the manifest's declared keys,
+    # and framework secrets (e.g. GEMINI_API_KEY, SESSION_SECRET) never enter the hub
+    # process to begin with.
     # Only the variables the hub actually needs are passed explicitly below.
     environment:
       <<: *common-env
@@ -305,12 +249,6 @@ services:
       TOOL_EXECUTION_TIMEOUT: ${TOOL_EXECUTION_TIMEOUT:-}
       HEALTH_FAILURE_THRESHOLD: ${HEALTH_FAILURE_THRESHOLD:-}
       HEALTH_COOLDOWN_SECONDS: ${HEALTH_COOLDOWN_SECONDS:-}
-      # Sandbox backend: container (runner) | auto | bwrap | landlock.
-      # v0.6 default is `container`: core/tool_runtime.execute_tool sends the call to
-      # the runner over RUNNER_SOCKET. `auto`/`bwrap`/`landlock` are LOCAL-DEV ONLY
-      # (the in-process sandbox; the unconfined security_opt lines above must be
-      # uncommented for bwrap).
-      SANDBOX_BACKEND: ${SANDBOX_BACKEND:-container}
       # Runner control API (the `runner-run` volume) and its bearer token.
       # RUNNER_TOKEN must match the runner service and the other callers.
       RUNNER_SOCKET: ${RUNNER_SOCKET:-/run/trellis/runner.sock}
@@ -320,34 +258,14 @@ services:
       AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET in .env (openssl rand -hex 32)}
       # Server-side allowlist enforcement: off | log | enforce (phase 3).
       ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
-      # Target uid/gid for the Landlock backend; matches the operator-owned workspace.
-      # Defaults to TRELLIS_UID/TRELLIS_GID, i.e. the hub's own identity, so the
-      # helper has no identity to drop on the default deployment.
-      SANDBOX_UID: ${SANDBOX_UID:-${TRELLIS_UID:-1000}}
-      SANDBOX_GID: ${SANDBOX_GID:-${TRELLIS_GID:-1000}}
-      # Syscall deny-list for the Landlock backend (on|off).
-      SANDBOX_SECCOMP: ${SANDBOX_SECCOMP:-on}
-      # Deployment default network policy for tools (allow|none). Per-tool
-      # `network:` overrides it; `allow` is the default.
-      SANDBOX_NET_DEFAULT: ${SANDBOX_NET_DEFAULT:-allow}
-      # Parent for per-run tmpdirs; empty = the helper's default (/tmp/trellis).
-      SANDBOX_TMP_ROOT: ${SANDBOX_TMP_ROOT:-}
-      # Limits are applied per tool by the Landlock helper only; the helper is
-      # not in the bwrap argv, so under bwrap these do nothing and the container
-      # limits below are the backstop. 0/unset = helper default (4 GiB AS,
-      # 600 s CPU, 64 MiB file size; NPROC off — it is host-uid-wide).
-      SANDBOX_RLIMIT_AS_MB: ${SANDBOX_RLIMIT_AS_MB:-}
-      SANDBOX_RLIMIT_CPU_S: ${SANDBOX_RLIMIT_CPU_S:-}
-      SANDBOX_RLIMIT_NPROC: ${SANDBOX_RLIMIT_NPROC:-}
-      SANDBOX_RLIMIT_FSIZE_MB: ${SANDBOX_RLIMIT_FSIZE_MB:-}
       # How often the hub re-reads the tool registry so a newly connected edge's tools
       # become executable without a restart. 0 disables the watcher.
       EDGE_TOOL_RECONCILE_SECONDS: ${EDGE_TOOL_RECONCILE_SECONDS:-10}
     # Per-container backstop against fork bombs: RLIMIT_NPROC counts the whole
     # host uid, while pids.max counts only this container's processes/threads.
     pids_limit: 1024
-    # Optional hard memory bound for the container (bwrap tools have no per-tool
-    # RLIMIT_AS). Uncomment and size it around your heaviest tool.
+    # Optional hard memory bound for the hub container. Uncomment and size it
+    # around your heaviest workload.
     # mem_limit: 4g
     depends_on:
       etcd:
@@ -652,12 +570,6 @@ services:
 networks:
   default:
     name: trellis-network
-  # The two tool networks (`trellis-tools-internal`, `trellis-tools-internet`) are
-  # deliberately NOT declared here. They are created out-of-band by
-  # scripts/setup-network-profiles.sh (`python -m core.execution.netprofiles
-  # --networks`) with pinned subnets and `enable_icc=false`, and the runner attaches
-  # tool containers to them by name. Declaring them here would let compose create
-  # them with the wrong subnet/options before the script ever ran.
 
 volumes:
   etcd-data:

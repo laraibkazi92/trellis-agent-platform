@@ -22,7 +22,7 @@
 # re-publishes the catalog (the proxy reconnects; in-flight calls fail rather than
 # being replayed).
 #   live-reloadable: exports, export_mcps, tools_dir, mcps_dir, lazy_catalog
-#   restart-required: site, server_url, token_env, token_file, tls_*, sandbox,
+#   restart-required: site, server_url, token_env, token_file, tls_*,
 #     env_passthrough, and the secrets_dir *path* -- for each one you try to apply with
 #     SIGHUP the proxy logs a warning and keeps the current value
 # Credential *contents* are a third case: tool calls read them every time (the sealed
@@ -62,9 +62,9 @@ token_file: /run/secrets/edge_token
 #
 # Directory holding this edge's tool.yaml directories. Same schema as the central
 # workspace (workspace/tools/<tool>/tool.yaml). The sample compose mounts the workspace
-# at /app/workspace read-write because the legacy sandbox grants tools exactly that one
-# writable path (override with SANDBOX_RW_PATH); mount :ro only for read-only tools.
-# Under `sandbox: container` the tool gets this suite mounted READ-ONLY plus
+# at /app/workspace read-write because exported tools may write there; mount :ro only
+# when every tool is read-only.
+# Each call runs in a runner container that gets this suite mounted READ-ONLY plus
 # `shared/` read-only; output dirs are granted one at a time via `output_dirs`.
 # Env equivalent: TRELLIS_EDGE_TOOLS_DIR.
 tools_dir: ./workspace/tools
@@ -197,34 +197,26 @@ env_passthrough: false
 # Default: false (full catalogs, byte-identical to pre-0.7).
 lazy_catalog: false
 
-# ---------------------------------------------------------------- sandbox
+# ---------------------------------------------------------------- runner
 #
-# Sandbox backend for tool processes and stdio MCP servers:
-#   container | auto | bwrap | landlock
-#
-# `container` is the DEFAULT for new installs (v0.6) and the only supported
-# production backend: every call runs in its own gVisor (runsc) container created by
-# the edge `runner` service in docker-compose.yml, reached over `runner_socket`
-# below. It requires that service to be up, runsc registered with the edge's Docker
-# daemon, and the runner to be pointed at this host's workspace path via
-# TRELLIS_HOST_WORKSPACE (see docs/proxy.md -> "Edge runner").
-#
-# `auto` (bwrap, then Landlock), `bwrap` and `landlock` are the LEGACY in-process
-# backends, kept for LOCAL DEVELOPMENT ONLY (a laptop without runsc). They execute
-# tools as a child of this container and are not the v0.6 isolation boundary.
-sandbox: container
+# Every tool call and stdio MCP session runs in its own gVisor (runsc) container
+# created by the edge `runner` service in docker-compose.yml, reached over
+# `runner_socket` below. The runner is the ONLY execution path since v0.7.1 -- the
+# legacy in-process backends (bwrap, Landlock) are gone, and there is no `sandbox:`
+# setting any more (an older proxy.yaml that still carries one is accepted, the key
+# ignored with a single warning). It requires that service to
+# be up, runsc registered with the edge's Docker daemon, and the runner pointed at
+# this host's workspace path via TRELLIS_HOST_WORKSPACE (see docs/proxy.md ->
+# "Edge runner"). A dev machine without gVisor sets CONTAINER_DEFAULT_RUNTIME=runc
+# on the runner service.
 #
 # Unix socket of the runner control API, shared with the runner container through the
-# `proxy-runner` volume. Ignored unless `sandbox: container`.
+# `proxy-runner` volume.
 # Env equivalent: RUNNER_SOCKET.
 runner_socket: /run/trellis/runner.sock
 #
-# Legacy knobs (dev-only backends): Node MCP servers need more address space than the
-# 4 GiB default: export SANDBOX_RLIMIT_AS_MB=8192 in the compose .env (applied by the
-# Landlock helper; under bwrap the container's own limits are the backstop). Under the
-# container backend these rlimits are INERT -- size the manifest's `limits:` block
-# instead.
-# RLIMIT_CPU counts consumed CPU, so a 600 s default does not evict an idle session.
+# Session/tool resource use is sized by the manifest's `limits:` block (cgroup v2 on
+# the runner container), not by environment variables.
 
 # ---------------------------------------------------------------- mutual TLS
 #
@@ -248,7 +240,7 @@ runner_socket: /run/trellis/runner.sock
 #   transport: stdio
 #   command: node
 #   args: [/opt/devops-cli-mcp/dist/index.js]
-#   network: allow                 # stdio sandbox net policy; `none` cuts the IP network
+#   network: egress                # stdio net policy: egress (default) | none
 #   secrets: [DEVOPS_URL, DEVOPS_USERNAME, DEVOPS_PASSWORD]
 #   optional_secrets: [CORALOGIX_API_KEY]
 #   variables: [CORALOGIX_DOMAIN]

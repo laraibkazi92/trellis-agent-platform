@@ -59,24 +59,14 @@ SUITE_MANIFEST = """\
   output_dirs: [output]
   timeout_seconds: 60
 
-- name: probe_internal
+- name: probe_egress
   version: 0.1.0
   author: live-test@example.com
-  description: "Live probe on the internal profile."
+  description: "Live probe with ordinary Docker egress (the default bridge)."
   runtime: python
   entrypoint: probe.py
   rel_path: tools/{suite}
-  network: internal
-  timeout_seconds: 60
-
-- name: probe_internet
-  version: 0.1.0
-  author: live-test@example.com
-  description: "Live probe on the internet profile."
-  runtime: python
-  entrypoint: probe.py
-  rel_path: tools/{suite}
-  network: internet
+  network: egress
   timeout_seconds: 60
 
 - name: probe_limits

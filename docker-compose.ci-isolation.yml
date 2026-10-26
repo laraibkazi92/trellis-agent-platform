@@ -6,8 +6,7 @@
 # socket and workspace. No etcd, no redis, no registry -- the runner resolves
 # agents and tools from the workspace files, which is what these tests exercise.
 #
-# Usage on a host with runsc registered and the profile rules installed:
-#   sudo scripts/setup-network-profiles.sh
+# Usage on a host with runsc registered and the Docker socket readable:
 #   RUNNER_TOKEN=$(openssl rand -hex 32) AGENT_TOKEN_SECRET=$(openssl rand -hex 32) \
 #   TRELLIS_HOST_WORKSPACE=$PWD/workspace TRELLIS_UID=$(id -u) TRELLIS_GID=$(id -g) \
 #   DOCKER_GID=$(getent group docker | cut -d: -f3) \
@@ -57,8 +56,6 @@ services:
       CONTAINER_DEFAULT_RUNTIME: ${CONTAINER_DEFAULT_RUNTIME:-runsc}
       RUNNER_IMAGE: *image
       ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
-      TOOLS_INTERNET_DNS: ${TOOLS_INTERNET_DNS:-1.1.1.1,8.8.8.8}
-      TOOLS_INTERNAL_DNS: ${TOOLS_INTERNAL_DNS:-}
       PYTHONDONTWRITEBYTECODE: "1"
     healthcheck:
       test: ["CMD-SHELL", "python -m core.execution.runner --healthcheck"]
@@ -74,8 +71,8 @@ services:
     depends_on:
       runner:
         condition: service_healthy
-    # Needs the network for the one-time pytest install and for the
-    # internet-profile probes; the containers under test are still isolated.
+    # Needs the network for the one-time pytest install; the containers under test
+    # are still isolated.
     volumes:
       - ./workspace:/app/workspace
       - ./tests:/app/tests:ro
@@ -90,13 +87,11 @@ services:
       WORKSPACE_ROOT: /app/workspace
       TRELLIS_UID: ${TRELLIS_UID:-1000}
       TRELLIS_GID: ${TRELLIS_GID:-1000}
-      TOOLS_INTERNET_DNS: ${TOOLS_INTERNET_DNS:-1.1.1.1,8.8.8.8}
-      TOOLS_INTERNAL_DNS: ${TOOLS_INTERNAL_DNS:-}
       PYTHONDONTWRITEBYTECODE: "1"
     entrypoint:
       - sh
       - -c
-      - python -m pip install -q pytest && python -m pytest tests/live -m "runsc or netprofiles" -p no:cacheprovider
+      - python -m pip install -q pytest && python -m pytest tests/live -m "runsc" -p no:cacheprovider
     restart: "no"
 
 volumes:

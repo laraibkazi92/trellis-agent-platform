@@ -59,7 +59,6 @@ def write_proxy_yaml(path, **overrides):
         "token_env": "EDGE_TOKEN",
         "tools_dir": "./workspace/tools",
         "exports": ["boiler_status"],
-        "sandbox": "auto",
     }
     data.update(overrides)
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
@@ -86,7 +85,27 @@ def test_load_config_parses_yaml(tmp_path):
     assert config.token_env == "EDGE_TOKEN"
     assert config.tools_dir == Path("workspace/tools")
     assert config.exports == ["boiler_status"]
-    assert config.sandbox == "auto"
+    # v0.7.1: there is no backend selector -- the runner is the only path.
+    assert not hasattr(config, "sandbox")
+
+
+def test_legacy_sandbox_key_is_accepted_with_one_deprecation_warning(tmp_path, caplog):
+    """An upgraded edge must not go offline because its proxy.yaml is old."""
+    config_path = write_proxy_yaml(tmp_path / "proxy.yaml", sandbox="bwrap")
+
+    with caplog.at_level("WARNING", logger="core.proxy"):
+        config = proxy.load_config(config_path)
+
+    assert config.site == "plant-floor"
+    assert config.exports == ["boiler_status"]
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == "WARNING" and "sandbox" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "ignored" in warnings[0]
+
 
 
 def test_load_config_defaults_to_cwd(monkeypatch, tmp_path):

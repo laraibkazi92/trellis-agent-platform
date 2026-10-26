@@ -29,12 +29,12 @@ def _isolated_workspace_io(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _restore_process_env_after_edge_runs():
-    """``core.proxy.run`` sets backend/mode env vars with ``setdefault``.
+    """``core.proxy.run`` sets mode env vars with ``setdefault``.
 
     That is correct for a real edge process but leaks into later tests in the same
-    interpreter (the edge default is ``container``), so snapshot and restore them.
+    interpreter, so snapshot and restore them.
     """
-    names = ("SANDBOX_BACKEND", "RUNNER_SOCKET", "TRELLIS_EDGE_MODE")
+    names = ("RUNNER_SOCKET", "TRELLIS_EDGE_MODE")
     before = {name: os.environ.get(name) for name in names}
     yield
     for name, value in before.items():

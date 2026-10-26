@@ -67,13 +67,12 @@ services:
   manifest. It has `network_mode: "none"` and serves a Unix socket at
   `/run/trellis/runner.sock`, never a port.
 - **`trellis-proxy`** — unchanged in role (dial out over WSS, one tunnel per edge), but
-  with `sandbox: container` (the default for new installs) it forwards execution over
-  the shared `proxy-runner` volume instead of forking tools.
+  it forwards every tool call and stdio MCP session over the shared `proxy-runner`
+  volume to the runner service instead of forking tools.
 
 Set in `proxy.yaml`:
 
 ```yaml
-sandbox: container
 runner_socket: /run/trellis/runner.sock
 ```
 
@@ -96,8 +95,18 @@ Prerequisites on the edge host are the same as central: `runsc` registered with 
 by `sudo scripts/setup-network-profiles.sh`. Both are covered in
 [deploy.md → Execution isolation](deploy.md#execution-isolation-v06).
 
-Legacy note: `sandbox: auto | bwrap | landlock` still works so an edge can be run from a
-laptop without `runsc`, but it is development-only from v0.6. `edge-secrets/` (the shared
+> **v0.7.1:** the network profiles (and `scripts/setup-network-profiles.sh`) are
+> removed, and the legacy `sandbox: auto | bwrap | landlock` values below no longer
+> select anything -- the edge runner is the only execution path. Set
+> `CONTAINER_DEFAULT_RUNTIME=runc` on a host without gVisor. See
+> [upgrading.md → v0.7.1](upgrading.md#v071--in-development-breaking).
+
+Legacy note: `sandbox: auto | bwrap | landlock` (and `sandbox: container`) is gone as of
+v0.7.1. An existing `proxy.yaml` that still carries a `sandbox:` key **loads normally** —
+the key is ignored with a single deprecation warning, because the edge always runs tools
+through the runner — but nothing selects an in-process backend any more, so an edge needs
+a working runner even on a laptop (set `CONTAINER_DEFAULT_RUNTIME=runc` there).
+`edge-secrets/` (the shared
 service account) is unchanged by phase 4; the plaintext `edge-user-secrets/` directory and
 its `user-secrets` CLI were **removed** -- per-user credentials are now browser-sealed
 ciphertext opened with `edge-key` (see [Per-user credentials and the edge
@@ -452,7 +461,7 @@ credentials.
 - **Home and login state die with the session.** The server's `$HOME` is the container
   tmpfs, so tokens/cookies/keys it stores there are gone on TTL expiry, eviction, `SIGHUP`,
   a runner restart, or process death. Nothing is written under the edge's workspace, and
-  `writable_root()/mcp-sessions/` is no longer used — if an upgraded edge still has one, it
+  `$WORKSPACE_ROOT/mcp-sessions/` is no longer used — if an upgraded edge still has one, it
   is dead v0.5 state: delete it. The proxy logs one warning at startup when it exists.
 - **Idle TTL** 30 minutes, overridable per `export_mcps` entry (`session_ttl_minutes`). A
   periodic sweep retires idle sessions; a call in progress is never swept.
@@ -495,9 +504,10 @@ for a long-lived Node process. Under the container backend these are `limits:` i
 requires `tmpfs_mb * 2 <= memory_mb`. See
 [mcp.md → Memory sizing](mcp.md#memory-sizing-sessions--limitsmemory_mb--60--of-host-ram).
 
-The legacy bwrap/Landlock path (`sandbox: auto | bwrap | landlock`, development only) still
-uses `SANDBOX_RLIMIT_AS_MB` / `SANDBOX_RLIMIT_CPU_S`; those are inert under the container
-backend. See [deploy.md → Sandbox settings and rollback](deploy.md#sandbox-settings-and-rollback).
+The legacy bwrap/Landlock path (`sandbox: auto | bwrap | landlock`, and the
+`SANDBOX_RLIMIT_AS_MB` / `SANDBOX_RLIMIT_CPU_S` knobs it read) was removed in v0.7.1;
+container limits come from the manifest's `limits:` block only. See
+[upgrading.md → v0.7.1](upgrading.md#v071--in-development-breaking).
 
 ## Protocol v2 and compatibility
 
@@ -678,14 +688,14 @@ The dashboard, `/v1`, and `/mcp` share that nginx, so remove the variable to rec
 
 ### Filesystem
 
-Tools run inside the same sandbox as the hub's, which grants exactly one writable path:
-`/app/workspace` (override with `SANDBOX_RW_PATH`). The directory must exist in the proxy
-container. Mount it writable if any exported tool writes files; a read-only mount is fine
-only for read-only tools. The proxy logs a warning at startup when the path is missing.
+The proxy writes no state of its own. Tools and MCP servers run in runner containers, so a
+tool sees only its suite (`workspace/tools/<suite>`, read-only), `workspace/shared`
+(read-only) and the output directory its manifest declares; a stdio MCP session gets only
+its own container tmpfs `HOME`/`TMPDIR`. The edge's workspace mount is therefore read-only
+in every supported setup.
 
-MCP session state lives under that same root (`mcp-sessions/<mcp>/<hash>/`, mode `0700`),
-as each session's `HOME`/`TMPDIR`. A read-only workspace mount therefore breaks stdio MCP
-sessions — and server login state is exactly what they store there.
+`WORKSPACE_ROOT` (default `/app/workspace`) is read for one thing only: the startup warning
+when a v0.5 `mcp-sessions/` directory is still lying around (dead state — delete it).
 
 ### Reloading without a restart
 

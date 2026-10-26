@@ -47,7 +47,6 @@ EXPECTED_KEYS = {
     "export_mcps",
     "secrets_dir",
     "env_passthrough",
-    "sandbox",
     "runner_socket",
     "lazy_catalog",
 }
@@ -147,7 +146,8 @@ def test_example_values_parse_as_declared():
     assert config.secrets_dir == Path("/etc/trellis/edge-secrets")
     assert not hasattr(config, "user_secrets_dir")
 
-    assert config.sandbox == "container"
+    # v0.7.1: no backend selector exists; the runner is the only execution path.
+    assert not hasattr(config, "sandbox")
     assert config.runner_socket == "/run/trellis/runner.sock"
     assert config.env_passthrough is False
     assert config.tls_ca_file is None

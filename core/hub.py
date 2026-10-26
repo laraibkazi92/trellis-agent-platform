@@ -23,19 +23,14 @@ from core.auth import get_identity_manager
 from core.caller_identity import resolve_user_email
 from core.env_sanitize import sanitized_env
 from core.devmode import enforce_dev_mode_safety
-from core import sandbox_preflight
 # The execution core lives in core.tool_runtime so the edge proxy
 # (core.proxy) can run tools identically without importing this module's
 # etcd-backed identity manager. Re-exported here for existing callers.
 from core.tool_runtime import (  # noqa: F401
     MAX_RESULT_CHARS,
-    MAX_STDERR_BYTES,
-    MAX_STDOUT_BYTES,
     RESTRICTED_ENV_VARS,
     TRUNCATION_MARKER,
     TransientToolError,
-    _communicate_bounded,
-    _kill_process_tree,
     execute_tool,
 )
 from core.background.tasks import (
@@ -64,20 +59,14 @@ _registration_lock = threading.Lock()
 
 @mcp.custom_route("/healthz", methods=["GET"])
 async def healthz(request):
-    """Sandbox health probe for the container healthcheck.
+    """Liveness probe for the container healthcheck.
 
-    The payload normally comes from the startup probes cached by
-    ``sandbox_preflight.warmup()``. After a classified tool failure invalidates
-    that cache, this re-probes so the verdict reflects the host as it is now
-    (cooldown-bounded). Probing forks helper processes, so it runs off the event
-    loop instead of stalling in-flight tool I/O. Container-internal only:
-    FastMCP custom routes bypass MCP auth, so do not publish this port outside
-    the compose network.
+    Executable health now belongs to the runner (``GET /v1/healthz`` over its
+    socket): the hub owns no sandbox of its own, so this route only reports that
+    the process is serving. Container-internal only: FastMCP custom routes
+    bypass MCP auth, so do not publish this port outside the compose network.
     """
-    status_code, payload = await asyncio.to_thread(
-        sandbox_preflight.build_healthz_payload
-    )
-    return JSONResponse(payload, status_code=status_code)
+    return JSONResponse({"ok": True, "backend": "container"}, status_code=200)
 
 
 class _LifespanDrainWrapper:
@@ -909,9 +898,6 @@ if __name__ == "__main__":
         install_tool_authz_watch()
     except Exception:
         logger.exception("Failed to install tool-authorization watch; using the cache TTL")
-    # Startup probes for /healthz. Never raises: a broken sandbox must not block
-    # the hub from starting, it only flips the health payload to 503.
-    sandbox_preflight.warmup()
     register_tools()
     # Edge catalogs are published at runtime, so the tool table has to follow etcd
     # instead of being read once at boot. 0 disables the watcher (tests/CI).

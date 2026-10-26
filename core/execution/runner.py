@@ -8,8 +8,8 @@ manifest on disk, checks the caller's digest, derives a hardened container spec
 (``core.execution.spec``) and runs it through ``ContainerBackend``. It serves a
 Unix-socket HTTP API (no TCP listener, no network namespace of its own) so the
 control plane cannot be reached from a tool container, and it fails closed: a
-missing runtime, a missing image, absent firewall rules or a broken host-path mount
-stop it at startup instead of degrading to a weaker sandbox.
+missing runtime, a missing image or a broken host-path mount stop it at startup
+instead of degrading to a weaker sandbox.
 
 Capacity is enforced without blocking: two semaphores (global + per target) guard
 container slots, and a caller that finds none gets ``429 capacity_exhausted`` so the
@@ -45,7 +45,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from core import agent_token as agent_token_module
 from core import allowlist
-from core.execution import canary, netprofiles, spec
+from core.execution import canary, spec
 from core.execution.backend import (
     AttachHandle,
     BackendError,
@@ -321,16 +321,30 @@ def startup_ready(checks: Sequence[Check]) -> bool:
 
 
 async def _check_runtime(backend: ContainerBackend) -> Check:
+    """The configured runtime must be registered with the daemon -- no more.
+
+    ``runsc`` is the default; ``runc`` is a legitimate choice here (a dev
+    machine, or a per-tool ``container_runtime``) and only costs kernel-syscall
+    isolation.
+    """
     runtime = _default_runtime()
-    if await backend.has_runtime(runtime):
-        return Check("runtime", True, f"container runtime {runtime!r} is registered")
-    return Check(
-        "runtime",
-        False,
-        f"container runtime {runtime!r} is not registered with the container daemon. "
-        "Install and register gVisor (runsc) in /etc/docker/daemon.json and restart "
-        "Docker; runc is not accepted as a fallback.",
-    )
+    if not await backend.has_runtime(runtime):
+        return Check(
+            "runtime",
+            False,
+            f"container runtime {runtime!r} is not registered with the container daemon. "
+            "Register it in /etc/docker/daemon.json and restart Docker, or set "
+            "CONTAINER_DEFAULT_RUNTIME to a runtime that is registered "
+            "(runsc for syscall isolation, runc on a dev machine).",
+        )
+    if runtime == "runc":
+        return Check(
+            "runtime",
+            True,
+            "container runtime 'runc' is registered (no kernel-syscall isolation; "
+            "intended for dev machines or a deliberate per-tool choice)",
+        )
+    return Check("runtime", True, f"container runtime {runtime!r} is registered")
 
 
 async def _check_image(backend: ContainerBackend) -> Check:
@@ -405,65 +419,14 @@ async def _check_manifest_runtimes(backend: ContainerBackend) -> Check:
     )
 
 
-async def _check_network_rules(backend: ContainerBackend) -> Check:
-    """Verify the profile *networks* exist; the DOCKER-USER rules are host-side.
-
-    The runner has no network namespace and (deliberately) no iptables, so it
-    cannot inspect host firewall rules. ``scripts/setup-network-profiles.sh
-    --verify`` is the operator-side gate for those; here the runner only refuses
-    to start when a profile network a manifest needs is missing entirely.
-    """
-    profiles = set()
-    for _kind, config in _iter_manifests():
-        profiles.add(spec.network_profile_for(config))
-    needed = sorted(p for p in profiles if p != netprofiles.PROFILE_NONE)
-    if not needed:
-        logger.info(
-            "runner preflight: no manifest declares network internal/internet; "
-            "skipping tool-network verification"
-        )
-        return Check(
-            "network_profiles",
-            True,
-            "skipped: no manifest declares network internal or internet",
-            skipped=True,
-        )
-
-    missing: list[str] = []
-    for profile in needed:
-        name = netprofiles.network_name(profile)
-        info = await backend.network_info(name) if name else None
-        # Subnet/ICC mismatch is worse than absence: the rules exist but match no
-        # container address, so the profile is silently unenforced.
-        ok, detail = netprofiles.network_matches(profile, info)
-        if not ok:
-            missing.append(f"{profile}: {detail}")
-    if missing:
-        return Check(
-            "network_profiles",
-            False,
-            "tool network(s) missing: "
-            + ", ".join(missing)
-            + ". Run scripts/setup-network-profiles.sh --all on the host "
-            "(networks + DOCKER-USER rules); --verify checks the rules.",
-        )
-    return Check(
-        "network_profiles",
-        True,
-        f"tool networks present for {', '.join(needed)}; DOCKER-USER rules are "
-        "verified host-side by scripts/setup-network-profiles.sh --verify",
-    )
-
-
 async def run_preflight(backend: Optional[ContainerBackend] = None) -> list[Check]:
-    """The four startup gates, in order. The host-path canary runs afterwards."""
+    """The startup gates, in order. The host-path canary runs afterwards."""
     backend = backend or get_backend()
     return [
         await _check_runtime(backend),
         await _check_image(backend),
         await _check_tool_identity(),
         await _check_manifest_runtimes(backend),
-        await _check_network_rules(backend),
     ]
 
 

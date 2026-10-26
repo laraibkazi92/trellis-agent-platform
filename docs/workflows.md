@@ -2,6 +2,15 @@
 
 Background Workflows are asynchronous tasks that run without direct human interaction. They are triggered by cron schedules or inbound webhooks and can be either procedural scripts or LLM-powered agents.
 
+> **v0.7.1 removed the sandbox-backend and network-profile model.** Every tool call is a
+> `runner` container, and a workflow's per-manifest `network:` is only `egress` (the
+> default: Docker's default bridge) or `none` — the `internal`/`internet`/`allow` profile
+> names load as `egress` with one deprecation warning per value, and
+> `SANDBOX_BACKEND`/`TRELLIS_INTERNAL_CIDRS` no longer exist. Script workflows still run
+> their tools as subprocesses today; moving each run into one sandboxed container is
+> tracked for this release, as is the full rewrite of this page. Cross-check with
+> [upgrading.md → v0.7.1](upgrading.md#v071--in-development-breaking).
+
 ---
 
 ## Consuming Workflows

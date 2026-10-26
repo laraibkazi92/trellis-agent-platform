@@ -39,6 +39,7 @@ from core.execution.backend import (
     ExecRaw,
 )
 from core.execution.spec import (
+    DEFAULT_NETWORK_MODE,
     MAX_STDERR_BYTES,
     MAX_STDOUT_BYTES,
     ContainerSpec,
@@ -77,6 +78,11 @@ def _create_payload(spec: ContainerSpec) -> dict:
     This is the only place Docker hardening flags are emitted. Nothing is copied
     from the caller, so no field can add capabilities, devices, extra mounts,
     host namespaces, or a writable rootfs.
+
+    Network: there is no profile machinery and no resolv.conf bind. A container
+    that may use the network gets Docker's default (the default bridge), so no
+    NetworkMode is emitted at all; only ``network: none`` names a network, to
+    take it away.
     """
     binds = [
         f"{mount.source}:{mount.target}:{'ro' if mount.read_only else 'rw'}"
@@ -88,7 +94,6 @@ def _create_payload(spec: ContainerSpec) -> dict:
         "Memory": spec.memory_mb * 1024 * 1024,
         "NanoCpus": int(spec.cpus * 1_000_000_000),
         "PidsLimit": spec.pids,
-        "NetworkMode": spec.network_mode,
         "Runtime": spec.runtime,
         "CapDrop": ["ALL"],
         "SecurityOpt": ["no-new-privileges:true"],
@@ -102,6 +107,8 @@ def _create_payload(spec: ContainerSpec) -> dict:
         # No swap: a memory limit that can swap is not a memory limit.
         "MemorySwap": spec.memory_mb * 1024 * 1024,
     }
+    if spec.network_mode != DEFAULT_NETWORK_MODE:
+        host_config["NetworkMode"] = spec.network_mode
     payload: dict = {
         "Image": spec.image,
         "Cmd": list(spec.cmd),
@@ -415,30 +422,6 @@ class DockerBackend(ContainerBackend):
                 return False
             raise
         return True
-
-    async def has_network(self, name: str) -> bool:
-        return (await self.network_info(name)) is not None
-
-    async def network_info(self, name: str) -> Optional[Mapping[str, Any]]:
-        try:
-            response = await self._request("GET", f"/networks/{quote(name, safe='')}")
-        except BackendError as exc:
-            if getattr(exc, "status", 0) == 404:
-                return None
-            raise
-        payload = response.json()
-        if not isinstance(payload, dict):
-            return None
-        subnets = [
-            str(config.get("Subnet"))
-            for config in (payload.get("IPAM") or {}).get("Config") or []
-            if config.get("Subnet")
-        ]
-        options = payload.get("Options") or {}
-        return {
-            "subnet": subnets[0] if subnets else None,
-            "icc": str(options.get("com.docker.network.bridge.enable_icc", "true")),
-        }
 
     # --- one-shot execution -------------------------------------------------
 

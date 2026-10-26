@@ -48,8 +48,6 @@ ENV_VARS = (
     "TRELLIS_EDGE_MCPS_DIR",
     "EDGE_PRIVATE_KEY_PATH",
     "WORKSPACE_ROOT",
-    "SANDBOX_BACKEND",
-    "SANDBOX_RW_PATH",
     "DEVOPS_PASSWORD",
     "CORALOGIX_DOMAIN",
 )
@@ -737,7 +735,7 @@ def fake_sessions(tmp_path, monkeypatch):
     from fastmcp.client.transports.memory import FastMCPTransport
 
     writable = tmp_path / "rw"
-    monkeypatch.setenv("SANDBOX_RW_PATH", str(writable))
+    monkeypatch.setenv("WORKSPACE_ROOT", str(writable))
     created = []
 
     class FakeRunnerTransport(ClientTransport):

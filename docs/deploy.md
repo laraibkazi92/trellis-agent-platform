@@ -20,19 +20,27 @@ engine clone (pinned tag)          content repo (yours)             docker volum
 
 A rebuild or upgrade replaces the engine only. The content mount and the `etcd-data` volume are untouched, so your agents and your data survive.
 
+> **v0.7.1 breaking changes.** The legacy in-process sandbox backends (bwrap, Landlock,
+> the shipped AppArmor profile), the network profiles and the opt-in egress proxy were
+> removed: every tool/MCP call is a runner container, and tool containers use Docker's
+> default bridge (`network: egress`) or no network (`none`). Sections below that still
+> describe the v0.6 machinery — *Sandbox settings and rollback*, *Hardened Landlock-only
+> variant*, *Network profiles*, *Egress mode* — carry a **Removed in v0.7.1** note and are
+> kept as history until the v0.7.1 docs pass rewrites them. Follow
+> [upgrading.md → v0.7.1](upgrading.md#v071--in-development-breaking) instead.
+
 ## Prerequisites
 
-Docker Engine with the Compose v2 plugin is the only host dependency — the prebuilt image bundles the full toolchain (Python, Node, Go), so no language runtimes are needed on the host. The host kernel and LSM decide which sandbox backend can run tools; the hub probes both at startup and reports the verdict at `/healthz` (`backend`, `code`, `remediation`):
+Docker Engine with the Compose v2 plugin is the only host dependency — the prebuilt image bundles the full toolchain (Python, Node, Go), so no language runtimes are needed on the host. Every tool call is a container started by the `runner` service, so the only host-side question is which OCI runtime is registered: `runsc` (gVisor) where it is installed, `runc` otherwise (`CONTAINER_DEFAULT_RUNTIME`). `GET /v1/healthz` over the runner's socket reports the verdict.
 
-| Host | bwrap | Landlock | Support |
-| --- | --- | --- | --- |
-| Rootful Docker, AppArmor relaxed (`apparmor=unconfined`) | ✅ | ✅ | **Primary path**; both backends covered by the `smoke` matrix job on Ubuntu 24.04 |
-| Rootful Docker + the `deploy/apparmor/trellis-hub` profile | ✅ | ✅ | Policy-compliance alternative for orgs that ban unconfined profiles; **validated under enforcement** by the `apparmor` CI job on Ubuntu 24.04 |
-| AppArmor locked, SELinux disabled, rootless Docker / userns-remap | ❌ | ✅ | **Supported, auto-fallback**; covered by the `sandbox-smoke` CI job on Ubuntu 24.04 |
-| SELinux enforcing (RHEL/CentOS/Fedora) | ❌ | ✅ | **Not certified** — needs a real-host validation |
-| Kernel < 5.13, or Landlock blocked by an LSM/seccomp policy | ❌ | ❌ | Unsupported; `/healthz` returns 503 with a diagnosis |
+> The v0.6 backend matrix (bwrap / Landlock per host kernel and LSM) no longer applies: since
+> v0.7.1 the container runner is the only execution path, so the host only needs Docker plus
+> the runtime the runner uses — `runsc` (gVisor) in production, `runc` on a dev machine
+> (`CONTAINER_DEFAULT_RUNTIME`). What a tool container can see is proven by the runsc
+> isolation harness (`docker-compose.ci-isolation.yml`, self-hosted with runsc registered)
+> and, on `runc`, by the `Sandbox smoke` workflow.
 
-In every supported case the hub container runs as `${TRELLIS_UID:-1000}` — the operator uid that owns the workspace — not root. The matrix is about the host kernel and LSM, not the container uid.
+In every supported case the hub container runs as `${TRELLIS_UID:-1000}` — the operator uid that owns the workspace — not root, and tool containers run as that same uid.
 
 ## Install path A: pull prebuilt images (recommended)
 
@@ -298,37 +306,33 @@ The clone ships three samples: `workspace/agents/demo-assistant/`, `workspace/to
 - **Front door.** `nginx-gateway` publishes ports 80 and 443 and is the single entry point for the stack. Set `SSL_ENABLED=True` and `SSL_DNS_NAME=<your-domain>` in `.env` to serve HTTPS; certificates are read from `SSL_CERT_DIR` (default `./gateway/ssl`, expecting `cert.pem` and `key.pem`). The cert-directory volume mount is commented out in `docker-compose.yml` — enable it by uncommenting that block, or via a local `docker-compose.override.yml`, which keeps the engine clone pristine.
 - **Bind address.** `HOST_BIND` defaults to `0.0.0.0`, so published ports are reachable from anywhere. Set `HOST_BIND=127.0.0.1` to keep them loopback-only — this also covers the Hindsight ports (8888 API, 9999 Control Plane UI). etcd and Redis are never published regardless.
 - **Authentication.** Keep `DEV_MODE=false` for anything shared: `true` disables API-key auth, UI login, and MCP auth across `host`, `hub`, `gateway`, and `ui`, and only logs a startup warning — it does not restrict the bind host. Optional SSO is configured with `GITHUB_CLIENT_ID`/`GITHUB_CLIENT_SECRET` or the `OIDC_*` variables, plus `ALLOWED_DOMAINS` to restrict by email domain.
-- **Tool sandbox.** Every tool invocation runs in one of two sandbox backends, selected once at hub startup (`core/sandbox.py`): `auto` (the default) prefers **bwrap** and falls back to **Landlock** when bwrap cannot run. The hub container itself runs as `${TRELLIS_UID:-1000}` — the operator uid that owns the bind-mounted workspace — drops all capabilities (`cap_drop: [ALL]`, no `cap_add`), and keeps `no-new-privileges`.
-  - **bwrap** is the stronger isolation and stays the default wherever it works. Each tool gets a read-only bind of `/`, a read-write bind of `/app/workspace`, a private tmpfs `/tmp`, a fresh `/proc`, and its own user, PID, IPC, and UTS namespaces, with every capability dropped (`--cap-drop ALL`). To build that root bwrap calls `mount(2)` and `pivot_root(2)`, which it performs with the `CAP_SYS_ADMIN` it receives inside its own user namespace — so the container needs **no capabilities** (`cap_drop: [ALL]`, empty `cap_add`), only `seccomp=unconfined` (Docker's seccomp profile blocks `pivot_root`), `systempaths=unconfined` (bwrap mounts a fresh `/proc`), and **`apparmor=unconfined`**: AppArmor is independent of seccomp, and Docker's `docker-default` profile contains `deny mount,`, which blocks every tool's first bind mount. Orgs that forbid unconfined profiles can use the shipped `deploy/apparmor/trellis-hub` profile instead (see below). Tools with `network: none` additionally get `--unshare-net`: a private network namespace with no interfaces, so even loopback is unreachable. The preflight probes that separately (`evidence.bwrap_netns`): a host that refuses netns creation keeps the bwrap verdict healthy but warns `netns_denied`, because only `none` tools are affected.
-  - **Landlock** is the unprivileged fallback: a static helper (`/usr/local/bin/trellis-sandbox`) confines filesystem writes (`/` read-only; `/app/workspace` and a per-run `TMPDIR` writable), installs a syscall deny-list unless `SANDBOX_SECCOMP=off`, and runs the tool as `SANDBOX_UID` (default: the hub's own uid) with capabilities cleared. Because that is the hub's identity by default there is no uid drop to perform; the helper only drops identity when it starts privileged (a root hub). It creates no namespaces and needs no mounts, so it works under `docker-default`, SELinux, and rootless Docker. Tools with `network: none` run with `--deny-net`, which handles Landlock's TCP connect/bind rights without granting any — deny-all, loopback included — and, while the seccomp deny-list is at its default `on`, also refuses AF_INET/AF_INET6 datagram and raw socket creation via seccomp; it requires Landlock ABI 4+ (Linux 6.7+). On an older kernel such a tool exits 65 (`landlock_net_unsupported`) instead of running with network access.
-  - **Same identity in both backends.** bwrap maps the hub's uid 1:1 inside its namespaces (it does not switch to root), so tools run as `${TRELLIS_UID}` with `CapEff=0`; Landlock runs them as `SANDBOX_UID`, which defaults to the same uid. Files they create under `/app/workspace` are operator-owned — the same ownership contract as the rest of the stack.
-  - **Filesystem permissions.** Tools run as the workspace owner, so normal writes work: in both backends a tool can create files in an operator-owned `0755` directory under `/app/workspace`. Use `$TMPDIR` for scratch that should not survive the run.
-  - **Landlock limitations.** It restores filesystem blast-radius control and privilege separation, not bwrap's process isolation. `/proc` is shared; the hub and its tools run as one uid, so Yama `kernel.yama.ptrace_scope >= 1` is what keeps another process's environment out, and the hub returns 503 when the scope is 0 or missing. `/tmp` is shared too: each run gets a `0700` directory, but tools share one uid, so **never write secrets there**. `/dev/shm` is not writable, so POSIX shared memory (numpy/torch multiprocessing) fails. `/dev/ptmx` is not granted, so PTY allocation fails (`pexpect`, `node-pty`, `script`). `truncate` on a read-only file is unconfined at Landlock ABI 2 (Debian 12). At ABI >= 6, signal scoping makes `kill -0` on a process outside the sandbox return `EPERM` instead of `ESRCH`. `network: none` denies TCP connect/bind through Landlock, and the helper's seccomp filter additionally refuses AF_INET/AF_INET6 datagram and raw socket creation (`EACCES`), closing the UDP/raw gap on ABI 4–6. That second half is the deny-list: with `SANDBOX_SECCOMP=off` the policy is TCP-only, and a UDP socket is created normally — use bwrap (`--unshare-net`) for tools that must have no IP network when the filter is disabled. bwrap's `--unshare-net` remains the stronger policy: the tool gets no interface at all, independent of the filter.
-  - **Fallback.** If tool execution still fails with bwrap/userns errors on an exotic host, add back only `SYS_ADMIN` to the hub — the sole capability the container may need. Never re-add `SETUID`/`SETGID`/`CHOWN`: on a non-root hub they would grant privilege escalation rather than enable a uid drop. Replacing the hub's `cap_drop`/`security_opt` block with `privileged: true` remains a worse last resort; it removes every container-level control above, so treat it as a temporary host workaround and record why.
+- **Tool sandbox.** Every tool invocation is its own container, started by the `runner`
+  service (`runsc` in production, `runc` on a dev machine — see
+  [Execution isolation](#execution-isolation-v06)). The hub container runs as
+  `${TRELLIS_UID:-1000}` — the operator uid that owns the bind-mounted workspace — and drops
+  all capabilities (`cap_drop: [ALL]`, empty `cap_add`, `no-new-privileges`), because no tool
+  process runs inside it any more. A tool container gets only the mounts its manifest
+  declares, `network: egress` (Docker's default bridge) or `none`, and the cgroup limits from
+  `limits:`. **`runsc` is the isolation boundary**: it is the only thing between a tool and
+  the host kernel, so a production deployment must not run on `runc`.
 
-The AppArmor profile is `docker-default` with its `deny mount,` replaced by `mount,`, `pivot_root,` added (bwrap's final step into its root is mediated separately from mount rules), and `userns,` added at `abi <abi/4.0>,` so the rule is mediated. It is not a hardening win over `apparmor=unconfined` — it is the policy-compliance option. It is **validated under enforcement** by the `apparmor` job in `.github/workflows/sandbox-smoke.yml`: an Ubuntu 24.04 GitHub-hosted runner VM (AppArmor enabled in the kernel, AppArmor 4.0 userspace, Docker's `docker-default` available, `apparmor_restrict_unprivileged_userns=1`) loads the profile host-side with `apparmor_parser -r -K`, then runs the full stack plus the sandbox smoke harness with `security_opt: apparmor=trellis-hub` — once with `auto` selecting bwrap, once with the Landlock fallback forced. The ABI 4.0 pin needs AppArmor 4.0 userspace; Ubuntu 22.04's parser cannot compile this profile, but 22.04 has no unprivileged-userns restriction, so `apparmor=unconfined` remains the supported posture there. It is not used when the hub keeps `apparmor=unconfined`. Install it on the **host** — profiles load on the host kernel, not inside the container — and select it for the hub:
+**v0.7.1:** the in-process backends (`bwrap`, `Landlock`, the `trellis-sandbox` helper) and
+the shipped `deploy/apparmor/trellis-hub` profile were deleted. The hub needs no relaxed LSM
+profile — nothing executes in it — and the v0.6 `smoke`/`apparmor`/`egress` CI jobs are gone
+with the backends they proved. The proofs that a tool container is real are now:
 
-```bash
-sudo install -m 0644 deploy/apparmor/trellis-hub /etc/apparmor.d/trellis-hub
-sudo apparmor_parser -r /etc/apparmor.d/trellis-hub
-```
-
-```yaml
-    security_opt:
-      - "apparmor=trellis-hub"
-```
-
-### CI validation
-
-`.github/workflows/sandbox-smoke.yml` runs two kernel/LSM-facing jobs on `ubuntu-24.04` — an Ubuntu 24.04 GitHub-hosted runner VM, with AppArmor enabled in the kernel and Docker's `docker-default` profile active:
-
-| Job | Proves |
+| Proof | Covers |
 | --- | --- |
-| `smoke` (`bwrap` + `landlock` matrix legs) | The default path (`auto → bwrap`) works with `apparmor=unconfined`; the fallback works when the container is confined by `docker-default`; the native helper suite passes. |
-| `egress` (egress changes, dispatch, PR) | The opt-in egress override removes the hub's default network, the CONNECT proxy allows an allowlisted name and denies a sibling name and an IP literal, and `NO_PROXY` covers the framework services. |
-| `apparmor` (sandbox changes, `workflow_dispatch`, nightly) | The shipped `deploy/apparmor/trellis-hub` profile loads and confines the hub (`apparmor=trellis-hub`, label asserted at runtime) with no `apparmor=unconfined`, and both bwrap and the forced Landlock fallback pass the full smoke harness. |
+| `docker-compose.ci-isolation.yml` (self-hosted host with `runsc` registered) | What a real gVisor tool container can see, write and reach — `tests/live -m runsc`, including "no egress under `network: none`". |
+| `.github/workflows/sandbox-smoke.yml` → job `Sandbox smoke` | The same container contract end to end on the container runtime every dev machine has (`runc`): build the stack, run `scripts/sandbox_smoke.py --tool text_stats`. |
 
 ### Sandbox settings and rollback
+
+> **Removed in v0.7.1.** Every variable in the table below is gone — nothing in the code
+> reads `SANDBOX_*` any more (setting one is ignored, not honoured) — and there is no
+> backend to roll back to: the container runner is the only execution path. Per-tool
+> `container_runtime: runsc | runc` is the only sandbox-related manifest knob left, and
+> `CONTAINER_DEFAULT_RUNTIME` the only deployment-wide one.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
@@ -351,6 +355,10 @@ Rollback levers, cheapest first: `SANDBOX_BACKEND=bwrap` (one env var, no rebuil
 To return to the old root-hub posture (for example, a host where bwrap can only set up its user namespace as root), delete the hub's `user:` line and restore the capabilities the root helper expects — `cap_add: [SYS_ADMIN, SETFCAP, SETUID, SETGID, CHOWN]` — then `docker compose up -d hub`. That is only needed when bwrap cannot start as the operator uid; it brings back the privilege-separation wart this migration removed (bwrap tools are uid 0 inside their namespaces, owned by root on the host, and Landlock relies on a setuid drop), so exhaust `SYS_ADMIN` alone and `SANDBOX_BACKEND=landlock` first.
 
 ### Hardened Landlock-only variant
+
+> **Removed in v0.7.1.** There is no Landlock backend (and no `trellis-sandbox` helper) to
+> pin any more. Hardening a deployment now means the runtime: `runsc` (the default), nobody
+> else's data in the workspace, and `network: none` on tools that do not need egress.
 
 If you never want bwrap's container-level exceptions, pin the Landlock backend. The helper only *adds* restrictions (it runs unprivileged, applies Landlock, and installs seccomp), so Docker's default seccomp and AppArmor profiles are **expected** to be fine — this variant is not exercised in CI yet, so validate it against your Docker version before standardising on it:
 
@@ -492,6 +500,13 @@ against the wrong tree.
 
 ### Network profiles
 
+> **Removed in v0.7.1.** There are no profiles and no host firewall rules. `network:` is
+> `egress` (the default: Docker's default bridge — the container reaches whatever the host
+> can, cloud metadata included) or `none`. The `internal`/`internet`/`allow` values load as
+> `egress` with one deprecation warning per value; `deny`/`off` load as `none`. The table
+> and scripts below describe the v0.6 deployment and are kept as history until the v0.7.1
+> docs pass rewrites this section.
+
 | Profile | Docker network | Subnet (default) | Egress policy |
 | --- | --- | --- | --- |
 | `none` | — (`network_mode: none`) | — | loopback only |
@@ -564,6 +579,14 @@ That path is for development hosts only — see [Sandbox settings and
 rollback](#sandbox-settings-and-rollback).
 
 ## Egress mode (opt-in)
+
+> **Removed in v0.7.1.** `docker-compose.egress.yml`, `docker-compose.egress-ci.yml`,
+> `scripts/egress_proxy.py` and `scripts/generate_egress_acl.py` were deleted with the
+> network profiles: tool containers get Docker's default bridge (`network: egress`) or no
+> network at all (`none`), and no proxy, ACL or allowlist is involved. The commands below
+> — including `sandbox_smoke.py --check-egress`, a flag that no longer exists — describe
+> the v0.6 deployment and are kept only as history until the v0.7.1 docs pass rewrites this
+> section. `network: none` is the only containment option now.
 
 By default the hub — and therefore every tool it spawns — has the same unrestricted outbound access as any other container on `trellis-network`. Egress mode removes that: the hub gets a route to **one** CONNECT proxy and nothing else, and that proxy only connects to domains some tool declared in its `tool.yaml`. LLM providers are unaffected: those calls are made by `host`, which keeps its default-network route.
 
@@ -666,9 +689,8 @@ docker compose ps                       # every service up; db-sync exited 0
 curl -sI localhost                      # front door answers through nginx
 docker compose exec host curl -sf http://127.0.0.1:8000/health
 docker compose exec hub curl -s localhost:8001/healthz | python -m json.tool
-docker compose exec hub trellis-sandbox --version
-# Egress mode only: topology, allowlist, IP-literal guard, NO_PROXY.
-docker compose exec hub python scripts/sandbox_smoke.py --check-egress
+# The container execution contract, end to end (needs the runner + Docker).
+docker compose exec hub python scripts/sandbox_smoke.py --tool text_stats
 docker compose logs db-sync             # sync counts
 docker compose exec host python scripts/trellis logs --limit 5
 ```

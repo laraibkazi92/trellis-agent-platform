@@ -52,14 +52,13 @@ DEADLINE_MS = 60_000
 
 @pytest.fixture(autouse=True)
 def edge_env(tmp_path, monkeypatch):
-    """A private sandbox writable root and a clean identity/token environment."""
+    """A private workspace root and a clean identity/token environment."""
     rw = tmp_path / "rw"
-    monkeypatch.setenv("SANDBOX_RW_PATH", str(rw))
+    monkeypatch.setenv("WORKSPACE_ROOT", str(rw))
     for var in (
         "TRELLIS_USER_ID",
         "TRELLIS_USER_EMAIL",
         "TRELLIS_EDGE_TOKEN",
-        "SANDBOX_BACKEND",
         "TRELLIS_EDGE_CONFIG",
         "TRELLIS_EDGE_MCPS_DIR",
     ):

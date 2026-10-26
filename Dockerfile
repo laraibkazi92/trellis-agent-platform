@@ -5,15 +5,6 @@
 # (.github/dependabot.yml); re-check the arm64 leg after a manual bump.
 ARG PYTHON_BASE=python:3.12-slim@sha256:cb33f7f771ecec2ef1225cf39b159591a040391bd73e4c01f00fdfc4c47611d2
 
-# Static Landlock sandbox helper (core/sandbox.py). Built on the same base image
-# as the runtime stage so the static binary matches its architecture.
-FROM ${PYTHON_BASE} AS sandbox-build
-COPY sandbox/trellis-sandbox.c /src/trellis-sandbox.c
-RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
-    && mkdir -p /out \
-    && gcc -O2 -Wall -Wextra -static -s -o /out/trellis-sandbox /src/trellis-sandbox.c \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
-
 # Use Python 3.12 slim as the base image
 FROM ${PYTHON_BASE}
 # Pinned like the base: `latest` would change the dependency resolver under a
@@ -33,7 +24,6 @@ ARG TARGETARCH
 RUN apt-get update && apt-get install -y \
     curl \
     git \
-    bubblewrap \
     ca-certificates \
     && update-ca-certificates \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
@@ -92,16 +82,13 @@ COPY templates/ templates/
 COPY scripts/ scripts/
 COPY docs/ docs/
 
-# Landlock + uid-drop sandbox helper used when bwrap cannot run.
-COPY --chmod=0755 --from=sandbox-build /out/trellis-sandbox /usr/local/bin/trellis-sandbox
-
 # Non-root runtime user. docker-compose passes the host uid:gid (TRELLIS_UID/TRELLIS_GID)
 # as PUID/PGID so files written into the bind-mounted workspace/ are owned by the operator
 # instead of root. /app/data is created here and owned by that user: the `health-data`
 # named volume inherits this ownership when Docker first populates it (first `up`).
 # Every app service — the hub included — runs as ${TRELLIS_UID:-1000} via compose's
-# `user:`; the sandbox helper drops identity only when it starts privileged (a root hub),
-# so on the default non-root hub tools run at this same uid, which is the workspace owner.
+# `user:`, which is also the identity tool containers run as (they are started by the
+# runner, not by the hub).
 ARG PUID=1000
 ARG PGID=1000
 # Reported in the edge hello frame / Admin -> Edges so an operator can spot a proxy

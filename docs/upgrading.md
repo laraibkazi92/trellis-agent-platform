@@ -11,6 +11,89 @@ that your content is then inside the tree you check out tags into.
 
 ---
 
+## v0.7.1 — in development (breaking)
+
+`v0.7.1` removes the legacy in-process sandbox backends and all of the network-profile
+machinery. Tools and MCP sessions run **only** in runner containers, and tool containers
+get plain Docker egress. This section is being written as the changes land: the entries
+below cover the sandbox/network removals, and further v0.7.1 removals (token identity,
+tool access policy, workflow containers, secret handling) are appended here before the
+tag.
+
+#### Sandbox backends removed — every call runs in a runner container
+
+`bwrap`, Landlock, the `auto` selector and the AppArmor profile are gone, together with
+`sandbox/trellis-sandbox.c`, `core/sandbox_preflight.py`, `deploy/apparmor/` and the
+`SANDBOX_BACKEND` selector. Tools have run in the runner container-per-call path since
+v0.6, so for the shipped compose stack this changes nothing at runtime.
+
+**What to do instead**
+
+- Nothing to configure, and nothing to install. Tool/MCP execution is the `runner`
+  service; there is no backend to select or pin.
+- Delete the legacy keys from `.env` if you carry them: `SANDBOX_BACKEND`,
+  `SANDBOX_SECCOMP`, `SANDBOX_NET_DEFAULT`, `SANDBOX_UID`, `SANDBOX_GID`,
+  `SANDBOX_TMP_ROOT`, `SANDBOX_RLIMIT_AS_MB`, `SANDBOX_RLIMIT_CPU_S`,
+  `SANDBOX_RLIMIT_NPROC`, `SANDBOX_RLIMIT_FSIZE_MB`. They are ignored.
+- Remove any `systempaths=unconfined` / `seccomp=unconfined` / `apparmor=unconfined`
+  lines from your own compose overrides: the hub now keeps `cap_drop: [ALL]` and
+  `no-new-privileges` and needs no LSM exception. Unload a host-installed
+  `trellis-hub` AppArmor profile if you added one.
+- **Dev machines without gVisor** run the same runner: set
+  `CONTAINER_DEFAULT_RUNTIME=runc` (default stays `runsc`, which is the only isolation
+  boundary in production). A per-tool `container_runtime: runc` still works.
+
+#### Network profiles and the egress proxy removed — tools use normal Docker egress
+
+The two tool networks (`trellis-tools-internal`, `trellis-tools-internet`), the
+`DOCKER-USER` rules, the generated `resolv.conf` mounts and the CONNECT allowlist proxy
+are all gone, with the files that built them: `core/execution/netprofiles.py`,
+`scripts/setup-network-profiles.sh`, `scripts/egress_proxy.py`,
+`scripts/generate_egress_acl.py`, `docker-compose.egress.yml`,
+`docker-compose.egress-ci.yml`, `docker-compose.ci-bwrap.yml` and
+`docker-compose.ci-apparmor.yml`.
+
+**What to do instead**
+
+- Delete the removed keys from `.env`: `TRELLIS_INTERNAL_CIDRS`, `TRELLIS_ENGINE_SUBNETS`,
+  `TOOLS_INTERNAL_DNS`, `TOOLS_INTERNET_DNS`, `TOOLS_NET_INTERNAL_SUBNET`,
+  `TOOLS_NET_INTERNET_SUBNET`, and any `EGRESS_*` value. Nothing reads them.
+- Drop `COMPOSE_FILE=...docker-compose.egress.yml` (and the `--build`/`-f` form) from your
+  upgrade commands — the file no longer exists.
+- Tool containers now run on **Docker's default bridge**, so names resolve the same way
+  they do for any container on that bridge (this is also what makes DNS work under
+  `runsc`). If you need no network at all, declare `network: none` in the manifest.
+- Tear down leftovers on the host once: `docker network rm trellis-tools-internal
+  trellis-tools-internet` (they are no longer created) and remove any `DOCKER-USER`
+  rules you added for the profiles.
+- **Accepted risk (unchanged in spirit, wider in reach):** with no profiles, a tool can
+  reach anything the Docker host can reach, including cloud metadata endpoints. Engine
+  services stay off the default bridge (compose keeps them on the project network), so a
+  tool cannot address them by service name — but containers on the default bridge can
+  reach each other by IP. Use `network: none` for tools that need no network.
+
+#### `network:` collapses to `none | egress`, and the default changes
+
+Manifest `network:` values are now `egress` (Docker default bridge) and `none`.
+The old `allow`, `internet` and `internal` values are accepted and treated as `egress`,
+with **one deprecation warning per value** per process; they will be rejected in a later
+release. `deny`/`off` still mean `none`, and any unrecognized value still falls back to
+`none` with a warning.
+
+**What to do instead**
+
+- Rewrite every `network: allow` / `internet` / `internal` in `tool.yaml`, `mcp.yaml` and
+  workflow `config.yaml` to `egress` (or `none`). A `grep -rn "network:" workspace/` is
+  usually enough.
+- Note the **default change**: tools and MCP sessions that declare no `network:` used to
+  run with no network (`none`) and now run with `egress`. Set `network: none` explicitly
+  on any manifest that must stay offline. The interactive `execute` path is unaffected —
+  it is always `none`.
+
+<!-- v0.7.1: further removals are appended below this marker before the tag. -->
+
+---
+
 ## Versioning & the compatibility promise
 
 Releases are tagged `vMAJOR.MINOR.PATCH`. `v0.2.0` is the first release.

@@ -22,8 +22,6 @@ from pydantic import BaseModel, Field
 # ``discovery`` one-shot MCP discovery (same transport, torn down after)
 ExecKind = Literal["tool", "console", "mcp_session", "discovery"]
 
-NetworkProfile = Literal["none", "internal", "internet"]
-
 RunnerErrorCode = Literal[
     "capacity_exhausted",
     "unknown_target",
@@ -62,9 +60,6 @@ class ExecRequest(BaseModel):
     # console only: the shell command to run.
     command: Optional[str] = None
     deadline_ms: int = 300_000
-    # Phase 1 accepts the field but always derives the profile from the manifest;
-    # only ``console`` may force ``none``.
-    network_profile: Optional[NetworkProfile] = None
     # Phase 3: short-lived HMAC token minted by the agent runtime.
     agent_token: Optional[str] = None
 
@@ -98,7 +93,6 @@ class SessionCreateRequest(BaseModel):
     # leaked container can be traced back to a client-side session.
     session_key: str = Field(pattern=r"^[0-9a-f]{32}$")
     env: dict[str, str] = Field(default_factory=dict)
-    network_profile: Optional[NetworkProfile] = None
     deadline_ms: int = 900_000
     agent_token: Optional[str] = None
 

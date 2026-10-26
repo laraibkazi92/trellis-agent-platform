@@ -18,7 +18,7 @@ import pytest
 from core.execution import docker_backend
 from core.execution.backend import BackendError
 from core.execution.docker_backend import DockerBackend, _create_payload, parse_frames
-from core.execution.spec import ContainerSpec, Mount
+from core.execution.spec import DEFAULT_NETWORK_MODE, ContainerSpec, Mount
 
 
 def _spec(**overrides) -> ContainerSpec:
@@ -37,7 +37,7 @@ def _spec(**overrides) -> ContainerSpec:
         memory_mb=512,
         cpus=1.5,
         pids=256,
-        network_mode="trellis-tools-internal",
+        network_mode=DEFAULT_NETWORK_MODE,
         labels={"trellis.install": "default", "trellis.kind": "tool"},
         user="1000:1000",
         kind="tool",
@@ -82,7 +82,6 @@ def test_create_payload_sets_every_hardening_flag():
         "Memory",
         "NanoCpus",
         "PidsLimit",
-        "NetworkMode",
         "Runtime",
         "CapDrop",
         "SecurityOpt",
@@ -122,8 +121,73 @@ def test_create_payload_binds_tmpfs_and_limits():
     assert host["Memory"] == 512 * 1024 * 1024
     assert host["NanoCpus"] == 1_500_000_000
     assert host["PidsLimit"] == 256
-    assert host["NetworkMode"] == "trellis-tools-internal"
+    # Egress is Docker's own default bridge, so the payload names no network at all.
+    assert "NetworkMode" not in host
     assert host["Runtime"] == "runsc"
+
+
+def test_create_payload_network_none_is_the_only_network_override():
+    host = _create_payload(_spec(network_mode="none"))["HostConfig"]
+
+    assert host["NetworkMode"] == "none"
+
+
+@pytest.mark.parametrize("network_mode", [DEFAULT_NETWORK_MODE, "none"])
+def test_create_payload_never_mounts_a_resolv_conf(network_mode):
+    """Docker supplies /etc/resolv.conf; the generated-file machinery is gone."""
+    payload = _create_payload(_spec(network_mode=network_mode))
+
+    assert all("resolv.conf" not in bind for bind in payload["HostConfig"]["Binds"])
+    assert all("resolv" not in key for key in payload["HostConfig"]["Tmpfs"])
+
+
+def test_console_payload_has_no_network(monkeypatch):
+    monkeypatch.setenv("TRELLIS_UID", "1000")
+    monkeypatch.setenv("TRELLIS_GID", "1000")
+    from core.execution.spec import build_console_spec
+
+    payload = _create_payload(build_console_spec("id", env={}))
+
+    assert payload["HostConfig"]["NetworkMode"] == "none"
+    assert payload["HostConfig"]["Binds"] == []
+
+
+def test_legacy_internal_manifest_runs_on_the_default_bridge(tmp_path, monkeypatch, caplog):
+    """Acceptance gate: `network: internal` loads, runs with egress, one warning."""
+    from core.execution.spec import build_spec
+    from core.models import ToolConfig, reset_network_policy_warnings
+
+    root = tmp_path / "workspace"
+    suite = root / "tools" / "legacy"
+    suite.mkdir(parents=True)
+    (suite / "tool.py").write_text("print('{}')\n", encoding="utf-8")
+    monkeypatch.setenv("TRELLIS_UID", "1000")
+    monkeypatch.setenv("TRELLIS_GID", "1000")
+    monkeypatch.setenv("RUNNER_IMAGE", "trellis-agent-platform:test")
+    reset_network_policy_warnings()
+
+    with caplog.at_level("WARNING", logger="core.models"):
+        config = ToolConfig(
+            name="legacy",
+            description="d",
+            runtime="python",
+            entrypoint="tool.py",
+            network="internal",
+        )
+        spec = build_spec(
+            config,
+            kind="tool",
+            suite_rel="tools/legacy",
+            target="legacy",
+            env={},
+            host_workspace=str(root),
+        )
+    payload = _create_payload(spec)
+
+    assert config.network == "egress"
+    assert spec.network_mode == DEFAULT_NETWORK_MODE
+    assert "NetworkMode" not in payload["HostConfig"]
+    assert len([r for r in caplog.records if r.levelno == 30]) == 1
 
 
 def test_create_payload_session_keeps_stdin_open_and_omits_default_user():

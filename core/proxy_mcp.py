@@ -12,8 +12,8 @@ socket, so a reconnect re-publishes the catalog without losing state.
 Each session is a **runner container**: the MCP server no longer runs as a child of
 the proxy process and nothing about it is written to host disk. Its ``HOME`` and
 ``TMPDIR`` are the container's tmpfs, so two users cannot see one another's login
-state and a retired session takes that state with it. ``sandbox.writable_root()`` is
-not involved at all; a pre-existing ``mcp-sessions/`` directory is dead state.
+state and a retired session takes that state with it. No host path is involved at
+all; a pre-existing ``mcp-sessions/`` directory is dead state.
 
 Enforcement is edge-local (plan §2.3): the published catalog is the name authority,
 ``exclude_tools`` refuses even a name that is listed, and no MCP call is ever
@@ -51,7 +51,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import yaml
 
-from core import edge_env, edge_user_secrets, sandbox
+from core import edge_env, edge_user_secrets
 from core.execution.spec import declared_env_keys, manifest_digest
 from core.models import MCPConfig
 from core.tool_runtime import MAX_RESULT_CHARS
@@ -448,25 +448,27 @@ _DEAD_SESSION_STATE_WARNED = False
 
 
 def _warn_about_dead_session_state() -> None:
-    """Tell the operator that ``<writable_root>/mcp-sessions`` is a v0.5 leftover.
+    """Tell the operator that ``<WORKSPACE_ROOT>/mcp-sessions`` is a v0.5 leftover.
 
     Session HOME directories used to live there. They are never read or written
     now (state belongs to a container tmpfs), so the directory is dead weight that
-    still contains old login state -- safe, and recommended, to delete.
+    still contains old login state -- safe, and recommended, to delete. This is the
+    only reader of the workspace root here: the proxy itself writes no state.
     """
     global _DEAD_SESSION_STATE_WARNED
     if _DEAD_SESSION_STATE_WARNED:
         return
     _DEAD_SESSION_STATE_WARNED = True
     try:
-        legacy = sandbox.writable_root() / "mcp-sessions"
+        root = Path(os.getenv("WORKSPACE_ROOT") or "/app/workspace")
+        legacy = root / "mcp-sessions"
         if legacy.exists():
             logger.warning(
                 "Found %s: MCP sessions no longer use host directories (they run in "
                 "runner containers). This is dead state from v0.5 and may be deleted.",
                 legacy,
             )
-    except Exception:  # a broken SANDBOX_RW_PATH must not stop the edge
+    except Exception:  # a broken WORKSPACE_ROOT must not stop the edge
         logger.debug("Could not check for legacy MCP session state", exc_info=True)
 
 

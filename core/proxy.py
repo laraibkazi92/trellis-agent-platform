@@ -47,7 +47,6 @@ from core import (
     edge_secrets_central,
     edge_user_secrets,
     proxy_mcp,
-    sandbox,
     tool_runtime,
 )
 from core.edge_keypair import EdgeKey, EdgeKeyError
@@ -77,7 +76,6 @@ RESERVED_SITE_NAMES = frozenset({"mcp"})
 
 _SITE_RE = protocol.NAME_RE
 _WS_PREFIXES = ("ws://", "wss://")
-_VALID_SANDBOX_BACKENDS = frozenset({"auto", "bwrap", "landlock", "container"})
 
 # The default enrollment-token variable. Kept in ``core.edge_env`` so stripping it is
 # intrinsic to the env scoper; re-exported here because callers of this module name it.
@@ -158,9 +156,8 @@ class ProxyConfig:
     # Opt-out of the edge env allowlist: true restores the v0.4 denylist
     # (sanitized_env) for tools that cannot declare every key they read.
     env_passthrough: bool = False
-    sandbox: str = "container"
     # Control socket of this edge's runner (the only component with a container
-    # daemon). Only read when sandbox is "container".
+    # daemon). Every tool call and stdio MCP session goes through it.
     runner_socket: str = "/run/trellis/runner.sock"
     # Optional mutual TLS: the relay's CA plus this edge's client certificate.
     # Without these, a relay that enforces EDGE_MTLS_CA rejects every handshake.
@@ -346,13 +343,14 @@ def load_config(path: str | Path | None = None) -> ProxyConfig:
 
     export_mcps = proxy_mcp.validate_export_mcps(raw.get("export_mcps"))
 
-    # v0.6: the safe default. A legacy in-process backend sees the whole
-    # filesystem (`--ro /`), including the mounted edge private key, so it is an
-    # explicit opt-in for local development only.
-    sandbox = str(raw.get("sandbox") or "container").strip().lower()
-    if sandbox not in _VALID_SANDBOX_BACKENDS:
-        raise ValueError(
-            f"proxy config: sandbox must be one of {sorted(_VALID_SANDBOX_BACKENDS)} (got {sandbox!r})"
+    # v0.7.1: the runner is the only execution path, so an edge `proxy.yaml` that
+    # still carries the v0.6 selector is accepted and ignored rather than rejected
+    # -- an unreadable config would take every exported tool offline on upgrade.
+    if "sandbox" in raw:
+        logger.warning(
+            "proxy config: the 'sandbox' setting is ignored; the edge always runs "
+            "tools via the runner. Remove it from %s.",
+            config_path,
         )
 
     env_passthrough = _env_passthrough(_flag(raw.get("env_passthrough"), "env_passthrough"))
@@ -400,7 +398,6 @@ def load_config(path: str | Path | None = None) -> ProxyConfig:
             raw, "secrets_dir", "TRELLIS_EDGE_SECRETS_DIR", edge_user_secrets.DEFAULT_SECRETS_DIR
         ),
         env_passthrough=env_passthrough,
-        sandbox=sandbox,
         runner_socket=str(
             os.getenv("RUNNER_SOCKET")
             or raw.get("runner_socket")
@@ -1043,18 +1040,6 @@ async def handle_call(
             _elapsed_ms(started),
             error=(edge_crypto.CREDENTIAL_REJECTED, str(exc) or "sealed credential rejected"),
         )
-    if sealed is not None and proxy_config is not None and proxy_config.sandbox != "container":
-        # A legacy backend can read /etc/trellis/keys/edge-key (the tool sees the whole
-        # filesystem), which would make the seal meaningless. Refuse instead.
-        return _result_frame(
-            call["id"],
-            _elapsed_ms(started),
-            error=(
-                edge_crypto.CREDENTIAL_REJECTED,
-                "sealed credentials require sandbox: container on this edge "
-                "(a legacy backend can read the edge private key)",
-            ),
-        )
     try:
         env = build_env(
             tool_dir,
@@ -1217,9 +1202,8 @@ async def _call_with_deadline(
     The relay stops waiting at ``deadline_ms`` and reports a 504 to its own
     caller. If the edge kept running anyway, an abandoned call would hold one of
     ``MAX_INFLIGHT`` slots for the tool's full timeout (300 s by default).
-    Cancelling is safe: ``core.tool_runtime.execute_tool`` kills the child's
-    whole process group on ``CancelledError`` (``_kill_process_tree``) and
-    re-raises, so nothing survives the cancellation.
+    Cancelling is safe: the call is owned by the runner (one container per
+    call), so this process holds no child process that could outlive it.
     """
     started = time.monotonic()
     try:
@@ -1304,7 +1288,7 @@ class _Session:
         Re-reading is what makes ``SIGHUP`` useful after editing ``exports`` or
         ``export_mcps``: a directory entry alone would be filtered out by the
         in-memory allowlist. Fields that cannot be applied to a live tunnel
-        (identity, destination, the token, the sandbox backend, the env policy and
+        (identity, destination, the token, the env policy and
         the credential store *locations*) are reported rather than half-applied.
 
         Credential *content* needs no signal for tools: ``secrets_dir`` is read per
@@ -1346,7 +1330,6 @@ class _Session:
             "token_env",
             "token_file",
             "env_passthrough",
-            "sandbox",
             "secrets_dir",
             "tls_ca_file",
             "tls_cert_file",
@@ -1946,10 +1929,9 @@ async def run(
     """
     global _active_session, _active_loop
 
-    if config.sandbox != "auto":
-        os.environ.setdefault("SANDBOX_BACKEND", config.sandbox)
-    if config.sandbox == "container":
-        os.environ.setdefault("RUNNER_SOCKET", config.runner_socket)
+    # Every edge call runs through this edge's runner: the socket is the one
+    # execution path.
+    os.environ.setdefault("RUNNER_SOCKET", config.runner_socket)
 
     from core.agent_token import require_secret
 
@@ -1961,17 +1943,6 @@ async def run(
     # Tells shared core modules (core/tunables) not to look for etcd: an edge is a
     # standalone install and the failed refresh would log forever.
     os.environ.setdefault("TRELLIS_EDGE_MODE", "1")
-
-    if config.sandbox != "container":
-        writable = sandbox.writable_root()
-        if not writable.exists():
-            # Every landlock-sandboxed call binds this path. A tools-only mount (or a
-            # read-only workspace) otherwise fails with an opaque "Sandbox unavailable".
-            logger.warning(
-                "sandbox writable root %s does not exist; mount the workspace at that path "
-                "(see deploy/proxy/docker-compose.yml)",
-                writable,
-            )
 
     session = _Session(config, config_path)
     session.reload()

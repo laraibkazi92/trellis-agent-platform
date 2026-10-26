@@ -228,11 +228,54 @@ def test_preflight_fails_closed_without_the_configured_runtime(env):
 
     assert runtime_check.ok is False
     assert "runsc" in runtime_check.message
-    assert "runc is not accepted" in runtime_check.message
+    assert "CONTAINER_DEFAULT_RUNTIME" in runtime_check.message
     assert runner_module.startup_ready(checks) is False
 
     with pytest.raises(SystemExit):
         asyncio.run(runner_module.startup(env.backend))
+
+
+def test_runc_is_a_legitimate_runtime(env, monkeypatch):
+    """A dev machine (or a per-tool choice) may run on runc -- it is not an error."""
+    monkeypatch.setenv("CONTAINER_DEFAULT_RUNTIME", "runc")
+    env.backend.runtimes = {"runc"}
+
+    checks = asyncio.run(runner_module.run_preflight(env.backend))
+    runtime_check = next(check for check in checks if check.name == "runtime")
+
+    assert runtime_check.ok is True
+    assert "runc" in runtime_check.message
+    assert "syscall isolation" in runtime_check.message
+
+
+def test_preflight_checks_exactly_the_startup_gates(env):
+    """runtime, image, tool identity and manifest runtimes -- nothing network-bound."""
+    checks = asyncio.run(runner_module.run_preflight(env.backend))
+
+    assert [check.name for check in checks] == [
+        "runtime",
+        "image",
+        "tool_identity",
+        "manifest_runtimes",
+    ]
+    assert runner_module.startup_ready(checks) is True
+
+
+def test_preflight_fails_closed_on_an_unregistered_manifest_runtime(env):
+    """A tool pinning ``container_runtime: runc`` cannot start on a runsc-only host."""
+    (env.root / "tools" / "echo" / "tool.yaml").write_text(
+        TOOL_YAML.replace("network: none", "network: none\n  container_runtime: runc"),
+        encoding="utf-8",
+    )
+    env.backend.runtimes = {"runsc"}
+
+    checks = asyncio.run(runner_module.run_preflight(env.backend))
+    manifest_check = next(check for check in checks if check.name == "manifest_runtimes")
+
+    assert manifest_check.ok is False
+    assert "runc" in manifest_check.message
+    assert "echo" in manifest_check.message
+    assert runner_module.startup_ready(checks) is False
 
 
 def test_failed_canary_refuses_exec(env):

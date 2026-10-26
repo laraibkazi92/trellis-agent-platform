@@ -2,8 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import threading
+import time
 
-from core.models import ToolConfig, MCPConfig, is_routable_agent_type
+import pytest
+
+from core.models import (
+    MCPConfig,
+    ToolConfig,
+    is_routable_agent_type,
+    reset_network_policy_warnings,
+)
 
 
 def _tool_kwargs(**overrides):
@@ -33,18 +42,102 @@ def test_tool_config_retry_and_timeout_defaults():
     assert config.timeout_seconds is None
 
 
-def test_tool_config_network_defaults_to_none():
-    """v0.6 flips the default: undeclared egress is none, not internet."""
+def test_tool_config_network_defaults_to_egress():
+    """v0.7.1 flips the default: an undeclared tool gets ordinary Docker egress."""
     config = ToolConfig(**_tool_kwargs())
+    assert config.network == "egress"
+
+
+@pytest.mark.parametrize("legacy", ["allow", "internet", "internal"])
+def test_legacy_network_values_normalize_to_egress(caplog, legacy):
+    """The v0.6 profiles all meant "may use the network" -- now plain egress."""
+    reset_network_policy_warnings()
+    with caplog.at_level(logging.WARNING, logger="core.models"):
+        config = ToolConfig(**_tool_kwargs(network=legacy))
+
+    assert config.network == "egress"
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert legacy in warnings[0]
+    assert "egress" in warnings[0]
+
+
+def test_legacy_network_warning_is_logged_once_per_value(caplog):
+    reset_network_policy_warnings()
+    with caplog.at_level(logging.WARNING, logger="core.models"):
+        for _ in range(3):
+            assert ToolConfig(**_tool_kwargs(network="internal")).network == "egress"
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+
+
+def test_one_deprecation_warning_across_many_manifests(caplog):
+    """A whole workspace of legacy values must not flood the log: one line per value."""
+    reset_network_policy_warnings()
+    with caplog.at_level(logging.WARNING, logger="core.models"):
+        for index in range(5):
+            config = ToolConfig(**_tool_kwargs(name=f"tool{index}", network="internal"))
+            assert config.network == "egress"
+        assert MCPConfig(name="legacy-mcp", network="internal").network == "egress"
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "internal" in warnings[0].getMessage()
+
+
+def test_concurrent_normalization_still_warns_once(caplog, monkeypatch):
+    """Warn-once is check-and-add under a lock, not a bare set membership test.
+
+    Manifests are normalized from several threads at startup (registry sync, a hub
+    warm-up, an edge reloading its catalog). Without the lock two threads can both
+    see the value as new and log it twice, which is what the operator asked not to
+    happen. A slow ``add`` makes that window deterministic: the unlocked version
+    parks every thread inside it and logs once per thread.
+    """
+    import core.models as models_module
+
+    class SlowAddSet(set):
+        def add(self, value):
+            time.sleep(0.02)
+            super().add(value)
+
+    monkeypatch.setattr(models_module, "_WARNED_NETWORK_POLICIES", SlowAddSet())
+    reset_network_policy_warnings()
+
+    threads_per_round = 6
+    barrier = threading.Barrier(threads_per_round)
+    results = []
+    errors = []
+
+    def normalize():
+        try:
+            barrier.wait(timeout=10)
+            results.append(ToolConfig(**_tool_kwargs(network="internal")).network)
+        except BaseException as exc:  # surfaced below, not swallowed
+            errors.append(exc)
+
+    with caplog.at_level(logging.WARNING, logger="core.models"):
+        workers = [threading.Thread(target=normalize) for _ in range(threads_per_round)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=10)
+
+    assert not errors, errors
+    assert results == ["egress"] * threads_per_round
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+
+
+@pytest.mark.parametrize("legacy", ["deny", "off"])
+def test_legacy_deny_values_still_mean_no_network(caplog, legacy):
+    reset_network_policy_warnings()
+    with caplog.at_level(logging.WARNING, logger="core.models"):
+        config = ToolConfig(**_tool_kwargs(network=legacy))
+
     assert config.network == "none"
-
-
-def test_tool_config_network_allow_maps_to_internet():
-    assert ToolConfig(**_tool_kwargs(network="allow")).network == "internet"
-
-
-def test_tool_config_network_internal_is_accepted():
-    assert ToolConfig(**_tool_kwargs(network="internal")).network == "internal"
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
 
 def test_tool_config_network_accepts_none():
@@ -54,10 +147,12 @@ def test_tool_config_network_accepts_none():
 
 def test_tool_config_network_normalizes_case_and_whitespace():
     assert ToolConfig(**_tool_kwargs(network="  NONE ")).network == "none"
+    assert ToolConfig(**_tool_kwargs(network="  EGRESS ")).network == "egress"
 
 
 def test_tool_config_network_typo_keeps_the_tool(caplog):
     """A typo must not raise: load_tool_configs drops any config that fails."""
+    reset_network_policy_warnings()
     with caplog.at_level(logging.WARNING, logger="core.models"):
         config = ToolConfig(**_tool_kwargs(network="denny"))
 

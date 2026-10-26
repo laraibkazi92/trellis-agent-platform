@@ -2,6 +2,15 @@
 
 Tools are standalone executables that agents call to interact with external systems — APIs, databases, CLIs, or any process. They are language-agnostic and communicate via JSON over stdin/stdout.
 
+> **v0.7.1 removed the sandbox-backend and network-profile model.** There is exactly one
+> execution path — the `runner` starts one container per call (`runsc` in production,
+> `runc` on dev machines) — and per-manifest `network:` is now only `egress` (the default:
+> Docker's default bridge) or `none`. `SANDBOX_BACKEND`, the bwrap/Landlock backends, the
+> AppArmor profile, `TRELLIS_INTERNAL_CIDRS` and the opt-in egress proxy are gone. This
+> page is corrected where the change is security-relevant; the full rewrite is tracked for
+> the v0.7.1 docs pass, so prefer [upgrading.md → v0.7.1](upgrading.md#v071--in-development-breaking)
+> when the two disagree.
+
 ---
 
 ## Consuming Tools (As an Agent Developer)
@@ -52,33 +61,24 @@ Check the tool's `tool.yaml` for required `inputs`, `secrets`, and `variables` b
 
 ### Sandbox Model
 
-> **Legacy path.** The shipped v0.6 default is the [container execution
-> contract](#container-execution-contract-v06) below. This section describes the
-> in-process `bwrap`/`Landlock` backends, kept for local development.
-
-Every tool invocation runs in one of two sandbox backends, chosen once at hub startup. `auto` (the default) prefers **bwrap** and falls back to **Landlock** when bwrap cannot run; both drop all capabilities. The confinement they provide differs:
-
-| Property | bwrap | Landlock |
-| --- | --- | --- |
-| Write confinement | `/` read-only, `/app/workspace` read-write, private tmpfs `/tmp` | `/` read-only, `/app/workspace` and a per-run `TMPDIR` read-write (equivalent) |
-| Process isolation | private PID/IPC/UTS namespaces | shared; `kill -0` on an outside process returns `EPERM` at ABI >= 6 |
-| `/proc` | fresh procfs | shared, read-only; Yama `ptrace_scope>=1` keeps other processes' data out |
-| `/tmp` | private per run | shared between runs (per-run `0700` dir, same uid) |
-| `/dev/shm` | available in the private `/dev` | not writable (POSIX shm fails) |
-| PTY (`/dev/ptmx`) | available | not granted (`pexpect`, `node-pty`, `script` fail) |
-| Tool identity | the hub uid (`TRELLIS_UID`, the workspace owner) mapped 1:1 in its namespaces, `CapEff=0` | operator uid (`SANDBOX_UID`, default = hub uid = workspace owner), capabilities cleared |
-| Resource limits | none per tool — the hub container's limits (`pids_limit`, and `mem_limit`/`deploy.resources` if you set one) apply to every tool | address space 4 GiB / CPU 600 s / file size 64 MiB, applied by the helper before `exec` and configurable via `SANDBOX_RLIMIT_AS_MB`, `SANDBOX_RLIMIT_CPU_S`, `SANDBOX_RLIMIT_FSIZE_MB` (`0` disables) |
-
-Writes past the Landlock file-size limit fail with `SIGXFSZ` (the tool is killed, it does not just get an `EFBIG`); allocations past the address-space limit fail with `ENOMEM`. bwrap has no equivalent per-tool caps, so size a container limit around its heaviest tool.
-
-Tools run as `SANDBOX_UID`, which defaults to the hub's own uid — the workspace owner — so in both backends they can write anywhere you can. `HOME` is `/tmp` under bwrap and the per-run tmpdir under Landlock.
+There is one execution model since v0.7.1: every local tool call is its own **runner
+container** (see the [container execution contract](#container-execution-contract-v06)
+below). The in-process `bwrap` and `Landlock` backends, the `trellis-sandbox` helper, the
+shipped AppArmor profile and the `SANDBOX_BACKEND` selector were removed — a deployment that
+still sets `SANDBOX_BACKEND` is ignored rather than honoured.
 
 What that means for tool code:
 
-- Use `$TMPDIR` (also `HOME` under Landlock) for scratch work. It is writable in both backends and removed after the run.
-- **Never persist secrets in `$TMPDIR`.** Under Landlock it is shared between concurrent runs (same uid), so a `0700` directory is not a boundary. Keep credentials in memory or in the injected environment.
-- Keep files the host should see under `/app/workspace` — it is the only path guaranteed to survive the run. Normal Unix permissions still apply, but because the tool runs as the workspace owner, writes into operator-owned directories (including `0755`) work in both backends. Use `$TMPDIR` for throwaway scratch.
-- Avoid POSIX shared memory and PTY allocation under Landlock; use `$TMPDIR` files and subprocess pipes instead.
+- The container's `$HOME` and `$TMPDIR` are a disposable tmpfs: scratch space only, gone
+  with the container.
+- **Never persist secrets in `$TMPDIR`.** Keep credentials in memory or in the injected
+  environment.
+- Files the host should see go under a declared `output_dirs` mount
+  (`/app/workspace/output/<agent>` or `reports/<agent>`); everything else in the workspace
+  is read-only or absent. Normal Unix permissions still apply, and the tool runs as
+  `TRELLIS_UID`, the workspace owner.
+- POSIX shared memory and PTY allocation work as they do in any container started from the
+  image; size `limits:` around a tool that needs more than the defaults.
 
 ### Container execution contract (v0.6)
 
@@ -103,11 +103,12 @@ the way results reach the agent.
 - **`HOME`, `TMPDIR`, `TMP`, `TEMP` are one disposable tmpfs** at `/tmp`, sized by
   `limits.tmpfs_mb`. It is destroyed with the container, so it is scratch space only and
   nothing in it is visible on the host.
-- **No network unless declared.** `network:` is `none` (default), `internal`, or
-  `internet`; legacy `allow` still parses and means `internet`. `none` has no route at
-  all (loopback included), `internal` reaches only the CIDRs in
-  `TRELLIS_INTERNAL_CIDRS`, and `internet` blocks RFC1918/CGNAT/link-local/cloud-metadata
-  and the framework's own networks. See [deploy.md](deploy.md#network-profiles).
+- **`network:` is `egress` (default) or `none`.** `egress` is Docker's **default bridge**:
+  the container can reach whatever the host can reach, including RFC1918 addresses and the
+  cloud metadata endpoint. `none` removes the network entirely (no route, no loopback, no
+  resolver) and is the only containment option v0.7.1 offers. The v0.6 profile names
+  `allow`, `internet` and `internal` still load as `egress` and log **one** deprecation
+  warning per value per process; `deny`/`off` load as `none`.
 - **Environment:** only the keys your manifest declares (`secrets`, `optional_secrets`,
   `variables`, `secret_groups` fields) plus `TRELLIS_USER_ID`/`TRELLIS_USER_EMAIL` are
   present; the rest of the environment is the image's base (`PATH`, `LANG`, `TZ`, ...).
@@ -133,7 +134,7 @@ when the manifest is parsed.
 ```yaml
 - name: issues_create_ticket
   # ... required fields ...
-  network: internal               # none (default) | internal | internet
+  network: egress                 # egress (default) | none
   container_runtime: runsc        # runsc (default) | runsc-variant | runc
   output_dirs: [reports]          # subset of [reports, output]
   limits:
@@ -245,12 +246,13 @@ except Exception as e:
       - BG_SERVICE_URL
   public: false                   # Optional. Expose this tool for direct execution by external MCP
                                   #   clients via the Gateway's search_tools/use_tool (no agent hop).
-  network: internal               # Optional. none (default), internal, or internet; legacy
-                                  #   `allow` maps to internet. "none" gives the tool no
-                                  #   network at all, loopback included.
-  egress:                         # Optional. Domains this tool reaches when egress mode is on.
-    - api.example.com             #   Plain lowercase DNS suffix: covers the name and *.api.example.com.
-    - "*.vendor.example"          #   A leading '*.' is accepted and normalized to a plain suffix.
+  network: none                   # Optional. egress (default) | none. `none` gives the
+                                  #   tool no network at all, loopback included. Legacy
+                                  #   `allow`/`internet`/`internal` load as egress with one
+                                  #   warning per value; `deny`/`off` load as none.
+  egress:                         # Optional and INERT since v0.7.1: the egress allowlist
+    - api.example.com             #   proxy was removed. Accepted so old manifests parse.
+    - "*.vendor.example"
   optional_secrets:               # Optional. Injected when present; never required for the tool to run.
     - MY_OPTIONAL_TOKEN
 ```
@@ -272,17 +274,21 @@ variables:
 
 **`optional_secrets` / `secret_groups`**: `optional_secrets` are injected when the caller has stored them but never count against configuration readiness. `secret_groups` is a UI hint that renders a set of optional secrets as a single card with a selector (e.g. an environment dropdown) on the configuration page; each group is `{label, select_label, options: [{value, label, fields: [{key, label, type}]}]}`.
 
-**`network`**: Set `none` for every tool that does not call an external API — it is the cheapest exfiltration control, since a compromised tool then has nowhere to send the workspace or its injected secrets. It is the default in v0.6, and it also blocks loopback, so a tool that must reach the framework API itself needs an explicit profile. `internal` reaches only `TRELLIS_INTERNAL_CIDRS`; `internet` (what legacy `allow` maps to) blocks RFC1918, cloud-metadata and the framework's own networks. An unrecognized value warns and falls back to `none` (the most restrictive profile) rather than disqualifying the tool. Under the legacy Landlock backend the policy additionally requires kernel Landlock ABI 4+ (Linux 6.7+) and the helper's seccomp filter for UDP/raw sockets; bwrap closes them with a private netns. See [deploy.md → Network profiles](deploy.md#network-profiles).
+**`network`**: `egress` is the default and means Docker's default bridge — the container
+can reach whatever the host can reach, **including cloud metadata** (`169.254.169.254`) and
+anything on the host's private networks. `none` is the only containment option: no route,
+no loopback, no resolver, so a compromised tool has nowhere to send the workspace or its
+injected secrets. A tool that must reach the framework API itself needs `egress` (loopback
+is gone under `none`). A value that is not recognized warns and falls back to `none` (a typo
+must not hand a tool the network), and nothing is dropped. Legacy `allow`/`internet`/
+`internal` load as `egress` with one deprecation warning per value per process; `deny`/`off`
+load as `none`.
 
-**`egress`**: The domains a tool needs when the operator has enabled [egress mode](deploy.md#egress-mode-opt-in). It is a list of plain DNS suffixes — `example.com` covers `example.com` and every `*.example.com` — and the proxy is the only way out. A leading `*.` is accepted and normalized to the same plain suffix, so `"*.example.com"` and `example.com` are the same entry.
-
-Three things to know before using it:
-
-- **v1 is a union.** The proxy generates one allowlist from every tool's `egress:` list, so any tool can reach any declared domain. The field still matters: it is the auditable declaration of what your deployment needs, and per-tool enforcement can build on it later. Keep it as narrow as the vendor's API allows.
-- **Enforcement is opt-in at the deployment level.** Without the compose override nothing reads `egress:` and tools keep their normal outbound access. With it, a domain that is missing from the union is simply unreachable (`ENETUNREACH` or `403`).
-- **Some clients ignore the proxy env.** Python `requests`/`httpx` honour `HTTPS_PROXY`; Node's built-in `fetch`/`undici` do not, and fail closed because there is no direct route. Go tools are compiled in the hub and honour the proxy during that build, so add `proxy.golang.org` (and any module host) to a tool's `egress:` list when it imports third-party packages.
-
-The allowlist is regenerated when the proxy container starts, so after editing `egress:` run `docker compose restart egress-proxy` (or rebuild). Tools that need no network should still use `network: none`: it is stronger than egress mode because there is no route even to the proxy.
+**`egress`**: **Inert since v0.7.1.** The opt-in egress allowlist proxy
+(`docker-compose.egress.yml`, `scripts/egress_proxy.py`) was removed with the network
+profiles: nothing reads the list and no domain is enforced. The field is still accepted so
+existing manifests keep parsing; use `network: none` for anything that does not need the
+network, because that is now the only real control.
 
 ---
 
