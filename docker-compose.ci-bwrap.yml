@@ -1,0 +1,30 @@
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+#
+# CI-only override: give the hub the dev-only security options the legacy
+# in-process bwrap backend needs.
+#
+# docker-compose.yml ships `SANDBOX_BACKEND=container` -- v0.6 executes every tool
+# through the runner -- and therefore keeps the hub under Docker's stock
+# `docker-default` AppArmor profile, which contains `deny mount,`. bwrap's
+# bind/proc/tmpfs mounts and its pivot_root fail under that profile, so `auto`
+# falls back to Landlock. The three options below are the documented dev-only
+# escape hatch; the base file keeps them commented out on purpose.
+#
+# This file exists only so the two legs that assert the bwrap backend on a
+# GitHub-hosted runner -- the `smoke` matrix's bwrap leg and the `egress` job --
+# exercise it end to end (and that `auto` short-circuits instead of probing the
+# fallback). The landlock leg does NOT use it: the base profile is already the
+# hardened case it asserts.
+#
+# security_opt is a list and Compose APPENDS override entries to the base list,
+# so the base `no-new-privileges:true` must be repeated and `!override` used to
+# replace the list (Compose 2.24.4+). Verify the merge with:
+#   docker compose -f docker-compose.yml -f docker-compose.ci-bwrap.yml config
+services:
+  hub:
+    security_opt: !override
+      - "no-new-privileges:true"
+      - "systempaths=unconfined"
+      - "seccomp=unconfined"
+      - "apparmor=unconfined"

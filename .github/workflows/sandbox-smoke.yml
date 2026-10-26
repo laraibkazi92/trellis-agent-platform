@@ -3,14 +3,17 @@
 #
 # Sandbox backend matrix: prove BOTH backends on a real CI host.
 #
-#   bwrap    - the default backend. docker-compose.yml ships `apparmor=unconfined`
-#              for the hub, which is what lets bwrap perform its bind/proc/tmpfs
-#              mounts under Ubuntu's enforcing docker-default AppArmor profile.
-#              This leg leaves that line untouched and asserts `auto` selects bwrap.
-#   landlock - the fallback (Phase 4 regression test). It strips
-#              `apparmor=unconfined` so docker-default stays enforced (it denies
-#              mount), which is what a hardened runner/org policy looks like; the
-#              hub must select Landlock and every sandbox check must pass.
+#   bwrap    - the preferred backend when it can work. Since v0.6 the shipped
+#              compose default is `SANDBOX_BACKEND=container` (every tool runs in
+#              the runner) and the hub stays under Docker's stock `docker-default`
+#              AppArmor profile, which denies mount, so bwrap cannot start from an
+#              unmodified checkout. This leg opts into the documented dev-only
+#              security options through docker-compose.ci-bwrap.yml and asserts
+#              `auto` selects bwrap without probing the fallback.
+#   landlock - the fallback (Phase 4 regression test). Same stack without that
+#              override, so docker-default stays enforced (it denies mount) -- what
+#              a hardened runner/org policy looks like; the hub must select
+#              Landlock and every sandbox check must pass.
 #
 # Both legs also run the native helper suite (tests/test_sandbox_native.py), which
 # previously never ran in CI. Like before, this exercises the smoke harness and the
@@ -40,6 +43,7 @@ on:
       - "Dockerfile"
       - "docker-compose.yml"
       - "docker-compose.ci-apparmor.yml"
+      - "docker-compose.ci-bwrap.yml"
       - "docker-compose.egress.yml"
       - "docker-compose.egress-ci.yml"
       - "scripts/sandbox_smoke.py"
@@ -56,6 +60,7 @@ on:
       - "Dockerfile"
       - "docker-compose.yml"
       - "docker-compose.ci-apparmor.yml"
+      - "docker-compose.ci-bwrap.yml"
       - "docker-compose.egress.yml"
       - "docker-compose.egress-ci.yml"
       - "scripts/sandbox_smoke.py"
@@ -81,6 +86,10 @@ jobs:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      # Only the bwrap leg opts into the dev-only unconfined security options;
+      # the landlock leg proves the shipped, hardened profile.
+      COMPOSE_FILE: ${{ matrix.compose_file }}
     strategy:
       # Both legs are independent proofs: a bwrap failure must not hide the
       # fallback's verdict (and vice versa).
@@ -89,8 +98,10 @@ jobs:
         include:
           - backend: bwrap
             leg: bwrap (ubuntu-24.04)
+            compose_file: docker-compose.yml:docker-compose.ci-bwrap.yml
           - backend: landlock
             leg: landlock fallback (ubuntu-24.04)
+            compose_file: docker-compose.yml
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -104,12 +115,17 @@ jobs:
           echo "yama ptrace_scope: $(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo absent)"
           docker info --format '{{json .SecurityOptions}}' || true
 
-      - name: Drop apparmor=unconfined so docker-default stays enforced
-        # Landlock leg only: this is the hardened-host simulation that must force
-        # the fallback. The bwrap leg deliberately keeps the line — without it,
-        # docker-default denies mount and bwrap cannot run at all.
+      - name: Confirm the hardened profile drives the fallback
+        # Landlock leg only. Since v0.6 the base file already leaves the hub under
+        # Docker's stock `docker-default` profile (its unconfined security options
+        # are commented out for the `container` execution default), which is the
+        # hardened-host case this leg asserts -- so there is nothing to strip.
         if: matrix.backend == 'landlock'
-        run: sed -i '/apparmor=unconfined/d' docker-compose.yml
+        run: |
+          if grep -qE '^\s*-\s*"?apparmor=unconfined"?\s*$' docker-compose.yml; then
+            echo "docker-compose.yml mentions apparmor=unconfined; re-check whether this leg still forces the Landlock fallback" >&2
+            exit 1
+          fi
 
       - name: Seed the .env the compose file expects
         # host/ui declare `env_file: .env`, which is not tracked in git.
@@ -138,15 +154,25 @@ jobs:
           # otherwise the runner fails its runtime preflight and every service that
           # depends_on it healthy never starts.
           CONTAINER_DEFAULT_RUNTIME=runc
+          # The smoke harness calls the hub directly (no host, no agent token), so
+          # run the agent-token gate in its documented rollout mode: it still
+          # verifies and logs, but a missing token is not a 403. These legs prove
+          # the sandbox, not the token gate -- that is the unit suite's and the
+          # live runs' job.
+          ENFORCE_AGENT_TOKENS=log
+          # Explicit rather than relying on the fallback: the v0.6 `container`
+          # default is not a backend /healthz knows, so it warns and normalises to
+          # `auto` anyway. This just states the intent and silences the warning.
+          SANDBOX_BACKEND=auto
           ENV
 
       - name: Allow unprivileged user namespaces on the bwrap leg
         if: matrix.backend == 'bwrap'
         # Ubuntu 24.04 restricts unprivileged user namespaces to processes whose
         # AppArmor profile mediates the `userns` permission. This leg runs the
-        # container unconfined (compose default), which the restriction refuses,
-        # so bwrap cannot create its namespace. The point here is bwrap's own
-        # confinement, not Ubuntu's userns policy, and the runner VM is
+        # container unconfined (docker-compose.ci-bwrap.yml), which the restriction
+        # refuses, so bwrap cannot create its namespace. The point here is bwrap's
+        # own confinement, not Ubuntu's userns policy, and the runner VM is
         # ephemeral. The `apparmor` job exercises the profile path (with
         # `userns,` in the profile) and leaves this sysctl at its default.
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -280,7 +306,9 @@ jobs:
     timeout-minutes: 30
     env:
       # The whole point of the leg: the committed override is not auto-loaded.
-      COMPOSE_FILE: docker-compose.yml:docker-compose.egress.yml:docker-compose.egress-ci.yml
+      # ci-bwrap is the same dev-only security opt the matrix's bwrap leg needs, so
+      # the "auto selected bwrap" assertion below still holds.
+      COMPOSE_FILE: docker-compose.yml:docker-compose.ci-bwrap.yml:docker-compose.egress.yml:docker-compose.egress-ci.yml
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -314,11 +342,22 @@ jobs:
           # otherwise the runner fails its runtime preflight and every service that
           # depends_on it healthy never starts.
           CONTAINER_DEFAULT_RUNTIME=runc
+          # The smoke harness calls the hub directly (no host, no agent token), so
+          # run the agent-token gate in its documented rollout mode: it still
+          # verifies and logs, but a missing token is not a 403. These legs prove
+          # the sandbox, not the token gate -- that is the unit suite's and the
+          # live runs' job.
+          ENFORCE_AGENT_TOKENS=log
+          # Explicit rather than relying on the fallback: the v0.6 `container`
+          # default is not a backend /healthz knows, so it warns and normalises to
+          # `auto` anyway. This just states the intent and silences the warning.
+          SANDBOX_BACKEND=auto
           ENV
 
       - name: Allow unprivileged user namespaces (bwrap leg)
-        # Same reason as the bwrap matrix leg: the hub keeps
-        # `apparmor=unconfined`, which Ubuntu 24.04's userns restriction refuses.
+        # Same reason as the bwrap matrix leg: docker-compose.ci-bwrap.yml gives the
+        # hub `apparmor=unconfined`, and Ubuntu 24.04's userns restriction refuses
+        # that even inside an unconfined container.
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Declare the egress fixture tool
@@ -528,6 +567,16 @@ jobs:
           # otherwise the runner fails its runtime preflight and every service that
           # depends_on it healthy never starts.
           CONTAINER_DEFAULT_RUNTIME=runc
+          # The smoke harness calls the hub directly (no host, no agent token), so
+          # run the agent-token gate in its documented rollout mode: it still
+          # verifies and logs, but a missing token is not a 403. These legs prove
+          # the sandbox, not the token gate -- that is the unit suite's and the
+          # live runs' job.
+          ENFORCE_AGENT_TOKENS=log
+          # Explicit rather than relying on the fallback: the v0.6 `container`
+          # default is not a backend /healthz knows, so it warns and normalises to
+          # `auto` anyway. This just states the intent and silences the warning.
+          SANDBOX_BACKEND=auto
           ENV
 
       - name: Build and start the stack under apparmor=trellis-hub
