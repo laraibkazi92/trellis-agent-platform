@@ -420,3 +420,23 @@ def test_handler_returns_a_tool_error_rather_than_breaking_the_session(
     # MCP session would have to recover from.
     assert result == {"error": DENIED.format(name="opsctl")}
     assert executions == []
+
+
+def test_hub_mode_promoted_after_the_snapshot_ttl_is_honoured(executions, registry):
+    """A long-running hub must notice a promotion instead of keeping its boot mode.
+
+    Live symptom this pins: `hub_call_mode` set to shadow was ignored by the running
+    hub (no ring entries, tools still allowed) until the container restarted, because
+    the fast path trusted an expired snapshot's mode and never triggered a re-read.
+    """
+    fake = registry(policy=DENY_ALL, hub_mode="off")
+    assert call({}) == {"ok": True}
+    assert tool_authz.shadow_denies() == []
+    reads_when_warm = fake.policy_reads
+
+    fake.hub_mode = "shadow"
+    tool_authz._snapshot_expiry = 0.0
+
+    assert call({}) == {"ok": True}          # shadow records, never blocks
+    assert [entry["surface"] for entry in tool_authz.shadow_denies()] == ["hub_direct"]
+    assert fake.policy_reads > reads_when_warm

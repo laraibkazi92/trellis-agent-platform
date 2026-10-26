@@ -207,17 +207,21 @@ def get_hub_call_mode() -> str:
 
 
 def cached_mode_for_surface(surface: Optional[str] = None) -> Optional[str]:
-    """The mode from the last snapshot, without any etcd I/O; ``None`` when cold.
+    """The mode from the last snapshot, without any etcd I/O; ``None`` when unusable.
 
-    Bound tools and hub calls need this: ``off`` (the default) must stay free of authz
-    reads, and a full snapshot load under an etcd outage blocks for the retry budget. A
-    caller that gets ``None`` must fall back to :func:`mode_for_surface` (one blocking
-    read). An unknown surface fails closed to ``enforcing`` here too, so a caller that
-    never teaches this map about its surface cannot inherit the ``use_tool`` switch.
+    Returns ``None`` when the snapshot is cold **or past its TTL**: the caller must fall
+    back to :func:`mode_for_surface` (one read) rather than trusting a stale mode. That
+    distinction is load-bearing -- a gate whose only snapshot reader is its own fast path
+    would otherwise keep the mode it saw first (a process that booted with ``off`` would
+    never notice a promotion). Bound tools and hub calls need the fast path: ``off`` (the
+    default) stays free of authz reads, and a read under an etcd outage blocks for the
+    retry budget. An unknown surface fails closed to ``enforcing`` here too, so a caller
+    that never teaches this map about its surface cannot inherit the ``use_tool`` switch.
     """
     with _snapshot_lock:
         snapshot = _snapshot
-    if snapshot is None:
+        expired = time.monotonic() >= _snapshot_expiry
+    if snapshot is None or expired:
         return None
     key = _SURFACE_MODE_KEYS.get(surface)
     if key is None:

@@ -1136,3 +1136,20 @@ def test_stored_groups_accept_a_comma_separated_record_value(use_registry):
     )
 
     assert tool_authz.resolved_groups("user:alice") == ["oncall", "ops"]
+
+
+def test_cached_mode_is_not_authoritative_after_the_ttl(use_registry):
+    """Regression: a gate whose only snapshot reader is its own fast path must not
+    keep the mode it booted with. An expired cache has to decline the fast path so
+    the caller re-reads; the live symptom was a hub that never noticed hub_call_mode.
+    """
+    fake = use_registry(policy=_policy(), mode="off", bound_mode="off", hub_mode="off")
+    tool_authz.get_mode()  # warm the snapshot
+    assert tool_authz.cached_mode_for_surface("hub_direct") == "off"
+
+    fake.hub_mode = "enforcing"
+    tool_authz._snapshot_expiry = 0.0
+
+    assert tool_authz.cached_mode_for_surface("hub_direct") is None
+    assert tool_authz.mode_for_surface("hub_direct") == "enforcing"
+    assert tool_authz.cached_mode_for_surface("hub_direct") == "enforcing"
