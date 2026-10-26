@@ -100,6 +100,66 @@ async def _abort_if_cancelled(identity_mgr, agent_name: str, task_id: str) -> bo
     return False
 
 
+async def _check_input_guardrails(
+    identity_mgr,
+    agent_name: str,
+    task_id: str,
+    user_id: str,
+    prompt: str,
+    config_data: Dict[str, Any],
+) -> tuple[bool, str]:
+    """Run the input guardrail over a run's prompt; returns ``(blocked, prompt)``.
+
+    Shared by the agent and script paths so both record the same state and event on a
+    hit. Fail-open: any evaluation failure leaves the prompt untouched, and only an
+    explicit "block" stops the run. Callers decide what "stopped" means (no LLM call
+    for an agent, no subprocess for a script).
+    """
+    input_action, checked_prompt, input_hits = "allow", prompt, []
+    try:
+        from core import guardrails
+        input_action, checked_prompt, input_hits = await asyncio.to_thread(
+            guardrails.evaluate_agent_input, prompt, config_data)
+    except Exception as err:
+        print(f"Guardrail input evaluation failed for {agent_name} run {task_id}: {err}")
+        input_action, checked_prompt, input_hits = "allow", prompt, []
+
+    input_hit_counts: Dict[str, int] = {}
+    if input_hits:
+        try:
+            from core import guardrails
+            input_hit_counts = dict(await asyncio.to_thread(guardrails.hit_counts, input_hits))
+        except Exception as err:
+            print(f"Failed to count guardrail hits for {agent_name} run {task_id}: {err}")
+        try:
+            await asyncio.to_thread(
+                identity_mgr.record_guardrail_hits, agent_name, input_hit_counts)
+        except Exception as err:
+            print(f"Failed to record guardrail hits for {agent_name} run {task_id}: {err}")
+
+    if input_action != "block":
+        return False, checked_prompt
+
+    failed = await _record_run_state(
+        identity_mgr,
+        agent_name,
+        task_id,
+        "failed",
+        {
+            "prompt": _truncate_output(prompt, max_chars=8192),
+            "user_id": user_id,
+            "error": "guardrail blocked input",
+            "guardrail_hits": input_hit_counts,
+        },
+    )
+    if failed:
+        await _append_run_event(
+            identity_mgr, agent_name, task_id, "run_failed",
+            {"error_type": "GuardrailBlocked", "error_chars": 0},
+        )
+    return True, prompt
+
+
 async def enqueue_workflow_run(
     name: str,
     config: Dict,
@@ -559,7 +619,16 @@ async def run_background_script(
         disabled_workflows = await asyncio.to_thread(identity_mgr.get_disabled_workflows)
         if agent_name in disabled_workflows:
             raise ValueError(f"Workflow '{agent_name}' is currently disabled.")
-        
+
+        # Same input guardrail the agent path applies, over the rendered prompt (the
+        # event payload that becomes the script's stdin). A hit fails the run before
+        # anything is spawned; an empty prompt has nothing to check.
+        if prompt:
+            blocked, prompt = await _check_input_guardrails(
+                identity_mgr, agent_name, task_id, user_id, prompt, config_data)
+            if blocked:
+                return "SYSTEM: Input blocked by guardrail policy."
+
         # Prepare execution environment
         base_dir = Path(__file__).parent.parent
         rel_path = config_data.get("rel_path")
@@ -753,49 +822,10 @@ async def run_background_agent(
 
         # 2. Guardrail check on the input. Fail-open: any evaluation failure leaves the
         # prompt untouched, and only an explicit "block" stops the run before the LLM call.
-        input_action, checked_prompt, input_hits = "allow", prompt, []
-        try:
-            from core import guardrails
-            input_action, checked_prompt, input_hits = await asyncio.to_thread(
-                guardrails.evaluate_agent_input, prompt, config_data)
-        except Exception as err:
-            print(f"Guardrail input evaluation failed for {agent_name} run {task_id}: {err}")
-            input_action, checked_prompt, input_hits = "allow", prompt, []
-
-        input_hit_counts: Dict[str, int] = {}
-        if input_hits:
-            try:
-                from core import guardrails
-                input_hit_counts = dict(await asyncio.to_thread(guardrails.hit_counts, input_hits))
-            except Exception as err:
-                print(f"Failed to count guardrail hits for {agent_name} run {task_id}: {err}")
-            try:
-                await asyncio.to_thread(
-                    identity_mgr.record_guardrail_hits, agent_name, input_hit_counts)
-            except Exception as err:
-                print(f"Failed to record guardrail hits for {agent_name} run {task_id}: {err}")
-
-        if input_action == "block":
-            failed = await _record_run_state(
-                identity_mgr,
-                agent_name,
-                task_id,
-                "failed",
-                {
-                    "prompt": _truncate_output(prompt, max_chars=8192),
-                    "user_id": user_id,
-                    "error": "guardrail blocked input",
-                    "guardrail_hits": input_hit_counts,
-                },
-            )
-            if failed:
-                await _append_run_event(
-                    identity_mgr, agent_name, task_id, "run_failed",
-                    {"error_type": "GuardrailBlocked", "error_chars": 0},
-                )
+        blocked, prompt = await _check_input_guardrails(
+            identity_mgr, agent_name, task_id, user_id, prompt, config_data)
+        if blocked:
             return "SYSTEM: Input blocked by guardrail policy."
-
-        prompt = checked_prompt
 
         # 3. Build the PydanticAI Agent with full parity (Hub, MCP, A2A)
         agent = await build_agent(agent_name)

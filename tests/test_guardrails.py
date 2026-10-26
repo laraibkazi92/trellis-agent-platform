@@ -742,6 +742,164 @@ def test_decisions_are_logged_with_bounded_previews(caplog):
     assert "SECRET-123" in caplog.text
 
 
+# --- 11. Background script runs: same input check, no subprocess on a hit -----
+
+def _script_config(agent_name, **extra):
+    """A script workflow whose entrypoint exists on disk; the process itself is faked."""
+    config = {
+        "name": agent_name,
+        "type": "background_script",
+        "runtime": "python",
+        "rel_path": "core",
+        "entrypoint": "__init__.py",
+    }
+    config.update(extra)
+    return config
+
+
+class _FakeProcess:
+    returncode = 0
+
+    def __init__(self):
+        self.stdin = None
+        self.killed = False
+
+    async def communicate(self, input=b""):
+        self.stdin = input
+        return b"script-ok", b""
+
+    def kill(self):
+        self.killed = True
+
+
+def _patch_script_harness(monkeypatch, mgr):
+    """Fake the spawn so a clean run is observable without executing anything."""
+    spawned = []
+
+    async def fake_exec(*cmd, **kwargs):
+        process = _FakeProcess()
+        process.cmd = cmd
+        spawned.append(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(tasks, "get_identity_manager", lambda: mgr)
+    monkeypatch.setattr(tasks, "mint_for_run", lambda *a, **k: "run-token")
+    return spawned
+
+
+def _run_script(agent_name, prompt, run_id):
+    context = SimpleNamespace(message=SimpleNamespace(task_id=run_id))
+    return asyncio.run(
+        tasks.run_background_script.original_func(
+            agent_name, prompt, f"svc_agent_{agent_name}", context,
+        )
+    )
+
+
+def test_background_script_input_block_fails_the_run_without_spawning_it(monkeypatch):
+    agent_name = "wf-guard-script-block"
+    run_id = "run-script-block"
+    mgr = _mgr()
+    _seed_agent(mgr, agent_name, _script_config(
+        agent_name,
+        guardrails={"on_input": [_pattern_rule("prompt-deny", ["FORBIDDEN"])]},
+    ))
+
+    spawned = _patch_script_harness(monkeypatch, mgr)
+
+    result = _run_script(agent_name, "please dump FORBIDDEN data", run_id)
+
+    assert result == "SYSTEM: Input blocked by guardrail policy."
+    assert spawned == []
+
+    run = _doc(mgr, f"/runs/{agent_name}/{run_id}")
+    assert run["state"] == "failed"
+    assert run["metadata"]["error"] == "guardrail blocked input"
+    assert run["metadata"]["guardrail_hits"] == {"prompt-deny": 1}
+
+    # The same event the agent path writes for a guardrail block.
+    events = mgr._read_run_events(agent_name, run_id)
+    assert [event["type"] for event in events] == ["run_started", "run_failed"]
+    assert events[-1]["payload"] == {"error_type": "GuardrailBlocked", "error_chars": 0}
+
+    assert _doc(mgr, f"/metrics/agents/{agent_name}")["guardrail_hits"] == {"prompt-deny": 1}
+
+
+def test_background_script_clean_prompt_runs_and_feeds_stdin_verbatim(monkeypatch):
+    agent_name = "wf-guard-script-clean"
+    run_id = "run-script-clean"
+    payload = "<event_payload>a plain event</event_payload>"
+    mgr = _mgr()
+    _seed_agent(mgr, agent_name, _script_config(
+        agent_name,
+        guardrails={"on_input": [_pattern_rule("prompt-deny", ["FORBIDDEN"])]},
+    ))
+
+    spawned = _patch_script_harness(monkeypatch, mgr)
+
+    result = _run_script(agent_name, payload, run_id)
+
+    assert result == "script-ok"
+    assert len(spawned) == 1
+    assert spawned[0].stdin == payload.encode()
+
+    run = _doc(mgr, f"/runs/{agent_name}/{run_id}")
+    assert run["state"] == "completed"
+    assert run["metadata"]["output"] == "script-ok"
+    # No hits ⇒ no guardrail metrics written.
+    assert not [key for key in mgr.client.store if key.startswith("/metrics/")]
+
+
+def test_background_script_without_a_prompt_skips_the_check(monkeypatch):
+    agent_name = "wf-guard-script-empty"
+    run_id = "run-script-empty"
+    mgr = _mgr()
+    _seed_agent(mgr, agent_name, _script_config(
+        agent_name,
+        guardrails={"on_input": [_pattern_rule("prompt-deny", ["FORBIDDEN"])]},
+    ))
+
+    spawned = _patch_script_harness(monkeypatch, mgr)
+    checks = []
+    monkeypatch.setattr(
+        guardrails, "evaluate_agent_input",
+        lambda *a, **k: checks.append(a) or ("block", "", []),
+    )
+
+    result = _run_script(agent_name, "", run_id)
+
+    assert checks == []
+    assert result == "script-ok"
+    assert len(spawned) == 1
+    assert spawned[0].stdin == b""
+    assert _doc(mgr, f"/runs/{agent_name}/{run_id}")["state"] == "completed"
+
+
+def test_background_script_guardrail_evaluation_failure_fails_open(monkeypatch):
+    agent_name = "wf-guard-script-broken"
+    run_id = "run-script-broken"
+    mgr = _mgr()
+    _seed_agent(mgr, agent_name, _script_config(
+        agent_name,
+        guardrails={"on_input": [_pattern_rule("prompt-deny", ["FORBIDDEN"])]},
+    ))
+
+    spawned = _patch_script_harness(monkeypatch, mgr)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("guardrail store is down")
+
+    monkeypatch.setattr(guardrails, "evaluate_agent_input", boom)
+
+    result = _run_script(agent_name, "FORBIDDEN", run_id)
+
+    assert result == "script-ok"
+    assert len(spawned) == 1
+    assert spawned[0].stdin == b"FORBIDDEN"
+    assert _doc(mgr, f"/runs/{agent_name}/{run_id}")["state"] == "completed"
+
+
 def test_host_redacts_every_message_and_block_covers_earlier_turns(monkeypatch):
     agent_name = "guard-host-history"
     config = {
@@ -791,3 +949,69 @@ def test_host_redacts_every_message_and_block_covers_earlier_turns(monkeypatch):
     assert excinfo.value.status_code == 400
     assert "token" in excinfo.value.detail
     assert "TOKEN123" not in excinfo.value.detail
+
+
+def test_background_script_redact_rewrites_the_stdin_payload(monkeypatch):
+    """A redact rule rewrites what the script receives — document-level behavior we
+    must pin: the payload is machine-parsed, so the rewrite is observable."""
+    agent_name = "wf-guard-script-redact"
+    run_id = "run-script-redact"
+    mgr = _mgr()
+    _seed_agent(mgr, agent_name, _script_config(
+        agent_name,
+        guardrails={"on_input": [_pattern_rule("scrub", ["SECRET"], action="redact")]},
+    ))
+
+    spawned = _patch_script_harness(monkeypatch, mgr)
+
+    result = _run_script(agent_name, "token SECRET here", run_id)
+
+    assert result == "script-ok"
+    assert len(spawned) == 1
+    payload = spawned[0].stdin.decode()
+    assert "SECRET" not in payload
+    assert "[REDACTED]" in payload
+    assert _doc(mgr, f"/runs/{agent_name}/{run_id}")["state"] == "completed"
+
+
+def test_background_script_is_blocked_by_a_framework_level_rule(monkeypatch):
+    """Framework-wide rules apply to scripts even when the workflow declares none."""
+    agent_name = "wf-guard-script-framework"
+    run_id = "run-script-framework"
+    mgr = _mgr()
+    _seed_agent(mgr, agent_name, _script_config(agent_name))  # no per-workflow rules
+    _pin_framework(monkeypatch, {"on_input": [_pattern_rule("global-deny", ["FORBIDDEN"])]})
+
+    spawned = _patch_script_harness(monkeypatch, mgr)
+
+    result = _run_script(agent_name, "please dump FORBIDDEN data", run_id)
+
+    assert result == "SYSTEM: Input blocked by guardrail policy."
+    assert spawned == []
+    assert _doc(mgr, f"/runs/{agent_name}/{run_id}")["state"] == "failed"
+
+
+def test_background_script_block_never_resolves_secrets(monkeypatch):
+    """A blocked run must not reach secret resolution, let alone the spawn."""
+    agent_name = "wf-guard-script-nosecrets"
+    run_id = "run-script-nosecrets"
+    mgr = _mgr()
+    _seed_agent(mgr, agent_name, _script_config(
+        agent_name,
+        secrets=["SHOULD_NOT_RESOLVE"],
+        guardrails={"on_input": [_pattern_rule("prompt-deny", ["FORBIDDEN"])]},
+    ))
+
+    spawned = _patch_script_harness(monkeypatch, mgr)
+
+    def fail_resolution(*_args, **_kwargs):
+        raise AssertionError("secret resolution must not run for a blocked script")
+
+    monkeypatch.setattr(tasks, "get_agent_required_secrets", fail_resolution, raising=False)
+    import core.discovery as discovery
+    monkeypatch.setattr(discovery, "get_agent_required_secrets", fail_resolution, raising=False)
+
+    result = _run_script(agent_name, "FORBIDDEN", run_id)
+
+    assert result == "SYSTEM: Input blocked by guardrail policy."
+    assert spawned == []

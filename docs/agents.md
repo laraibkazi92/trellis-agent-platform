@@ -193,8 +193,12 @@ marker). Framework-wide rules can be added by an admin at
   `GUARDRAIL` badge on the Agents page.
 - Rules are admin-authored regexes with no runtime timeout — keep them simple (catastrophic
   backtracking blocks the worker). A malformed rule is skipped and logged (fail-open).
+- Coverage: user agents and `background_agent` workflows are checked on input and output;
+  `background_script` workflows are checked on input only — the rendered trigger payload is
+  evaluated before the script is spawned, and a block fails the run (`guardrail blocked input`,
+  `GuardrailBlocked` event) without executing it. A script's own stdout is not inspected.
 - Known gaps in v1: streaming replies are checked only after the full output is assembled;
-  `background_script` workflows and supervisor-delegated sub-agent turns are not checked.
+  supervisor-delegated sub-agent turns are not checked.
 
 **`provider` / `base_url`**: Which LLM vendor serves `model`. Provider credentials are configured in **Admin → LLM Providers** — one card per provider, stored Fernet-encrypted in etcd, never read from the environment. Fifteen providers are selectable:
 

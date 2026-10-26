@@ -9,8 +9,9 @@ stalls the whole process, not just the evaluating thread. Keep patterns simple.
 A malformed rule is skipped and logged (fail-open).
 
 Known v1 gaps: streaming replies are checked on the final assembled output only;
-``background_script`` workflows and supervisor-delegated sub-agent turns are not
-evaluated (only the orchestrating agent's rules apply).
+supervisor-delegated sub-agent turns are not evaluated (only the orchestrating
+agent's rules apply), and ``background_script`` runs are input-checked only --
+their stdout is not.
 """
 import logging
 import re
