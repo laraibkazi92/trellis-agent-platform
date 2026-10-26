@@ -769,3 +769,223 @@ def test_an_oversized_sealed_blob_is_rejected():
         protocol.validate_call(
             {"id": "c1", "tool": "echo", "sealed": _sealed("A" * (MAX_SEALED_BYTES + 4))}
         )
+
+
+# --- lazy catalogs (P6) ------------------------------------------------------
+
+
+def _summary_entry(description=None, **overrides):
+    """One lazy-catalog tool entry: a name, a short summary, no ``inputs``."""
+    entry = {
+        "name": "boiler_status",
+        "description": "Read the boiler status." if description is None else description,
+    }
+    entry.update(overrides)
+    return entry
+
+
+def test_lazy_hello_accepts_a_summary_entry_without_inputs():
+    _, _, tools, _, caps = protocol.validate_hello(
+        {
+            "proto": protocol.PROTO,
+            "edge_version": "0.6.2",
+            "caps": ["tools", "lazy_catalog"],
+            "tools": [_summary_entry("s" * protocol.MAX_TOOL_SUMMARY_CHARS)],
+        }
+    )
+
+    assert caps == ["tools", "lazy_catalog"]
+    assert tools[0].name == "boiler_status"
+    # The schema is deferred to a tool_detail read, so the entry carries none.
+    assert tools[0].inputs == {}
+    assert tools[0].description == "s" * protocol.MAX_TOOL_SUMMARY_CHARS
+
+
+def test_lazy_hello_accepts_mcp_tools_without_an_input_schema():
+    _, _, _, mcps, caps = protocol.validate_hello(
+        {
+            "proto": protocol.PROTO,
+            "edge_version": "0.6.2",
+            "caps": ["tools", "mcp", "lazy_catalog"],
+            "mcps": [
+                {
+                    "name": "devops-cli",
+                    "tools": [
+                        {"name": "tenant_account_tools", "description": "manage tenants"}
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert "lazy_catalog" in caps
+    assert mcps[0].tools[0].input_schema == {}
+
+
+def test_without_the_cap_a_summary_entry_validates_exactly_as_before():
+    (tool,) = protocol.validate_tools([_summary_entry()])
+
+    assert tool.inputs == {}
+    assert tool.description == "Read the boiler status."
+
+
+def test_without_the_cap_a_summary_length_description_is_not_rejected():
+    """The 120-char cap only applies to a lazy hello; a full catalog keeps today's rule."""
+    description = "d" * (protocol.MAX_TOOL_SUMMARY_CHARS + 80)
+
+    (tool,) = protocol.validate_tools([_summary_entry(description)])
+
+    assert tool.description == description
+
+
+def test_a_lazy_hello_over_the_summary_cap_is_refused():
+    description = "d" * (protocol.MAX_TOOL_SUMMARY_CHARS + 1)
+
+    with pytest.raises(protocol.ProtocolError) as exc:
+        protocol.validate_hello(
+            {
+                "proto": protocol.PROTO,
+                "caps": ["tools", "lazy_catalog"],
+                "tools": [_summary_entry(description)],
+            }
+        )
+
+    assert "lazy_catalog" in str(exc.value)
+    assert str(protocol.MAX_TOOL_SUMMARY_CHARS) in str(exc.value)
+    assert exc.value.close_code == protocol.CLOSE_MALFORMED
+
+
+def test_validate_tool_detail_accepts_a_full_entry():
+    tool = protocol.validate_tool_detail(
+        {
+            "name": "boiler_status",
+            "description": "Read the boiler status.",
+            "inputs": {"q": {"type": "string", "required": True}},
+        }
+    )
+
+    assert tool == protocol.EdgeTool(
+        name="boiler_status",
+        description="Read the boiler status.",
+        inputs={"q": {"type": "string", "required": True}},
+    )
+
+
+def test_validate_tool_detail_requires_a_name_and_inputs():
+    with pytest.raises(protocol.ProtocolError) as exc:
+        protocol.validate_tool_detail({"description": "d", "inputs": {}})
+    assert "invalid tool name" in str(exc.value)
+
+    with pytest.raises(protocol.ProtocolError) as exc:
+        protocol.validate_tool_detail({"name": "echo", "description": "d"})
+    assert "must carry inputs" in str(exc.value)
+
+
+def test_validate_tool_detail_rejects_non_object_inputs():
+    with pytest.raises(protocol.ProtocolError) as exc:
+        protocol.validate_tool_detail(
+            {"name": "echo", "description": "d", "inputs": ["q"]}
+        )
+
+    assert "inputs must be an object" in str(exc.value)
+
+
+def test_validate_tool_detail_truncates_a_long_description_like_a_catalog():
+    """Same 2000-char rule as ``validate_tools``: cut, not refused."""
+    tool = protocol.validate_tool_detail(
+        {"name": "echo", "description": "d" * 5000, "inputs": {}}
+    )
+
+    assert len(tool.description) == 2000
+
+    (catalog_tool,) = protocol.validate_tools(
+        [{"name": "echo", "description": "d" * 5000}]
+    )
+    assert catalog_tool.description == tool.description
+
+
+def test_validate_mcp_tool_detail_accepts_the_entry_verbatim():
+    schema = {
+        "type": "object",
+        "oneOf": [{"properties": {"action": {"const": "list_actions"}}}],
+    }
+
+    detail = protocol.validate_mcp_tool_detail(
+        {
+            "name": "tenant_account_tools",
+            "description": "manage tenants",
+            "inputSchema": schema,
+        }
+    )
+
+    assert detail == {
+        "name": "tenant_account_tools",
+        "description": "manage tenants",
+        "inputSchema": schema,
+    }
+    assert detail["inputSchema"] is schema
+
+
+def test_validate_mcp_tool_detail_requires_the_schema():
+    with pytest.raises(protocol.ProtocolError) as exc:
+        protocol.validate_mcp_tool_detail(
+            {"name": "tenant_account_tools", "description": "d"}
+        )
+
+    assert "must carry inputSchema" in str(exc.value)
+
+
+def test_validate_mcp_tool_detail_enforces_the_schema_size_cap():
+    schema = {"type": "object", "description": "x" * protocol.MAX_MCP_SCHEMA_BYTES}
+
+    with pytest.raises(protocol.ProtocolError) as exc:
+        protocol.validate_mcp_tool_detail(
+            {"name": "tenant_account_tools", "description": "d", "inputSchema": schema}
+        )
+
+    assert f"exceeds {protocol.MAX_MCP_SCHEMA_BYTES} bytes" in str(exc.value)
+
+
+def test_result_carries_a_detail_object_through():
+    detail = {
+        "name": "boiler_status",
+        "description": "Read the boiler status.",
+        "inputs": {"q": {"type": "string"}},
+    }
+
+    parsed = protocol.validate_result(
+        {"t": "result", "id": "d1", "ok": True, "result": None, "detail": detail}
+    )
+
+    assert parsed == {"id": "d1", "ok": True, "result": None, "detail": detail}
+    assert parsed["detail"] is detail
+
+
+def test_result_rejects_a_non_object_detail():
+    with pytest.raises(protocol.ProtocolError) as exc:
+        protocol.validate_result(
+            {"id": "d1", "ok": True, "detail": ["not", "an", "object"]}
+        )
+
+    assert "result.detail must be an object" in str(exc.value)
+
+
+def test_result_without_detail_is_unchanged():
+    assert protocol.validate_result({"id": "d1", "ok": True, "result": {}}) == {
+        "id": "d1",
+        "ok": True,
+        "result": {},
+    }
+
+
+@pytest.mark.parametrize("frame_type", ["tool_detail", "mcp_tool_detail"])
+def test_relay_only_detail_frames_are_not_edge_frames(frame_type):
+    """The relay asks; the edge answers with an ordinary validated ``result``."""
+    assert frame_type in protocol.RELAY_FRAMES
+    assert frame_type not in protocol.EDGE_FRAMES
+
+    raw = protocol.encode({"t": frame_type, "id": "d1", "tool": "echo"})
+    with pytest.raises(protocol.ProtocolError) as exc:
+        protocol.decode(raw, protocol.EDGE_FRAMES)
+
+    assert exc.value.close_code == protocol.CLOSE_UNKNOWN_TYPE

@@ -1149,7 +1149,8 @@ def _register_admin_tools(agent: Agent):
             "source}. Use this to pick a tool name and its parameter schema, then call "
             "use_tool(tool_name, arguments) to execute it directly — no agent hop needed. "
             "Tools with configured=false are missing credentials — do not call use_tool "
-            "on them; tell the user which credentials are missing instead. "
+            "on them; tell the user which credentials are missing instead. A card with "
+            "detail='lazy' has no parameters yet — call describe_tool for its schema. "
             "Does not return the full catalog — search with a focused query."
         ),
     )
@@ -1162,6 +1163,20 @@ def _register_admin_tools(agent: Agent):
             user_id=user_id,
             principal=_current_authz_principal(),
         )
+
+    @agent.tool_plain(
+        name="describe_tool",
+        description=(
+            "Return the full schema (parameters and description) for exactly one tool. "
+            "Use after search_tools when a card is summary-only (detail: 'lazy') or when "
+            "the schema is needed without ranking. Takes the same name forms as use_tool "
+            "and never executes the tool."
+        ),
+    )
+    async def describe_tool(tool_name: str) -> Dict[str, Any]:
+        from core.tool_search import describe_tool_entry
+
+        return await describe_tool_entry(tool_name, user_id_var.get())
 
     @agent.tool_plain(
         name="use_tool",

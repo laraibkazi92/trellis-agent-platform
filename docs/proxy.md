@@ -503,7 +503,8 @@ backend. See [deploy.md → Sandbox settings and rollback](deploy.md#sandbox-set
 
 `v0.5.0` bumps the edge/relay protocol to `proto: 2`. The handshake stays strict:
 
-- The hello frame gains `caps` (`["tools"]` or `["tools", "mcp"]`) and `mcps` (the
+- The hello frame gains `caps` (`["tools"]`, `["tools", "mcp"]`, plus `lazy_catalog` when
+  `lazy_catalog: true` is set) and `mcps` (the
   catalogs). A proto-1 hello has neither and is read as tools-only.
 - Calls carry `kind: "tool" | "mcp"` (absent means `"tool"`, so v0.4 frames are
   unchanged), plus `mcp` for MCP calls and the optional `user_email`.
@@ -513,6 +514,10 @@ backend. See [deploy.md → Sandbox settings and rollback](deploy.md#sandbox-set
   (60 s, jittered), so it never reads as a generic disconnect.
   The reverse — a v0.4 edge against a v0.5 relay — is fully supported: its tools work
   unchanged and MCP calls to it answer `404` ("edge does not export MCPs").
+- **`lazy_catalog` needs a v0.7 relay.** The capability is opt-in; an older relay rejects
+  the unknown cap at handshake (`CLOSE_MALFORMED`), so leave `lazy_catalog: false` until
+  central is upgraded. There is no automatic downgrade-republish: flip the flag off on
+  the edge if you must roll back before upgrading central.
 
 
 ## Failure semantics

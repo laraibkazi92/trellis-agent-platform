@@ -167,6 +167,10 @@ class ProxyConfig:
     tls_ca_file: Optional[str] = None
     tls_cert_file: Optional[str] = None
     tls_key_file: Optional[str] = None
+    # Publish summaries (no tool ``inputs``, no MCP ``inputSchema``) and answer the
+    # relay's ``tool_detail`` / ``mcp_tool_detail`` reads from the local catalog.
+    # A big catalog otherwise costs the relay a multi-hundred-KB hello every reconnect.
+    lazy_catalog: bool = False
 
 
 # ---------------------------------------------------------------- configuration
@@ -352,6 +356,7 @@ def load_config(path: str | Path | None = None) -> ProxyConfig:
         )
 
     env_passthrough = _env_passthrough(_flag(raw.get("env_passthrough"), "env_passthrough"))
+    lazy_catalog = _flag(raw.get("lazy_catalog"), "lazy_catalog")
 
     token_env = str(raw.get("token_env") or DEFAULT_TOKEN_ENV).strip() or DEFAULT_TOKEN_ENV
     token_file = os.getenv("TRELLIS_EDGE_TOKEN_FILE") or raw.get("token_file")
@@ -404,6 +409,7 @@ def load_config(path: str | Path | None = None) -> ProxyConfig:
         tls_ca_file=str(tls_ca_file) if tls_ca_file else None,
         tls_cert_file=str(tls_cert_file) if tls_cert_file else None,
         tls_key_file=str(tls_key_file) if tls_key_file else None,
+        lazy_catalog=lazy_catalog,
     )
 
 
@@ -716,6 +722,28 @@ def _edge_tool(config: ToolConfig) -> protocol.EdgeTool:
     return protocol.validate_tools([_catalog_entry(config)])[0]
 
 
+def _hello_tool_entry(config: ToolConfig, *, lazy_catalog: bool) -> Dict[str, Any]:
+    """One ``hello.tools`` entry: full schema, or the summary a lazy catalog sends."""
+    tool = _edge_tool(config)
+    if not lazy_catalog:
+        return tool.as_dict()
+    return {
+        "name": tool.name,
+        "description": tool.description[: protocol.MAX_TOOL_SUMMARY_CHARS],
+    }
+
+
+def _hello_mcp_entry(
+    catalog: protocol.EdgeMcp, *, lazy_catalog: bool
+) -> Dict[str, Any]:
+    """One ``hello.mcps`` entry; a lazy catalog drops every ``inputSchema``."""
+    entry = catalog.as_dict()
+    if lazy_catalog:
+        for tool in entry["tools"]:
+            tool.pop("inputSchema", None)
+    return entry
+
+
 def _credential_key_lists(config: Any) -> Dict[str, List[str]]:
     """The names a manifest exposes to the browser's seal form.
 
@@ -756,6 +784,7 @@ def hello_frame(
     mcp_entries: Optional[Mapping[str, Any]] = None,
     edge_key: Optional[EdgeKey] = None,
     prev_edge_key: Optional[EdgeKey] = None,
+    lazy_catalog: bool = False,
 ) -> Dict[str, Any]:
     """The catalog frame. Entries go through the same cleaning the relay applies,
     so the schema the relay publishes is byte-for-byte what the edge validates
@@ -765,6 +794,12 @@ def hello_frame(
     and reads the frame as tools-only, while any MCP catalog makes it ``["tools","mcp"]``.
     MCP ``inputSchema`` payloads are carried verbatim (L6).
 
+    ``lazy_catalog`` publishes summaries instead: no tool ``inputs``, a description
+    cut to ``MAX_TOOL_SUMMARY_CHARS``, and no MCP ``inputSchema``. The relay then
+    fetches each entry with a ``tool_detail`` / ``mcp_tool_detail`` read, which this
+    edge answers from the same catalog -- so the schema the agent sees is still the
+    cleaned one, just later and only for the tools actually used.
+
     ``edge_pubkey`` / ``edge_key_fp`` / ``prev_edge_key_fp`` are the public half of the
     key central seals per-user credentials to; the relay pins them in the site record
     so the browser form knows which key to encrypt to. They are omitted when this edge
@@ -773,17 +808,23 @@ def hello_frame(
     catalogs = mcp_catalogs or {}
     if edge_key is None and prev_edge_key is None:
         edge_key, prev_edge_key = _load_edge_keys()
+    caps = ["tools"]
+    if catalogs:
+        caps.append("mcp")
+    if lazy_catalog:
+        caps.append("lazy_catalog")
     frame: Dict[str, Any] = {
         "t": "hello",
         "proto": PROTO_VERSION,
         "edge_version": EDGE_VERSION,
-        "caps": ["tools", "mcp"] if catalogs else ["tools"],
+        "caps": caps,
         "tools": [
-            _edge_tool(config).as_dict()
+            _hello_tool_entry(config, lazy_catalog=lazy_catalog)
             for _, (config, _dir) in sorted(config_map.items())
         ],
         "mcps": [
-            catalog.as_dict() for _, catalog in sorted(catalogs.items())
+            _hello_mcp_entry(catalog, lazy_catalog=lazy_catalog)
+            for _, catalog in sorted(catalogs.items())
         ],
         "credential_keys": credential_keys(config_map, mcp_entries),
     }
@@ -801,6 +842,7 @@ def _fit_hello_budget(
     mcp_entries: Optional[Mapping[str, Any]] = None,
     edge_key: Optional[EdgeKey] = None,
     prev_edge_key: Optional[EdgeKey] = None,
+    lazy_catalog: bool = False,
 ) -> Dict[str, protocol.EdgeMcp]:
     """Drop MCP catalogs until the whole hello fits ``MAX_FRAME_BYTES`` (plan §2.3).
 
@@ -822,6 +864,7 @@ def _fit_hello_budget(
                     mcp_entries=mcp_entries,
                     edge_key=edge_key,
                     prev_edge_key=prev_edge_key,
+                    lazy_catalog=lazy_catalog,
                 )
             ).encode("utf-8")
         )
@@ -1324,6 +1367,9 @@ class _Session:
             # mcps_dir/export_mcps are live-reloadable: they only feed the next publish.
             mcps_dir=fresh.mcps_dir,
             export_mcps=fresh.export_mcps,
+            # Publishing policy too: the SIGHUP path republishes the hello, so a
+            # switch to lazy summaries applies without a restart.
+            lazy_catalog=fresh.lazy_catalog,
         )
         new_tools = load_tools(candidate.tools_dir, candidate.exports)
         self.config = candidate
@@ -1418,6 +1464,7 @@ class _Session:
             mcp_entries=entries,
             edge_key=self.edge_key,
             prev_edge_key=self.prev_edge_key,
+            lazy_catalog=self.config.lazy_catalog,
         )
         self.mcp.set_entries(entries, self.mcp_catalogs)
         # A SIGHUP is the operator's escape hatch for credentials: sessions resolve
@@ -1667,6 +1714,49 @@ def _terminal_close_message(close_code: int, site: str) -> str:
     )
 
 
+def _detail_frame(frame: Dict[str, Any], session: "_Session") -> Dict[str, Any]:
+    """Answer a ``tool_detail`` / ``mcp_tool_detail`` frame from the local catalog.
+
+    A pure local read: no inflight slot, no runner, no MCP session. The payload is
+    the full entry the hello summary left out, and the relay re-validates it with
+    ``protocol.validate_tool_detail`` / ``validate_mcp_tool_detail``.
+    """
+    started = time.monotonic()
+    frame_id = frame.get("id") if isinstance(frame.get("id"), str) else ""
+    if frame.get("t") == "tool_detail":
+        found = session.tools.get(frame.get("tool"))
+        if found is None:
+            return _result_frame(
+                frame_id,
+                _elapsed_ms(started),
+                error=("unknown_tool", f"unknown tool: {frame.get('tool')!r}"),
+            )
+        reply = _result_frame(frame_id, _elapsed_ms(started))
+        reply["detail"] = _catalog_entry(found[0])
+        return reply
+
+    catalog = session.mcp_catalogs.get(frame.get("mcp"))
+    if catalog is None:
+        return _result_frame(
+            frame_id,
+            _elapsed_ms(started),
+            error=("unknown_mcp", f"unknown mcp server: {frame.get('mcp')!r}"),
+        )
+    tool = next((t for t in catalog.tools if t.name == frame.get("tool")), None)
+    if tool is None:
+        return _result_frame(
+            frame_id,
+            _elapsed_ms(started),
+            error=(
+                "unknown_tool",
+                f"unknown mcp tool: {frame.get('mcp')!r}/{frame.get('tool')!r}",
+            ),
+        )
+    reply = _result_frame(frame_id, _elapsed_ms(started))
+    reply["detail"] = tool.as_dict()
+    return reply
+
+
 async def _serve(session: _Session, ws) -> None:
     """Handshake, then pump frames until the connection closes."""
     await ws.send(
@@ -1677,6 +1767,7 @@ async def _serve(session: _Session, ws) -> None:
                 mcp_entries=session.mcps,
                 edge_key=session.edge_key,
                 prev_edge_key=session.prev_edge_key,
+                lazy_catalog=session.config.lazy_catalog,
             )
         )
     )
@@ -1765,6 +1856,22 @@ async def _serve(session: _Session, ws) -> None:
                 session.reconnect.set()
                 await ws.close(code=1000, reason="drain")
                 return
+
+            if frame_type in ("tool_detail", "mcp_tool_detail"):
+                # A lazy-catalog read, answered inline from memory: no inflight
+                # slot is taken (nothing executes) and a bad lookup replies with an
+                # error frame rather than closing the tunnel.
+                try:
+                    detail_reply = _detail_frame(frame, session)
+                except Exception:
+                    logger.exception("Failed to answer a %s frame", frame_type)
+                    detail_reply = _result_frame(
+                        frame.get("id") if isinstance(frame.get("id"), str) else "",
+                        0,
+                        error=("edge_error", "edge could not read the catalog entry"),
+                    )
+                await ws.send(protocol.encode(detail_reply))
+                continue
 
             # Only "call" is left: the closed set was validated by decode().
             if inflight.locked():

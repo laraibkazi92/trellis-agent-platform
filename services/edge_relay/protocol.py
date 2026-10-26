@@ -48,6 +48,11 @@ MAX_FRAME_BYTES = 10 * 1024 * 1024
 MAX_ARGS_BYTES = 1 * 1024 * 1024
 MAX_TOOLS = 200
 MAX_TOOL_NAME = 64
+# A lazy-catalog hello carries a short summary per tool: the full input schema is
+# fetched later with a ``tool_detail`` round trip. A longer summary is refused
+# rather than silently shortened, so the edge and the registry agree on what was
+# published.
+MAX_TOOL_SUMMARY_CHARS = 120
 MAX_INFLIGHT = 16
 MAX_DEADLINE_MS = 3_600_000
 # MCP catalogs ride the same hello frame, so every cap here is also bounded by
@@ -75,7 +80,12 @@ EDGE_FRAMES = frozenset({"hello", "result", "ping"})
 # `drain` is sent on relay shutdown (best effort: uvicorn may close first) so edges
 # reconnect promptly instead of waiting out their backoff. `catalog` is RESERVED (force a republish without reconnecting):
 # accepted and handled, but no sender emits it yet -- do not build runbooks on it.
-RELAY_FRAMES = frozenset({"welcome", "call", "ping", "catalog", "drain"})
+# `tool_detail` / `mcp_tool_detail` are lazy-catalog reads: the edge answers them with
+# an ordinary `result` frame whose payload is a validated `detail` object, so they ride
+# the same id correlation as a call (``EdgeConn.inflight``).
+RELAY_FRAMES = frozenset(
+    {"welcome", "call", "ping", "catalog", "drain", "tool_detail", "mcp_tool_detail"}
+)
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -91,7 +101,9 @@ MAX_ENV_NAME_CHARS = 128
 EDGE_KEY_BITS = 3072
 
 # hello.caps: what the edge can serve. Tools-only is the v0.4 default.
-SUPPORTED_CAPS = frozenset({"tools", "mcp"})
+# `lazy_catalog` means the hello carries summaries only (no tool `inputs`, no MCP
+# `inputSchema`); the relay must then ask for each entry before calling it.
+SUPPORTED_CAPS = frozenset({"tools", "mcp", "lazy_catalog"})
 # mcp.yaml transports the relay is willing to store; the edge owns the actual client.
 SUPPORTED_MCP_TRANSPORTS = frozenset({"stdio", "http", "streamable-http", "sse"})
 
@@ -379,8 +391,14 @@ def _validate_inputs(raw: Any) -> Dict[str, Any]:
     return cleaned
 
 
-def validate_tools(raw_tools: Any) -> List[EdgeTool]:
-    """Validate a published catalog. Names must be unique and namespace-safe."""
+def validate_tools(raw_tools: Any, *, lazy_catalog: bool = False) -> List[EdgeTool]:
+    """Validate a published catalog. Names must be unique and namespace-safe.
+
+    With the ``lazy_catalog`` capability an entry is a *summary*: ``inputs`` is
+    deferred to a ``tool_detail`` round trip, and the description is capped at
+    ``MAX_TOOL_SUMMARY_CHARS`` (refused, not truncated -- a hello that silently
+    lost half of a description would publish a catalog the operator never wrote).
+    """
     if raw_tools in (None, []):
         return []
     if not isinstance(raw_tools, list):
@@ -403,14 +421,48 @@ def validate_tools(raw_tools: Any) -> List[EdgeTool]:
         description = raw.get("description") or ""
         if not isinstance(description, str):
             raise ProtocolError(f"tool {name!r} description must be a string")
+        if lazy_catalog and len(description) > MAX_TOOL_SUMMARY_CHARS:
+            raise ProtocolError(
+                f"tool {name!r} description is {len(description)} chars; a "
+                f"lazy_catalog hello carries at most {MAX_TOOL_SUMMARY_CHARS} "
+                "per tool"
+            )
+        if not lazy_catalog:
+            description = description[:2000]
         tools.append(
             EdgeTool(
                 name=name,
-                description=description[:2000],
+                description=description,
                 inputs=_validate_inputs(raw.get("inputs")),
             )
         )
     return tools
+
+
+def validate_tool_detail(entry: Dict[str, Any]) -> EdgeTool:
+    """Validate one full tool entry -- the ``tool_detail`` reply payload.
+
+    This is the strict counterpart of a ``lazy_catalog`` hello entry: the summary
+    omitted ``inputs``, so the detail must carry them. Names are checked exactly as
+    in ``validate_tools`` (same regex, same ``__`` ban) and the description is
+    truncated to the catalog limit rather than refused: a too-long detail is a cost,
+    not an ambiguity.
+    """
+    if not isinstance(entry, dict):
+        raise ProtocolError("tool detail must be an object")
+    name = entry.get("name")
+    if not isinstance(name, str) or not NAME_RE.match(name):
+        raise ProtocolError(f"invalid tool name: {name!r}")
+    _check_namespace(name, "tool name")
+    if not isinstance(entry.get("description"), str):
+        raise ProtocolError(f"tool {name!r} detail must carry a string description")
+    if "inputs" not in entry:
+        raise ProtocolError(f"tool {name!r} detail must carry inputs")
+    return EdgeTool(
+        name=name,
+        description=entry["description"][:2000],
+        inputs=_validate_inputs(entry.get("inputs")),
+    )
 
 
 @dataclass(frozen=True)
@@ -508,6 +560,33 @@ def _validate_mcp_tools(server: str, raw_tools: Any) -> List[EdgeMcpTool]:
     return tools
 
 
+def validate_mcp_tool_detail(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate one full MCP tool entry -- the ``mcp_tool_detail`` reply payload.
+
+    Returns the entry as a plain dict (``name``/``description``/``inputSchema``)
+    because an MCP schema must stay byte-identical to what the server published:
+    rebuilding it into ``EdgeMcpTool`` would be no different, but a dict is what the
+    relay has to hand to the registry anyway. ``inputSchema`` goes through the same
+    ``MAX_MCP_SCHEMA_BYTES`` check as the catalog, so a detail cannot smuggle in a
+    schema a hello would have refused.
+    """
+    if not isinstance(entry, dict):
+        raise ProtocolError("mcp tool detail must be an object")
+    name = entry.get("name")
+    if not isinstance(name, str) or not NAME_RE.match(name):
+        raise ProtocolError(f"invalid mcp tool name: {name!r}")
+    _check_namespace(name, "mcp tool name")
+    if not isinstance(entry.get("description"), str):
+        raise ProtocolError(f"mcp tool {name!r} detail must carry a description")
+    if "inputSchema" not in entry:
+        raise ProtocolError(f"mcp tool {name!r} detail must carry inputSchema")
+    return {
+        "name": name,
+        "description": entry["description"][:MAX_MCP_DESC_CHARS],
+        "inputSchema": _validate_mcp_schema(name, entry.get("inputSchema")),
+    }
+
+
 def validate_mcps(raw_mcps: Any) -> List[EdgeMcp]:
     """Validate an edge's MCP catalog. Names must be unique and namespace-safe."""
     if raw_mcps in (None, []):
@@ -577,6 +656,12 @@ def validate_hello(
     block is optional (a v0.5 edge has none), but when present it is fully checked --
     an unparsable SPKI, a non-3072-bit key or a fingerprint that does not match the
     key closes the connection rather than pinning bad material in the registry.
+
+    A ``lazy_catalog`` edge publishes summaries: tool entries carry no ``inputs``
+    (and at most ``MAX_TOOL_SUMMARY_CHARS`` of description), MCP tool entries carry
+    no ``inputSchema``. Both omissions are legal in a full hello too -- an MCP
+    server with no declared schema publishes ``{}`` -- so the cap only tightens the
+    tool description. Without the cap the frame is validated exactly as before.
     """
     proto = frame.get("proto")
     # bool is an int subclass: a JSON ``true`` must not read as proto 1.
@@ -601,7 +686,7 @@ def validate_hello(
     return HelloValidation(
         proto,
         version[:64],
-        validate_tools(frame.get("tools")),
+        validate_tools(frame.get("tools"), lazy_catalog="lazy_catalog" in caps),
         mcps,
         caps,
         _validate_edge_credentials(frame),
@@ -711,7 +796,19 @@ def validate_result(frame: Dict[str, Any]) -> Dict[str, Any]:
         raise ProtocolError("result.ok must be a boolean")
 
     if ok:
-        return {"id": call_id, "ok": True, "result": frame.get("result")}
+        result: Dict[str, Any] = {
+            "id": call_id,
+            "ok": True,
+            "result": frame.get("result"),
+        }
+        if "detail" in frame:
+            # The lazy-catalog reply. Only the shape is checked here; the caller
+            # validates the entry with validate_tool_detail / validate_mcp_tool_detail.
+            detail = frame["detail"]
+            if not isinstance(detail, dict):
+                raise ProtocolError("result.detail must be an object")
+            result["detail"] = detail
+        return result
 
     error = frame.get("error")
     if not isinstance(error, dict):

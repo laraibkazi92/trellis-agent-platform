@@ -28,7 +28,11 @@ from core.agent_token import mint_for_run
 from core.devmode import configure_cors, enforce_dev_mode_safety
 from core.discovery import discover_agents, is_agent_configured, is_tool_configured
 from core.agent_search import search_agents as _search_agents_ranked
-from core.tool_search import search_tools as _search_tools_ranked, execute_whitelisted_tool
+from core.tool_search import (
+    describe_tool_entry,
+    search_tools as _search_tools_ranked,
+    execute_whitelisted_tool,
+)
 from core.agent_factory import get_hub_client, get_external_mcp_client
 from core.remote_mcp import call_edge_mcp
 from core.models import is_agent_external, is_routable_agent_type
@@ -525,9 +529,11 @@ async def search_tools(ctx: Context, query: str, limit: Optional[int] = None) ->
     it directly, with no intermediate agent hop.
 
     Returns a short, ranked list of Tool Cards: `{name, description, parameters,
-    configured, status, source}`. Unconfigured tools are included with `configured:
-    false` and a note in their description listing the missing secrets/variables. Only
-    call `use_tool` on tools where `configured` is true.
+    configured, status, source}`. A card carrying `detail: "lazy"` (with an empty
+    `parameters` map) is an edge tool that published only a summary — call
+    `describe_tool` for its real schema before `use_tool`. Unconfigured tools are
+    included with `configured: false` and a note in their description listing the
+    missing secrets/variables. Only call `use_tool` on tools where `configured` is true.
 
     Args:
         query: Natural-language description of the command or lookup to find a tool for.
@@ -546,6 +552,29 @@ async def search_tools(ctx: Context, query: str, limit: Optional[int] = None) ->
     names = [r["name"] for r in results]
     await ctx.report_progress(1, 1, message=f"Found {len(results)} tool(s): {', '.join(names) if names else 'none'}")
     return results
+
+
+@mcp.tool(
+    title="Describe Tool",
+    annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True),
+)
+async def describe_tool(ctx: Context, tool_name: str) -> Dict:
+    """Return the full schema (parameters, description) for exactly one tool.
+
+    Use this after `search_tools` when a card is summary-only (`detail: "lazy"`) or when
+    the schema is needed without ranking. Takes the same name forms as `use_tool`:
+    a local name, a central MCP tool's `mcp__{server}__{name}`, or an edge tool's
+    `<site>__{tool}` / `mcp__{site}__{mcp}__{name}` form. Never executes the tool.
+
+    Returns `{name, description, parameters, source, detail}`, or `{name, unavailable:
+    true, reason}` when the tool is unknown or an edge could not answer.
+
+    Args:
+        tool_name: Exact name of the tool to describe, as returned by `search_tools`.
+    """
+    result = await describe_tool_entry(tool_name, user_id_var.get())
+    await ctx.report_progress(1, 1, message=f"Described tool: {tool_name}")
+    return result
 
 
 @mcp.tool(

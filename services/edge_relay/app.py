@@ -67,6 +67,14 @@ _configure_logging()
 RATE_LIMIT_PER_MIN = normalise_rate(os.getenv("EDGE_RATE_LIMIT_PER_MIN", "120"))
 limiter = SiteLimiter(RATE_LIMIT_PER_MIN)
 
+# A lazy-catalog detail read is a manifest lookup on an edge that is already connected:
+# generous, but nowhere near a tool call's 330 s default, so a hung edge cannot pin the
+# hub's schema lookup.
+DETAIL_DEADLINE_MS = 20_000
+# Detail reads are metadata only: a small, separate budget keeps a burst of schema
+# lookups from consuming the call path's inflight slots.
+DETAIL_MAX_INFLIGHT = 4
+
 
 class EdgeOffline(Exception):
     """No live connection for the site."""
@@ -90,6 +98,15 @@ class EdgeTimeout(Exception):
 
 class EdgeDisconnected(Exception):
     """The socket went away while the call was pending."""
+
+
+class EdgeDetailError(Exception):
+    """The edge answered a lazy-catalog detail request with an error result."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 def _consume_exception(future: "asyncio.Future[Any]") -> None:
@@ -117,6 +134,7 @@ class EdgeConn:
         self.mcps: Dict[str, EdgeMcp] = dict(mcps or {})
         self.caps: List[str] = ["tools"] if caps is None else list(caps)
         self.inflight: Dict[str, "asyncio.Future[Any]"] = {}
+        self.detail_sem = asyncio.Semaphore(DETAIL_MAX_INFLIGHT)
         self.closed = False
         # What the edge claimed at handshake; echoed back in the site status.
         self.proto: Optional[int] = None
@@ -183,6 +201,83 @@ class EdgeConn:
         frame["mcp"] = mcp
         return await self._forward(frame, tool, mcp=mcp)
 
+    async def request_tool_detail(self, tool: str) -> Dict[str, Any]:
+        """Ask the edge for one tool's full detail (lazy catalog).
+
+        The tool must be in this connection's published catalog: an edge is never asked
+        about a name it did not announce. A refusal arrives as an error result and
+        becomes ``EdgeDetailError`` rather than a relay-side 404 -- the edge owns the
+        authority over its own catalog, exactly as on an MCP call.
+        """
+        if self.closed:
+            raise EdgeDisconnected(f"edge '{self.site}' is closed")
+        if "lazy_catalog" not in self.caps:
+            raise EdgeDetailError(
+                "detail_unsupported",
+                f"edge '{self.site}' does not support lazy catalogs",
+            )
+        if tool not in self.tools:
+            raise EdgeUnknownTool(f"tool '{tool}' is not exported by edge '{self.site}'")
+        frame = {"t": "tool_detail", "id": uuid.uuid4().hex, "tool": tool}
+        detail = await self._request_detail(frame, tool)
+        # The hello carried a summary: keep the live catalog in sync with the fetched
+        # schema, or the very next call is rejected by args_for_tool for not knowing
+        # the real arguments.
+        try:
+            self.tools[tool] = protocol.validate_tool_detail(detail)
+        except ProtocolError as exc:
+            raise EdgeDetailError("detail_invalid", str(exc)) from exc
+        return detail
+
+    async def request_mcp_tool_detail(self, mcp: str, tool: str) -> Dict[str, Any]:
+        """Ask the edge for one MCP tool's full entry (schema included)."""
+        if self.closed:
+            raise EdgeDisconnected(f"edge '{self.site}' is closed")
+        if "lazy_catalog" not in self.caps:
+            raise EdgeDetailError(
+                "detail_unsupported",
+                f"edge '{self.site}' does not support lazy catalogs",
+            )
+        if mcp not in self.mcps:
+            raise EdgeUnknownMcp(f"mcp '{mcp}' is not exported by edge '{self.site}'")
+        frame = {
+            "t": "mcp_tool_detail",
+            "id": uuid.uuid4().hex,
+            "mcp": mcp,
+            "tool": tool,
+        }
+        return await self._request_detail(frame, tool, mcp=mcp)
+
+    async def _request_detail(
+        self, frame: Dict[str, Any], tool: str, mcp: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Send one detail frame and return its ``detail`` payload.
+
+        It rides the ordinary result correlation (``inflight[id] -> Future``), so the
+        receive loop needs no branch for it. The local deadline is deliberately much
+        shorter than a call's: reading a manifest on a healthy edge is immediate, and a
+        hung edge must not pin the hub's schema lookup for five minutes.
+        """
+        async with self.detail_sem:
+            payload = await self._forward(
+                frame, tool, mcp=mcp, deadline_ms=DETAIL_DEADLINE_MS
+            )
+        if not payload.get("ok"):
+            error = payload.get("error") or {}
+            raise EdgeDetailError(
+                str(error.get("code") or "detail_failed"),
+                str(error.get("message") or f"edge '{self.site}' refused the detail read"),
+            )
+        detail = payload.get("detail")
+        if not isinstance(detail, dict):
+            # Only reachable if the peer answers without the validated `detail` object
+            # (an old edge that accepted an unknown frame type); refuse to cache it.
+            raise EdgeDetailError(
+                "detail_missing",
+                f"edge '{self.site}' answered without a detail object",
+            )
+        return detail
+
     def _call_frame(
         self,
         tool: str,
@@ -216,17 +311,22 @@ class EdgeConn:
         return frame
 
     async def _forward(
-        self, frame: Dict[str, Any], tool: str, mcp: Optional[str] = None
+        self,
+        frame: Dict[str, Any],
+        tool: str,
+        mcp: Optional[str] = None,
+        deadline_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Send a call frame and await its result.
+        """Send a frame and await its result.
 
         The deadline is read back from the frame (``_call_frame`` already clamped it)
-        so the local timer and the edge's cannot disagree.
+        so the local timer and the edge's cannot disagree. A caller that has no wire
+        deadline (a detail read) passes its local bound instead.
         """
         if len(self.inflight) >= MAX_INFLIGHT:
             raise EdgeOverloaded(f"edge '{self.site}' is at {MAX_INFLIGHT} in-flight calls")
 
-        timeout_ms = frame["deadline_ms"]
+        timeout_ms = deadline_ms or frame.get("deadline_ms") or DEFAULT_DEADLINE_MS
         call_id = frame["id"]
         future: "asyncio.Future[Any]" = asyncio.get_running_loop().create_future()
         future.add_done_callback(_consume_exception)
@@ -428,8 +528,13 @@ def _publish_catalogs(
     different things: an admin narrowing ``exports`` to nothing is intent for tools,
     while nothing on the site record filters MCPs -- an empty MCP catalog from a
     connected edge is always a suspected edge-side misconfiguration.
+
+    ``lazy_catalog`` is derived once from the advertised caps and passed to both
+    halves, so the tool and MCP records of one handshake always agree about whether
+    their detail is complete.
     """
     mgr = _identity_manager()
+    lazy_catalog = "lazy_catalog" in (caps or [])
     published = registry.publish_catalog(
         mgr,
         site,
@@ -439,6 +544,7 @@ def _publish_catalogs(
         mcps=mcps,
         proto=proto,
         caps=caps,
+        lazy_catalog=lazy_catalog,
     )
     published_mcps = registry.publish_mcp_catalog(
         mgr,
@@ -448,6 +554,7 @@ def _publish_catalogs(
         allow_empty=allow_empty_mcps,
         proto=proto,
         caps=caps,
+        lazy_catalog=lazy_catalog,
     )
     return published, published_mcps
 
@@ -569,6 +676,19 @@ async def _authorize_agent(
 
 class McpCallBody(CallBody):
     """Same shape as ``CallBody``; the MCP name rides the path, not the body."""
+
+
+class ToolDetailBody(BaseModel):
+    """A lazy-catalog read: which exported tool's full detail is wanted."""
+
+    tool: str
+
+
+class McpToolDetailBody(BaseModel):
+    """The MCP half of the same read; the server name rides the body."""
+
+    mcp: str
+    tool: str
 
 
 def _catalog_signature(config: Dict[str, Any], mcps: Any = ()) -> tuple:
@@ -921,7 +1041,12 @@ async def call_site_tool(site: str, body: CallBody) -> JSONResponse:
         return _error(400, "invalid_arguments", str(exc))
 
     try:
-        args = protocol.args_for_tool(tool, body.args)
+        if "lazy_catalog" in conn.caps and not tool.inputs:
+            # The published schema is a summary; the edge validates the real manifest
+            # itself, so unknown-key rejection here would make the tool uncallable.
+            args = body.args
+        else:
+            args = protocol.args_for_tool(tool, body.args)
     except ProtocolError as exc:
         audit_call("invalid_arguments")
         return _error(400, "invalid_arguments", str(exc))
@@ -1088,6 +1213,124 @@ async def call_site_mcp(site: str, mcp: str, body: McpCallBody) -> JSONResponse:
         status_code=200,
         content={"tool": body.tool, "result": payload.get("result")},
     )
+
+
+def _detail_outcome(exc: Exception) -> str:
+    """The error code for one failed detail read (never the exception text)."""
+    if isinstance(exc, EdgeOffline):
+        return "edge_offline"
+    if isinstance(exc, EdgeTimeout):
+        return "edge_timeout"
+    if isinstance(exc, EdgeDisconnected):
+        return "edge_disconnected"
+    if isinstance(exc, EdgeOverloaded):
+        return "edge_overloaded"
+    if isinstance(exc, EdgeUnknownTool):
+        return "unknown_tool"
+    if isinstance(exc, EdgeUnknownMcp):
+        return "unknown_mcp"
+    if isinstance(exc, EdgeDetailError):
+        return exc.code or "detail_failed"
+    return "edge_error"
+
+
+async def _serve_detail(
+    site: str, tool: str, *, mcp: Optional[str] = None
+) -> JSONResponse:
+    """Cache first, edge second: the body shared by both detail endpoints.
+
+    A live edge is asked and the answer is cached in the tool's own registry record; a
+    cached record is served without touching the edge, which is what keeps a schema read
+    working while the edge is briefly offline. ``requester`` raising means the edge
+    could not answer, and ``registry.fetch_tool_detail`` turns that into a payload --
+    this route never propagates an edge failure as an exception.
+    """
+    started = time.monotonic()
+    # Only the outcome of a failed read is recorded here; the payload (a schema) must
+    # never reach an audit line.
+    failure: Dict[str, str] = {}
+
+    def audit_detail(outcome: str) -> None:
+        audit.record(
+            "detail",
+            site=site,
+            tool=tool,
+            mcp=mcp,
+            outcome=outcome,
+            ms=int((time.monotonic() - started) * 1000),
+        )
+
+    try:
+        # The names become registry key segments, so they get the same rules a hello
+        # applies: a crafted site/tool/mcp must not read another record.
+        protocol.validate_site_name(site)
+        for label, value in (("tool", tool), ("mcp", mcp)):
+            if value is None:
+                continue
+            if "__" in value or not protocol.NAME_RE.fullmatch(value):
+                raise ProtocolError(f"invalid {label} name: {value!r}")
+    except ProtocolError as exc:
+        audit_detail("invalid_request")
+        return _error(400, "invalid_request", str(exc))
+
+    conn = relay.get(site)
+
+    async def requester(mcp_name: Optional[str], tool_name: str) -> Dict[str, Any]:
+        try:
+            if conn is None:
+                raise EdgeOffline(f"edge '{site}' is not connected")
+            if mcp_name is None:
+                return await conn.request_tool_detail(tool_name)
+            return await conn.request_mcp_tool_detail(mcp_name, tool_name)
+        except Exception as exc:
+            failure["outcome"] = _detail_outcome(exc)
+            raise
+
+    result = await registry.fetch_tool_detail(
+        _identity_manager(), site, tool, requester, mcp=mcp
+    )
+    if result.get("unavailable"):
+        outcome = failure.get("outcome") or "unavailable"
+        audit_detail(outcome)
+        status = 404 if outcome in ("unknown_tool", "unknown_mcp") else 503
+        return _error(
+            status,
+            outcome,
+            str(result.get("reason") or "the edge could not provide this detail"),
+        )
+
+    audit_detail("ok")
+    content: Dict[str, Any] = {
+        "site": site,
+        "tool": tool,
+        "detail": result.get("detail") or {},
+        "description": result.get("description") or "",
+        "detail_state": result.get("detail_state") or "full",
+        "cached": bool(result.get("cached")),
+    }
+    if mcp is not None:
+        content["mcp"] = mcp
+    if result.get("stale"):
+        content["stale"] = True
+    return JSONResponse(status_code=200, content=content)
+
+
+@app.post("/v1/sites/{site}/tool_detail")
+async def get_site_tool_detail(site: str, body: ToolDetailBody) -> JSONResponse:
+    """Internal-only: the hub asks for one exported tool's full inputs.
+
+    Not an agent-token route: the answer is metadata about a tool the caller already
+    knows by name, and the caller is the hub/host on the internal network. It is wired
+    exactly like ``/call`` -- reachable only from inside the deployment, never through
+    the gateway.
+    """
+    return await _serve_detail(site, body.tool)
+
+
+@app.post("/v1/sites/{site}/mcp_tool_detail")
+async def get_site_mcp_tool_detail(site: str, body: McpToolDetailBody) -> JSONResponse:
+    """Internal-only: the hub asks for one MCP tool's full entry (schema included)."""
+    return await _serve_detail(site, body.tool, mcp=body.mcp)
 
 
 @app.get("/healthz")
