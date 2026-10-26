@@ -1092,6 +1092,220 @@ Changes to declare:
 
 ---
 
+### v0.7.0 — 2026-10-26
+
+Changes since `v0.6.1`: durable run history, LLM latency metrics, declarative
+guardrails, default-deny tool authorization, and lazy edge tool catalogs. The four new
+gates default to off (`tool_authz_mode`, `bound_tools_mode`, `hub_call_mode`,
+`lazy_catalog`), so nothing is enforced until an operator promotes it — but guardrails,
+orphan reaping and run-subtree pruning are **not** switched off, and they change behaviour
+on upgrade (see **Guardrails** and **Data migrations** below). The `TRELLIS_IMAGE` default
+moves to `v0.7.0`.
+
+#### Feature set
+
+- **Hash-chained run event log + live heartbeat.** Every workflow run (script and agent)
+  appends `run_enqueued`, `run_started`, `run_completed`, `run_failed`, `run_cancelled`,
+  `run_orphaned` and `run_retried` to `/runs/{agent}/{run_id}/events/{seq:08d}`, each entry
+  carrying the previous digest, with the chain head on the run record. A heartbeat key is
+  rewritten every 15 s while the run executes. The Workflows page shows a per-run timeline
+  with a `CHAIN OK` / `CHAIN BROKEN @ seq N` badge, served by
+  `GET /workflows/{agent}/runs/{run_id}/events`.
+- **Orphan reaper + bounded whole-run retry.** A scheduled task (`*/2 * * * *`) fails runs
+  that a dead worker left behind, and optionally re-enqueues them **whole** under a new
+  `run_id`. No mid-run resume and no checkpointing. Retries are opt-in per workflow
+  (`config.yaml → retries: {max_attempts, backoff_s}`, default `1` / `60 s`, i.e. no retry)
+  and apply **only** to runs the reaper orphaned — a run that failed for any other reason is
+  never retried. The retried prompt is the stored copy, truncated to 8 KiB. The staleness
+  windows are tunables: `REAPER_STALE_HEARTBEAT_S` (90), `REAPER_STALE_PENDING_S` (300),
+  `REAPER_STALE_PROCESSING_S` (3600).
+- **LLM latency metrics with provider rollups.** Each call records end-to-end latency (and
+  first-observable-event time when streaming) into `/metrics/agents/{agent}` and
+  `/metrics/providers/{provider}`; the LLM Providers page shows TTFT and total p50/p95 plus
+  an error rate, the Agents page a per-agent `p50 / p95 / err` line. Recording is
+  fire-and-forget — a metrics failure never breaks a response.
+- **Declarative regex guardrails (v1).** Per-agent and per-workflow `on_input` / `on_output`
+  rules, plus framework-wide defaults, with `block` and `redact` actions.
+- **Default-deny tool-boundary authorization, staged.** One policy document gates tool
+  discovery and invocation; rollout is per surface, `off → shadow → enforcing`.
+- **Lazy edge tool catalogs + `describe_tool`.** An edge can publish tool names and short
+  summaries only, with full schemas fetched on demand over the tunnel and cached centrally.
+
+#### Tool authorization: three switches, all `off`
+
+Admin → **Tool Authorization** (`/admin/tool-authz`). One policy document
+(`/registry/tool_policies`), one evaluator, one shared deny ring, three rollout switches.
+In every evaluating mode a call with **no matching rule is denied**.
+
+| Switch | etcd key | Gates |
+| --- | --- | --- |
+| **Mode** | `/config/framework/tool_authz_mode` | `use_tool` (gateway and supervisor/agent) and `search_tools` |
+| **Bound tools** | `/config/framework/bound_tools_mode` | tools an agent lists in `allowed_tools` / `allowed_mcps` |
+| **Direct hub calls** | `/config/framework/hub_call_mode` | every call the hub dispatches, local or to an edge |
+
+| Value | Behaviour |
+| --- | --- |
+| `off` (default; also what an absent key means) | No evaluation. Identical to `v0.6.1`. |
+| `shadow` | Evaluates and records would-be denials in the ring, still allows the call. |
+| `enforcing` | Denies unmatched calls; tools do not run. |
+
+**A fresh install does nothing until an operator promotes a switch.** All three keys are
+absent after the upgrade, which means `off`.
+
+- **Promote in this order: `use_tool` → bound tools → direct hub calls.** The last switch
+  sits on the hub's last mile, so it re-checks traffic the other two already let through;
+  promoting it to `enforcing` denies agent calls with no matching rule *regardless of* the
+  other two modes. Settle and soak the first two before touching it.
+- **`enforcing` needs a coverage pass first.** **Bootstrap** on the policy page generates
+  the initial document from the current public whitelist: one rule per public tool with
+  `allow_principals: ["*"]`, plus one rule per agent covering every tool it binds directly,
+  granted to `agent:<name>` / `workflow:<name>`. Bootstrap **replaces the whole document**,
+  so re-running it resets hand-written tightening. Before flipping a surface, run it in
+  `shadow` under real traffic and reconcile every entry in the deny table.
+- **A `*` (public) rule masks a missing per-agent rule**, so a deny probe must use a
+  non-public tool; probing with a public tool proves nothing. The table's `surface` column
+  tells you which switch recorded an entry, and all three share one 200-entry ring — soak
+  one surface at a time.
+- Denials keep the existing shapes: the `SYSTEM: Access denied…` string for agent-side
+  calls, `SYSTEM: Access denied. Tool '<name>' is not permitted for this principal.` as a
+  tool-error dict from the hub. Deny log lines carry the principal, tool, scope and mode —
+  never tool arguments.
+- **Rollback is immediate:** set the mode back to `shadow` (or `off`). The etcd watch
+  invalidates every process's cache without a restart.
+- A mode key holding an unrecognised value **fails closed to `enforcing`**, so a typo does
+  not silently disable a gate you already promoted. The one exception is a cold process
+  that has **never** read a policy: if that first read fails (etcd unreachable at startup)
+  the gate evaluates nothing and allows calls for ~5 s per process until a read succeeds,
+  so watch the deny log for the first minutes after a deploy.
+- **Scope:** console tools (`ls`, `read_file`, …), A2A/subagent delegation and admin tools
+  are framework capabilities, not hub tools, and stay outside the policy.
+
+#### `OIDC_GROUPS_CLAIM` and `group:` membership
+
+`OIDC_GROUPS_CLAIM` (optional, default `groups`) names the identity-provider claim that
+`group:` rules match. The OIDC callback reads it from the validated **ID token** and stores
+the result as `groups` on the user record — never in the session cookie. The claim may be a
+list or a **comma**-separated string; spaces are part of a name, never a separator (a group
+called `All Staff` stays one group).
+
+- **An absent or malformed claim means "no groups"**; it never fails a login. For OIDC the
+  claim must be present in the **ID token** — the framework does not call the userinfo
+  endpoint. Check **Your resolved groups** on the tool-authorization page after logging in.
+- The claim is **unioned with** `/config/framework/principal_groups`, a manual mapping that
+  can add a group but cannot revoke one the IdP asserted. Both are additive; an install that
+  sets neither behaves exactly as before.
+- **Groups refresh at login only**, and API-key traffic never re-authenticates through the
+  IdP — a user removed from a group at the IdP keeps the grant until their next login.
+- **Background runs have no request context** and resolve to `workflow:<name>`, which has no
+  stored user record: IdP groups never apply there. Only `/config/framework/principal_groups`
+  can grant a workflow a group.
+
+#### Guardrails (agents and workflows)
+
+`config.yaml` gains an optional block, identical for user agents, `background_agent` and
+`background_script` workflows:
+
+```yaml
+guardrails:
+  on_input:
+    - type: deny_patterns
+      name: no_secrets
+      patterns: ["AKIA[0-9A-Z]{16}"]
+      action: block          # block | redact
+  on_output:
+    - type: deny_patterns
+      name: pii_email
+      patterns: ["[\\w.+-]+@[\\w-]+\\.[\\w.]+"]
+      action: redact
+    - type: max_chars
+      value: 8000            # input over the limit blocks; output truncates with a marker
+```
+
+Framework-wide rules live at `/config/framework/guardrails_defaults` in the same
+`on_input` / `on_output` shape. They are merged **first**, the agent's or workflow's own
+rules appended, and cached for 30 seconds. There is no admin UI for the framework defaults —
+set them through etcd. An interactive input block returns HTTP `400` naming the rule;
+an output block replaces the reply with a `SYSTEM:` notice and redaction rewrites it before
+it is stored or returned. Hits are counted in the agent's metrics doc and shown as a
+`GUARDRAIL` badge. A malformed rule is skipped and logged (fail-open); there is no runtime
+timeout on a regex, so keep admin-authored patterns simple.
+
+**Behaviour change — the one that can break an existing workflow.** A `background_script`
+run's rendered trigger payload is now evaluated **before** the script is spawned. A blocking
+rule fails the run (`guardrail blocked input`, `run_failed` event with
+`error_type: GuardrailBlocked`) and the process never executes; a `redact` rule rewrites the
+payload the script reads from `stdin`. Scripts parse that payload as machine input, so prefer
+`block` there. Framework defaults apply to scripts too, so a workflow with no `guardrails`
+key of its own is **not** exempt. Note also that the registry sync stores `config.yaml`
+verbatim: a workflow that already carries an inert `guardrails:` block becomes active on
+this deploy. Check `workspace/workflows/*/config.yaml` before upgrading.
+
+Guardrails are a filter on what a run consumes and returns, not a vault: a run's prompt is
+written to `/runs/{agent}/{run_id}` at `processing` **before** the input rules run, and an
+input redaction only rewrites what a script receives on `stdin`. If the payload carries a
+credential you must not persist, block it rather than redact it, and keep such values out of
+`.env`-injected tool secrets.
+
+Known v1 gaps, unchanged by the above: a script's `stdout` is not inspected, streaming
+replies are checked only after the full output is assembled, and supervisor-delegated
+sub-agent turns are not checked.
+
+#### Lazy edge catalogs: opt-in and relay-version bound
+
+`proxy.yaml` gains `lazy_catalog` (default `false`, live on `SIGHUP`). With it on, the edge
+publishes tool names and summaries only (≤120 characters, no argument schemas) and the relay
+fetches a full schema on demand over the tunnel, caches it in the registry, and re-indexes
+the embeddings. Callers get the schema through the new `describe_tool` tool, agent-side and
+on `/mcp`.
+
+- **The central relay must be `v0.7` or newer.** A `v0.6.1` relay rejects the capability at
+  the handshake (`CLOSE_MALFORMED`) and the edge keeps retrying; there is no automatic
+  downgrade-republish. Leave the flag off until central is upgraded, and flip it off on the
+  edge if you must roll back before upgrading central.
+- A lazy tool must be described before it is called with arguments: `describe_tool` first,
+  then `use_tool`.
+- Degradation is explicit: with the edge offline, a describe serves the cached schema if one
+  exists and an `unavailable` marker otherwise, and never blocks tool execution.
+
+#### Upgrade actions
+
+1. `docker compose pull && docker compose up -d` — or `docker compose up -d --build` if you
+   build from source. Nothing else is required; the four new gates stay off.
+2. If you want any of the new controls: set `OIDC_GROUPS_CLAIM` if your IdP does not use
+   `groups`, then work through the tool-authorization promotion order above, and enable
+   `lazy_catalog` on edges only after central is on `v0.7.0`.
+
+**Upgrading from `v0.5.x`:** read the `v0.6.0` section first. `RUNNER_TOKEN`,
+`AGENT_TOKEN_SECRET` and `TRELLIS_HOST_WORKSPACE` are required (compose refuses to start
+while they are empty); that has been true since `v0.6.0` and is unchanged in `v0.7.0`.
+
+Changes to declare:
+
+- **Compose services:** none. No service, port, volume, capability or healthcheck changed.
+- **`.env` keys:** added `OIDC_GROUPS_CLAIM` (optional, default `groups`). No key renamed or
+  removed; all tool-authorization, guardrail and catalog controls live in etcd or
+  `proxy.yaml`, not in `.env`.
+- **Registry sync:** none. `guardrails` and `retries` live inside `config.yaml`, which the
+  sync already stores verbatim.
+- **Tool protocol / `workspace/` layout:** none — `stdin` JSON in, `stdout` JSON out, and the
+  directory layout are unchanged. The edge tunnel gains a `lazy_catalog` capability and two
+  detail frames, both inert unless an edge sets `lazy_catalog: true`.
+- **Data migrations:** none. etcd gains additive key families created on first write —
+  run event/heartbeat keys, `/metrics/agents/*` and `/metrics/providers/*`,
+  `/registry/tool_policies`, `/registry/tool_authz_denies`,
+  `/config/framework/{tool_authz_mode,bound_tools_mode,hub_call_mode,guardrails_defaults,principal_groups}`
+  — plus a `groups` field on user records at the next login. Existing users, keys, agent
+  configs and run history are untouched. Two changes to be aware of: hourly pruning now
+  deletes a run's whole subtree (state, events, heartbeat), and the reaper will mark runs
+  that were **already** stuck in `processing` or `pending` before the upgrade as `failed`
+  once they pass its staleness window (raise `REAPER_STALE_PENDING_S` /
+  `REAPER_STALE_PROCESSING_S` before upgrading if a long backlog is legitimate).
+- **Image pins:** `TRELLIS_IMAGE` default → `v0.7.0` in `docker-compose.yml`,
+  `.env.example`, `docker-compose.egress.yml` and `docker-compose.egress-ci.yml` (the same
+  tag appears in the commented `RUNNER_IMAGE` example in `.env.example`).
+
+---
+
 ## Release checklist (maintainer template)
 
 Copy this into the release PR/notes and fill it in per release.
