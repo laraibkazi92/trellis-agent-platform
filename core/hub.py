@@ -900,6 +900,15 @@ if __name__ == "__main__":
 
     install_redaction()
     require_secret("hub")
+    # Policy and rollout-mode changes have to reach the last mile as fast as the other
+    # surfaces: without this watch the hub only notices them when its 30 s snapshot
+    # cache expires, so an operator's rollback to `shadow` would not be immediate.
+    try:
+        from core.tool_authz import install_tool_authz_watch
+
+        install_tool_authz_watch()
+    except Exception:
+        logger.exception("Failed to install tool-authorization watch; using the cache TTL")
     # Startup probes for /healthz. Never raises: a broken sandbox must not block
     # the hub from starting, it only flips the health payload to 503.
     sandbox_preflight.warmup()
