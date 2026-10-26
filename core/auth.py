@@ -1377,6 +1377,33 @@ class IdentityManager:
             )
         self.set_config("tool_authz_mode", mode)
 
+    def get_bound_tools_mode(self) -> str:
+        """Retrieve the agent-bound-tool rollout mode.
+
+        An absent key means ``off`` (ships dark). A *present but unrecognized* value
+        fails closed to ``enforcing`` and logs: a typo must not silently disable the
+        gate. Not itself @retry_etcd()-decorated: get_config() already retries -- see
+        get_disabled_standard_agents above for the single-retry-layer rationale."""
+        value = self.get_config("bound_tools_mode", None)
+        if value is None or value == "":
+            return "off"
+        if value in ("off", "shadow", "enforcing"):
+            return value
+        logger.error(
+            "Unrecognized bound_tools_mode %r; failing closed to 'enforcing'", value
+        )
+        return "enforcing"
+
+    def set_bound_tools_mode(self, mode: str) -> None:
+        """Set the agent-bound-tool rollout mode (off | shadow | enforcing).
+
+        Not itself @retry_etcd()-decorated -- see get_bound_tools_mode above."""
+        if mode not in ("off", "shadow", "enforcing"):
+            raise ValueError(
+                f"invalid bound_tools_mode {mode!r}: expected one of off, shadow, enforcing"
+            )
+        self.set_config("bound_tools_mode", mode)
+
     def get_principal_groups(self) -> Dict[str, List[str]]:
         """Retrieve the principal -> group mapping ({} when absent or malformed).
 

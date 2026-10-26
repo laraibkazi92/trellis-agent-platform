@@ -1003,6 +1003,7 @@ async def admin_tool_authz_page(request: Request):
     tool_authz = _tool_authz()
     policy = await asyncio.to_thread(tool_authz.load_policy)
     mode = await asyncio.to_thread(tool_authz.get_mode)
+    bound_mode = await asyncio.to_thread(tool_authz.get_bound_tools_mode)
     shadow_denies = await asyncio.to_thread(tool_authz.shadow_denies)
     principal_groups = await asyncio.to_thread(identity_mgr.get_principal_groups)
 
@@ -1014,6 +1015,7 @@ async def admin_tool_authz_page(request: Request):
             "policy": policy,
             "policy_yaml": yaml.safe_dump(policy, sort_keys=False),
             "mode": mode,
+            "bound_mode": bound_mode,
             "shadow_denies": shadow_denies,
             "principal_groups": principal_groups,
             "principal_groups_yaml": yaml.safe_dump(principal_groups, sort_keys=False),
@@ -1073,6 +1075,31 @@ async def save_tool_authz_mode(request: Request):
     return RedirectResponse(url='/admin/tool-authz', status_code=303)
 
 
+@router.post("/admin/tool-authz/bound-mode")
+async def save_bound_tools_mode(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    form = await request.form()
+    mode = str(form.get("mode") or "").strip().lower()
+    if mode not in _TOOL_AUTHZ_MODES:
+        request.session["flash_msg"] = (
+            f"Unknown bound-tools mode '{mode}'. Use one of: {', '.join(_TOOL_AUTHZ_MODES)}."
+        )
+        return RedirectResponse(url='/admin/tool-authz', status_code=303)
+    if mode == "enforcing" and form.get("confirm") != "on":
+        request.session["flash_msg"] = "Confirmation required to enforce bound-tool authorization."
+        return RedirectResponse(url='/admin/tool-authz', status_code=303)
+
+    await asyncio.to_thread(identity_mgr.set_bound_tools_mode, mode)
+    _tool_authz().reset_cache()
+    request.session["flash_msg"] = (
+        f"Bound-tool authorization mode set to '{mode}'. It is a separate switch from the "
+        "use_tool mode; rollback is immediate (set it back to shadow/off)."
+    )
+    return RedirectResponse(url='/admin/tool-authz', status_code=303)
+
+
 @router.post("/admin/tool-authz/bootstrap")
 async def bootstrap_tool_authz_policy(request: Request):
     if redirect := require_admin(request, '/admin'):
@@ -1080,9 +1107,10 @@ async def bootstrap_tool_authz_policy(request: Request):
 
     tool_configs = await asyncio.to_thread(identity_mgr.get_all_tool_configs)
     mcp_configs = await asyncio.to_thread(identity_mgr.get_all_mcp_configs)
+    agent_configs = await asyncio.to_thread(identity_mgr.get_all_agent_configs)
 
     tool_authz = _tool_authz()
-    doc = tool_authz.bootstrap_policy(tool_configs, mcp_configs)
+    doc = tool_authz.bootstrap_policy(tool_configs, mcp_configs, agent_configs)
     await asyncio.to_thread(identity_mgr.save_tool_policies, doc)
     tool_authz.reset_cache()
 
@@ -1090,7 +1118,8 @@ async def bootstrap_tool_authz_policy(request: Request):
     # The mode is deliberately untouched: bootstrapping from the public whitelist is
     # safe at any mode, and flipping to enforcing is a separate, confirmed action.
     request.session["flash_msg"] = (
-        f"Generated {rules} rule(s) from the live registry (one per public tool). "
+        f"Generated {rules} rule(s) from the live registry "
+        "(one per public tool, plus one per agent for its bound tools). "
         "Mode unchanged. Review the YAML, then try shadow before enforcing."
     )
     return RedirectResponse(url='/admin/tool-authz', status_code=303)

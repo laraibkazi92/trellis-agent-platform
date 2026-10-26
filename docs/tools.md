@@ -425,6 +425,36 @@ Agent-driven calls resolve to `agent:<name>`/`workflow:<name>`, so user-scoped r
 apply to direct gateway calls.
 
 **Scope:** the boundary covers `use_tool` (gateway and supervisor/agent) and `search_tools`.
-Tools bound directly to an agent, and direct hub `/tools/call` traffic, are not gated yet.
+Tools bound directly to an agent are gated separately — see **Bound tools** below. Direct hub
+`/tools/call` traffic is not gated yet.
 Denials are logged as structured JSON (`event: tool_authz_deny`) with the principal, tool,
 scope and mode — never tool arguments.
+
+### Bound tools
+
+Tools listed in an agent's `allowed_tools` / `allowed_mcps` are registered straight onto the
+agent (`core/agent_factory.py`) and never pass through `use_tool`, so they have their own
+switch on the same page: **Bound tools**, stored at
+`/config/framework/bound_tools_mode`.
+
+| Mode | Behavior |
+| --- | --- |
+| `off` (default) | No-op. Bound tools run exactly as they did before the gate existed. |
+| `shadow` | Evaluates each call, records would-be denials in the shared ring (`surface: bound_tool`), still runs the tool. |
+| `enforcing` | A bound call with no matching rule returns an access-denied message to the model and the tool does not run. |
+
+- **Default off.** Nothing changes until an operator promotes the mode, and promotion to
+  `enforcing` requires the confirmation checkbox. Use `shadow` first: the policy was written
+  for `use_tool` traffic and rarely has rules for `agent:<name>` / `workflow:<name>` yet.
+- The evaluator, scope (`tools:call`), principal resolution and rule language are the same as
+  `use_tool` — one policy document, one deny ring, only the rollout key and the
+  `surface` tag differ. MCP tools are matched by their registry name
+  (`mcp__server__tool`, `mcp__site__mcp__tool`), not the agent-side short name.
+- **Not covered:** console tools (`ls`, `read_file`, …), A2A/subagent delegation and admin
+  tools. These are framework capabilities, not hub tools, and stay outside the policy.
+- A tool that is **both** bound to an agent and public can also be reached through the
+  supervisor's `use_tool`; that path is evaluated by the *use_tool* switch, not the bound-tool
+  one. Enforcing bound tools alone does not close it.
+- Rollback is immediate: set the mode back to `shadow`/`off`; the etcd watch invalidates every
+  process's cache without a restart.
+

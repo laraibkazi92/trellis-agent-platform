@@ -31,8 +31,9 @@
             Scope: this gate covers calls that go through <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">use_tool</code>
             (direct gateway use, and agent <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">use_tool</code>)
             and the <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">search_tools</code> listing. Tools bound
-            directly to an agent, and direct hub <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">/tools/call</code>
-            traffic, are not gated yet. Agent-driven calls resolve to
+            directly to an agent are gated separately below (<strong>Bound tools</strong>); direct hub
+            <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">/tools/call</code>
+            traffic is not gated yet. Agent-driven calls resolve to
             <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">agent:&lt;name&gt;</code> /
             <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">workflow:&lt;name&gt;</code>, not the end user.
         </p>
@@ -47,7 +48,9 @@
     <!-- Mode selector -->
     <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm space-y-4 mb-6">
         <div class="flex flex-wrap items-center gap-3">
-            <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Mode</h2>
+            <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Mode
+                <span class="font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">use_tool</span>
+            </h2>
             <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-mono font-bold uppercase rounded border {{ mode_styles.get(mode, mode_styles['off']) }}">
                 {% if mode == 'enforcing' %}<i data-lucide="shield-alert" class="w-3 h-3 mr-1"></i>{% elif mode == 'shadow' %}<i data-lucide="eye" class="w-3 h-3 mr-1"></i>{% else %}<i data-lucide="shield-off" class="w-3 h-3 mr-1"></i>{% endif %}
                 CURRENT: {{ mode }}
@@ -99,6 +102,71 @@
             <div class="flex justify-end">
                 <button type="submit" class="bg-accent hover:bg-accent-dark text-white font-mono font-bold text-sm uppercase py-2.5 px-6 transition-colors rounded">
                     Save mode
+                </button>
+            </div>
+        </form>
+    </div>
+
+    <!-- Bound-tool mode selector -->
+    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm space-y-4 mb-6">
+        <div class="flex flex-wrap items-center gap-3">
+            <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Bound tools</h2>
+            <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-mono font-bold uppercase rounded border {{ mode_styles.get(bound_mode, mode_styles['off']) }}">
+                {% if bound_mode == 'enforcing' %}<i data-lucide="shield-alert" class="w-3 h-3 mr-1"></i>{% elif bound_mode == 'shadow' %}<i data-lucide="eye" class="w-3 h-3 mr-1"></i>{% else %}<i data-lucide="shield-off" class="w-3 h-3 mr-1"></i>{% endif %}
+                CURRENT: {{ bound_mode }}
+            </span>
+        </div>
+        <p class="font-mono text-xs text-neutral-500 dark:text-neutral-400">
+            Tools listed in an agent's <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">allowed_tools</code> /
+            <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">allowed_mcps</code> are registered straight onto the
+            agent and never go through <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">use_tool</code>, so they
+            have their own switch and their own rollout. Console tools, A2A delegation and admin tools are not covered.
+            {% if bound_mode == 'enforcing' %}
+            Enforcing &mdash; a bound tool with no matching rule returns an access-denied message to the model instead of running.
+            {% elif bound_mode == 'shadow' %}
+            Shadow &mdash; would-be denials are recorded below with <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">surface=bound_tool</code>, and the tool still runs.
+            {% else %}
+            Off &mdash; bound tools run without any authorization check. Default for this release.
+            {% endif %}
+        </p>
+
+        <form action="/admin/tool-authz/bound-mode" method="POST" class="space-y-4">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            {% set mode_options = [
+                ('off', 'Off', 'No checks for bound tools.'),
+                ('shadow', 'Shadow', 'Evaluate and log would-be denials, still run the tool.'),
+                ('enforcing', 'Enforcing', 'Deny bound-tool calls with no matching rule.')
+            ] %}
+            <div class="grid gap-2 sm:grid-cols-3">
+                {% for value, label, description in mode_options %}
+                <label class="cursor-pointer block">
+                    <input type="radio" name="mode" value="{{ value }}" class="peer sr-only" {% if bound_mode == value %}checked{% endif %}>
+                    <span class="block h-full border border-neutral-200 dark:border-neutral-800 rounded px-4 py-3 transition-colors text-neutral-900 dark:text-neutral-100 peer-checked:border-accent dark:peer-checked:border-accent-dark peer-checked:bg-accent/5 dark:peer-checked:bg-accent-dark/10 peer-focus-visible:ring-2 peer-focus-visible:ring-accent">
+                        <span class="block font-mono font-bold text-xs uppercase tracking-widest">{{ label }}</span>
+                        <span class="block font-mono text-[10px] text-neutral-500 dark:text-neutral-400 mt-1">{{ description }}</span>
+                    </span>
+                </label>
+                {% endfor %}
+            </div>
+
+            <div class="border border-red-500/40 bg-red-50 dark:bg-red-950/20 rounded p-4 space-y-2">
+                <label class="inline-flex items-start gap-2 cursor-pointer select-none">
+                    <input type="checkbox" name="confirm" value="on" class="mt-0.5 accent-current">
+                    <span class="font-mono text-xs text-red-700 dark:text-red-300">
+                        I understand that switching bound tools to <strong>enforcing</strong> denies every bound-tool
+                        call without a matching rule, which can break agents already using those tools.
+                    </span>
+                </label>
+                <p class="font-mono text-[11px] text-red-700/80 dark:text-red-300/80">
+                    Only required for enforcing. Run shadow first: the policy was written for
+                    <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">use_tool</code> traffic and rarely has
+                    rules for <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">agent:&lt;name&gt;</code> bound calls yet.
+                </p>
+            </div>
+
+            <div class="flex justify-end">
+                <button type="submit" class="bg-accent hover:bg-accent-dark text-white font-mono font-bold text-sm uppercase py-2.5 px-6 transition-colors rounded">
+                    Save bound-tools mode
                 </button>
             </div>
         </form>
@@ -159,6 +227,8 @@
                 <span class="font-mono text-[11px] text-neutral-500 dark:text-neutral-400">
                     Newest first &mdash; denials from every service process (sampled at most one per second per
                     process, capped at 200). Shadow entries are would-be denials; enforcing entries were denied.
+                    The surface column names the gate: <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">use_tool</code>
+                    or <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">bound_tool</code>.
                 </span>
             </div>
             {% if shadow_denies %}
@@ -181,6 +251,7 @@
                         <th scope="col" class="px-3 py-2 font-normal">Tool</th>
                         <th scope="col" class="px-3 py-2 font-normal">Scope</th>
                         <th scope="col" class="px-3 py-2 font-normal">Mode</th>
+                        <th scope="col" class="px-3 py-2 font-normal">Surface</th>
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-neutral-200 dark:divide-neutral-800">
@@ -191,6 +262,7 @@
                         <td class="px-3 py-2 text-neutral-900 dark:text-neutral-100 break-all">{{ deny.tool }}</td>
                         <td class="px-3 py-2 text-neutral-700 dark:text-neutral-300">{{ deny.scope }}</td>
                         <td class="px-3 py-2 text-neutral-500 dark:text-neutral-400">{{ deny.mode or 'shadow' }}</td>
+                        <td class="px-3 py-2 text-neutral-700 dark:text-neutral-300">{{ deny.surface or 'use_tool' }}</td>
                     </tr>
                     {% endfor %}
                 </tbody>
@@ -200,7 +272,7 @@
         <div class="border border-dashed border-neutral-300 dark:border-neutral-700 rounded p-8 text-center">
             <p class="font-mono text-sm font-bold uppercase tracking-widest text-neutral-700 dark:text-neutral-300">No shadow denials recorded</p>
             <p class="font-mono text-xs text-neutral-500 dark:text-neutral-400 mt-2">
-                Switch the mode to shadow to log calls that the current policy would deny, without blocking them.
+                Switch either mode (use_tool or bound tools) to <span class="font-bold">shadow</span> to log calls that the current policy would deny, without blocking them.
             </p>
         </div>
         {% endif %}

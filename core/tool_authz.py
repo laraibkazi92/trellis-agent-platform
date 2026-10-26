@@ -12,6 +12,11 @@ watches invalidate, so admin edits apply without a restart.
 Denials are logged as structured JSON (principal, tool, scope, rule index) and
 never include tool arguments.
 
+Surfaces share this engine but not their rollout switch: ``use_tool``/``search_tools``
+are governed by ``tool_authz_mode``, while tools bound directly to an agent call
+``allowed(..., surface="bound_tool")`` and follow the separate ``bound_tools_mode``
+key (see ``mode_for_surface``).
+
 Two operational caveats: (1) if the very first policy read fails, the cache falls
 back to the cold snapshot (mode ``off``) until a read succeeds -- authz fails open
 only while the framework has never seen a policy; (2) tool calls made *through an
@@ -35,10 +40,21 @@ MODES = ("off", "shadow", "enforcing")
 SCOPES = ("tools:read", "tools:call")
 SHADOW_DENY_CAP = 200
 
+# Denial-ring tag for the gate that produced an entry. Bound tools (registered straight
+# onto an agent from `allowed_tools`/`allowed_mcps`) never reach `use_tool`, so their
+# wrappers run the same evaluator under their own rollout mode.
+BOUND_TOOL_SURFACE = "bound_tool"
+
 POLICY_PATH = "/registry/tool_policies"
 MODE_KEY = "tool_authz_mode"
+BOUND_TOOLS_MODE_KEY = "bound_tools_mode"
 GROUPS_KEY = "principal_groups"
-_WATCH_PREFIXES = (POLICY_PATH, f"/config/framework/{MODE_KEY}", f"/config/framework/{GROUPS_KEY}")
+_WATCH_PREFIXES = (
+    POLICY_PATH,
+    f"/config/framework/{MODE_KEY}",
+    f"/config/framework/{BOUND_TOOLS_MODE_KEY}",
+    f"/config/framework/{GROUPS_KEY}",
+)
 
 CACHE_TTL_S = 30.0
 CACHE_ERROR_TTL_S = 5.0
@@ -60,7 +76,9 @@ _request_groups: ContextVar[Optional[Tuple[str, ...]]] = ContextVar(
 _deny_ring: "deque[Dict[str, Any]]" = deque(maxlen=SHADOW_DENY_CAP)
 _deny_lock = threading.Lock()
 _DENY_PERSIST_MIN_INTERVAL_S = 1.0
-_last_deny_persist: float = 0.0
+# Throttled per surface: a busy use_tool denial must not starve bound_tool entries out
+# of the shared ring (the operator reads it to decide whether a surface is safe to flip).
+_last_deny_persist: Dict[str, float] = {}
 
 # Cache of agent name -> is background (for workflow principal classification).
 _agent_type_cache: Dict[str, Tuple[float, bool]] = {}
@@ -71,7 +89,7 @@ _watch_ids: Optional[List[Any]] = None
 
 
 def _cold_snapshot() -> Dict[str, Any]:
-    return {"policy": {}, "mode": "off", "groups": {}}
+    return {"policy": {}, "mode": "off", "bound_mode": "off", "groups": {}}
 
 
 def _snapshot_values(attempt: int = 0) -> Dict[str, Any]:
@@ -88,10 +106,15 @@ def _snapshot_values(attempt: int = 0) -> Dict[str, Any]:
         mgr = get_identity_manager()
         policy = mgr.get_tool_policies()
         mode = mgr.get_tool_authz_mode()
+        # A registry stand-in without the bound-tools accessor is simply "never rolled
+        # out" (off); a real manager that returns junk fails closed, as above.
+        read_bound_mode = getattr(mgr, "get_bound_tools_mode", None)
+        bound_mode = read_bound_mode() if callable(read_bound_mode) else "off"
         groups = mgr.get_principal_groups()
         fresh = {
             "policy": policy if isinstance(policy, dict) else {},
             "mode": mode if mode in MODES else "off",
+            "bound_mode": bound_mode if bound_mode in MODES else "enforcing",
             "groups": groups if isinstance(groups, dict) else {},
         }
     except Exception as e:
@@ -130,6 +153,44 @@ def get_mode() -> str:
     """Current rollout mode (``off`` when unset or unreadable)."""
     mode = _snapshot_values().get("mode")
     return mode if mode in MODES else "off"
+
+
+def get_bound_tools_mode() -> str:
+    """Current agent-bound-tool rollout mode (``off`` when unset or unreadable)."""
+    mode = _snapshot_values().get("bound_mode")
+    return mode if mode in MODES else "off"
+
+
+def cached_mode_for_surface(surface: Optional[str] = None) -> Optional[str]:
+    """The mode from the last snapshot, without any etcd I/O; ``None`` when cold.
+
+    Bound tools need this: ``off`` (the default) must stay free of authz reads, and a
+    full snapshot load under an etcd outage blocks for the retry budget. A caller that
+    gets ``None`` must fall back to :func:`mode_for_surface` (one blocking read).
+    """
+    with _snapshot_lock:
+        snapshot = _snapshot
+    if snapshot is None:
+        return None
+    key = "bound_mode" if surface == BOUND_TOOL_SURFACE else "mode"
+    mode = snapshot.get(key)
+    return mode if mode in MODES else None
+
+
+def mode_for_surface(surface: Optional[str] = None) -> str:
+    """The rollout mode governing ``surface``.
+
+    ``bound_tool`` has its own key so the bound-tool gate can be promoted on its own
+    schedule; ``None`` is the ``use_tool``/``search_tools`` gate and uses
+    ``tool_authz_mode``. A surface with no configured switch fails closed: a new
+    enforcement point must never silently inherit someone else's rollout state.
+    """
+    if surface == BOUND_TOOL_SURFACE:
+        return get_bound_tools_mode()
+    if surface is None:
+        return get_mode()
+    logger.error("tool_authz: unknown surface %r; failing closed to 'enforcing'", surface)
+    return "enforcing"
 
 
 def load_policy() -> Dict[str, Any]:
@@ -259,7 +320,9 @@ def evaluate(principal: str, tool: str, scope: str) -> Tuple[str, Optional[Dict[
     return "deny", None
 
 
-def _record_deny(principal: str, tool: str, scope: str, mode: str) -> None:
+def _record_deny(
+    principal: str, tool: str, scope: str, mode: str, surface: Optional[str] = None
+) -> None:
     global _last_deny_persist
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -271,24 +334,33 @@ def _record_deny(principal: str, tool: str, scope: str, mode: str) -> None:
         # the ring/log shape stays stable if rule-level reasons are added later.
         "matched_rule": None,
     }
+    # Only tagged surfaces carry it: entries written before bound tools existed (and
+    # by the use_tool gate, which is the default) keep their exact shape.
+    if surface:
+        entry["surface"] = surface
     with _deny_lock:
         _deny_ring.append(entry)
-    logger.warning(json.dumps({
+    logged = {
         "event": "tool_authz_deny",
         "mode": mode,
         "principal": principal,
         "tool": tool,
         "scope": scope,
         "matched_rule": entry["matched_rule"],
-    }))
+    }
+    if surface:
+        logged["surface"] = surface
+    logger.warning(json.dumps(logged))
 
     # Persist a sampled copy to the shared ring: the Admin UI is a separate process
-    # and cannot see this one's deque. Throttled so a deny-everything policy cannot
-    # turn every tool call into an etcd write.
+    # and cannot see this one's deque. Throttled per surface so a deny-everything
+    # policy cannot turn every tool call into an etcd write, while one surface's
+    # traffic cannot hide another's denials from the operator.
     now = time.monotonic()
-    if now - _last_deny_persist < _DENY_PERSIST_MIN_INTERVAL_S:
+    key = surface or ""
+    if now - _last_deny_persist.get(key, 0.0) < _DENY_PERSIST_MIN_INTERVAL_S:
         return
-    _last_deny_persist = now
+    _last_deny_persist[key] = now
     try:
         from core.auth import get_identity_manager
 
@@ -297,16 +369,28 @@ def _record_deny(principal: str, tool: str, scope: str, mode: str) -> None:
         logger.debug("Failed to persist tool_authz denial: %s", e)
 
 
-def allowed(principal: str, tool: str, scope: str) -> bool:
-    """Mode-aware verdict: ``off`` never denies, ``shadow`` logs and allows."""
-    mode = get_mode()
-    if mode == "off":
+def allowed(
+    principal: str,
+    tool: str,
+    scope: str,
+    surface: Optional[str] = None,
+    mode: Optional[str] = None,
+) -> bool:
+    """Mode-aware verdict for ``surface`` (default: the ``use_tool`` gate).
+
+    ``off`` never denies, ``shadow`` logs and allows, ``enforcing`` denies. The mode is
+    resolved per surface (``bound_tool`` has its own key), and the denial is tagged with
+    the surface it came from. Pass ``mode`` when the caller already resolved it (the
+    bound-tool fast path does) so a single call cannot see two different modes.
+    """
+    resolved = mode or mode_for_surface(surface)
+    if resolved == "off":
         return True
     decision, _rule = evaluate(principal, tool, scope)
     if decision == "allow":
         return True
-    _record_deny(principal or "anonymous", tool or "", scope or "", mode)
-    return mode != "enforcing"
+    _record_deny(principal or "anonymous", tool or "", scope or "", resolved, surface)
+    return resolved != "enforcing"
 
 
 def shadow_denies() -> List[Dict[str, Any]]:
@@ -400,11 +484,65 @@ def resolve_current_principal() -> str:
     return f"user:{user_id}" if user_id else "anonymous"
 
 
-def bootstrap_policy(tool_configs: Dict[str, Any], mcp_configs: Dict[str, Any]) -> Dict[str, Any]:
+def _mcp_names_for_server(server: str, config: Any) -> Set[str]:
+    """Every ``mcp__<server>__<tool>`` name one MCP config declares."""
+    if not isinstance(config, dict):
+        return set()
+    tools = config.get("tools")
+    if not isinstance(tools, list):
+        return set()
+    names: Set[str] = set()
+    for entry in tools:
+        if isinstance(entry, dict):
+            name = entry.get("name")
+            if isinstance(name, str) and name:
+                names.add(f"mcp__{server}__{name}")
+    return names
+
+
+def _agent_bound_names(config: Dict[str, Any], mcps_map: Dict[str, Any]) -> Set[str]:
+    """Policy names of the tools one agent binds directly (``allowed_tools``/``allowed_mcps``).
+
+    Bound tools never pass through ``use_tool``, so nothing else would ever put them in
+    the bootstrap document. Console tools are capabilities, not hub tools: they are not
+    part of the policy language and must not appear in a generated rule.
+    """
+    from core.allowlist import CONSOLE_TOOLS
+
+    names: Set[str] = set()
+    for tool in config.get("allowed_tools") or []:
+        if isinstance(tool, str) and tool and tool not in CONSOLE_TOOLS:
+            names.add(tool)
+    for entry in config.get("allowed_mcps") or []:
+        if not isinstance(entry, str) or not entry:
+            continue
+        if entry.endswith("__*"):
+            site = entry[: -len("__*")]
+            for server in mcps_map:
+                if server.startswith(f"{site}__"):
+                    names |= _mcp_names_for_server(server, mcps_map[server])
+        elif entry in mcps_map:
+            names |= _mcp_names_for_server(entry, mcps_map[entry])
+        else:
+            names.update(n for n in _mcp_names_for_server(entry, {}) if n)
+    return names
+
+
+def bootstrap_policy(
+    tool_configs: Dict[str, Any],
+    mcp_configs: Dict[str, Any],
+    agent_configs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """One explicit rule per currently-public tool, callable by everyone.
 
     Tightening later is deleting lines, so the generated document doubles as an
     inventory of what used to be reachable. Malformed configs are skipped.
+
+    When ``agent_configs`` is supplied, each agent also gets one rule per tool it binds
+    directly (``allowed_tools``/``allowed_mcps``), granted to its own principal only
+    (``agent:<name>``, or ``workflow:<name>`` for background types). Those tools never
+    reach ``use_tool``, so without this the bound-tool gate would have no rule to match
+    and no in-product remediation path.
     """
     tools_map = tool_configs if isinstance(tool_configs, dict) else {}
     mcps_map = mcp_configs if isinstance(mcp_configs, dict) else {}
@@ -435,13 +573,30 @@ def bootstrap_policy(tool_configs: Dict[str, Any], mcp_configs: Dict[str, Any]) 
             if every_tool or tool_name in public_tools:
                 names.add(f"mcp__{server}__{tool_name}")
 
-    return {
-        "default_action": "deny",
-        "rules": [
-            {"tools": [name], "allow_principals": ["*"], "scopes": list(SCOPES)}
-            for name in sorted(names)
-        ],
-    }
+    rules = [
+        {"tools": [name], "allow_principals": ["*"], "scopes": list(SCOPES)}
+        for name in sorted(names)
+    ]
+    if isinstance(agent_configs, dict):
+        for agent_name, config in agent_configs.items():
+            if not isinstance(agent_name, str) or not agent_name or not isinstance(config, dict):
+                continue
+            bound = _agent_bound_names(config, mcps_map)
+            if not bound:
+                continue
+            kind = (
+                "workflow"
+                if config.get("type") in ("background_agent", "background_script")
+                else "agent"
+            )
+            rules.append(
+                {
+                    "tools": sorted(bound),
+                    "allow_principals": [f"{kind}:{agent_name}"],
+                    "scopes": list(SCOPES),
+                }
+            )
+    return {"default_action": "deny", "rules": rules}
 
 
 def _on_authz_change(event) -> None:

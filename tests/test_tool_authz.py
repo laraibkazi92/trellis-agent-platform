@@ -26,18 +26,20 @@ EDGE_TOOL = "mcp__site__mcp__tool"
 
 
 class FakeAuthzManager:
-    """Registry stand-in carrying only the three authz reads.
+    """Registry stand-in carrying only the authz reads.
 
     ``fail_from`` makes ``get_tool_policies`` raise from the Nth snapshot load on,
     which is how a warm-cache etcd outage is simulated without a network.
     """
 
-    def __init__(self, *, policy=None, mode="off", groups=None, fail_from=None):
+    def __init__(self, *, policy=None, mode="off", bound_mode="off", groups=None, fail_from=None):
         self.policy = {} if policy is None else policy
         self.mode = mode
+        self.bound_mode = bound_mode
         self.groups = {} if groups is None else groups
         self.fail_from = fail_from
         self.policy_reads = 0
+        self.persisted: list = []
 
     def get_tool_policies(self):
         self.policy_reads += 1
@@ -48,8 +50,21 @@ class FakeAuthzManager:
     def get_tool_authz_mode(self):
         return self.mode
 
+    def get_bound_tools_mode(self):
+        return self.bound_mode
+
     def get_principal_groups(self):
         return self.groups
+
+    def append_tool_authz_deny(self, entry, cap: int = 200):
+        self.persisted.insert(0, entry)
+        del self.persisted[cap:]
+
+    def get_tool_authz_denies(self):
+        return list(self.persisted)
+
+    def clear_tool_authz_denies(self):
+        self.persisted.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -566,11 +581,12 @@ def test_watch_install_is_idempotent_and_cancellable(monkeypatch):
     assert client.watches == [
         "/registry/tool_policies",
         "/config/framework/tool_authz_mode",
+        "/config/framework/bound_tools_mode",
         "/config/framework/principal_groups",
     ]
 
     tool_authz.cancel_tool_authz_watch()
-    assert client.cancelled == [1, 2, 3]
+    assert client.cancelled == [1, 2, 3, 4]
     tool_authz.cancel_tool_authz_watch()  # idempotent
 
 
@@ -581,3 +597,201 @@ def test_unrecognized_mode_fails_closed_to_enforcing():
     mgr.get_config = lambda key, default=None: "enforcin"  # typo
 
     assert mgr.get_tool_authz_mode() == "enforcing"
+
+
+# --- 9. bound-tool surface (v0.7.1) ------------------------------------------
+
+def _mode_manager(store):
+    """An IdentityManager carrying only the config read/write pair."""
+    from core.auth import IdentityManager
+
+    mgr = IdentityManager.__new__(IdentityManager)
+    mgr.get_config = lambda key, default=None: store.get(key, default)
+    mgr.set_config = lambda key, value: store.__setitem__(key, value)
+    return mgr
+
+
+@pytest.mark.parametrize("stored", [pytest.param(None, id="absent"), pytest.param("", id="empty")])
+def test_bound_tools_mode_is_off_when_unset(stored):
+    store = {} if stored is None else {"bound_tools_mode": stored}
+
+    assert _mode_manager(store).get_bound_tools_mode() == "off"
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforcing"])
+def test_bound_tools_mode_set_get_round_trip(mode):
+    store = {}
+    mgr = _mode_manager(store)
+
+    mgr.set_bound_tools_mode(mode)
+
+    assert store == {"bound_tools_mode": mode}
+    assert mgr.get_bound_tools_mode() == mode
+
+
+def test_bound_tools_mode_rejects_unknown_values():
+    mgr = _mode_manager({})
+
+    with pytest.raises(ValueError):
+        mgr.set_bound_tools_mode("enforcin")
+
+
+def test_unrecognized_bound_tools_mode_fails_closed_to_enforcing(caplog):
+    mgr = _mode_manager({"bound_tools_mode": "enforcin"})
+
+    with caplog.at_level(logging.ERROR, logger="core.auth"):
+        assert mgr.get_bound_tools_mode() == "enforcing"
+
+    assert "Unrecognized bound_tools_mode" in caplog.text
+
+
+def test_mode_for_surface_picks_each_gates_own_key(use_registry):
+    use_registry(policy=_policy(), mode="enforcing", bound_mode="off")
+
+    assert tool_authz.get_mode() == "enforcing"
+    assert tool_authz.get_bound_tools_mode() == "off"
+    # None is the use_tool/search_tools gate (unchanged default argument).
+    assert tool_authz.mode_for_surface() == "enforcing"
+    assert tool_authz.mode_for_surface("use_tool") == "enforcing"
+    assert tool_authz.mode_for_surface(tool_authz.BOUND_TOOL_SURFACE) == "off"
+
+
+def test_bound_surface_off_never_evaluates_or_records(use_registry, caplog):
+    use_registry(policy=_policy(), mode="enforcing", bound_mode="off")
+
+    with caplog.at_level(logging.WARNING, logger="core.tool_authz"):
+        assert tool_authz.allowed(
+            "agent:supervisor", LOCAL_TOOL, "tools:call", surface="bound_tool"
+        ) is True
+
+    assert tool_authz.shadow_denies() == []
+    assert "tool_authz_deny" not in caplog.text
+
+
+def test_bound_surface_shadow_allows_and_tags_the_shared_ring(use_registry, monkeypatch):
+    monkeypatch.setattr(tool_authz, "_DENY_PERSIST_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(tool_authz, "_last_deny_persist", {})
+    fake = use_registry(policy=_policy(), mode="enforcing", bound_mode="shadow")
+
+    assert tool_authz.allowed(
+        "agent:supervisor", LOCAL_TOOL, "tools:call", surface="bound_tool"
+    ) is True
+
+    # Shadow executes the tool but records the would-be denial under the bound surface.
+    entry = fake.persisted[0]
+    assert entry["surface"] == "bound_tool"
+    assert entry["mode"] == "shadow"
+    assert entry["principal"] == "agent:supervisor"
+    assert entry["tool"] == LOCAL_TOOL
+    assert entry["scope"] == "tools:call"
+
+    # The use_tool gate is untouched: same policy, its own mode, its old entry shape.
+    assert tool_authz.allowed("agent:supervisor", LOCAL_TOOL, "tools:call") is False
+    legacy = fake.persisted[0]
+    assert "surface" not in legacy
+    assert legacy["mode"] == "enforcing"
+
+
+def test_bound_surface_enforcing_denies(use_registry):
+    use_registry(
+        policy=_policy(_rule([LOCAL_TOOL], ["user:bob"])), mode="off", bound_mode="enforcing"
+    )
+
+    assert tool_authz.allowed(
+        "agent:supervisor", LOCAL_TOOL, "tools:call", surface="bound_tool"
+    ) is False
+    assert tool_authz.allowed(
+        "user:bob", LOCAL_TOOL, "tools:call", surface="bound_tool"
+    ) is True
+
+
+def test_unrecognized_bound_mode_in_the_registry_fails_closed(use_registry):
+    use_registry(policy=_policy(), mode="off", bound_mode="not-a-mode")
+
+    assert tool_authz.get_bound_tools_mode() == "enforcing"
+
+
+def test_registry_without_the_bound_mode_accessor_is_off(monkeypatch):
+    """A stand-in manager predating the key must not enable the gate."""
+
+    class LegacyManager:
+        def get_tool_policies(self):
+            return _policy()
+
+        def get_tool_authz_mode(self):
+            return "enforcing"
+
+        def get_principal_groups(self):
+            return {}
+
+        def append_tool_authz_deny(self, entry, cap: int = 200):
+            pass
+
+        def get_tool_authz_denies(self):
+            return []
+
+        def clear_tool_authz_denies(self):
+            pass
+
+    monkeypatch.setattr(auth, "get_identity_manager", lambda: LegacyManager())
+    tool_authz.reset_cache()
+
+    assert tool_authz.get_bound_tools_mode() == "off"
+    assert tool_authz.allowed(
+        "agent:supervisor", LOCAL_TOOL, "tools:call", surface="bound_tool"
+    ) is True
+
+
+# --- v0.7.1: per-agent bootstrap rules + surface safety -----------------------
+
+
+def test_bootstrap_adds_one_rule_per_agent_for_bound_tools():
+    tool_configs = {
+        "text_stats": {"name": "text_stats", "public": False},
+        "opsctl": {"name": "opsctl", "public": False},
+    }
+    mcp_configs = {
+        "srv": {"tools": [{"name": "do__thing"}]},
+        "site__mcp": {"tools": [{"name": "tool"}]},
+    }
+    agent_configs = {
+        "demo": {
+            "type": "user_agent",
+            "allowed_tools": ["text_stats", "mcp__srv__do__thing", "ls"],
+            "allowed_mcps": [],
+        },
+        "wf": {"type": "background_agent", "allowed_tools": [], "allowed_mcps": ["site__mcp"]},
+        "empty": {"type": "user_agent", "allowed_tools": []},
+    }
+
+    doc = tool_authz.bootstrap_policy(tool_configs, mcp_configs, agent_configs)
+
+    rules = {(tuple(r["tools"]), tuple(r["allow_principals"])) for r in doc["rules"]}
+    assert (("mcp__site__mcp__tool",), ("workflow:wf",)) in rules
+    assert (("mcp__srv__do__thing", "text_stats"), ("agent:demo",)) in rules
+    # Console tools are capabilities, not policy targets; a spec-less agent adds nothing.
+    assert all("ls" not in tools for tools, _ in rules)
+    assert len(doc["rules"]) == 2
+
+
+def test_bootstrap_without_agent_configs_keeps_the_public_only_shape():
+    tool_configs = {"text_stats": {"name": "text_stats", "public": True}}
+    doc = tool_authz.bootstrap_policy(tool_configs, {})
+    assert doc == {
+        "default_action": "deny",
+        "rules": [
+            {"tools": ["text_stats"], "allow_principals": ["*"], "scopes": list(tool_authz.SCOPES)}
+        ],
+    }
+
+
+def test_unknown_surface_fails_closed(monkeypatch):
+    assert tool_authz.mode_for_surface("hub_direct") == "enforcing"
+    assert tool_authz.mode_for_surface(None) in tool_authz.MODES
+
+
+def test_allowed_accepts_a_pre_resolved_mode(use_registry, monkeypatch):
+    """The bound-tool fast path resolves the mode once and passes it in."""
+    use_registry(policy=_policy(_rule([LOCAL_TOOL], ["*"])), mode="off", bound_mode="enforcing")
+    monkeypatch.setattr(tool_authz, "mode_for_surface", lambda *_: pytest.fail("re-resolved"))
+    assert tool_authz.allowed("user:a", LOCAL_TOOL, "tools:call", mode="enforcing") is True
