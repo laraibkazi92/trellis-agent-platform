@@ -23,6 +23,12 @@ back to the cold snapshot (mode ``off``) until a read succeeds -- authz fails op
 only while the framework has never seen a policy; (2) tool calls made *through an
 agent* resolve to ``agent:<name>``/``workflow:<name>``, so user- and group-scoped
 rules only apply to direct gateway calls unless the rule names those principals.
+
+Group membership comes from the identity provider's groups claim (stored on the user
+record at login), unioned with the manual ``/config/framework/principal_groups``
+mapping. The claim is published per request by the ASGI middleware; without it
+(hub-dispatched calls, background runs, the admin page) the stored record is read
+through a 30 s cache.
 """
 
 import fnmatch
@@ -85,6 +91,15 @@ _snapshot_lock = threading.Lock()
 _request_groups: ContextVar[Optional[Tuple[str, ...]]] = ContextVar(
     "tool_authz_request_groups", default=None
 )
+
+# IdP groups stored on the user record at login, read only when no request-scoped
+# claim was published (hub-dispatched calls, background runs, the admin page). Small
+# and short-lived: a group change at the IdP is visible within a login refresh.
+USER_GROUPS_TTL_S = 30.0
+USER_GROUPS_ERROR_TTL_S = 5.0
+USER_GROUPS_CACHE_MAX = 256
+_user_groups_cache: Dict[str, Tuple[float, Tuple[str, ...]]] = {}
+_user_groups_lock = threading.Lock()
 
 # --- shadow-deny ring ---------------------------------------------------------
 
@@ -331,9 +346,58 @@ def _rule_matches(rule: Dict[str, Any], principal: str, tool: str, scope: str, g
     return any(_principal_matches(p, principal, groups) for p in principals)
 
 
+def _stored_user_groups(principal: str) -> Set[str]:
+    """IdP groups stored on ``user:<id>``'s record, cached for ~30 s.
+
+    Only reachable for user principals: ``agent:``/``workflow:`` calls have no user
+    record of their own. Any read failure grants "no groups" (a ``group:``
+    rule then simply does not match) and is cached for a few seconds so an etcd
+    outage cannot turn every tool call into a retry-budget read.
+    """
+    if not principal.startswith("user:"):
+        return set()
+    user_id = principal[len("user:"):]
+    if not user_id:
+        return set()
+
+    now = time.monotonic()
+    with _user_groups_lock:
+        cached = _user_groups_cache.get(user_id)
+        if cached is not None and now < cached[0]:
+            return set(cached[1])
+
+    expiry = now + USER_GROUPS_TTL_S
+    values: Tuple[str, ...] = ()
+    try:
+        from core.auth import get_identity_manager, normalize_groups
+
+        read_user = getattr(get_identity_manager(), "get_user", None)
+        record = read_user(user_id) if callable(read_user) else None
+        if isinstance(record, dict):
+            values = tuple(normalize_groups(record.get("groups")))
+    except Exception as e:
+        logger.debug("Failed to read stored groups for %r: %s", principal, e)
+        expiry = now + USER_GROUPS_ERROR_TTL_S
+
+    with _user_groups_lock:
+        if len(_user_groups_cache) >= USER_GROUPS_CACHE_MAX:
+            _user_groups_cache.clear()
+        _user_groups_cache[user_id] = (expiry, values)
+    return set(values)
+
+
 def _groups_for(principal: str) -> Set[str]:
-    """Request-claim groups unioned with the etcd principal->group mapping."""
-    groups: Set[str] = set(_request_groups.get() or ())
+    """Caller groups: the request claim (else the stored IdP groups) ∪ the etcd mapping.
+
+    The mapping is a manual grant unioned on top -- it can add a group but cannot
+    revoke one the identity provider asserted.
+    """
+    claimed = _request_groups.get()
+    groups: Set[str] = set(claimed or ())
+    if claimed is None:
+        # No claim in this context (hub-dispatched call, background run, admin page):
+        # fall back to what the identity provider stored on the user record at login.
+        groups |= _stored_user_groups(principal)
     config = _load_groups()
 
     direct = config.get(principal)
@@ -344,6 +408,11 @@ def _groups_for(principal: str) -> Set[str]:
         if isinstance(bare, list):
             groups.update(bare)
     return groups
+
+
+def resolved_groups(principal: str) -> List[str]:
+    """Sorted groups a principal resolves to right now (read-only, for the admin UI)."""
+    return sorted(_groups_for(principal or "anonymous"))
 
 
 def evaluate(principal: str, tool: str, scope: str) -> Tuple[str, Optional[Dict[str, Any]]]:
@@ -459,11 +528,11 @@ def clear_shadow_denies() -> None:
 
 
 def set_request_groups(groups: Iterable[str]) -> None:
-    """Publish the caller's OIDC group claim for the current request/task.
+    """Publish the caller's group claim for the current request/task.
 
-    Not wired by the HTTP layer yet: no current entry point exposes OIDC groups to
-    a tool call, so ``group:`` rules resolve from ``/config/framework/principal_groups``
-    in practice. Kept as the seam for when the claim is propagated.
+    Set by the ASGI auth middleware from the user record it already loaded (the
+    identity provider's groups claim, stored at login). While it is set, ``group:``
+    rules resolve from it instead of re-reading the record.
     """
     if isinstance(groups, str):
         groups = [groups]

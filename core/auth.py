@@ -40,6 +40,54 @@ run_id_var = contextvars.ContextVar("run_id", default=None)
 # key, and reject the call with 401.
 DEV_MODE_AUTH_TOKEN = "dev-token"
 
+# --- identity-provider group membership --------------------------------------
+# `group:` policy rules read the groups the IdP asserted at login. The claim name is
+# configurable because IdPs disagree (`groups`, `roles`, ...). The value is stored on
+# the user record and published per request; nothing else trusts it.
+GROUPS_CLAIM_ENV = "OIDC_GROUPS_CLAIM"
+MAX_CLAIM_GROUPS = 200
+
+
+def groups_claim_name() -> str:
+    """The claim carrying group membership (``OIDC_GROUPS_CLAIM``, default ``groups``)."""
+    return (os.getenv(GROUPS_CLAIM_ENV) or "").strip() or "groups"
+
+
+def normalize_groups(raw: Any) -> List[str]:
+    """Sorted, de-duplicated group names from a claim value or stored record field.
+
+    Accepts a comma-separated string or a list of strings. Any other shape --
+    including a malformed claim -- normalizes to ``[]``: a bad groups claim must never
+    be able to fail a login. (Whitespace is trimmed, not split on: a group literally
+    named "All Staff" must stay one group.)
+    """
+    if isinstance(raw, str):
+        candidates = raw.split(",")
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        candidates = [value for value in raw if isinstance(value, str)]
+    else:
+        return []
+
+    groups = sorted({value.strip() for value in candidates if value.strip()})
+    if len(groups) > MAX_CLAIM_GROUPS:
+        logger.warning(
+            "Groups claim carries %d entries; keeping the first %d", len(groups), MAX_CLAIM_GROUPS
+        )
+        groups = groups[:MAX_CLAIM_GROUPS]
+    return groups
+
+
+def claim_groups(userinfo: Dict) -> List[str]:
+    """The configured groups claim off one userinfo payload (never raises)."""
+    if not isinstance(userinfo, dict):
+        return []
+    try:
+        return normalize_groups(userinfo.get(groups_claim_name()))
+    except Exception:
+        logger.warning("Unreadable %s claim; treating the user as group-less", groups_claim_name())
+        return []
+
+
 # Edge (trellis-proxy) registry layout. `/registry/edges/<site>/config` is the site
 # record, `/status` is written by the relay, and `/edge_tokens/<sha256> -> site` is a
 # token index so the relay's pre-upgrade handshake is one get instead of a scan of
@@ -2251,7 +2299,11 @@ class AuthMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] not in ("http", "websocket"):
             return await self.app(scope, receive, send)
-            
+
+        # Imported here rather than at module scope: the authz engine imports this
+        # module lazily, and keeping the import one-directional avoids a cycle at boot.
+        from core import tool_authz
+
         try:
             path = scope.get("path", "")
             normalized_path = re.sub(r'/+', '/', path)
@@ -2306,11 +2358,23 @@ class AuthMiddleware:
                 # Add user_id to scope state for framework compatibility
                 scope["state"] = scope.get("state", {})
                 scope["state"]["user_id"] = user_id
-                
+
+                # Publish the IdP groups for `group:` policy rules. Uses the record
+                # already fetched for the ban check -- no second etcd read. An absent
+                # record means "no groups"; the groups-claim contextvar takes
+                # precedence over re-reading the record inside the authz engine.
+                tool_authz.set_request_groups(
+                    normalize_groups((user or {}).get("groups"))
+                )
+
             return await self.app(scope, receive, send)
         except Exception as e:
             logger.error(f"Unhandled exception in ASGI AuthMiddleware: {e}", exc_info=True)
             await self._send_error(scope, send, 500, b'{"error": "Internal Server Error"}')
+        finally:
+            # The contextvar outlives the request inside this task; clear it so a
+            # reused task/connection cannot serve one user's groups to the next call.
+            tool_authz.clear_request_groups()
 
     async def _validate_jwt(self, token: str) -> Optional[str]:
         """Validate an MCP OAuth JWT and return the sub (user_id) if valid."""

@@ -1008,6 +1008,13 @@ async def admin_tool_authz_page(request: Request):
     shadow_denies = await asyncio.to_thread(tool_authz.shadow_denies)
     principal_groups = await asyncio.to_thread(identity_mgr.get_principal_groups)
 
+    # What the signed-in admin resolves to, so an operator can see what the IdP's
+    # groups claim actually produced (claim/stored groups ∪ the mapping below).
+    session_user = request.session.get('user') or {}
+    sub = session_user.get('sub') if isinstance(session_user, dict) else None
+    my_principal = f"user:{sub}" if sub else "anonymous"
+    my_groups = await asyncio.to_thread(tool_authz.resolved_groups, my_principal)
+
     return templates.TemplateResponse(
         request=request,
         name="admin_tool_authz.html",
@@ -1021,6 +1028,8 @@ async def admin_tool_authz_page(request: Request):
             "shadow_denies": shadow_denies,
             "principal_groups": principal_groups,
             "principal_groups_yaml": yaml.safe_dump(principal_groups, sort_keys=False),
+            "my_principal": my_principal,
+            "my_groups": my_groups,
             "flash_msg": request.session.pop("flash_msg", None),
             "bootstrap_available": True,
         },

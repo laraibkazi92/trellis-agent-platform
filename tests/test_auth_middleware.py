@@ -20,7 +20,10 @@ network. Covers:
 import asyncio
 import json
 
+import pytest
+
 from core.auth import AuthMiddleware, auth_token_var, user_id_var
+from core import tool_authz
 
 
 class FakeInnerApp:
@@ -35,6 +38,8 @@ class FakeInnerApp:
                 "scope": scope,
                 "user_id": user_id_var.get(),
                 "auth_token": auth_token_var.get(),
+                # What `group:` rules would resolve for this request.
+                "request_groups": tool_authz._request_groups.get(),
             }
         )
         await send({"type": "http.response.start", "status": 200, "headers": []})
@@ -392,3 +397,102 @@ def test_dev_mode_still_validates_presented_bearer_token(monkeypatch):
     assert json.loads(body) == {"error": "Invalid or expired token"}
     assert fake.called("validate_key") == ["tl_still_bad"]
     assert inner.requests == []
+
+
+# --- IdP groups published for tool calls (v0.7.1 Phase 3) -------------------------
+
+
+@pytest.fixture(autouse=True)
+def _request_groups_isolation():
+    tool_authz.clear_request_groups()
+    yield
+    tool_authz.clear_request_groups()
+
+
+def test_record_groups_are_published_for_the_request_and_cleared_after(monkeypatch):
+    inner = FakeInnerApp()
+    fake = FakeIdentityManager(
+        key_user="alice",
+        user_profile={"sub": "alice", "groups": ["ops", "engineering"]},
+    )
+    middleware = _make_middleware(monkeypatch, inner, fake)
+
+    status, _, _ = _response(
+        _run(middleware, _scope("/v1/agents", headers=_bearer("tl_alice")))
+    )
+
+    assert status == 200
+    assert inner.requests[0]["request_groups"] == ("engineering", "ops")
+    # Cleared in `finally`: a reused task cannot serve these groups to the next call.
+    assert tool_authz._request_groups.get() is None
+
+
+def test_record_without_a_groups_field_publishes_an_empty_claim(monkeypatch):
+    inner = FakeInnerApp()
+    fake = FakeIdentityManager(key_user="alice", user_profile={"sub": "alice"})
+    middleware = _make_middleware(monkeypatch, inner, fake)
+
+    _response(_run(middleware, _scope("/v1/agents", headers=_bearer("tl_alice"))))
+
+    # An explicit empty claim means "this user has no groups"; the engine must not
+    # second-guess it with a record read.
+    assert inner.requests[0]["request_groups"] == ()
+
+
+def test_missing_user_record_publishes_an_empty_claim(monkeypatch):
+    inner = FakeInnerApp()
+    fake = FakeIdentityManager(key_user="ghost", user_profile=None)
+    middleware = _make_middleware(monkeypatch, inner, fake)
+
+    _response(_run(middleware, _scope("/v1/agents", headers=_bearer("tl_ghost"))))
+
+    assert inner.requests[0]["request_groups"] == ()
+
+
+def test_dev_mode_request_publishes_no_groups(monkeypatch):
+    inner = FakeInnerApp()
+    fake = FakeIdentityManager()
+    middleware = _make_middleware(monkeypatch, inner, fake, dev_mode=True)
+
+    _response(_run(middleware, _scope("/v1/agents")))
+
+    # No user record is read on the DEV_MODE path, so no claim is published either.
+    assert inner.requests[0]["request_groups"] is None
+    assert fake.calls == []
+    assert tool_authz._request_groups.get() is None
+
+
+def test_banned_user_never_publishes_groups(monkeypatch):
+    inner = FakeInnerApp()
+    fake = FakeIdentityManager(
+        key_user="banned-user",
+        user_profile={"sub": "banned-user", "is_banned": True, "groups": ["ops"]},
+    )
+    middleware = _make_middleware(monkeypatch, inner, fake)
+
+    status, _, _ = _response(_run(middleware, _scope("/v1/agents", headers=_bearer("tl_b"))))
+
+    assert status == 403
+    assert tool_authz._request_groups.get() is None
+
+
+def test_groups_are_cleared_when_the_inner_app_raises(monkeypatch):
+    """`finally` covers the failure path too: a published claim must not survive it."""
+
+    class ExplodingApp:
+        async def __call__(self, scope, receive, send):
+            assert tool_authz._request_groups.get() == ("engineering", "ops")
+            raise RuntimeError("boom")
+
+    fake = FakeIdentityManager(
+        key_user="alice",
+        user_profile={"sub": "alice", "groups": ["ops", "engineering"]},
+    )
+    middleware = _make_middleware(monkeypatch, ExplodingApp(), fake)
+
+    status, _, _ = _response(
+        _run(middleware, _scope("/v1/agents", headers=_bearer("tl_alice")))
+    )
+
+    assert status == 500
+    assert tool_authz._request_groups.get() is None

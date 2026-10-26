@@ -419,11 +419,40 @@ rules:
 ```
 
 Principals are `user:<sub>`, `agent:<name>`, `workflow:<name>`, `group:<name>` or `*`.
-`group:` membership comes from `/config/framework/principal_groups` (a
-`principal: [group, ...]` map); OIDC group claims are not propagated to tool calls yet.
+`group:` membership is the identity provider's groups claim **unioned** with
+`/config/framework/principal_groups` (a `principal: [group, ...]` map):
+
+- The claim name comes from `OIDC_GROUPS_CLAIM` (default `groups`). Both login callbacks
+  (OIDC and GitHub) read it from the validated profile, accept a comma-separated string or
+  a list, and store it as `groups` on the user record (never in the session cookie). A
+  missing or malformed claim means "no groups" — it never fails a login. For OIDC the
+  value must be present in the **ID token**: the framework does not call the userinfo
+  endpoint, so a provider that only exposes groups there yields zero groups (check the
+  admin page's "Your resolved groups" after logging in).
+- The HTTP auth middleware, which already loads the user record for the ban check,
+  publishes those groups to the policy engine for the duration of the request. That is
+  what makes `group:` rules match `use_tool`/gateway traffic.
+- Calls that do not pass through that middleware (a direct hub `/tools/call`, the admin
+  page) resolve the same groups from the stored record through a 30 s per-process read
+  cache. An etcd failure resolves to "no groups" (so `group:` rules simply do not match)
+  and never raises.
+- **Groups are refreshed at login only.** The record is written by the login callback;
+  the 30 s cache is just a read cache. A user removed from a group at the IdP keeps their
+  `group:` grants until they log in again (and API-key traffic never re-authenticates
+  through the IdP at all). Remove the group from `/config/framework/principal_groups`
+  if you granted it there, or re-login the user.
+- The etcd mapping is a **manual grant unioned on top**: it can add a group, it cannot
+  remove one the IdP asserted, and it is the only source when the IdP sends no claim.
+  The admin page shows the signed-in admin's resolved groups, read-only.
+
 Agent-driven calls resolve to `agent:<name>`/`workflow:<name>`, so user-scoped rules only
 apply where the caller is a user: a gateway call on a user's behalf, or a direct hub call that
-carries a user id.
+carries a user id. Because the claim is published for the whole request, a tool call made
+*inside* a chat-triggered agent run also carries that user's claim groups — so a `group:` rule
+can match an `agent:` principal when the user who started the run belongs to the group.
+**Background runs are different:** they execute in the task worker with no request context and
+resolve to `workflow:<name>`, which has no stored user record — IdP groups never apply there;
+only the etcd mapping does.
 
 **Scope:** the boundary covers `use_tool` (gateway and supervisor/agent) and `search_tools`.
 Tools bound directly to an agent are gated separately — see **Bound tools** below — and every
@@ -477,7 +506,10 @@ tool call before the tool is dispatched (locally or to an edge).
 - **It gates every hub call, not only "direct" ones.** The switch sits where the hub
   dispatches, so agent and bound-tool traffic passes it too. Promoting it to `enforcing`
   therefore denies agent calls with no matching rule *regardless of* `tool_authz_mode` and
-  `bound_tools_mode`. Promote it last, after the other two surfaces are settled.
+  `bound_tools_mode`. Promote it last, after the other two surfaces are settled. Note that a
+  call the host allowed through a `user:`/`group:` rule is re-evaluated in the hub process,
+  where the principal is `agent:<name>` / `workflow:<name>` — the policy needs rules for
+  those principals too (the shadow ring shows exactly which).
 - **The principal comes from the agent token the framework forwards.** Every agent-driven hub
   call already carries `__agent_token` (the run's short-lived token, `core/agent_token.py`). The
   hub verifies it and resolves the principal exactly as the other surfaces do:

@@ -355,8 +355,9 @@
         <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
             <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Principal groups</h2>
             <span class="font-mono text-[11px] text-neutral-500 dark:text-neutral-400">
-                Fallback for <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">group:</code> rules when the
-                identity provider sends no groups claim. A string or a list of strings per principal.
+                Manual grant for <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">group:</code> rules,
+                unioned with the identity provider's groups claim (it can add a group, not remove one). A string or a
+                list of strings per principal.
             </span>
         </div>
 
@@ -376,6 +377,34 @@
                 </button>
             </div>
         </form>
+    </div>
+
+    <!-- What the signed-in admin resolves to (read-only) -->
+    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm space-y-3 mt-6">
+        <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+            <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Your resolved groups</h2>
+            <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-mono font-bold uppercase rounded border border-neutral-500/30 bg-neutral-100 text-neutral-600 dark:bg-neutral-800/40 dark:text-neutral-400">
+                {{ my_groups | length }} group{% if my_groups | length != 1 %}s{% endif %}
+            </span>
+        </div>
+        <p class="font-mono text-xs text-neutral-500 dark:text-neutral-400">
+            Read-only. Resolved for
+            <code class="bg-neutral-100 dark:bg-neutral-800 px-1 py-0.5 rounded-sm">{{ my_principal }}</code>
+            from the identity provider's groups claim (stored on the user record at sign-in) unioned with the
+            mapping above &mdash; the mapping is a manual grant and cannot remove a claim group.
+        </p>
+        {% if my_groups %}
+        <div class="flex flex-wrap gap-2">
+            {% for group in my_groups %}
+            <span class="inline-flex items-center px-2 py-0.5 text-[11px] font-mono rounded border border-accent/30 bg-accent/5 dark:bg-accent-dark/10 text-neutral-900 dark:text-neutral-100 break-all">{{ group }}</span>
+            {% endfor %}
+        </div>
+        {% else %}
+        <p class="font-mono text-[11px] text-neutral-500 dark:text-neutral-400">
+            No groups resolved &mdash; a <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">group:</code>
+            rule cannot match for this account.
+        </p>
+        {% endif %}
     </div>
 </div>
 {% endblock %}

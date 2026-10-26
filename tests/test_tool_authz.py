@@ -32,14 +32,28 @@ class FakeAuthzManager:
     which is how a warm-cache etcd outage is simulated without a network.
     """
 
-    def __init__(self, *, policy=None, mode="off", bound_mode="off", hub_mode="off", groups=None, fail_from=None):
+    def __init__(
+        self,
+        *,
+        policy=None,
+        mode="off",
+        bound_mode="off",
+        hub_mode="off",
+        groups=None,
+        users=None,
+        user_error=None,
+        fail_from=None,
+    ):
         self.policy = {} if policy is None else policy
         self.mode = mode
         self.bound_mode = bound_mode
         self.hub_mode = hub_mode
         self.groups = {} if groups is None else groups
+        self.users = {} if users is None else users
+        self.user_error = user_error
         self.fail_from = fail_from
         self.policy_reads = 0
+        self.user_reads = 0
         self.persisted: list = []
 
     def get_tool_policies(self):
@@ -60,6 +74,12 @@ class FakeAuthzManager:
     def get_principal_groups(self):
         return self.groups
 
+    def get_user(self, user_id):
+        self.user_reads += 1
+        if self.user_error is not None:
+            raise self.user_error
+        return self.users.get(user_id)
+
     def append_tool_authz_deny(self, entry, cap: int = 200):
         self.persisted.insert(0, entry)
         del self.persisted[cap:]
@@ -77,10 +97,12 @@ def _authz_isolation():
     tool_authz.reset_cache()
     tool_authz.clear_shadow_denies()
     tool_authz.clear_request_groups()
+    tool_authz._user_groups_cache.clear()
     yield
     tool_authz.reset_cache()
     tool_authz.clear_shadow_denies()
     tool_authz.clear_request_groups()
+    tool_authz._user_groups_cache.clear()
 
 
 @pytest.fixture
@@ -952,3 +974,165 @@ def test_allowed_accepts_a_pre_resolved_mode(use_registry, monkeypatch):
     use_registry(policy=_policy(_rule([LOCAL_TOOL], ["*"])), mode="off", bound_mode="enforcing")
     monkeypatch.setattr(tool_authz, "mode_for_surface", lambda *_: pytest.fail("re-resolved"))
     assert tool_authz.allowed("user:a", LOCAL_TOOL, "tools:call", mode="enforcing") is True
+
+
+# --- 12. IdP groups on the user record (v0.7.1 Phase 3) -----------------------
+
+ALICE_RECORD = {"sub": "alice", "email": "alice@example.com", "groups": ["ops"]}
+
+
+def test_stored_idp_groups_drive_group_rules_without_a_request_claim(use_registry):
+    """The hub-dispatched / background path: no middleware, groups come off the record."""
+    fake = use_registry(
+        policy=_policy(_rule([LOCAL_TOOL], ["group:ops"])),
+        mode="enforcing",
+        users={"alice": ALICE_RECORD},
+    )
+
+    assert tool_authz.allowed("user:alice", LOCAL_TOOL, "tools:call") is True
+    assert tool_authz.evaluate("user:alice", LOCAL_TOOL, "tools:call")[0] == "allow"
+    assert tool_authz.allowed("user:mallory", LOCAL_TOOL, "tools:call") is False
+    assert fake.user_reads >= 1
+
+
+def test_stored_idp_groups_also_gate_the_hub_direct_surface(use_registry):
+    fake = use_registry(
+        policy=_policy(_rule([LOCAL_TOOL], ["group:ops"])),
+        mode="off",
+        hub_mode="enforcing",
+        users={"alice": ALICE_RECORD},
+    )
+
+    assert (
+        tool_authz.allowed(
+            "user:alice", LOCAL_TOOL, "tools:call", surface=tool_authz.HUB_DIRECT_SURFACE
+        )
+        is True
+    )
+    assert (
+        tool_authz.allowed(
+            "user:mallory", LOCAL_TOOL, "tools:call", surface=tool_authz.HUB_DIRECT_SURFACE
+        )
+        is False
+    )
+    assert fake.user_reads == 2  # one record read per distinct principal
+
+
+def test_request_claim_replaces_the_record_read(use_registry):
+    """When the middleware published the claim, the engine must not re-read etcd."""
+    fake = use_registry(
+        policy=_policy(_rule([LOCAL_TOOL], ["group:ops"])),
+        mode="enforcing",
+        users={"alice": {"sub": "alice", "groups": ["devops"]}},
+    )
+    tool_authz.set_request_groups(["ops"])
+
+    assert tool_authz.allowed("user:alice", LOCAL_TOOL, "tools:call") is True
+    assert tool_authz.evaluate("user:alice", LOCAL_TOOL, "tools:call")[0] == "allow"
+    assert fake.user_reads == 0
+
+    # The record's group is not consulted while a claim is published.
+    use_registry(policy=_policy(_rule([LOCAL_TOOL], ["group:devops"])), mode="enforcing")
+    tool_authz.set_request_groups(["ops"])
+    assert tool_authz.allowed("user:alice", LOCAL_TOOL, "tools:call") is False
+
+
+def test_mapping_unions_with_the_stored_groups(use_registry):
+    """The etcd mapping is a manual grant; it adds to the claim/stored groups."""
+    use_registry(
+        policy=_policy(_rule([LOCAL_TOOL], ["group:oncall"])),
+        mode="enforcing",
+        groups={"alice": ["oncall"]},
+        users={"alice": ALICE_RECORD},
+    )
+
+    assert tool_authz.allowed("user:alice", LOCAL_TOOL, "tools:call") is True
+    assert tool_authz.resolved_groups("user:alice") == ["oncall", "ops"]
+    # Another user still gets nothing from the mapping.
+    assert tool_authz.resolved_groups("user:mallory") == []
+
+
+def test_resolved_groups_unions_the_claim_and_the_mapping(use_registry):
+    use_registry(mode="off", groups={"user:alice": ["oncall"]})
+    tool_authz.set_request_groups(["ops", "ops"])
+
+    assert tool_authz.resolved_groups("user:alice") == ["oncall", "ops"]
+
+    tool_authz.clear_request_groups()
+    assert tool_authz.resolved_groups("") == []
+    assert tool_authz.resolved_groups("anonymous") == []
+
+
+def test_stored_groups_read_is_cached(use_registry):
+    fake = use_registry(
+        policy=_policy(_rule([LOCAL_TOOL], ["group:ops"])),
+        mode="enforcing",
+        users={"alice": ALICE_RECORD},
+    )
+
+    for _ in range(3):
+        assert tool_authz.allowed("user:alice", LOCAL_TOOL, "tools:call") is True
+
+    assert fake.user_reads == 1
+
+
+def test_stored_groups_cache_expires(use_registry, monkeypatch):
+    monkeypatch.setattr(tool_authz, "USER_GROUPS_TTL_S", 0.0)
+    fake = use_registry(
+        policy=_policy(_rule([LOCAL_TOOL], ["group:ops"])),
+        mode="enforcing",
+        users={"alice": ALICE_RECORD},
+    )
+
+    assert tool_authz.allowed("user:alice", LOCAL_TOOL, "tools:call") is True
+    assert tool_authz.allowed("user:alice", LOCAL_TOOL, "tools:call") is True
+
+    assert fake.user_reads == 2
+
+
+def test_stored_groups_read_failure_fails_open_to_no_groups(use_registry, caplog):
+    fake = use_registry(
+        policy=_policy(_rule([LOCAL_TOOL], ["group:ops"])),
+        mode="enforcing",
+        user_error=RuntimeError("etcd unavailable"),
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="core.tool_authz"):
+        assert tool_authz.allowed("user:alice", LOCAL_TOOL, "tools:call") is False
+        assert tool_authz.resolved_groups("user:alice") == []
+
+    # The failure is cached for a few seconds: no retry-budget read per tool call.
+    assert fake.user_reads == 1
+    assert "Failed to read stored groups" in caplog.text
+
+
+def test_security_principals_never_read_a_user_record(use_registry):
+    fake = use_registry(
+        policy=_policy(_rule([LOCAL_TOOL], ["*"])), mode="enforcing", users={"alice": ALICE_RECORD}
+    )
+
+    for principal in ("agent:supervisor", "workflow:nightly", "anonymous", "user:"):
+        tool_authz.evaluate(principal, LOCAL_TOOL, "tools:call")
+
+    assert fake.user_reads == 0
+
+
+def test_stored_record_without_a_groups_field_means_no_groups(use_registry):
+    use_registry(
+        policy=_policy(_rule([LOCAL_TOOL], ["group:ops"])),
+        mode="enforcing",
+        users={"alice": {"sub": "alice"}, "bob": "not-a-dict"},
+    )
+
+    assert tool_authz.allowed("user:alice", LOCAL_TOOL, "tools:call") is False
+    assert tool_authz.allowed("user:bob", LOCAL_TOOL, "tools:call") is False
+
+
+def test_stored_groups_accept_a_comma_separated_record_value(use_registry):
+    use_registry(
+        policy=_policy(_rule([LOCAL_TOOL], ["group:oncall"])),
+        mode="enforcing",
+        users={"alice": {"sub": "alice", "groups": "ops, oncall"}},
+    )
+
+    assert tool_authz.resolved_groups("user:alice") == ["oncall", "ops"]

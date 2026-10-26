@@ -87,13 +87,14 @@ def authz(monkeypatch):
     monkeypatch.setattr(tool_authz, "get_bound_tools_mode", lambda: "off")
     monkeypatch.setattr(tool_authz, "get_hub_call_mode", lambda: "off")
     monkeypatch.setattr(tool_authz, "shadow_denies", lambda: [])
+    monkeypatch.setattr(tool_authz, "resolved_groups", lambda principal: [])
     monkeypatch.setattr(tool_authz, "reset_cache", lambda: resets.append(1))
     fake.resets = resets
     return fake
 
 
 def _admin_session():
-    return {"user": {"email": ADMIN_EMAIL}}
+    return {"user": {"email": ADMIN_EMAIL, "sub": "admin-sub"}}
 
 
 def _form(pairs):
@@ -164,6 +165,62 @@ def test_non_admin_cannot_see_the_page(authz):
     assert response.status_code == 303
     assert response.headers["location"] == "/admin"
     assert session["flash_msg"] == "Unauthorized access."
+
+
+# --- resolved groups for the signed-in admin (v0.7.1 Phase 3) -----------------
+
+
+def test_page_shows_the_admin_resolved_groups(monkeypatch, authz):
+    seen = []
+
+    def fake_resolved(principal):
+        seen.append(principal)
+        return ["oncall", "ops"]
+
+    monkeypatch.setattr(tool_authz, "resolved_groups", fake_resolved)
+
+    response = asyncio.run(admin.admin_tool_authz_page(FakeRequest(session=_admin_session())))
+
+    html = response.body.decode()
+    assert seen == ["user:admin-sub"]  # resolved for the session's `sub`, not the email
+    assert "Your resolved groups" in html
+    assert "2 groups" in html
+    assert "user:admin-sub" in html
+    assert "oncall" in html
+    assert "ops" in html
+    assert "Read-only" in html
+
+
+def test_page_labels_an_empty_resolution(monkeypatch, authz):
+    response = asyncio.run(admin.admin_tool_authz_page(FakeRequest(session=_admin_session())))
+
+    html = response.body.decode()
+    assert "0 groups" in html
+    assert "No groups resolved" in html
+
+
+def test_page_without_a_session_sub_resolves_anonymous(monkeypatch, authz):
+    seen = []
+    monkeypatch.setattr(
+        tool_authz, "resolved_groups", lambda principal: seen.append(principal) or []
+    )
+    session = {"user": {"email": ADMIN_EMAIL}}
+
+    asyncio.run(admin.admin_tool_authz_page(FakeRequest(session=session)))
+
+    assert seen == ["anonymous"]
+
+
+def test_page_escapes_group_names(monkeypatch, authz):
+    monkeypatch.setattr(
+        tool_authz, "resolved_groups", lambda principal: ["<script>alert('x')</script>"]
+    )
+
+    response = asyncio.run(admin.admin_tool_authz_page(FakeRequest(session=_admin_session())))
+
+    html = response.body.decode()
+    assert "<script>alert('x')</script>" not in html
+    assert "&lt;script&gt;" in html
 
 
 # --- POST /admin/tool-authz/bound-mode ---------------------------------------
