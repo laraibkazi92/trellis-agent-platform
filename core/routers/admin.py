@@ -723,6 +723,18 @@ async def delete_admin_configuration_key(request: Request, secret_key: str = For
         
     return RedirectResponse(url='/admin/configuration', status_code=303)
 
+def _provider_latency(provider_id: str) -> dict:
+    """Best-effort latency summary for one provider (worker-thread etcd read).
+
+    Metrics are supplementary: a failing read blanks only that provider's card.
+    """
+    try:
+        return identity_mgr.get_provider_latency(provider_id) or {}
+    except Exception as e:
+        logger.debug("Provider latency read failed for '%s': %s", provider_id, e)
+        return {}
+
+
 @router.get("/admin/llm-providers", response_class=HTMLResponse)
 async def admin_llm_providers_page(request: Request):
     if redirect := require_admin(request, '/admin'):
@@ -744,6 +756,14 @@ async def admin_llm_providers_page(request: Request):
             "base_url_value": base_url_value,
             "value_preview": None,
         })
+
+    # Latency strips are fetched concurrently (one etcd read per provider) rather than
+    # sequentially; _provider_latency() already degrades a failed read to {}.
+    latencies = await asyncio.gather(
+        *(asyncio.to_thread(_provider_latency, card["id"]) for card in cards)
+    )
+    for card, latency in zip(cards, latencies):
+        card["latency"] = latency or {}
 
     # Framework defaults view: the provider select offers only providers that could
     # actually serve traffic (provider_is_usable); the model select is that provider's
@@ -926,6 +946,259 @@ async def delete_llm_provider_key(request: Request, key_name: str = Form(...)):
         request.session["flash_msg"] = f"'{key_name}' was not set."
 
     return RedirectResponse(url='/admin/llm-providers', status_code=303)
+
+# --- Tool authorization (default-deny policy) ---------------------------------
+#
+# Staged rollout: `off` (no checks) -> `shadow` (log would-be denies, allow) ->
+# `enforcing` (deny on no match). The mode and the policy live in etcd and are
+# cached by core/tool_authz.py; reset_cache() after a write makes the change apply
+# without a restart. Entries of the shadow-deny ring are display-only.
+
+_TOOL_AUTHZ_MODES = ("off", "shadow", "enforcing")
+
+
+def _tool_authz():
+    """Import the policy engine lazily so this router never loads it until needed.
+
+    The engine owns an etcd watch and is wired into the gateway/tool-search hot path;
+    keeping the import inside the authz routes means importing ``core.routers.admin``
+    stays cheap (and works even if the engine is unavailable).
+    """
+    from core import tool_authz
+
+    return tool_authz
+
+
+def _validate_principal_groups(doc) -> list[str]:
+    """Validate `principal -> [groups]`; a single string is accepted as a 1-group list."""
+    if doc is None:
+        return []
+    if not isinstance(doc, dict):
+        return ["Expected a mapping of principal to a group list."]
+    errors = []
+    for principal, groups in doc.items():
+        if not isinstance(principal, str) or not principal.strip():
+            errors.append("Principal keys must be non-empty strings.")
+            continue
+        if isinstance(groups, str):
+            continue
+        if not isinstance(groups, list) or not all(isinstance(g, str) and g.strip() for g in groups):
+            errors.append(f"Groups for '{principal}' must be a string or a list of non-empty strings.")
+    return errors
+
+
+def _normalize_principal_groups(doc: dict) -> dict[str, list[str]]:
+    normalized = {}
+    for principal, groups in doc.items():
+        values = [groups] if isinstance(groups, str) else groups
+        normalized[principal.strip()] = [group.strip() for group in values if group.strip()]
+    return normalized
+
+
+@router.get("/admin/tool-authz", response_class=HTMLResponse)
+async def admin_tool_authz_page(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    tool_authz = _tool_authz()
+    policy = await asyncio.to_thread(tool_authz.load_policy)
+    mode = await asyncio.to_thread(tool_authz.get_mode)
+    bound_mode = await asyncio.to_thread(tool_authz.get_bound_tools_mode)
+    hub_mode = await asyncio.to_thread(tool_authz.get_hub_call_mode)
+    shadow_denies = await asyncio.to_thread(tool_authz.shadow_denies)
+    principal_groups = await asyncio.to_thread(identity_mgr.get_principal_groups)
+
+    # What the signed-in admin resolves to, so an operator can see what the IdP's
+    # groups claim actually produced (claim/stored groups ∪ the mapping below).
+    session_user = request.session.get('user') or {}
+    sub = session_user.get('sub') if isinstance(session_user, dict) else None
+    my_principal = f"user:{sub}" if sub else "anonymous"
+    my_groups = await asyncio.to_thread(tool_authz.resolved_groups, my_principal)
+
+    return templates.TemplateResponse(
+        request=request,
+        name="admin_tool_authz.html",
+        context={
+            "user": request.session.get('user'),
+            "policy": policy,
+            "policy_yaml": yaml.safe_dump(policy, sort_keys=False),
+            "mode": mode,
+            "bound_mode": bound_mode,
+            "hub_mode": hub_mode,
+            "shadow_denies": shadow_denies,
+            "principal_groups": principal_groups,
+            "principal_groups_yaml": yaml.safe_dump(principal_groups, sort_keys=False),
+            "my_principal": my_principal,
+            "my_groups": my_groups,
+            "flash_msg": request.session.pop("flash_msg", None),
+            "bootstrap_available": True,
+        },
+    )
+
+
+@router.post("/admin/tool-authz/policy")
+async def save_tool_authz_policy(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    form = await request.form()
+    raw = str(form.get("policy_yaml") or "")
+    try:
+        doc = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        request.session["flash_msg"] = f"Policy YAML did not parse: {exc}"
+        return RedirectResponse(url='/admin/tool-authz', status_code=303)
+
+    tool_authz = _tool_authz()
+    errors = await asyncio.to_thread(tool_authz.validate_policy, doc)
+    if errors:
+        request.session["flash_msg"] = "Policy not saved: " + " | ".join(errors[:3])
+        return RedirectResponse(url='/admin/tool-authz', status_code=303)
+
+    await asyncio.to_thread(identity_mgr.save_tool_policies, doc)
+    tool_authz.reset_cache()
+    request.session["flash_msg"] = "Tool authorization policy saved."
+    return RedirectResponse(url='/admin/tool-authz', status_code=303)
+
+
+@router.post("/admin/tool-authz/mode")
+async def save_tool_authz_mode(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    form = await request.form()
+    mode = str(form.get("mode") or "").strip().lower()
+    if mode not in _TOOL_AUTHZ_MODES:
+        request.session["flash_msg"] = (
+            f"Unknown mode '{mode}'. Use one of: {', '.join(_TOOL_AUTHZ_MODES)}."
+        )
+        return RedirectResponse(url='/admin/tool-authz', status_code=303)
+    if mode == "enforcing" and form.get("confirm") != "on":
+        request.session["flash_msg"] = "Confirmation required to switch to enforcing."
+        return RedirectResponse(url='/admin/tool-authz', status_code=303)
+
+    await asyncio.to_thread(identity_mgr.set_tool_authz_mode, mode)
+    _tool_authz().reset_cache()
+    request.session["flash_msg"] = (
+        f"Tool authorization mode set to '{mode}'. Rollback is immediate: set the mode "
+        "back to shadow/off (the etcd watch invalidates the cache, no restart needed)."
+    )
+    return RedirectResponse(url='/admin/tool-authz', status_code=303)
+
+
+@router.post("/admin/tool-authz/bound-mode")
+async def save_bound_tools_mode(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    form = await request.form()
+    mode = str(form.get("mode") or "").strip().lower()
+    if mode not in _TOOL_AUTHZ_MODES:
+        request.session["flash_msg"] = (
+            f"Unknown bound-tools mode '{mode}'. Use one of: {', '.join(_TOOL_AUTHZ_MODES)}."
+        )
+        return RedirectResponse(url='/admin/tool-authz', status_code=303)
+    if mode == "enforcing" and form.get("confirm") != "on":
+        request.session["flash_msg"] = "Confirmation required to enforce bound-tool authorization."
+        return RedirectResponse(url='/admin/tool-authz', status_code=303)
+
+    await asyncio.to_thread(identity_mgr.set_bound_tools_mode, mode)
+    _tool_authz().reset_cache()
+    request.session["flash_msg"] = (
+        f"Bound-tool authorization mode set to '{mode}'. It is a separate switch from the "
+        "use_tool mode; rollback is immediate (set it back to shadow/off)."
+    )
+    return RedirectResponse(url='/admin/tool-authz', status_code=303)
+
+
+@router.post("/admin/tool-authz/hub-mode")
+async def save_hub_call_mode(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    form = await request.form()
+    mode = str(form.get("mode") or "").strip().lower()
+    if mode not in _TOOL_AUTHZ_MODES:
+        request.session["flash_msg"] = (
+            f"Unknown hub-call mode '{mode}'. Use one of: {', '.join(_TOOL_AUTHZ_MODES)}."
+        )
+        return RedirectResponse(url='/admin/tool-authz', status_code=303)
+    if mode == "enforcing" and form.get("confirm") != "on":
+        request.session["flash_msg"] = (
+            "Confirmation required to enforce direct hub call authorization."
+        )
+        return RedirectResponse(url='/admin/tool-authz', status_code=303)
+
+    await asyncio.to_thread(identity_mgr.set_hub_call_mode, mode)
+    _tool_authz().reset_cache()
+    request.session["flash_msg"] = (
+        f"Direct hub call mode set to '{mode}'. It is a separate switch from the use_tool "
+        "and bound-tool modes; rollback is immediate (set it back to shadow/off)."
+    )
+    return RedirectResponse(url='/admin/tool-authz', status_code=303)
+
+
+@router.post("/admin/tool-authz/bootstrap")
+async def bootstrap_tool_authz_policy(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    tool_configs = await asyncio.to_thread(identity_mgr.get_all_tool_configs)
+    mcp_configs = await asyncio.to_thread(identity_mgr.get_all_mcp_configs)
+    agent_configs = await asyncio.to_thread(identity_mgr.get_all_agent_configs)
+
+    tool_authz = _tool_authz()
+    doc = tool_authz.bootstrap_policy(tool_configs, mcp_configs, agent_configs)
+    await asyncio.to_thread(identity_mgr.save_tool_policies, doc)
+    tool_authz.reset_cache()
+
+    rules = len(doc.get("rules") or []) if isinstance(doc, dict) else 0
+    # The mode is deliberately untouched: bootstrapping from the public whitelist is
+    # safe at any mode, and flipping to enforcing is a separate, confirmed action.
+    request.session["flash_msg"] = (
+        f"Generated {rules} rule(s) from the live registry "
+        "(one per public tool, plus one per agent for its bound tools). "
+        "Mode unchanged. Review the YAML, then try shadow before enforcing."
+    )
+    return RedirectResponse(url='/admin/tool-authz', status_code=303)
+
+
+@router.post("/admin/tool-authz/clear-shadow")
+async def clear_tool_authz_shadow_denies(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    _tool_authz().clear_shadow_denies()
+    request.session["flash_msg"] = "Shadow-deny log cleared."
+    return RedirectResponse(url='/admin/tool-authz', status_code=303)
+
+
+@router.post("/admin/tool-authz/groups")
+async def save_tool_authz_groups(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    form = await request.form()
+    raw = str(form.get("groups_yaml") or "")
+    try:
+        doc = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        request.session["flash_msg"] = f"Principal groups YAML did not parse: {exc}"
+        return RedirectResponse(url='/admin/tool-authz', status_code=303)
+
+    errors = _validate_principal_groups(doc)
+    if errors:
+        request.session["flash_msg"] = "Groups not saved: " + " | ".join(errors[:3])
+        return RedirectResponse(url='/admin/tool-authz', status_code=303)
+
+    normalized = _normalize_principal_groups(doc or {})
+    await asyncio.to_thread(identity_mgr.set_principal_groups, normalized)
+    _tool_authz().reset_cache()
+    request.session["flash_msg"] = (
+        f"Principal groups saved for {len(normalized)} principal(s)."
+    )
+    return RedirectResponse(url='/admin/tool-authz', status_code=303)
+
 
 # --- Edge nodes (trellis-proxy) ------------------------------------------------
 #

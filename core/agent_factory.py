@@ -516,11 +516,65 @@ async def discover_external_mcps(force: bool = False):
     _external_remote_mcps = new_remote_mcps
     _last_discovery_time = now
 
+async def _bound_tool_denial(policy_tool_name: str) -> Optional[str]:
+    """Gate one bound-tool call: a denial message, or ``None`` when it may execute.
+
+    Tools bound to an agent from ``allowed_tools``/``allowed_mcps`` are called straight
+    through their wrapper and never reach ``use_tool``, so this is their only gate. It
+    uses the same evaluator, scope and principal as ``use_tool``, but reads the
+    ``bound_tools_mode`` rollout key and tags its deny-ring entries
+    ``surface="bound_tool"``.
+
+    ``off`` (the default) is a no-I/O fast path once the authz cache is warm: the mode
+    is read from the last snapshot and the principal is never resolved. A cold cache
+    (first call after a start, or after a config change invalidated it) costs one read,
+    as on the ``use_tool`` boundary.
+
+    A denial is the recoverable string ``use_tool`` hands the model -- never a raised
+    exception: one ungranted tool must not fail the whole turn. An exception inside the
+    check also fails closed. Note the engine's documented caveat: if the authz state
+    has *never* been readable, the cold snapshot says ``off``; this gate fails open
+    only while the framework has never seen a policy, exactly like ``use_tool``.
+    """
+    from core import tool_authz
+
+    surface = tool_authz.BOUND_TOOL_SURFACE
+
+    def _verdict() -> Optional[str]:
+        mode = tool_authz.cached_mode_for_surface(surface)
+        if mode is None:
+            mode = tool_authz.mode_for_surface(surface)
+        if mode == "off":
+            return None
+        principal = tool_authz.resolve_current_principal()
+        if tool_authz.allowed(
+            principal, policy_tool_name, "tools:call", surface=surface, mode=mode
+        ):
+            return None
+        return (
+            f"SYSTEM: Access denied. Tool '{policy_tool_name}' is not permitted "
+            "for this principal."
+        )
+
+    try:
+        return await asyncio.to_thread(_verdict)
+    except Exception:
+        logger.exception("Bound-tool authorization check failed for %r", policy_tool_name)
+        return (
+            f"SYSTEM: Error checking tool access for '{policy_tool_name}'. "
+            "Please try again later."
+        )
+
+
 def _register_mcp_tool(agent: Agent, mcp_tool: Any):
     safe_mcp_tool = copy.deepcopy(mcp_tool) if hasattr(mcp_tool, "model_copy") else mcp_tool
     tool_name_for_agent = safe_mcp_tool.name
-    
+    # Hub tools are addressed by their bare registry name in the policy, as in use_tool.
+    policy_tool_name = safe_mcp_tool.name
+
     async def tool_wrapper(ctx: RunContext[None], **kwargs: Any) -> Any:
+        if denial := await _bound_tool_denial(policy_tool_name):
+            return denial
         health_monitor = get_health_monitor()
         if (await asyncio.to_thread(health_monitor.get_status, "tool", safe_mcp_tool.name)).get("status") == "Offline":
             return "SYSTEM: Tool offline."
@@ -556,8 +610,13 @@ def _register_external_mcp_tool(
     """
     safe_mcp_tool = copy.deepcopy(mcp_tool) if hasattr(mcp_tool, "model_copy") else mcp_tool
     tool_name_for_agent = prefixed_name or safe_mcp_tool.name
+    # The policy namespaces MCP tools as `mcp__<server>__<tool>`, whatever the agent-side
+    # name is -- the same string `use_tool` and the bootstrap generator use.
+    policy_tool_name = f"mcp__{mcp_name}__{safe_mcp_tool.name}"
 
     async def tool_wrapper(ctx: RunContext[None], **kwargs: Any) -> Any:
+        if denial := await _bound_tool_denial(policy_tool_name):
+            return denial
         health_monitor = get_health_monitor()
         if (await asyncio.to_thread(health_monitor.get_status, "tool", safe_mcp_tool.name)).get("status") == "Offline":
             return "SYSTEM: Tool offline."
@@ -610,8 +669,12 @@ def _register_remote_mcp_tool(
     """
     safe_mcp_tool = copy.deepcopy(mcp_tool) if hasattr(mcp_tool, "model_copy") else mcp_tool
     tool_name_for_agent = prefixed_name or f"mcp__{site}__{mcp}__{safe_mcp_tool.name}"
+    # Edge tools are addressed `mcp__<site>__<mcp>__<tool>` in the policy namespace.
+    policy_tool_name = f"mcp__{site}__{mcp}__{safe_mcp_tool.name}"
 
     async def tool_wrapper(ctx: RunContext[None], **kwargs: Any) -> Any:
+        if denial := await _bound_tool_denial(policy_tool_name):
+            return denial
         user_id = user_id_var.get()
         if not user_id: raise Exception("No user_id found")
         result = await call_edge_mcp(
@@ -1069,6 +1132,21 @@ async def prewarm_agents() -> None:
 def _register_admin_tools(agent: Agent):
     identity_mgr = get_identity_manager()
 
+    def _current_authz_principal() -> Optional[str]:
+        """Best-effort authorization principal for the tool seams below.
+
+        Taskiq/host turns resolve from the caller's token via the tool-authz
+        engine; when that is unavailable we pass None and let the callee resolve
+        (or fail closed) on its own rather than breaking the agent turn.
+        """
+        try:
+            from core import tool_authz
+
+            return tool_authz.resolve_current_principal()
+        except Exception:
+            logger.debug("Could not resolve tool-authorization principal", exc_info=True)
+            return None
+
     @agent.tool_plain(
         name="search_agents",
         description=(
@@ -1134,14 +1212,34 @@ def _register_admin_tools(agent: Agent):
             "source}. Use this to pick a tool name and its parameter schema, then call "
             "use_tool(tool_name, arguments) to execute it directly — no agent hop needed. "
             "Tools with configured=false are missing credentials — do not call use_tool "
-            "on them; tell the user which credentials are missing instead. "
+            "on them; tell the user which credentials are missing instead. A card with "
+            "detail='lazy' has no parameters yet — call describe_tool for its schema. "
             "Does not return the full catalog — search with a focused query."
         ),
     )
     async def search_tools(query: str, limit: Optional[int] = None) -> List[Dict]:
         from core.tool_search import search_tools as _search_tools_ranked
         user_id = user_id_var.get()
-        return await _search_tools_ranked(query, limit=limit, user_id=user_id)
+        return await _search_tools_ranked(
+            query,
+            limit=limit,
+            user_id=user_id,
+            principal=_current_authz_principal(),
+        )
+
+    @agent.tool_plain(
+        name="describe_tool",
+        description=(
+            "Return the full schema (parameters and description) for exactly one tool. "
+            "Use after search_tools when a card is summary-only (detail: 'lazy') or when "
+            "the schema is needed without ranking. Takes the same name forms as use_tool "
+            "and never executes the tool."
+        ),
+    )
+    async def describe_tool(tool_name: str) -> Dict[str, Any]:
+        from core.tool_search import describe_tool_entry
+
+        return await describe_tool_entry(tool_name, user_id_var.get())
 
     @agent.tool_plain(
         name="use_tool",
@@ -1165,6 +1263,7 @@ def _register_admin_tools(agent: Agent):
             get_hub_client_fn=get_hub_client,
             get_external_mcp_client_fn=get_external_mcp_client,
             call_edge_mcp_fn=call_edge_mcp,
+            principal=_current_authz_principal(),
         )
 
     @agent.tool_plain(name="manage_agent", description="Enable, disable or reload an agent.")

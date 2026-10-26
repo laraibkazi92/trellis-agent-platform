@@ -3,6 +3,7 @@
 
 import json
 import asyncio
+import time
 import uuid
 import logging
 
@@ -49,6 +50,12 @@ async def lifespan(app: FastAPI):
     _memory_isolation_watch_id = identity_mgr.client.add_watch_prefix_callback("/config/framework/agent_memory_isolated_per_user", on_memory_flag_change)
     install_llm_key_watch()
     install_llm_defaults_watch()
+    try:
+        from core.tool_authz import install_tool_authz_watch
+
+        install_tool_authz_watch()
+    except Exception:
+        logger.exception("Failed to install tool-authorization watch; continuing startup")
     # Warm the LLM provider-key cache off the event loop so the first request-path
     # lookup is a cache hit instead of a (possibly ~20s) etcd round-trip.
     await asyncio.to_thread(warm_key_cache)
@@ -72,6 +79,12 @@ async def lifespan(app: FastAPI):
         identity_mgr.client.cancel_watch(_memory_isolation_watch_id)
     cancel_llm_key_watch()
     cancel_llm_defaults_watch()
+    try:
+        from core.tool_authz import cancel_tool_authz_watch
+
+        cancel_tool_authz_watch()
+    except Exception:
+        logger.exception("Failed to cancel tool-authorization watch")
     hub_client = await get_hub_client()
     if hub_client:
         await hub_client.__aexit__(None, None, None)
@@ -107,6 +120,18 @@ from core.memory import get_memory_manager
 identity_mgr = get_identity_manager()
 app.add_middleware(AuthMiddleware, identity_mgr=identity_mgr)
 health_monitor = get_health_monitor()
+
+
+async def _record_latency(provider, agent_name, user_id, ttft_ms, total_ms, ok):
+    """Record one call's latency; metrics failures never affect the response."""
+    try:
+        await asyncio.to_thread(
+            identity_mgr.record_agent_latency,
+            user_id, agent_name, provider, ttft_ms, total_ms, ok,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to record LLM latency for {agent_name}: {e}")
+
 
 BASE_DIR = Path(__file__).parent.parent
 
@@ -190,6 +215,7 @@ async def health():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatRequest):
+    t0 = time.monotonic()
     if not request.messages or request.messages[-1].role != "user":
         raise HTTPException(status_code=400, detail="Invalid messages")
 
@@ -207,6 +233,14 @@ async def chat_completions(request: ChatRequest):
     if request.model != "supervisor" and not is_agent_external(cfg_data):
         raise HTTPException(status_code=403, detail=f"Access denied: Agent '{request.model}' is internal and cannot be called directly.")
 
+    metric_provider = None
+    try:
+        from core.llm_defaults import provider_for_config
+
+        metric_provider = await asyncio.to_thread(provider_for_config, cfg_data)
+    except Exception as e:
+        logger.warning(f"Failed to resolve provider for '{request.model}' latency metric: {e}")
+
     agent_health = await asyncio.to_thread(health_monitor.get_status, "agent", request.model)
     if agent_health.get("status") == "Offline":
         raise HTTPException(status_code=503, detail="Agent offline")
@@ -218,7 +252,44 @@ async def chat_completions(request: ChatRequest):
         # error, not an internal failure: return the registry's message so the caller
         # sees "set DEEPSEEK_API_KEY in Admin -> LLM Providers" instead of a bare 500.
         raise HTTPException(status_code=400, detail=str(e))
-    
+
+    # Guardrail input check: every client-supplied turn is evaluated (not just the
+    # last one — earlier turns and system notes reach the model as history). Checked
+    # text is written back in place so history, execute_agent, run_stream and memory
+    # retain all see the same redaction. Fail-open: an error allows the request.
+    guardrail_block = False
+    all_hits = []
+    try:
+        from core import guardrails
+
+        for message in request.messages:
+            action, checked_text, hits = await asyncio.to_thread(
+                guardrails.evaluate_agent_input, message.content, cfg_data)
+            all_hits.extend(hits)
+            if action == "block":
+                guardrail_block = True
+            elif action == "redact":
+                message.content = checked_text
+    except Exception as e:
+        logger.warning(f"Guardrail input check failed for '{request.model}': {e}")
+        guardrail_block = False
+        all_hits = []
+    if all_hits:
+        try:
+            _spawn_background(
+                asyncio.to_thread(
+                    identity_mgr.record_guardrail_hits,
+                    request.model, guardrails.hit_counts(all_hits),
+                ),
+                f"guardrail_hits:{request.model}",
+            )
+        except Exception as e:
+            logger.error(f"Failed to record guardrail hits for {request.model}: {e}")
+    if guardrail_block:
+        # Rule names only -- never echo the matched previews/payload back to the caller.
+        raised = sorted({h.get("rule", "") for h in all_hits if isinstance(h, dict)})
+        raise HTTPException(status_code=400, detail=f"Blocked by guardrail: {', '.join(raised)}")
+
     history = []
     for msg in request.messages[:-1]:
         if msg.role == "user": history.append(ModelRequest(parts=[UserPromptPart(content=msg.content)]))
@@ -240,8 +311,43 @@ async def chat_completions(request: ChatRequest):
         principal="system" if request.model == "supervisor" else None,
     )
 
-    async def handle_success(result, user_id):
+    async def handle_success(result, user_id, ttft_ms=None):
+        # Measure before usage/memory side effects so p95 reflects the model call,
+        # not etcd retries from the bookkeeping that follows.
+        total_ms = (time.monotonic() - t0) * 1000
         await asyncio.to_thread(health_monitor.record_event, "agent", request.model, True)
+
+        # Guardrail output check. v1 only inspects the final assembled output, so a
+        # streamed reply is checked once complete rather than per chunk.
+        original_text = str(result.output or "")
+        try:
+            from core import guardrails
+
+            out_action, checked_text, out_hits = await asyncio.to_thread(
+                guardrails.evaluate_agent_output, original_text, cfg_data)
+        except Exception as e:
+            logger.warning(f"Guardrail output check failed for '{request.model}': {e}")
+            out_action, checked_text, out_hits = "allow", original_text, []
+        if out_hits:
+            try:
+                _spawn_background(
+                    asyncio.to_thread(
+                        identity_mgr.record_guardrail_hits,
+                        request.model, guardrails.hit_counts(out_hits),
+                    ),
+                    f"guardrail_hits:{request.model}",
+                )
+            except Exception as e:
+                logger.error(f"Failed to record guardrail hits for {request.model}: {e}")
+        if out_action == "block":
+            # The SYSTEM: prefix is load-bearing: client models degrade gracefully
+            # instead of treating an empty/withheld assistant turn as a prompt.
+            safe_text = "SYSTEM: Response blocked by guardrail policy. The agent output was withheld."
+        elif out_action == "redact":
+            safe_text = checked_text
+        else:
+            safe_text = original_text
+
         if user_id and hasattr(result, 'usage'):
             u = result.usage
             if callable(u):
@@ -260,20 +366,29 @@ async def chat_completions(request: ChatRequest):
                 _spawn_background(memory_mgr.retain(
                     bank=await asyncio.to_thread(memory_mgr.bank_for, request.model, user_id),
                     user_msg=request.messages[-1].content,
-                    agent_output=result.output,
+                    agent_output=safe_text,
                 ), f"memory_retain:{request.model}")
             except Exception as e:
                 logger.error(f"Failed to retain memory for {request.model}: {e}")
 
+        _spawn_background(
+            _record_latency(metric_provider, request.model, user_id, ttft_ms, total_ms, True),
+            f"latency:{request.model}",
+        )
+        return safe_text
     if request.stream:
         async def event_generator():
             agent_token_var.set(run_token)
             event_queue = asyncio.Queue()
+            first_event_at = None
             
             async def event_handler(*args, **kwargs):
+                nonlocal first_event_at
                 # PydanticAI streams events natively via event_stream_handler passing (run_ctx, event)
                 event = args[1] if len(args) > 1 else (args[0] if args else None)
                 if event and type(event).__name__ == "ToolCallEvent":
+                    if first_event_at is None:
+                        first_event_at = time.monotonic()
                     try:
                         # Extract tool name based on the event structure
                         if hasattr(event, "part") and hasattr(event.part, "tool_name"):
@@ -309,8 +424,11 @@ async def chat_completions(request: ChatRequest):
                         self.usage = usage
                 
                 result = MockResult(final_text, usage)
-                await handle_success(result, captured_user_id)
-                yield json.dumps({"choices": [{"message": {"role": "assistant", "content": final_text}}]}) + "\n"
+                if first_event_at is None:
+                    first_event_at = time.monotonic()
+                ttft_ms = (first_event_at - t0) * 1000
+                safe_text = await handle_success(result, captured_user_id, ttft_ms=ttft_ms)
+                yield json.dumps({"choices": [{"message": {"role": "assistant", "content": safe_text}}]}) + "\n"
             except asyncio.CancelledError:
                 if not task.done():
                     task.cancel()
@@ -319,6 +437,10 @@ async def chat_completions(request: ChatRequest):
                 if not task.done():
                     task.cancel()
                 await asyncio.to_thread(health_monitor.record_event, "agent", request.model, False, str(e))
+                _spawn_background(
+                    _record_latency(metric_provider, request.model, captured_user_id, None, (time.monotonic() - t0) * 1000, False),
+                    f"latency:{request.model}",
+                )
                 yield json.dumps({"error": "Internal error while running the agent."}) + "\n"
             finally:
                 if not task.done():
@@ -328,9 +450,13 @@ async def chat_completions(request: ChatRequest):
 
     try:
         result = await execute_agent()
-        await handle_success(result, captured_user_id)
-        return {"choices": [{"message": {"role": "assistant", "content": result.output}}]}
+        text = await handle_success(result, captured_user_id)
+        return {"choices": [{"message": {"role": "assistant", "content": text}}]}
     except Exception as e:
         await asyncio.to_thread(health_monitor.record_event, "agent", request.model, False, str(e))
         logger.exception("Agent '%s' execution failed", request.model)
+        _spawn_background(
+            _record_latency(metric_provider, request.model, captured_user_id, None, (time.monotonic() - t0) * 1000, False),
+            f"latency:{request.model}",
+        )
         raise HTTPException(status_code=500, detail="Internal error while running the agent.")

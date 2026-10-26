@@ -27,6 +27,8 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Dict
 
+import pytest
+
 from core import agent_factory
 from core.auth import user_id_var
 from core.models import MCPToolDefinition
@@ -855,3 +857,361 @@ def test_central_mcp_non_union_schema_is_unchanged_for_google(monkeypatch):
     assert tool.inputSchema == schema
 
 
+# --- Phase 1 (v0.7.1): bound-tool gating -------------------------------------
+#
+# Bound tools never reach `use_tool`, so the wrappers themselves ask the policy
+# engine. Every case stubs the authz registry and the run context; `off` must stay a
+# byte-for-byte no-op, `shadow` records and executes, `enforcing` refuses.
+
+DENIED = "SYSTEM: Access denied. Tool '{name}' is not permitted for this principal."
+
+
+class FakeAuthzRegistry:
+    """Authz-only registry stand-in (policy, both modes, the shared deny ring)."""
+
+    def __init__(self, *, policy=None, mode="off", bound_mode="off"):
+        self.policy = {} if policy is None else policy
+        self.mode = mode
+        self.bound_mode = bound_mode
+        self.denies = []
+        self.policy_reads = 0
+
+    def get_tool_policies(self):
+        self.policy_reads += 1
+        return self.policy
+
+    def get_tool_authz_mode(self):
+        return self.mode
+
+    def get_bound_tools_mode(self):
+        return self.bound_mode
+
+    def get_principal_groups(self):
+        return {}
+
+    def append_tool_authz_deny(self, entry, cap: int = 200):
+        self.denies.insert(0, entry)
+        del self.denies[cap:]
+
+    def get_tool_authz_denies(self):
+        return list(self.denies)
+
+    def clear_tool_authz_denies(self):
+        self.denies.clear()
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_authz_registry(monkeypatch):
+    """Never let a wrapper test read (or write) the real authz registry.
+
+    Every bound-tool call now asks the policy engine, and `tool_authz` imports
+    `get_identity_manager` from `core.auth` lazily -- patching `agent_factory`'s own
+    binding is not enough. Without this stub the pre-existing tests fail on a host
+    with `bound_tools_mode=enforcing` and write synthetic entries into the live deny
+    ring under `shadow`.
+    """
+    from core import auth, tool_authz
+
+    fake = FakeAuthzRegistry()
+    monkeypatch.setattr(auth, "get_identity_manager", lambda: fake)
+    tool_authz.reset_cache()
+    yield
+    tool_authz.reset_cache()
+
+
+@pytest.fixture
+def bound_authz(monkeypatch):
+    """Install a fake authz registry and a clean run context; ``install(**cfg)``."""
+    from core import auth, tool_authz
+
+    for var in (auth.agent_token_var, auth.user_id_var, auth.run_id_var):
+        var.set(None)
+    # Persist every denial instead of the production one-per-second sample.
+    monkeypatch.setattr(tool_authz, "_DENY_PERSIST_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(tool_authz, "_last_deny_persist", {})
+
+    def install(**kwargs):
+        fake = FakeAuthzRegistry(**kwargs)
+        monkeypatch.setattr(auth, "get_identity_manager", lambda: fake)
+        tool_authz.reset_cache()
+        tool_authz.clear_shadow_denies()
+        return fake
+
+    yield install
+
+    tool_authz.reset_cache()
+    tool_authz.clear_shadow_denies()
+    for var in (auth.agent_token_var, auth.user_id_var, auth.run_id_var):
+        var.set(None)
+
+
+class RecordingHubClient:
+    def __init__(self):
+        self.calls = []
+
+    async def call_tool(self, name, arguments):
+        self.calls.append((name, arguments))
+        return SimpleNamespace(content=["ok"])
+
+
+def _install_hub_tool(monkeypatch, *, health="Online"):
+    """Register one hub-backed bound tool; returns (wrapper, hub client)."""
+
+    class RecordingToolAgent:
+        def __init__(self):
+            self.tools = {}
+
+        def tool(self, name=None, description=None):
+            def deco(fn):
+                self.tools[name or fn.__name__] = fn
+                return fn
+
+            return deco
+
+    client = RecordingHubClient()
+
+    async def fake_get_hub_client():
+        return client
+
+    monkeypatch.setattr(
+        agent_factory, "get_health_monitor", lambda: SimpleNamespace(get_status=lambda *a: {"status": health})
+    )
+    monkeypatch.setattr(agent_factory, "get_hub_client", fake_get_hub_client)
+
+    fake_agent = RecordingToolAgent()
+    agent_factory._register_mcp_tool(
+        fake_agent, SimpleNamespace(name="opsctl", description="Inspects nodes.")
+    )
+    return fake_agent.tools["opsctl"], client
+
+
+def test_bound_tool_off_runs_and_records_nothing(monkeypatch, bound_authz):
+    from core import tool_authz
+
+    fake = bound_authz(policy={}, mode="off", bound_mode="off")
+    user_id_var.set("user-1")
+    wrapper, client = _install_hub_tool(monkeypatch)
+
+    result = asyncio.run(wrapper(None))
+
+    assert result == ["ok"]
+    assert [name for name, _ in client.calls] == ["opsctl"]
+    assert fake.denies == []
+    assert tool_authz.shadow_denies() == []
+
+
+def test_bound_tool_shadow_executes_and_records_the_surface(monkeypatch, bound_authz):
+    from core import tool_authz
+
+    fake = bound_authz(policy={}, mode="off", bound_mode="shadow")
+    user_id_var.set("user-1")
+    wrapper, client = _install_hub_tool(monkeypatch)
+
+    result = asyncio.run(wrapper(None))
+
+    # Shadow never changes behavior: the tool still ran.
+    assert result == ["ok"]
+    assert [name for name, _ in client.calls] == ["opsctl"]
+
+    [entry] = tool_authz.shadow_denies()
+    assert fake.denies[0] == entry
+    assert entry["surface"] == tool_authz.BOUND_TOOL_SURFACE
+    assert entry["mode"] == "shadow"
+    assert entry["principal"] == "user:user-1"
+    assert entry["tool"] == "opsctl"
+    assert entry["scope"] == "tools:call"
+
+
+def test_bound_tool_enforcing_denies_without_calling_the_hub(monkeypatch, bound_authz):
+    bound_authz(policy={}, mode="off", bound_mode="enforcing")
+    user_id_var.set("user-1")
+    wrapper, client = _install_hub_tool(monkeypatch)
+
+    result = asyncio.run(wrapper(None))
+
+    assert result == DENIED.format(name="opsctl")
+    assert client.calls == []
+
+
+def test_bound_tool_enforcing_allows_a_granted_tool(monkeypatch, bound_authz):
+    bound_authz(
+        policy={
+            "default_action": "deny",
+            "rules": [{"tools": ["opsctl"], "allow_principals": ["agent:supervisor"]}],
+        },
+        bound_mode="enforcing",
+    )
+    from core import agent_token
+
+    # A real agent-run token: the bound-tool principal is `agent:<name>`, as in use_tool.
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", "bound-tool-unit-secret-0123456789abcdef")
+    agent_token.mint_for_run("supervisor", "user-1", run_id="run-1")
+    user_id_var.set("user-1")
+    wrapper, client = _install_hub_tool(monkeypatch)
+
+    result = asyncio.run(wrapper(None))
+
+    assert result == ["ok"]
+    assert [name for name, _ in client.calls] == ["opsctl"]
+
+
+def test_bound_tool_enforcing_uses_the_agent_principal_not_the_user(monkeypatch, bound_authz):
+    from core import agent_token
+
+    bound_authz(
+        policy={
+            "default_action": "deny",
+            "rules": [{"tools": ["opsctl"], "allow_principals": ["user:user-1"]}],
+        },
+        bound_mode="enforcing",
+    )
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", "bound-tool-unit-secret-0123456789abcdef")
+    agent_token.mint_for_run("supervisor", "user-1", run_id="run-1")
+    user_id_var.set("user-1")
+    wrapper, client = _install_hub_tool(monkeypatch)
+
+    # A user-scoped rule does not grant an agent-driven bound call (same as use_tool).
+    assert asyncio.run(wrapper(None)) == DENIED.format(name="opsctl")
+    assert client.calls == []
+
+
+def test_external_mcp_bound_tool_is_gated_by_its_registry_name(monkeypatch, bound_authz):
+    bound_authz(
+        policy={
+            "default_action": "deny",
+            "rules": [{"tools": ["mcp__srv__clusters_get_all"], "allow_principals": ["*"]}],
+        },
+        bound_mode="enforcing",
+    )
+    user_id_var.set("user-1")
+
+    class RecordingToolAgent:
+        def __init__(self):
+            self.tools = {}
+
+        def tool(self, name=None, description=None):
+            def deco(fn):
+                self.tools[name or fn.__name__] = fn
+                return fn
+
+            return deco
+
+    calls = []
+
+    class FakeExternalClient:
+        async def call_tool(self, name, arguments):
+            calls.append((name, arguments))
+            return SimpleNamespace(content=["ok"])
+
+    async def fake_get_external_mcp_client(mcp_name, user_id):
+        return FakeExternalClient()
+
+    monkeypatch.setattr(
+        agent_factory, "get_health_monitor", lambda: SimpleNamespace(get_status=lambda *a: {"status": "Online"})
+    )
+    monkeypatch.setattr(agent_factory, "get_external_mcp_client", fake_get_external_mcp_client)
+
+    fake_agent = RecordingToolAgent()
+    # Registered under its bare name, but the policy namespace is `mcp__<server>__<tool>`.
+    agent_factory._register_external_mcp_tool(
+        fake_agent, "srv", SimpleNamespace(name="clusters_get_all", description="Lists clusters.")
+    )
+    wrapper = fake_agent.tools["clusters_get_all"]
+
+    assert asyncio.run(wrapper(None)) == ["ok"]
+    assert [name for name, _ in calls] == ["clusters_get_all"]
+
+    # The same server/tool pair with no rule is denied.
+    bound_authz(policy={"default_action": "deny", "rules": []}, bound_mode="enforcing")
+    assert asyncio.run(wrapper(None)) == DENIED.format(name="mcp__srv__clusters_get_all")
+    assert [name for name, _ in calls] == ["clusters_get_all"]
+
+
+def test_edge_mcp_bound_tool_is_gated_by_its_four_part_name(monkeypatch, bound_authz):
+    bound_authz(
+        policy={
+            "default_action": "deny",
+            "rules": [{"tools": ["mcp__site__mcp__read__x"], "allow_principals": ["*"]}],
+        },
+        bound_mode="enforcing",
+    )
+    user_id_var.set("user-1")
+
+    class RecordingToolAgent:
+        def __init__(self):
+            self.tools = {}
+
+        def tool(self, name=None, description=None):
+            def deco(fn):
+                self.tools[name or fn.__name__] = fn
+                return fn
+
+            return deco
+
+    calls = []
+
+    async def fake_call_edge_mcp(site, mcp, tool, arguments, user_id, agent_token=None):
+        calls.append(f"mcp__{site}__{mcp}__{tool}")
+        return {"content": ["ok"]}
+
+    monkeypatch.setattr(agent_factory, "call_edge_mcp", fake_call_edge_mcp)
+
+    fake_agent = RecordingToolAgent()
+    agent_factory._register_remote_mcp_tool(
+        fake_agent, "site", "mcp", SimpleNamespace(name="read__x", description="Edge tool.")
+    )
+    wrapper = fake_agent.tools["mcp__site__mcp__read__x"]
+
+    assert asyncio.run(wrapper(None)) == ["ok"]
+    assert calls == ["mcp__site__mcp__read__x"]
+
+    bound_authz(policy={"default_action": "deny", "rules": []}, bound_mode="enforcing")
+    assert asyncio.run(wrapper(None)) == DENIED.format(name="mcp__site__mcp__read__x")
+    assert calls == ["mcp__site__mcp__read__x"]
+
+
+
+
+def test_bound_tool_check_failure_fails_closed(monkeypatch, bound_authz):
+    """An evaluator crash must deny the call, not execute it and not raise."""
+    from core import tool_authz
+
+    bound_authz(policy={"default_action": "deny", "rules": []}, bound_mode="enforcing")
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("policy engine unavailable")
+
+    monkeypatch.setattr(tool_authz, "evaluate", boom)
+    user_id_var.set("user-1")
+    wrapper, client = _install_hub_tool(monkeypatch)
+
+    result = asyncio.run(wrapper(None))
+
+    assert result == "SYSTEM: Error checking tool access for 'opsctl'. Please try again later."
+    assert client.calls == []
+
+
+def test_bound_tool_mode_is_independent_of_the_use_tool_mode(monkeypatch, bound_authz):
+    """use_tool enforcing must not gate bound tools while their own switch is off."""
+    bound_authz(policy={"default_action": "deny", "rules": []}, mode="enforcing", bound_mode="off")
+    user_id_var.set("user-1")
+    wrapper, client = _install_hub_tool(monkeypatch)
+
+    assert asyncio.run(wrapper(None)) == ["ok"]
+    assert [name for name, _ in client.calls] == ["opsctl"]
+
+
+def test_bound_tool_off_makes_no_registry_read_once_warm(monkeypatch, bound_authz):
+    """The default mode must stay a no-I/O fast path after the cache is warm."""
+    from core import tool_authz
+
+    fake = bound_authz(policy={}, mode="off", bound_mode="off")
+    user_id_var.set("user-1")
+    wrapper, client = _install_hub_tool(monkeypatch)
+
+    assert asyncio.run(wrapper(None)) == ["ok"]
+    reads_after_first = fake.policy_reads
+
+    assert asyncio.run(wrapper(None)) == ["ok"]
+    assert fake.policy_reads == reads_after_first
+    assert tool_authz.cached_mode_for_surface(tool_authz.BOUND_TOOL_SURFACE) == "off"

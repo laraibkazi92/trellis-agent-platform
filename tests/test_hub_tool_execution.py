@@ -46,6 +46,24 @@ def _reset_registered_tools():
     hub._unreadable_tool_names.clear()
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_authz_registry(monkeypatch):
+    """Every hub call now asks the direct-call gate (``hub_call_mode``, default off).
+
+    ``core.tool_authz`` imports ``get_identity_manager`` from ``core.auth`` lazily, so
+    patching the hub's own binding is not enough: without this stub the first tool call
+    in each cache window would attempt a real etcd read.
+    """
+    import _hub_authz_registry as authz_registry
+
+    authz_registry.install(monkeypatch)
+    yield
+    from core import tool_authz
+
+    tool_authz.reset_cache()
+    tool_authz.clear_shadow_denies()
+
+
 ENTRYPOINT_SOURCE = "import json, sys\nprint(json.dumps({}))\n"
 
 

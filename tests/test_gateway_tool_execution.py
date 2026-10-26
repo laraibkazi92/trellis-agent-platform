@@ -6,8 +6,11 @@ import logging
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
-from core import gateway
+import pytest
+
+from core import auth, gateway, tool_authz, tool_search
 from core.auth import user_id_var
+from core.tool_search import execute_whitelisted_tool
 
 
 class FakeContext:
@@ -60,9 +63,10 @@ def test_search_tools_delegates_to_ranked_search_and_reports_progress(monkeypatc
         {"name": "netctl", "description": "Inspect cluster nodes.", "parameters": {}, "configured": True, "status": "Online", "source": "local"},
     ]
 
-    async def fake_ranked(query, limit=8, user_id=None):
+    async def fake_ranked(query, limit=8, user_id=None, principal=None):
         assert query == "inspect cluster nodes"
         assert user_id == "user-1"
+        assert principal == "user:user-1"
         return cards
 
     monkeypatch.setattr(gateway, "_search_tools_ranked", fake_ranked)
@@ -259,3 +263,345 @@ def test_use_tool_surfaces_execution_errors(monkeypatch, caplog):
     assert result == "SYSTEM: Error executing tool 'opsctl'. Please try again later."
     assert "hub unreachable" not in result
     assert "hub unreachable" in caplog.text
+
+
+# --- tool authorization (core.tool_authz) seams ------------------------------
+#
+# `execute_whitelisted_tool` runs whitelist -> authorization -> configuration ->
+# dispatch, and `search_tools` filters candidates before ranking. Both reach the
+# authz engine through the lazily imported `core.auth.get_identity_manager`, so a
+# fake registry makes these tests free of etcd, network and sleeps.
+
+class FakeAuthzRegistry:
+    """Registry stand-in carrying only the three tool-authz reads."""
+
+    def __init__(self, *, policy=None, mode="off", groups=None):
+        self.policy = {} if policy is None else policy
+        self.mode = mode
+        self.groups = {} if groups is None else groups
+        self.policy_reads = 0
+
+    def get_tool_policies(self):
+        self.policy_reads += 1
+        return self.policy
+
+    def get_tool_authz_mode(self):
+        return self.mode
+
+    def get_principal_groups(self):
+        return self.groups
+
+
+class FakeToolRegistry:
+    """The two registry lookups the whitelist guard performs."""
+
+    def __init__(self, tool_configs=None, mcp_configs=None):
+        self.tool_configs = tool_configs or {}
+        self.mcp_configs = mcp_configs or {}
+
+    def get_tool_config(self, name):
+        return self.tool_configs.get(name)
+
+    def get_mcp_config(self, name):
+        return self.mcp_configs.get(name)
+
+
+@pytest.fixture(autouse=True)
+def _authz_isolation():
+    """The authz snapshot/ring/caller-group state is process global; isolate it."""
+    tool_authz.reset_cache()
+    tool_authz.clear_shadow_denies()
+    tool_authz.clear_request_groups()
+    yield
+    tool_authz.reset_cache()
+    tool_authz.clear_shadow_denies()
+    tool_authz.clear_request_groups()
+
+
+def _install_authz(monkeypatch, *, policy=None, mode="off"):
+    fake = FakeAuthzRegistry(policy=policy, mode=mode)
+    monkeypatch.setattr(auth, "get_identity_manager", lambda: fake)
+    tool_authz.reset_cache()
+    return fake
+
+
+def _authz_policy(*rules):
+    return {"default_action": "deny", "rules": list(rules)}
+
+
+def _authz_rule(tools, principals=("*",), scopes=None):
+    rule = {"tools": list(tools), "allow_principals": list(principals)}
+    if scopes is not None:
+        rule["scopes"] = list(scopes)
+    return rule
+
+
+PUBLIC_OPSCTL = {"opsctl": {"name": "opsctl", "public": True}}
+
+
+def _configured_ok(calls=None):
+    async def fake_configured(tool_name, user_id=None):
+        if calls is not None:
+            calls.append(tool_name)
+        return {
+            "configured": True,
+            "missing_secrets": [],
+            "missing_variables": [],
+            "optional_missing_secrets": [],
+        }
+
+    return fake_configured
+
+
+def _forbidden_hub():
+    async def _fail():
+        raise AssertionError("get_hub_client must not be touched")
+
+    return _fail
+
+
+# --- execute_whitelisted_tool: authorization guard ---------------------------
+
+def test_execute_whitelisted_tool_denies_principal_without_a_matching_rule(monkeypatch):
+    _install_authz(monkeypatch, policy=_authz_policy(), mode="enforcing")
+    configured_calls = []
+
+    result = asyncio.run(
+        execute_whitelisted_tool(
+            "opsctl",
+            {"args": ["--help"]},
+            "user-1",
+            identity_manager=FakeToolRegistry(PUBLIC_OPSCTL),
+            is_configured=_configured_ok(configured_calls),
+            get_hub_client_fn=_forbidden_hub(),
+            principal="user:alice",
+        )
+    )
+
+    assert result == "SYSTEM: Access denied. Tool 'opsctl' is not permitted for this principal."
+    assert configured_calls == []  # denial happens before the configuration guard
+
+
+def test_execute_whitelisted_tool_uses_the_principal_kwarg(monkeypatch):
+    _install_authz(
+        monkeypatch,
+        policy=_authz_policy(_authz_rule(["opsctl"], ["user:bob"])),
+        mode="enforcing",
+    )
+    registry = FakeToolRegistry(PUBLIC_OPSCTL)
+
+    denied = asyncio.run(
+        execute_whitelisted_tool(
+            "opsctl",
+            {"args": ["--help"]},
+            "user-1",
+            identity_manager=registry,
+            is_configured=_configured_ok(),
+            get_hub_client_fn=_forbidden_hub(),
+            principal="user:alice",
+        )
+    )
+    assert denied == "SYSTEM: Access denied. Tool 'opsctl' is not permitted for this principal."
+
+    fake_client = FakeMCPClient(FakeCallToolResult(data={"stdout": "ok"}))
+
+    async def fake_get_hub_client():
+        return fake_client
+
+    allowed = asyncio.run(
+        execute_whitelisted_tool(
+            "opsctl",
+            {"args": ["--help"]},
+            "user-1",
+            identity_manager=registry,
+            is_configured=_configured_ok(),
+            get_hub_client_fn=fake_get_hub_client,
+            principal="user:bob",
+        )
+    )
+
+    assert allowed == {"stdout": "ok"}
+    assert len(fake_client.calls) == 1
+
+
+def test_execute_whitelisted_tool_shadow_executes_and_records_the_denial(monkeypatch):
+    _install_authz(monkeypatch, policy=_authz_policy(), mode="shadow")
+    fake_client = FakeMCPClient(FakeCallToolResult(data={"stdout": "{}"}))
+
+    async def fake_get_hub_client():
+        return fake_client
+
+    result = asyncio.run(
+        execute_whitelisted_tool(
+            "opsctl",
+            {"args": ["--help"]},
+            "user-1",
+            identity_manager=FakeToolRegistry(PUBLIC_OPSCTL),
+            is_configured=_configured_ok(),
+            get_hub_client_fn=fake_get_hub_client,
+            principal="user:alice",
+        )
+    )
+
+    assert result == {"stdout": "{}"}  # shadow still executes
+    entries = tool_authz.shadow_denies()
+    assert [(e["principal"], e["tool"], e["scope"]) for e in entries] == [
+        ("user:alice", "opsctl", "tools:call")
+    ]
+
+
+def test_execute_whitelisted_tool_with_authz_off_is_unchanged(monkeypatch):
+    _install_authz(monkeypatch, policy=_authz_policy(), mode="off")
+    fake_client = FakeMCPClient(
+        FakeCallToolResult(data={"stdout": "{}", "stderr": "", "exit_code": 0})
+    )
+
+    async def fake_get_hub_client():
+        return fake_client
+
+    result = asyncio.run(
+        execute_whitelisted_tool(
+            "opsctl",
+            {"args": ["--help"]},
+            "user-42",
+            identity_manager=FakeToolRegistry(PUBLIC_OPSCTL),
+            is_configured=_configured_ok(),
+            get_hub_client_fn=fake_get_hub_client,
+            principal="user:alice",
+        )
+    )
+
+    assert result == {"stdout": "{}", "stderr": "", "exit_code": 0}
+    name, arguments, raise_on_error = fake_client.calls[0]
+    assert name == "opsctl"
+    arguments.pop("__agent_token", None)
+    assert arguments == {"args": ["--help"], "__user_id": "user-42"}
+    assert raise_on_error is False
+    assert tool_authz.shadow_denies() == []
+
+
+def test_execute_whitelisted_tool_fails_closed_when_authz_raises(monkeypatch):
+    _install_authz(monkeypatch, policy=_authz_policy(), mode="enforcing")
+    configured_calls = []
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("policy engine exploded")
+
+    monkeypatch.setattr(tool_authz, "allowed", boom)
+
+    result = asyncio.run(
+        execute_whitelisted_tool(
+            "opsctl",
+            {"args": ["--help"]},
+            "user-1",
+            identity_manager=FakeToolRegistry(PUBLIC_OPSCTL),
+            is_configured=_configured_ok(configured_calls),
+            get_hub_client_fn=_forbidden_hub(),
+            principal="user:alice",
+        )
+    )
+
+    assert result == "SYSTEM: Error checking tool access for 'opsctl'. Please try again later."
+    assert configured_calls == []
+
+
+# --- search_tools: pre-rank authorization filter -----------------------------
+
+SEARCH_TOOL_CONFIGS = {
+    "opsctl": {
+        "name": "opsctl",
+        "description": "Executes opsctl CLI commands for connector diagnostics and metrics.",
+        "public": True,
+        "inputs": {},
+    },
+    "netctl": {
+        "name": "netctl",
+        "description": "Inspects cluster nodes, tenants, and connectors read-only.",
+        "public": True,
+        "inputs": {},
+    },
+    "system_restart": {
+        "name": "system_restart",
+        "description": "Restarts internal system services. Do not expose.",
+        "public": False,
+        "inputs": {},
+    },
+}
+
+
+def _patch_search_registry(monkeypatch):
+    mgr = tool_search.identity_mgr
+    monkeypatch.setattr(mgr, "get_all_tool_configs", lambda: SEARCH_TOOL_CONFIGS)
+    monkeypatch.setattr(mgr, "get_all_mcp_configs", lambda: {})
+    monkeypatch.setattr(mgr, "get_all_tool_embeddings", lambda: {})
+    monkeypatch.setattr(mgr, "get_all_health_statuses", lambda entity_type: {})
+    # Force the keyword ranker so ranking is deterministic without embeddings.
+    monkeypatch.setattr(tool_search, "embed_text", lambda text, task_type: None)
+
+
+def test_search_tools_filters_denied_tools_before_ranking(monkeypatch):
+    _patch_search_registry(monkeypatch)
+    _install_authz(
+        monkeypatch, policy=_authz_policy(_authz_rule(["netctl"])), mode="enforcing"
+    )
+
+    results = asyncio.run(
+        tool_search.search_tools("cluster nodes", limit=0, principal="user:bob")
+    )
+    assert [r["name"] for r in results] == ["netctl"]
+
+    # opsctl ranks first for this query, so a limit of 1 only returns netctl if the
+    # filter ran before ranking.
+    ranked = asyncio.run(
+        tool_search.search_tools(
+            "opsctl CLI commands", limit=1, principal="user:bob"
+        )
+    )
+    assert [r["name"] for r in ranked] == ["netctl"]
+
+
+def test_search_tools_keeps_denied_tools_and_records_them_in_shadow(monkeypatch):
+    _patch_search_registry(monkeypatch)
+    _install_authz(monkeypatch, policy=_authz_policy(), mode="shadow")
+
+    results = asyncio.run(
+        tool_search.search_tools("cluster nodes", limit=0, principal="user:bob")
+    )
+
+    assert {r["name"] for r in results} == {"opsctl", "netctl"}
+    entries = tool_authz.shadow_denies()  # newest first
+    assert {e["tool"] for e in entries} == {"opsctl", "netctl"}
+    assert {e["scope"] for e in entries} == {"tools:read"}
+
+
+def test_search_tools_with_authz_off_returns_all_candidates_and_records_nothing(monkeypatch):
+    _patch_search_registry(monkeypatch)
+    _install_authz(monkeypatch, policy=_authz_policy(), mode="off")
+
+    results = asyncio.run(
+        tool_search.search_tools("cluster nodes", limit=0, principal="user:bob")
+    )
+
+    assert {r["name"] for r in results} == {"opsctl", "netctl"}
+    assert tool_authz.shadow_denies() == []
+
+
+def test_use_tool_forwards_the_user_principal(monkeypatch):
+    monkeypatch.setattr(
+        gateway.identity_mgr, "get_tool_config",
+        lambda name: {"name": name, "public": True},
+    )
+    seen = {}
+
+    async def fake_execute(tool_name, arguments, user_id, **kwargs):
+        seen.update(tool_name=tool_name, user_id=user_id, **kwargs)
+        return "ok"
+
+    monkeypatch.setattr(gateway, "execute_whitelisted_tool", fake_execute)
+    user_id_var.set("user-1")
+
+    result = asyncio.run(gateway.use_tool(FakeContext(), "opsctl", {"x": 1}))
+
+    assert result == "ok"
+    assert seen["principal"] == "user:user-1"
+    assert seen["user_id"] == "user-1"

@@ -382,3 +382,183 @@ The hub reloads tool configs dynamically, so no restart is needed for most chang
 - [ ] Secrets/variables declared in `tool.yaml` and accessible via `os.getenv()`
 - [ ] Tool tested locally with `echo '{...}' | ENV_VAR=val python script.py`
 - [ ] `docker compose up -d --build` run after changes
+
+---
+
+## Tool Authorization (Default-Deny Boundary)
+
+Admin → **Tool Authorization** (`/admin/tool-authz`) gates tool discovery and direct tool
+calls through `use_tool`. A call is allowed only when an ordered policy rule matches its
+principal, tool name and scope — **no matching rule means deny**. The gate ships dark and is
+rolled out in stages:
+
+| Mode | Behavior |
+| --- | --- |
+| `off` (default) | No-op. Identical to running without a policy. |
+| `shadow` | Evaluates and records would-be denials, still allows. Use this to build the policy. |
+| `enforcing` | Denies unmatched tools at both `tools:call` and `tools:read`. |
+
+1. Click **Bootstrap** to generate one explicit rule per currently-public tool with
+   `allow_principals: ["*"]` and both scopes — day-one compatibility, tightened by deleting
+   lines. It also emits one rule per agent covering every tool the agent binds directly
+   (`allowed_tools` / `allowed_mcps`), granted to that agent's own principal
+   (`agent:<name>`, or `workflow:<name>` for a background type), so the bound-tool and hub
+   surfaces have something to match from the start. It enumerates an `allowed_mcps`
+   server's tools as they are registered when it runs, so re-run it (or hand-add the
+   missing rule) after a server gains a tool. **Bootstrap replaces the whole document**:
+   on an already-tuned policy prefer adding the one rule by hand, since re-running resets
+   the deletions that tightened it.
+2. Switch to `shadow` and let normal traffic run. Review the denial table (shared across
+   services, sampled, capped at 200) and reconcile every entry.
+3. Switch to `enforcing`. Rollback is immediate: set the mode back to `shadow`/`off` — the etcd
+   watch invalidates every process's cache without a restart.
+
+Policy document (`/registry/tool_policies`):
+
+```yaml
+default_action: deny            # the only accepted value
+rules:
+  - tools: [opsctl, "mcp__srv__*"]        # fnmatch globs over local / mcp__server__tool /
+                                          # mcp__site__mcp__tool names
+    allow_principals: [user:alice, group:ops, "agent:supervisor"]
+    scopes: [tools:read, tools:call]
+    rate_limit_per_min: 60                # schema-only in v1 (not enforced)
+```
+
+Principals are `user:<sub>`, `agent:<name>`, `workflow:<name>`, `group:<name>` or `*`.
+`group:` membership is the identity provider's groups claim **unioned** with
+`/config/framework/principal_groups` (a `principal: [group, ...]` map):
+
+- The claim name comes from `OIDC_GROUPS_CLAIM` (default `groups`). Both login callbacks
+  (OIDC and GitHub) read it from the validated profile, accept a comma-separated string or
+  a list, and store it as `groups` on the user record (never in the session cookie). A
+  missing or malformed claim means "no groups" — it never fails a login. For OIDC the
+  value must be present in the **ID token**: the framework does not call the userinfo
+  endpoint, so a provider that only exposes groups there yields zero groups (check the
+  admin page's "Your resolved groups" after logging in).
+- The HTTP auth middleware, which already loads the user record for the ban check,
+  publishes those groups to the policy engine for the duration of the request. That is
+  what makes `group:` rules match `use_tool`/gateway traffic.
+- Calls that do not pass through that middleware (a direct hub `/tools/call`, the admin
+  page) resolve the same groups from the stored record through a 30 s per-process read
+  cache. An etcd failure resolves to "no groups" (so `group:` rules simply do not match)
+  and never raises.
+- **Groups are refreshed at login only.** The record is written by the login callback;
+  the 30 s cache is just a read cache. A user removed from a group at the IdP keeps their
+  `group:` grants until they log in again (and API-key traffic never re-authenticates
+  through the IdP at all). Remove the group from `/config/framework/principal_groups`
+  if you granted it there, or re-login the user.
+- The etcd mapping is a **manual grant unioned on top**: it can add a group, it cannot
+  remove one the IdP asserted, and it is the only source when the IdP sends no claim.
+  The admin page shows the signed-in admin's resolved groups, read-only.
+
+Agent-driven calls resolve to `agent:<name>`/`workflow:<name>`, so user-scoped rules only
+apply where the caller is a user: a gateway call on a user's behalf, or a direct hub call that
+carries a user id. Because the claim is published for the whole request, a tool call made
+*inside* a chat-triggered agent run also carries that user's claim groups — so a `group:` rule
+can match an `agent:` principal when the user who started the run belongs to the group.
+**Background runs are different:** they execute in the task worker with no request context and
+resolve to `workflow:<name>`, which has no stored user record — IdP groups never apply there;
+only the etcd mapping does.
+
+**Scope:** the boundary covers `use_tool` (gateway and supervisor/agent) and `search_tools`.
+Tools bound directly to an agent are gated separately — see **Bound tools** below — and every
+call the hub dispatches is gated by its own switch — see **Direct hub calls** below. That last
+switch sits on the hub's last mile, so it also re-checks traffic that the other two surfaces
+already let through.
+Denials are logged as structured JSON (`event: tool_authz_deny`) with the principal, tool,
+scope and mode — never tool arguments.
+
+### Bound tools
+
+Tools listed in an agent's `allowed_tools` / `allowed_mcps` are registered straight onto the
+agent (`core/agent_factory.py`) and never pass through `use_tool`, so they have their own
+switch on the same page: **Bound tools**, stored at
+`/config/framework/bound_tools_mode`.
+
+| Mode | Behavior |
+| --- | --- |
+| `off` (default) | No-op. Bound tools run exactly as they did before the gate existed. |
+| `shadow` | Evaluates each call, records would-be denials in the shared ring (`surface: bound_tool`), still runs the tool. |
+| `enforcing` | A bound call with no matching rule returns an access-denied message to the model and the tool does not run. |
+
+- **Default off.** Nothing changes until an operator promotes the mode, and promotion to
+  `enforcing` requires the confirmation checkbox. Use `shadow` first: a policy written by
+  hand for `use_tool` traffic may not have rules for `agent:<name>` / `workflow:<name>` yet.
+  A freshly bootstrapped one does — Bootstrap emits a rule per agent for its bound tools —
+  but only for the bindings that existed when it ran.
+- The evaluator, scope (`tools:call`), principal resolution and rule language are the same as
+  `use_tool` — one policy document, one deny ring, only the rollout key and the
+  `surface` tag differ. MCP tools are matched by their registry name
+  (`mcp__server__tool`, `mcp__site__mcp__tool`), not the agent-side short name.
+- **Not covered:** console tools (`ls`, `read_file`, …), A2A/subagent delegation and admin
+  tools. These are framework capabilities, not hub tools, and stay outside the policy.
+- A tool that is **both** bound to an agent and public can also be reached through the
+  supervisor's `use_tool`; that path is evaluated by the *use_tool* switch, not the bound-tool
+  one. Enforcing bound tools alone does not close it.
+- Rollback is immediate: set the mode back to `shadow`/`off`; the etcd watch invalidates every
+  process's cache without a restart.
+
+### Direct hub calls
+
+`/tools/call` on the hub (`core/hub.py`, port 8001) is its own entry point: a caller there
+does not have to pass through `use_tool` or a bound-tool wrapper. It has a third switch on the
+same page — **Direct hub calls**, stored at `/config/framework/hub_call_mode` — that gates every
+tool call before the tool is dispatched (locally or to an edge).
+
+| Mode | Behavior |
+| --- | --- |
+| `off` (default) | No-op: no token verification, no policy evaluation. Current v0.7 behavior. |
+| `shadow` | Evaluates each call, records would-be denials in the shared ring (`surface: hub_direct`), still runs the tool. |
+| `enforcing` | A call with no matching rule returns `SYSTEM: Access denied. Tool '<name>' is not permitted for this principal.` and the tool does not run. |
+
+- **It gates every hub call, not only "direct" ones.** The switch sits where the hub
+  dispatches, so agent and bound-tool traffic passes it too. Promoting it to `enforcing`
+  therefore denies agent calls with no matching rule *regardless of* `tool_authz_mode` and
+  `bound_tools_mode`. Promote it last, after the other two surfaces are settled.
+- **It resolves the same principal and groups the host did.** The hub re-derives the
+  principal from the token the framework forwards, never from an `agent:` / `workflow:`
+  string the caller supplies, so for framework traffic it is the principal the host already
+  evaluated: `user:<id>` for a gateway call on a user's behalf, `agent:<name>` /
+  `workflow:<name>` otherwise. It resolves `group:` membership from that token's user record
+  too — the same record the host's middleware publishes from — so a `group:` rule reaches
+  the same verdict on both sides instead of matching on the host and denying at the last
+  mile. `workflow:` runs carry a service user id with no record, so the record contributes
+  no groups there — only `/config/framework/principal_groups` can grant a workflow a group
+  (as on every other surface). Given the same policy, enforcing therefore does not change a
+  decision the other gates already made; what it closes is the path that met none of them,
+  a direct `/tools/call`.
+- **The fallback is a different principal.** A token that cannot be verified (a key
+  mismatch, an expired token) contributes no claims, so the principal falls back to
+  `__user_id` or `anonymous`: `agent:` / `workflow:` rules cannot match, and the call is
+  denied unless a `user:`, `group:` or `*` rule covers the fallback. A supplied `__user_id`
+  also inherits that user's stored groups, so a `group:` rule is reachable from this path.
+  The hub logs a warning when a token was presented and did not verify; a call with no token
+  at all falls back silently.
+  Check the shadow ring for `hub_direct` rows before promoting — an entry means some
+  caller's principal has no rule. The ring is sampled and rate-limited per surface, so
+  absence only means nothing was denied in the window.
+- **The principal comes from the agent token the framework forwards.** Every agent-driven hub
+  call already carries `__agent_token` (the run's short-lived token, `core/agent_token.py`). The
+  hub verifies it and resolves the principal exactly as the other surfaces do:
+  `workflow:<agent>` for a background run, `user:<id>` for a gateway call on behalf of a user,
+  `agent:<name>` otherwise, then `user:<id>` from `__user_id` alone, then `anonymous`.
+  An invalid or expired token is *not* a call failure here: it simply contributes no claims, so
+  the call falls back to the user id (agent-token rejection is the separate
+  `ENFORCE_AGENT_TOKENS` gate). A failure inside the check itself fails closed with
+  `SYSTEM: Error checking tool access for '<name>'. Please try again later.`
+- **Network isolation is the assumption.** The hub is meant to be reachable only from the
+  framework (compose network, no published port). A caller that can reach `/tools/call` directly
+  *and* present a user id but no token resolves to `user:<id>` — the policy, not the network, is
+  what stops it once the mode is `enforcing`. Keep the hub port unpublished; the gate is
+  defense in depth, not a substitute for the network boundary.
+- **`DEV_MODE` has no authz bypass on this path.** The hub has never skipped tool authz for
+  dev; `DEV_MODE` only supplies the well-known fallback agent-token signing key, so tokens still
+  verify and the gate still applies. Default `off` is what keeps local development unchanged.
+- Rules for this surface are ordinary policy rules (`tools:call`); the bootstrap generator's
+  public-tool rules (`allow_principals: ["*"]`) already cover public tools for it.
+- **All three surfaces share one 200-entry ring.** The persist throttle is per surface, but the
+  ring is a single list, so a noisy surface can evict another's entries. Don't soak two
+  surfaces at once; run one at a time and review before promoting it.
+- Rollback is immediate: set the mode back to `shadow`/`off`; the etcd watch invalidates every
+  process's cache without a restart.

@@ -65,6 +65,14 @@ trigger:
 
 The `pipeline.py` is a **standard Python script** — not an agent, not stdin/stdout JSON. It runs as a normal process with access to all environment variables injected for the `background` secret context.
 
+The rendered trigger payload is evaluated against the workflow's `guardrails` before the script
+starts, exactly like a `background_agent`'s input: a blocking rule marks the run `failed`
+(`guardrail blocked input`) and the process is never spawned. The rule format is the same one
+documented for agents in the [Agent Guide](agents.md). Two consequences worth knowing: rules in
+`/config/framework/guardrails_defaults` apply here too (a workflow with no `guardrails` key is
+not exempt), and a `redact` rule rewrites the payload the script receives — scripts parse their
+stdin as machine input, so prefer `block` for them. Script **stdout** is not inspected.
+
 ```python
 # pipeline.py — example structure
 import os

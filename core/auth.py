@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import math
 import secrets
 import logging
 import time
@@ -38,6 +39,54 @@ run_id_var = contextvars.ContextVar("run_id", default=None)
 # "Bearer " header makes it skip its own DEV_MODE bypass, validate the sentinel as a
 # key, and reject the call with 401.
 DEV_MODE_AUTH_TOKEN = "dev-token"
+
+# --- identity-provider group membership --------------------------------------
+# `group:` policy rules read the groups the IdP asserted at login. The claim name is
+# configurable because IdPs disagree (`groups`, `roles`, ...). The value is stored on
+# the user record and published per request; nothing else trusts it.
+GROUPS_CLAIM_ENV = "OIDC_GROUPS_CLAIM"
+MAX_CLAIM_GROUPS = 200
+
+
+def groups_claim_name() -> str:
+    """The claim carrying group membership (``OIDC_GROUPS_CLAIM``, default ``groups``)."""
+    return (os.getenv(GROUPS_CLAIM_ENV) or "").strip() or "groups"
+
+
+def normalize_groups(raw: Any) -> List[str]:
+    """Sorted, de-duplicated group names from a claim value or stored record field.
+
+    Accepts a comma-separated string or a list of strings. Any other shape --
+    including a malformed claim -- normalizes to ``[]``: a bad groups claim must never
+    be able to fail a login. (Whitespace is trimmed, not split on: a group literally
+    named "All Staff" must stay one group.)
+    """
+    if isinstance(raw, str):
+        candidates = raw.split(",")
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        candidates = [value for value in raw if isinstance(value, str)]
+    else:
+        return []
+
+    groups = sorted({value.strip() for value in candidates if value.strip()})
+    if len(groups) > MAX_CLAIM_GROUPS:
+        logger.warning(
+            "Groups claim carries %d entries; keeping the first %d", len(groups), MAX_CLAIM_GROUPS
+        )
+        groups = groups[:MAX_CLAIM_GROUPS]
+    return groups
+
+
+def claim_groups(userinfo: Dict) -> List[str]:
+    """The configured groups claim off one userinfo payload (never raises)."""
+    if not isinstance(userinfo, dict):
+        return []
+    try:
+        return normalize_groups(userinfo.get(groups_claim_name()))
+    except Exception:
+        logger.warning("Unreadable %s claim; treating the user as group-less", groups_claim_name())
+        return []
+
 
 # Edge (trellis-proxy) registry layout. `/registry/edges/<site>/config` is the site
 # record, `/status` is written by the relay, and `/edge_tokens/<sha256> -> site` is a
@@ -171,6 +220,102 @@ def retry_etcd(max_retries=10, delay=2):
                     time.sleep(delay)
         return wrapper
     return decorator
+
+# --- Agent run records & hash-chained event history ---
+
+RUN_EVENT_GENESIS_DIGEST = "0" * 64
+
+
+def _run_event_digest(prev_digest: str, seq: int, event_type: str, ts: str, payload: Dict[str, Any]) -> str:
+    """sha256(prev_digest || canonical_json({seq,type,ts,payload})) hex digest."""
+    canonical = json.dumps(
+        {"seq": seq, "type": event_type, "ts": ts, "payload": payload},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(prev_digest.encode() + canonical.encode("utf-8")).hexdigest()
+
+
+# --- LLM latency / TTFT metrics ---
+#
+# `/metrics/agents/<agent>` and `/metrics/providers/<provider>` hold one rolling
+# document per entity: cumulative counters plus a bounded window of raw samples.
+# Aggregates (p50/p95/error rate) are derived on read, never stored, so a cap change
+# or a new percentile needs no migration.
+
+LATENCY_SAMPLE_CAP = 200
+
+
+def _latency_is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _latency_counter(value: Any) -> int:
+    """Read a stored counter; anything malformed counts as 0."""
+    if not _latency_is_number(value):
+        return 0
+    return int(value)
+
+
+def _latency_values(samples: Any, field: str) -> List[float]:
+    """Numeric ``field`` values across samples; missing/None/non-numeric are skipped."""
+    if not isinstance(samples, list):
+        return []
+    values = []
+    for sample in samples:
+        if not isinstance(sample, dict):
+            continue
+        value = sample.get(field)
+        if _latency_is_number(value):
+            values.append(float(value))
+    return values
+
+
+def _latency_percentile(values: List[float], pct: float) -> Optional[float]:
+    """Nearest-rank percentile over a sorted copy (None for an empty list)."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(1, math.ceil(pct / 100 * len(ordered)))
+    return round(ordered[min(rank, len(ordered)) - 1], 1)
+
+
+def _latency_doc(raw: Optional[bytes]) -> Optional[Dict[str, Any]]:
+    """Decode a stored latency document; absent or malformed bytes read as absent."""
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _latency_summary(doc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Percentile/error summary of a latency doc, tolerating missing or malformed fields."""
+    doc = doc if isinstance(doc, dict) else {}
+    count = _latency_counter(doc.get("count"))
+    error_count = _latency_counter(doc.get("error_count"))
+    samples = doc.get("samples")
+    raw_hits = doc.get("guardrail_hits")
+    guardrail_hits = {}
+    if isinstance(raw_hits, dict):
+        for rule, hits in raw_hits.items():
+            if isinstance(rule, str) and _latency_is_number(hits):
+                guardrail_hits[rule] = _latency_counter(hits)
+    return {
+        "count": count,
+        "error_count": error_count,
+        "error_rate": (error_count / count) if count else 0.0,
+        # Non-streaming calls store ttft_ms=None and so contribute to total only.
+        "ttft_p50_ms": _latency_percentile(_latency_values(samples, "ttft_ms"), 50),
+        "ttft_p95_ms": _latency_percentile(_latency_values(samples, "ttft_ms"), 95),
+        "total_p50_ms": _latency_percentile(_latency_values(samples, "total_ms"), 50),
+        "total_p95_ms": _latency_percentile(_latency_values(samples, "total_ms"), 95),
+        "guardrail_hits": guardrail_hits,
+    }
+
 
 class IdentityManager:
     def __init__(self, host: str = "127.0.0.1", port: int = 2379):
@@ -396,6 +541,20 @@ class IdentityManager:
         ~200+s) instead of adding to it -- see get_agent_memory_enabled above for the
         same pattern."""
         return self.get_config("disabled_workflows", [])
+
+    def get_guardrails_defaults(self) -> Dict[str, Any]:
+        """Retrieve the framework-wide guardrail rules applied to every agent.
+
+        Not itself @retry_etcd()-decorated: get_config() already retries -- see
+        get_disabled_standard_agents above for the single-retry-layer rationale."""
+        value = self.get_config("guardrails_defaults", {})
+        return value if isinstance(value, dict) else {}
+
+    def set_guardrails_defaults(self, rules: Dict[str, Any]) -> None:
+        """Persist the framework-wide guardrail rules.
+
+        Not itself @retry_etcd()-decorated -- see get_guardrails_defaults above."""
+        self.set_config("guardrails_defaults", rules if isinstance(rules, dict) else {})
 
     def _atomic_update_config_list(self, key: str, update_fn) -> List[str]:
         """Atomically update a JSON list in /config/framework/{key} using Compare-And-Swap (CAS).
@@ -1226,6 +1385,153 @@ class IdentityManager:
         return None
 
     @retry_etcd()
+    def save_tool_policies(self, policy: Dict[str, Any]) -> None:
+        """Persist the tool-authorization policy document."""
+        self.client.put("/registry/tool_policies", json.dumps(policy))
+
+    @retry_etcd()
+    def get_tool_policies(self) -> Dict[str, Any]:
+        """Retrieve the tool-authorization policy document ({} when absent)."""
+        value, _ = self.client.get("/registry/tool_policies")
+        if value:
+            data = json.loads(value.decode('utf-8'))
+            return data if isinstance(data, dict) else {}
+        return {}
+
+    def get_tool_authz_mode(self) -> str:
+        """Retrieve the tool-authorization rollout mode.
+
+        An absent key means ``off`` (ships dark). A *present but unrecognized* value
+        fails closed to ``enforcing`` and logs: a typo must not silently disable the
+        gate. Not itself @retry_etcd()-decorated: get_config() already retries -- see
+        get_disabled_standard_agents above for the single-retry-layer rationale."""
+        value = self.get_config("tool_authz_mode", None)
+        if value is None or value == "":
+            return "off"
+        if value in ("off", "shadow", "enforcing"):
+            return value
+        logger.error(
+            "Unrecognized tool_authz_mode %r; failing closed to 'enforcing'", value
+        )
+        return "enforcing"
+
+    def set_tool_authz_mode(self, mode: str) -> None:
+        """Set the tool-authorization rollout mode (off | shadow | enforcing).
+
+        Not itself @retry_etcd()-decorated -- see get_tool_authz_mode above."""
+        if mode not in ("off", "shadow", "enforcing"):
+            raise ValueError(
+                f"invalid tool_authz_mode {mode!r}: expected one of off, shadow, enforcing"
+            )
+        self.set_config("tool_authz_mode", mode)
+
+    def get_bound_tools_mode(self) -> str:
+        """Retrieve the agent-bound-tool rollout mode.
+
+        An absent key means ``off`` (ships dark). A *present but unrecognized* value
+        fails closed to ``enforcing`` and logs: a typo must not silently disable the
+        gate. Not itself @retry_etcd()-decorated: get_config() already retries -- see
+        get_disabled_standard_agents above for the single-retry-layer rationale."""
+        value = self.get_config("bound_tools_mode", None)
+        if value is None or value == "":
+            return "off"
+        if value in ("off", "shadow", "enforcing"):
+            return value
+        logger.error(
+            "Unrecognized bound_tools_mode %r; failing closed to 'enforcing'", value
+        )
+        return "enforcing"
+
+    def set_bound_tools_mode(self, mode: str) -> None:
+        """Set the agent-bound-tool rollout mode (off | shadow | enforcing).
+
+        Not itself @retry_etcd()-decorated -- see get_bound_tools_mode above."""
+        if mode not in ("off", "shadow", "enforcing"):
+            raise ValueError(
+                f"invalid bound_tools_mode {mode!r}: expected one of off, shadow, enforcing"
+            )
+        self.set_config("bound_tools_mode", mode)
+
+    def get_hub_call_mode(self) -> str:
+        """Retrieve the direct hub ``/tools/call`` rollout mode.
+
+        An absent key means ``off`` (ships dark). A *present but unrecognized* value
+        fails closed to ``enforcing`` and logs: a typo must not silently disable the
+        gate. Not itself @retry_etcd()-decorated: get_config() already retries -- see
+        get_disabled_standard_agents above for the single-retry-layer rationale."""
+        value = self.get_config("hub_call_mode", None)
+        if value is None or value == "":
+            return "off"
+        if value in ("off", "shadow", "enforcing"):
+            return value
+        logger.error(
+            "Unrecognized hub_call_mode %r; failing closed to 'enforcing'", value
+        )
+        return "enforcing"
+
+    def set_hub_call_mode(self, mode: str) -> None:
+        """Set the direct hub ``/tools/call`` rollout mode (off | shadow | enforcing).
+
+        Not itself @retry_etcd()-decorated -- see get_hub_call_mode above."""
+        if mode not in ("off", "shadow", "enforcing"):
+            raise ValueError(
+                f"invalid hub_call_mode {mode!r}: expected one of off, shadow, enforcing"
+            )
+        self.set_config("hub_call_mode", mode)
+
+    def get_principal_groups(self) -> Dict[str, List[str]]:
+        """Retrieve the principal -> group mapping ({} when absent or malformed).
+
+        Not itself @retry_etcd()-decorated -- see get_disabled_standard_agents above."""
+        value = self.get_config("principal_groups", {})
+        if not isinstance(value, dict):
+            return {}
+        return {
+            str(principal): [str(group) for group in groups]
+            for principal, groups in value.items()
+            if isinstance(groups, list)
+        }
+
+    def set_principal_groups(self, groups: Dict[str, List[str]]) -> None:
+        """Set the principal -> group mapping.
+
+        Not itself @retry_etcd()-decorated -- see get_tool_authz_mode above."""
+        self.set_config("principal_groups", groups)
+
+    def append_tool_authz_deny(self, entry: Dict[str, Any], cap: int = 200) -> None:
+        """Prepend one denial to the shared ring at ``/registry/tool_authz_denies``.
+
+        Shared (etcd) rather than in-process because the Admin UI runs in its own
+        process and never evaluates a tool call itself.
+        """
+        def update(current: Dict[str, Any]) -> Dict[str, Any]:
+            denies = current.get("denies")
+            denies = list(denies) if isinstance(denies, list) else []
+            denies.insert(0, entry)
+            return {"denies": denies[:cap]}
+
+        self._atomic_update_usage_json("/registry/tool_authz_denies", update)
+
+    @retry_etcd()
+    def get_tool_authz_denies(self) -> List[Dict[str, Any]]:
+        """Read the shared denial ring, newest first ([], malformed tolerated)."""
+        value, _ = self.client.get("/registry/tool_authz_denies")
+        if not value:
+            return []
+        try:
+            data = json.loads(value.decode("utf-8"))
+        except Exception as e:
+            logger.warning(f"Failed to decode tool_authz denies ring: {e}")
+            return []
+        denies = data.get("denies") if isinstance(data, dict) else None
+        return [deny for deny in denies if isinstance(deny, dict)] if isinstance(denies, list) else []
+
+    @retry_etcd()
+    def clear_tool_authz_denies(self) -> None:
+        """Empty the shared denial ring."""
+        self.client.put("/registry/tool_authz_denies", json.dumps({"denies": []}))
+
+    @retry_etcd()
     def get_health_status(self, entity_type: str, name: str) -> Optional[Dict]:
         """Retrieve the health status of an agent or tool."""
         value, _ = self.client.get(f"/health/{entity_type}/{name}")
@@ -1247,7 +1553,12 @@ class IdentityManager:
         return {"input_tokens": 0, "output_tokens": 0, "total_requests": 0}
 
     def _atomic_update_usage_json(self, key: str, update_fn) -> Dict[str, Any]:
-        """Atomically update a JSON record in etcd using Compare-And-Swap (CAS)."""
+        """Atomically update a JSON record in etcd using Compare-And-Swap (CAS).
+
+        Raises ``EtcdContentionError`` when the CAS budget is exhausted. A blind
+        last-write `put` here would overwrite concurrent updates with stale data
+        (silently losing samples/counters), so the write is dropped and reported.
+        """
         for _ in range(20):
             raw_val, _ = self.client.get(key)
             if raw_val is None:
@@ -1264,12 +1575,9 @@ class IdentityManager:
                 new_bytes = json.dumps(updated_data).encode('utf-8')
                 if self.client.replace(key, raw_val, new_bytes):
                     return updated_data
-        # Fallback if max retries reached
-        raw_val, _ = self.client.get(key)
-        current_data = json.loads(raw_val.decode('utf-8')) if raw_val else {}
-        final_data = update_fn(current_data)
-        self.client.put(key, json.dumps(final_data))
-        return final_data
+        raise EtcdContentionError(
+            f"Could not update {key} after 20 compare-and-swap attempts; the update was dropped."
+        )
 
     @retry_etcd()
     def record_usage(self, user_id: str, input_tokens: int, output_tokens: int) -> None:
@@ -1340,6 +1648,88 @@ class IdentityManager:
         current = int(value.decode('utf-8')) if value else 0
         
         self.client.put(key, str(current + 1))
+
+    def record_agent_latency(
+        self,
+        user_id: str,
+        agent_name: str,
+        provider: Optional[str],
+        ttft_ms: Optional[float],
+        total_ms: float,
+        ok: bool = True,
+    ) -> None:
+        """Append one LLM latency sample to the agent doc and, if known, the provider doc.
+
+        Not ``@retry_etcd``-wrapped: this performs two independent writes, and a retry
+        after the first succeeded would record a duplicate sample. ``user_id`` is
+        accepted for call-site symmetry with the usage helpers but is never persisted.
+        """
+        if not agent_name:
+            return
+
+        sample = {
+            "ts": _now_iso(),
+            "ttft_ms": float(ttft_ms) if ttft_ms is not None else None,
+            "total_ms": float(total_ms or 0.0),
+        }
+
+        def update(current: Dict[str, Any]) -> Dict[str, Any]:
+            doc = current if isinstance(current, dict) else {}
+            doc["count"] = _latency_counter(doc.get("count")) + 1
+            doc["error_count"] = _latency_counter(doc.get("error_count")) + (0 if ok else 1)
+            samples = doc.get("samples")
+            samples = list(samples) if isinstance(samples, list) else []
+            samples.append(dict(sample))
+            doc["samples"] = samples[-LATENCY_SAMPLE_CAP:]
+            return doc
+
+        self._atomic_update_usage_json(f"/metrics/agents/{agent_name}", update)
+        if provider:
+            try:
+                self._atomic_update_usage_json(f"/metrics/providers/{provider}", update)
+            except Exception as e:
+                # The provider doc is a shared hot key: contention there must not lose
+                # the agent sample that already landed.
+                logger.warning(f"Failed to record provider latency for '{provider}': {e}")
+
+    def record_guardrail_hits(self, agent_name: str, hits: Dict[str, int]) -> None:
+        """Merge guardrail rule hit counts into the agent's metrics doc.
+
+        Not ``@retry_etcd``-wrapped: this is a single CAS write and
+        ``_atomic_update_usage_json`` already loops through contention.
+        """
+        if not agent_name or not isinstance(hits, dict) or not hits:
+            return
+        valid = {
+            rule: int(count)
+            for rule, count in hits.items()
+            if isinstance(rule, str) and rule and _latency_is_number(count)
+        }
+        if not valid:
+            return
+
+        def update(current: Dict[str, Any]) -> Dict[str, Any]:
+            doc = current if isinstance(current, dict) else {}
+            counts = doc.get("guardrail_hits")
+            counts = dict(counts) if isinstance(counts, dict) else {}
+            for rule, count in valid.items():
+                counts[rule] = _latency_counter(counts.get(rule)) + count
+            doc["guardrail_hits"] = counts
+            return doc
+
+        self._atomic_update_usage_json(f"/metrics/agents/{agent_name}", update)
+
+    @retry_etcd()
+    def get_agent_latency(self, agent_name: str) -> Dict[str, Any]:
+        """Summarized LLM latency for one agent."""
+        value, _ = self.client.get(f"/metrics/agents/{agent_name}")
+        return _latency_summary(_latency_doc(value))
+
+    @retry_etcd()
+    def get_provider_latency(self, provider: str) -> Dict[str, Any]:
+        """Summarized LLM latency for one provider."""
+        value, _ = self.client.get(f"/metrics/providers/{provider}")
+        return _latency_summary(_latency_doc(value))
 
     @retry_etcd()
     def list_all_users(self) -> List[Dict]:
@@ -1441,6 +1831,13 @@ class IdentityManager:
                     _TERMINAL = {"completed", "failed", "cancelled"}
                     if existing.get("state") in _TERMINAL:
                         return False
+                    # Merge metadata instead of replacing it: a state transition must not
+                    # drop retry accounting (attempt/prior_run_id) written at enqueue.
+                    previous_metadata = existing.get("metadata")
+                    if isinstance(previous_metadata, dict) and isinstance(record.get("metadata"), dict):
+                        merged = dict(previous_metadata)
+                        merged.update(record["metadata"])
+                        record["metadata"] = merged
                     existing.update(record)
                     if "created_at" not in existing:
                         existing["created_at"] = existing.get("timestamp")
@@ -1454,6 +1851,263 @@ class IdentityManager:
 
             self.client.put(key, json.dumps(record))
             return True
+
+    def _read_run_events(self, agent_name: str, run_id: str) -> List[Dict[str, Any]]:
+        """Read every decodable event of a run, sorted by seq ascending (undecorated: callers retry)."""
+        prefix = f"/runs/{agent_name}/{run_id}/events/"
+        events = []
+        for value, metadata in self.client.get_prefix(prefix):
+            key_str = metadata.key.decode("utf-8")
+            if not value:
+                continue
+            try:
+                parsed = json.loads(value.decode("utf-8"))
+            except Exception as e:
+                logger.warning(f"Failed to decode run event {key_str}: {e}")
+                continue
+            if isinstance(parsed, dict):
+                events.append(parsed)
+        events.sort(key=lambda event: int(event.get("seq") or 0))
+        return events
+
+    @retry_etcd()
+    def append_run_event(
+        self,
+        agent_name: str,
+        run_id: str,
+        event_type: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Append one hash-chained event to a run's log and advance its chain head.
+
+        Takes the same lock as ``record_agent_run_state`` so appends serialize with
+        state transitions. Returns the event's sequence number.
+        """
+        key = f"/runs/{agent_name}/{run_id}"
+        events_prefix = f"{key}/events/"
+        # pyetcd's Lock.__enter__ ignores a failed acquire, which would let two
+        # writers pick the same seq and silently drop an event. Acquire explicitly
+        # and let @retry_etcd retry instead.
+        lock = self.client.lock(f"{key}_lock")
+        if not lock.acquire():
+            raise RuntimeError(f"Could not acquire run lock for {key}")
+        try:
+            value, _ = self.client.get(key)
+            state: Optional[Dict[str, Any]] = None
+            if value:
+                try:
+                    parsed = json.loads(value.decode("utf-8"))
+                    state = parsed if isinstance(parsed, dict) else None
+                except Exception:
+                    state = None
+
+            last_seq = int((state or {}).get("last_seq") or 0)
+            prev_digest = (state or {}).get("history_digest")
+            if state is None or (last_seq == 0 and not prev_digest):
+                # No chain head on the run record (missing, unreadable, or written
+                # before the first append). Recover it from the stored events under
+                # the same lock so a second append cannot overwrite seq 1.
+                existing_events = self._read_run_events(agent_name, run_id)
+                if existing_events:
+                    last_seq = int(existing_events[-1].get("seq") or 0)
+                    prev_digest = existing_events[-1].get("digest")
+            prev_digest = prev_digest or RUN_EVENT_GENESIS_DIGEST
+            seq = last_seq + 1
+            ts = datetime.now(timezone.utc).isoformat()
+            digest = _run_event_digest(prev_digest, seq, event_type, ts, payload or {})
+            event = {
+                "seq": seq,
+                "type": event_type,
+                "ts": ts,
+                "payload": payload or {},
+                "prev_digest": prev_digest,
+                "digest": digest,
+            }
+            # Zero-padded so prefix readback order equals numeric order.
+            self.client.put(f"{events_prefix}{seq:08d}", json.dumps(event, sort_keys=True))
+
+            if state is not None:
+                state["last_seq"] = seq
+                state["history_digest"] = digest
+                self.client.put(key, json.dumps(state))
+            return seq
+        finally:
+            lock.release()
+
+    @retry_etcd()
+    def record_run_heartbeat(self, agent_name: str, run_id: str) -> None:
+        """Write the run's liveness timestamp. No lock: the runner is the single writer."""
+        self.client.put(
+            f"/runs/{agent_name}/{run_id}/heartbeat",
+            datetime.now(timezone.utc).isoformat(),
+        )
+
+    @retry_etcd()
+    def mark_run_retry_due(self, agent_name: str, run_id: str, retry_at: str) -> bool:
+        """Schedule a retry for a failed run; idempotent once a retry is already queued."""
+        key = f"/runs/{agent_name}/{run_id}"
+        # pyetcd's Lock.__enter__ ignores a failed acquire; acquire explicitly and let
+        # @retry_etcd retry instead.
+        lock = self.client.lock(f"{key}_lock")
+        if not lock.acquire():
+            raise RuntimeError(f"Could not acquire run lock for {key}")
+        try:
+            record = self._read_run_record(key)
+            if record is None or record.get("state") != "failed":
+                return False
+            metadata = record.setdefault("metadata", {})
+            # Never push an existing deadline out, and never re-queue a run that was
+            # already retried (or whose retry enqueue died mid-flight).
+            if metadata.get("retried_run_id") or metadata.get("retry_at"):
+                return False
+            metadata["retry_at"] = retry_at
+            record["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self.client.put(key, json.dumps(record))
+            return True
+        finally:
+            lock.release()
+
+    @retry_etcd()
+    def claim_run_retry(self, agent_name: str, run_id: str) -> bool:
+        """Claim a due retry; only the first caller wins (sentinel ``retried_run_id``)."""
+        key = f"/runs/{agent_name}/{run_id}"
+        lock = self.client.lock(f"{key}_lock")
+        if not lock.acquire():
+            raise RuntimeError(f"Could not acquire run lock for {key}")
+        try:
+            record = self._read_run_record(key)
+            if record is None or record.get("state") != "failed":
+                return False
+            metadata = record.setdefault("metadata", {})
+            if metadata.get("retried_run_id"):
+                return False
+            # Sentinel, not a real id: an enqueue that dies after the claim is
+            # deliberately not retried again.
+            metadata["retried_run_id"] = "claimed"
+            record["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self.client.put(key, json.dumps(record))
+            return True
+        finally:
+            lock.release()
+
+    @retry_etcd()
+    def complete_run_retry(self, agent_name: str, run_id: str, new_run_id: str) -> bool:
+        """Attach the new run's id to a claimed retry, replacing the sentinel."""
+        key = f"/runs/{agent_name}/{run_id}"
+        lock = self.client.lock(f"{key}_lock")
+        if not lock.acquire():
+            raise RuntimeError(f"Could not acquire run lock for {key}")
+        try:
+            record = self._read_run_record(key)
+            if record is None:
+                return False
+            metadata = record.setdefault("metadata", {})
+            if metadata.get("retried_run_id") != "claimed":
+                return False
+            metadata["retried_run_id"] = new_run_id
+            record["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self.client.put(key, json.dumps(record))
+            return True
+        finally:
+            lock.release()
+
+    @retry_etcd()
+    def clear_run_retry(self, agent_name: str, run_id: str, reason: str) -> bool:
+        """Abandon a scheduled retry (e.g. max_attempts was lowered under it)."""
+        key = f"/runs/{agent_name}/{run_id}"
+        lock = self.client.lock(f"{key}_lock")
+        if not lock.acquire():
+            raise RuntimeError(f"Could not acquire run lock for {key}")
+        try:
+            record = self._read_run_record(key)
+            if record is None or record.get("state") != "failed":
+                return False
+            metadata = record.setdefault("metadata", {})
+            if metadata.get("retried_run_id") or not metadata.get("retry_at"):
+                return False
+            metadata.pop("retry_at", None)
+            metadata["retry_abandoned"] = reason
+            record["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self.client.put(key, json.dumps(record))
+            return True
+        finally:
+            lock.release()
+
+    def _read_run_record(self, key: str) -> Optional[Dict[str, Any]]:
+        """Decode a run record under the caller's lock; None when absent or unreadable."""
+        value, _ = self.client.get(key)
+        if not value:
+            return None
+        try:
+            parsed = json.loads(value.decode("utf-8"))
+        except Exception as e:
+            logger.warning(f"Failed to decode agent run record for {key}: {e}")
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    @retry_etcd()
+    def get_run_heartbeat(self, agent_name: str, run_id: str) -> Optional[str]:
+        """Return the run's last heartbeat timestamp, or None when never written."""
+        value, _ = self.client.get(f"/runs/{agent_name}/{run_id}/heartbeat")
+        if value:
+            return value.decode("utf-8")
+        return None
+
+    @retry_etcd()
+    def get_run_events(self, agent_name: str, run_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Return the newest ``limit`` events of a run, still in ascending seq order."""
+        events = self._read_run_events(agent_name, run_id)
+        if limit and limit > 0:
+            return events[-limit:]
+        return events
+
+    @retry_etcd()
+    def verify_run_history(self, agent_name: str, run_id: str) -> Dict[str, Any]:
+        """Recompute the event hash chain and report the first break, if any.
+
+        Also checks the run record's chain head, so deleting the newest event(s)
+        (tail truncation) is detected even though the remaining chain is internally
+        consistent.
+        """
+        events = self._read_run_events(agent_name, run_id)
+        expected_prev = RUN_EVENT_GENESIS_DIGEST
+        for expected_seq, event in enumerate(events, start=1):
+            seq = event.get("seq")
+            if seq != expected_seq:
+                return {"ok": False, "count": len(events), "broken_at_seq": expected_seq}
+            if event.get("prev_digest") != expected_prev:
+                return {"ok": False, "count": len(events), "broken_at_seq": seq}
+            digest = _run_event_digest(
+                expected_prev,
+                seq,
+                event.get("type") or "",
+                event.get("ts") or "",
+                event.get("payload") or {},
+            )
+            if digest != event.get("digest"):
+                return {"ok": False, "count": len(events), "broken_at_seq": seq}
+            expected_prev = digest
+
+        value, _ = self.client.get(f"/runs/{agent_name}/{run_id}")
+        if value:
+            try:
+                state = json.loads(value.decode("utf-8"))
+            except Exception:
+                state = None
+            if isinstance(state, dict):
+                head_seq = state.get("last_seq")
+                head_digest = state.get("history_digest")
+                if isinstance(head_seq, int) and head_seq > len(events):
+                    # The record remembers more events than are stored: tail truncated.
+                    return {"ok": False, "count": len(events), "broken_at_seq": len(events) + 1}
+                if (
+                    isinstance(head_seq, int)
+                    and head_seq == len(events)
+                    and head_digest
+                    and head_digest != expected_prev
+                ):
+                    return {"ok": False, "count": len(events), "broken_at_seq": len(events)}
+        return {"ok": True, "count": len(events), "broken_at_seq": None}
 
     @retry_etcd()
     def get_agent_run(self, agent_name: str, run_id: str) -> Optional[Dict]:
@@ -1470,10 +2124,16 @@ class IdentityManager:
 
     @retry_etcd()
     def get_agent_runs(self, agent_name: str, limit: Optional[int] = None) -> List[Dict]:
-        """Retrieve runs for a specific agent, sorted by timestamp descending, with optional limit."""
+        """Retrieve runs for a specific agent, sorted by timestamp descending, with optional limit.
+
+        Only exact run records are returned; event/heartbeat sub-keys are skipped.
+        """
         runs = []
         prefix = f"/runs/{agent_name}/"
         for value, metadata in self.client.get_prefix(prefix):
+            key_str = metadata.key.decode('utf-8')
+            if "/" in key_str[len(prefix):]:
+                continue
             if value:
                 try:
                     runs.append(json.loads(value.decode('utf-8')))
@@ -1487,23 +2147,25 @@ class IdentityManager:
     @retry_etcd()
     def prune_agent_runs(self, agent_name: str, keep_last: int = 50) -> int:
         """Prune historical runs for an agent, retaining only the latest `keep_last` records.
-        
-        Returns the number of deleted records.
+
+        Deletes each pruned run's whole subtree. Returns the number of run records
+        pruned (sub-keys are not counted).
         """
         prefix = f"/runs/{agent_name}/"
         records = []
         for value, metadata in self.client.get_prefix(prefix):
             key_str = metadata.key.decode('utf-8')
+            if "/" in key_str[len(prefix):]:
+                continue
+            ts = ""
             if value:
                 try:
                     parsed = json.loads(value.decode('utf-8'))
                     ts = parsed.get("updated_at", parsed.get("timestamp", ""))
-                    records.append((key_str, ts))
                 except Exception:
                     # If corrupted, mark for deletion
-                    records.append((key_str, ""))
-            else:
-                records.append((key_str, ""))
+                    ts = ""
+            records.append((key_str, ts))
 
         if len(records) <= keep_last:
             return 0
@@ -1515,6 +2177,9 @@ class IdentityManager:
         for key_str, _ in to_delete:
             try:
                 self.client.delete(key_str)
+                # The trailing slash matters: a bare prefix delete would also hit
+                # sibling runs whose id starts with this one's.
+                self.client.delete_prefix(f"{key_str}/")
                 deleted_count += 1
             except Exception as e:
                 logger.warning(f"Failed to delete old run key {key_str}: {e}")
@@ -1634,7 +2299,11 @@ class AuthMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] not in ("http", "websocket"):
             return await self.app(scope, receive, send)
-            
+
+        # Imported here rather than at module scope: the authz engine imports this
+        # module lazily, and keeping the import one-directional avoids a cycle at boot.
+        from core import tool_authz
+
         try:
             path = scope.get("path", "")
             normalized_path = re.sub(r'/+', '/', path)
@@ -1689,11 +2358,23 @@ class AuthMiddleware:
                 # Add user_id to scope state for framework compatibility
                 scope["state"] = scope.get("state", {})
                 scope["state"]["user_id"] = user_id
-                
+
+                # Publish the IdP groups for `group:` policy rules. Uses the record
+                # already fetched for the ban check -- no second etcd read. An absent
+                # record means "no groups"; the groups-claim contextvar takes
+                # precedence over re-reading the record inside the authz engine.
+                tool_authz.set_request_groups(
+                    normalize_groups((user or {}).get("groups"))
+                )
+
             return await self.app(scope, receive, send)
         except Exception as e:
             logger.error(f"Unhandled exception in ASGI AuthMiddleware: {e}", exc_info=True)
             await self._send_error(scope, send, 500, b'{"error": "Internal Server Error"}')
+        finally:
+            # The contextvar outlives the request inside this task; clear it so a
+            # reused task/connection cannot serve one user's groups to the next call.
+            tool_authz.clear_request_groups()
 
     async def _validate_jwt(self, token: str) -> Optional[str]:
         """Validate an MCP OAuth JWT and return the sub (user_id) if valid."""

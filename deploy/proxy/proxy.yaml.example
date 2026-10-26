@@ -21,7 +21,7 @@
 # RELOAD: SIGHUP (`docker kill -s HUP trellis-proxy`) re-reads this file and
 # re-publishes the catalog (the proxy reconnects; in-flight calls fail rather than
 # being replayed).
-#   live-reloadable: exports, export_mcps, tools_dir, mcps_dir
+#   live-reloadable: exports, export_mcps, tools_dir, mcps_dir, lazy_catalog
 #   restart-required: site, server_url, token_env, token_file, tls_*, sandbox,
 #     env_passthrough, and the secrets_dir *path* -- for each one you try to apply with
 #     SIGHUP the proxy logs a warning and keeps the current value
@@ -186,6 +186,16 @@ secrets_dir: /etc/trellis/edge-secrets
 # are still stripped). Costs you the isolation between tools.
 # Env equivalent: TRELLIS_EDGE_ENV_PASSTHROUGH=true.
 env_passthrough: false
+
+# ---------------------------------------------------------------- lazy catalog
+#
+# Publish tools as name + a short summary (<=120 chars) instead of shipping every
+# input schema in the hello frame; central fetches a full schema on demand over the
+# same tunnel (describe_tool / search_tools detail) and caches it. Requires a relay
+# from v0.7 or newer -- an older relay rejects the `lazy_catalog` capability and the
+# edge cannot connect, so leave this off until central is upgraded.
+# Default: false (full catalogs, byte-identical to pre-0.7).
+lazy_catalog: false
 
 # ---------------------------------------------------------------- sandbox
 #

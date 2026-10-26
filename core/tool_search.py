@@ -9,10 +9,13 @@ matching when embeddings are unavailable. Only tools/MCP tools explicitly marked
 ``public`` are ever considered candidates — internal tools are never returned
 regardless of query, per the secure-by-default whitelisting model.
 """
+import os
 import re
 import asyncio
 import logging
 from typing import List, Dict, Any, Optional
+
+import httpx
 
 from core.auth import get_identity_manager
 from core.embeddings import embed_text, cosine
@@ -22,6 +25,17 @@ from core.tunables import resolve as resolve_tunable
 logger = logging.getLogger(__name__)
 
 identity_mgr = get_identity_manager()
+
+RELAY_URL_ENV = "EDGE_RELAY_URL"
+_DEFAULT_RELAY_URL = "http://edge-relay:8100"
+# A schema read is a small, interactive lookup: a slow relay must not hold an agent
+# turn open the way a tool call's own timeout allows.
+_DETAIL_TIMEOUT = 5.0
+
+
+def _relay_url() -> str:
+    """Base URL of the in-cluster edge relay (same contract as ``core.remote_mcp``)."""
+    return os.getenv(RELAY_URL_ENV, _DEFAULT_RELAY_URL).rstrip("/")
 
 
 def _keyword_rank_tools(query: str, candidates: List[Dict]) -> List[Dict]:
@@ -64,6 +78,262 @@ def _mcp_tool_parameters(input_schema: Dict) -> Dict[str, Any]:
     return parameters
 
 
+def _mcp_tool_entry(config: Optional[Dict], tool: str) -> Optional[Dict]:
+    """The ``tools`` entry named ``tool`` in one MCP server's registry config."""
+    for entry in (config or {}).get("tools") or []:
+        if isinstance(entry, dict) and entry.get("name") == tool:
+            return entry
+    return None
+
+
+def _mcp_tool_is_lazy(mcp_config: Dict, entry: Dict) -> bool:
+    """True when one MCP tool entry is a summary the edge withheld the schema for.
+
+    The server flag alone is not enough: it flips to ``"full"`` after the first
+    per-tool fetch, so an entry without a schema and not listed in ``detail_tools``
+    is still summary-only. A record from before lazy publishing has no ``detail``
+    key at all and always carries its schema.
+    """
+    if "detail" not in mcp_config:
+        return False
+    if (entry or {}).get("inputSchema"):
+        return False
+    fetched = mcp_config.get("detail_tools") or []
+    return not (isinstance(fetched, list) and entry.get("name") in fetched)
+
+
+def _unavailable(name: str, reason: str) -> Dict[str, Any]:
+    """The single failure shape every ``describe_tool_entry`` path returns."""
+    return {"name": name, "unavailable": True, "reason": reason or "edge_unavailable"}
+
+
+def _relay_error_code(body: Any) -> str:
+    """``error.code`` from a relay error body (``{"error": {"code": ...}}``)."""
+    if not isinstance(body, dict):
+        return ""
+    error = body.get("error")
+    if not isinstance(error, dict):
+        return ""
+    code = error.get("code")
+    return code if isinstance(code, str) and code else ""
+
+
+async def _post_relay_detail(path: str, payload: Dict[str, Any]) -> tuple[Optional[Dict], str]:
+    """POST one detail request; ``(body, "")`` on success, ``(None, reason)`` otherwise.
+
+    Never raises: a schema read is best-effort for the caller's next step, so an
+    unreachable/broken relay degrades to a reason code. Only the endpoint label and the
+    exception class are logged -- never the payload or the schema itself.
+    """
+    url = f"{_relay_url()}{path}"
+    label = path.rsplit("/", 1)[-1]
+    try:
+        async with httpx.AsyncClient(timeout=_DETAIL_TIMEOUT) as client:
+            response = await client.post(url, json=payload)
+    except Exception as exc:
+        logger.warning("Edge %s request failed (%s)", label, type(exc).__name__)
+        return None, "edge_unavailable"
+
+    try:
+        body = response.json()
+    except Exception:
+        body = None
+
+    if response.status_code != 200:
+        logger.info("Edge %s request returned HTTP %s", label, response.status_code)
+        return None, _relay_error_code(body) or "edge_unavailable"
+    if not isinstance(body, dict):
+        return None, "edge_unavailable"
+    return body, ""
+
+
+async def _describe_edge_tool(
+    name: str, site: str, tool: str, *, config: Optional[Dict] = None
+) -> Dict[str, Any]:
+    """Full detail of one ``<site>__<tool>`` edge tool, from the registry or the relay."""
+    if config and config.get("detail") == "full":
+        return {
+            "name": name,
+            "description": config.get("description", ""),
+            "parameters": _local_tool_parameters(config),
+            "source": "local",
+            "detail": "full",
+            "cached": True,
+        }
+    body, reason = await _post_relay_detail(
+        f"/v1/sites/{site}/tool_detail", {"tool": tool}
+    )
+    detail = (body or {}).get("detail")
+    if reason or not isinstance(detail, dict):
+        if config and config.get("inputs"):
+            # Relay unreachable: the already-fetched schema beats "unavailable".
+            return {
+                "name": name,
+                "description": config.get("description", ""),
+                "parameters": _local_tool_parameters(config),
+                "source": "local",
+                "detail": "full",
+                "cached": True,
+                "stale": True,
+            }
+        return _unavailable(name, reason)
+    # The relay payload's `detail` is the inputs mapping itself, not a full entry.
+    return {
+        "name": name,
+        "description": (body or {}).get("description") or "",
+        "parameters": _local_tool_parameters({"inputs": detail}),
+        "source": "local",
+        "detail": "full",
+    }
+
+
+async def _describe_edge_mcp_tool(
+    name: str, site: str, mcp: str, tool: str, *, config: Optional[Dict] = None
+) -> Dict[str, Any]:
+    """Full detail of one ``mcp__<site>__<mcp>__<tool>`` tool, cached or via the relay."""
+    entry = _mcp_tool_entry(config, tool) if config else None
+    if entry is not None and config is not None and not _mcp_tool_is_lazy(config, entry):
+        return {
+            "name": name,
+            "description": entry.get("description", "") or config.get("description", ""),
+            "parameters": _mcp_tool_parameters(entry.get("inputSchema") or {}),
+            "source": f"{site}__{mcp}",
+            "detail": "full",
+            "cached": True,
+        }
+    body, reason = await _post_relay_detail(
+        f"/v1/sites/{site}/mcp_tool_detail", {"mcp": mcp, "tool": tool}
+    )
+    detail = (body or {}).get("detail")
+    if reason or not isinstance(detail, dict):
+        if entry is not None and entry.get("inputSchema"):
+            return {
+                "name": name,
+                "description": entry.get("description", ""),
+                "parameters": _mcp_tool_parameters(entry["inputSchema"]),
+                "source": f"{site}__{mcp}",
+                "detail": "full",
+                "cached": True,
+                "stale": True,
+            }
+        return _unavailable(name, reason)
+    # The relay payload's `detail` is the MCP `inputSchema` itself.
+    return {
+        "name": name,
+        "description": (body or {}).get("description") or "",
+        "parameters": _mcp_tool_parameters(detail),
+        "source": f"{site}__{mcp}",
+        "detail": "full",
+    }
+
+
+async def _edge_tool_from_name(mgr: Any, name: str) -> Optional[tuple[str, str]]:
+    """``(site, tool)`` when ``name`` is ``<site>__<tool>`` and ``site`` is a known edge.
+
+    Only a fallback for a name the tool registry holds no config for: the registry
+    record (checked by the caller) is the authoritative signal, and this catches a
+    reference that still reaches a registered site.
+    """
+    if name.startswith("mcp__") or "__" not in name:
+        return None
+    site, _, tool = name.partition("__")
+    if not site or not tool:
+        return None
+    try:
+        edge = await asyncio.to_thread(mgr.get_edge_config, site)
+    except Exception:
+        logger.debug("Could not read edge config for site %r", site, exc_info=True)
+        return None
+    return (site, tool) if edge else None
+
+
+async def describe_tool_entry(
+    name: str,
+    user_id: Optional[str] = None,
+    *,
+    identity_manager=None,
+) -> Dict[str, Any]:
+    """Return the full schema of exactly one tool, whichever surface owns it.
+
+    Accepts the same name forms as ``use_tool``: ``<tool>`` (local, or an edge
+    ``<site>__<tool>`` record), ``mcp__<server>__<tool>`` (central MCP) and
+    ``mcp__<site>__<mcp>__<tool>`` (edge MCP). The registry decides which reading
+    applies -- a name is an edge reference only when its record carries a ``remote``
+    block -- exactly as :func:`core.discovery.resolve_edge_mcp_target` does for
+    execution.
+
+    Local and central tools answer from the registry. Edge tools ask the relay for the
+    detail a lazy publish withheld (``tool_detail`` / ``mcp_tool_detail``). Failures are
+    values, never exceptions: every unsuccessful path returns
+    ``{"name", "unavailable": True, "reason": ...}`` so a caller can keep its summary
+    card instead of failing its turn.
+    """
+    mgr = identity_manager or identity_mgr
+
+    try:
+        config = await asyncio.to_thread(mgr.get_tool_config, name)
+    except Exception:
+        logger.warning("Could not read the tool config for %r", name, exc_info=True)
+        config = None
+
+    if config:
+        remote = config.get("remote")
+        if isinstance(remote, dict) and remote.get("site"):
+            # Registry-backed edge tool: the remote block names the bare tool, which
+            # is what the relay's routes take (the registry key is `<site>__<tool>`).
+            site = str(remote["site"])
+            tool = str(remote.get("tool") or name.partition("__")[2] or name)
+            return await _describe_edge_tool(name, site, tool, config=config)
+        return {
+            "name": name,
+            "description": config.get("description", ""),
+            "parameters": _local_tool_parameters(config),
+            "source": "local",
+            "detail": "full",
+        }
+
+    if name.startswith("mcp__"):
+        try:
+            target = await resolve_edge_mcp_target(name, mgr)
+        except Exception:
+            logger.warning("Could not resolve the MCP target for %r", name, exc_info=True)
+            target = None
+        if target:
+            site, mcp, tool = target
+            try:
+                mcp_config = await asyncio.to_thread(mgr.get_mcp_config, f"{site}__{mcp}")
+            except Exception:
+                mcp_config = None
+            return await _describe_edge_mcp_tool(
+                name, site, mcp, tool, config=mcp_config
+            )
+
+        parts = name.split("__", 2)
+        if len(parts) == 3 and parts[1] and parts[2]:
+            server, tool = parts[1], parts[2]
+            try:
+                mcp_config = await asyncio.to_thread(mgr.get_mcp_config, server)
+            except Exception:
+                logger.warning("Could not read the MCP config for %r", server, exc_info=True)
+                mcp_config = None
+            entry = _mcp_tool_entry(mcp_config, tool)
+            if entry is not None:
+                return {
+                    "name": name,
+                    "description": entry.get("description", "")
+                    or (mcp_config or {}).get("description", ""),
+                    "parameters": _mcp_tool_parameters(entry.get("inputSchema") or {}),
+                    "source": server,
+                    "detail": "full",
+                }
+        return _unavailable(name, "unknown_tool")
+
+    edge = await _edge_tool_from_name(mgr, name)
+    if edge:
+        return await _describe_edge_tool(name, *edge)
+    return _unavailable(name, "unknown_tool")
+
+
 def _missing_configuration_labels(status: Dict[str, Any]) -> List[str]:
     """Shape-safe flattening of a readiness status's missing_* fields for display.
 
@@ -86,7 +356,13 @@ def _missing_configuration_labels(status: Dict[str, Any]) -> List[str]:
     return labels
 
 
-async def search_tools(query: str, limit: Optional[int] = None, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+async def search_tools(
+    query: str,
+    limit: Optional[int] = None,
+    user_id: Optional[str] = None,
+    principal: Optional[str] = None,
+    detail: bool = False,
+) -> List[Dict[str, Any]]:
     """Return up to ``limit`` publicly-whitelisted tools most relevant to ``query``.
 
     Each result is a Tool Card: ``{"name", "description", "parameters", "configured",
@@ -101,9 +377,21 @@ async def search_tools(query: str, limit: Optional[int] = None, user_id: Optiona
     ``is_tool_configured``; unconfigured tools get ``configured: False`` and their
     description gains a trailing note naming the missing secrets/variables.
 
+    When the tool-authorization engine is enforced (any mode but ``off``), candidates
+    the principal may not read are dropped before ranking; ``shadow`` mode logs the
+    would-be denial and keeps the tool. ``principal`` defaults to the caller's
+    context principal, resolved once via ``tool_authz.resolve_current_principal``.
+
     Pass ``limit <= 0`` to get the full ranked list (mirrors ``search_agents``).
     ``limit=None`` (the default) resolves to the admin-tunable ``tool_search_limit``
     (env ``TOOL_SEARCH_LIMIT``, default 8).
+
+    A lazy edge card (``detail: "lazy"``) is summary-only: its description is kept but
+    its ``parameters`` were withheld by the edge, so the card carries ``{}``. The
+    ``detail`` key is only present on edge records whose catalog publish wrote it --
+    local and central tools never gain it. With ``detail=True``, the parameters of just
+    the selected lazy cards are fetched in one batch (see :func:`describe_tool_entry`),
+    bounded by the card count; a failed fetch leaves the card summary-only.
     """
     if limit is None:
         limit = resolve_tunable("tool_search_limit")
@@ -125,14 +413,21 @@ async def search_tools(query: str, limit: Optional[int] = None, user_id: Optiona
         # malformed `public: "false"` must fail closed, not leak the tool.
         if config.get("public") is not True:
             continue
-        candidates.append({
+        card = {
             "name": config.get("name", name),
             "description": config.get("description", ""),
             "parameters": _local_tool_parameters(config),
             "status": (health.get(name) or {}).get("status", "Online"),
             "source": "local",
             "_vec": embeddings.get(name),
-        })
+        }
+        # Only a lazy-publishing edge writes `detail`; an absent key means a full
+        # record (including every central tool), which must not gain the key.
+        if "detail" in config:
+            card["detail"] = "lazy" if config.get("detail") == "lazy" else "full"
+            if card["detail"] == "lazy":
+                card["parameters"] = {}
+        candidates.append(card)
 
     for mcp_name, mcp_config in mcp_configs.items():
         mcp_public = mcp_config.get("public") is True
@@ -143,7 +438,7 @@ async def search_tools(query: str, limit: Optional[int] = None, user_id: Optiona
             if not tool_name or not (mcp_public or tool_name in public_tools):
                 continue
             prefixed_name = f"mcp__{mcp_name}__{tool_name}"
-            candidates.append({
+            card = {
                 "name": prefixed_name,
                 "description": t.get("description", ""),
                 "parameters": _mcp_tool_parameters(t.get("inputSchema", {})),
@@ -153,7 +448,37 @@ async def search_tools(query: str, limit: Optional[int] = None, user_id: Optiona
                 # prefixed name — the `use_tool` execution form — so MCP tools rank by
                 # cosine like local tools; a missing/stale vector degrades to 0.0.
                 "_vec": embeddings.get(prefixed_name),
-            })
+            }
+            # Same rule one level down: only a lazy publish wrote `detail` on the
+            # server record, and only the entries that still lack a schema are lazy.
+            if "detail" in mcp_config:
+                card["detail"] = "full" if not _mcp_tool_is_lazy(mcp_config, t) else "lazy"
+                if card["detail"] == "lazy":
+                    card["parameters"] = {}
+            candidates.append(card)
+
+    if not candidates:
+        return []
+
+    # Default-deny read filter. `off` bypasses the engine entirely; in `shadow` the
+    # engine logs the would-be denial and still returns True, so one comprehension
+    # covers both enforce modes. A failure here is fail-closed: no tools at all.
+    try:
+        from core import tool_authz
+
+        def _filter_readable(cands: List[Dict]) -> List[Dict]:
+            if tool_authz.get_mode() == "off":
+                return cands
+            authz_principal = principal or tool_authz.resolve_current_principal()
+            return [
+                c for c in cands
+                if tool_authz.allowed(authz_principal, c["name"], "tools:read")
+            ]
+
+        candidates = await asyncio.to_thread(_filter_readable, candidates)
+    except Exception:
+        logger.exception("Tool authorization filter failed; returning no tools")
+        return []
 
     if not candidates:
         return []
@@ -166,6 +491,33 @@ async def search_tools(query: str, limit: Optional[int] = None, user_id: Optiona
         ranked = _keyword_rank_tools(query, candidates)
 
     selected = ranked if limit <= 0 else ranked[:limit]
+
+    # Schema fetch for the selected lazy cards only: post-limit, so a broad query can
+    # never fan out relay reads. Failures (values, not exceptions) leave the card as
+    # the summary the search already had.
+    if detail and selected:
+        # `limit <= 0` means "the full ranked list": cap the fan-out to one search page
+        # so a broad query cannot turn into a relay read per catalog entry.
+        window = selected if limit and limit > 0 else selected[: max(1, resolve_tunable("tool_search_limit"))]
+        lazy_cards = [c for c in window if c.get("detail") == "lazy"]
+        if lazy_cards:
+            described = await asyncio.gather(
+                *(
+                    describe_tool_entry(c["name"], user_id, identity_manager=identity_mgr)
+                    for c in lazy_cards
+                ),
+                return_exceptions=True,
+            )
+            for card, info in zip(lazy_cards, described):
+                if isinstance(info, BaseException):
+                    logger.warning("Detail fetch failed for tool %r: %s", card["name"], info)
+                    continue
+                if not isinstance(info, dict) or info.get("unavailable"):
+                    continue
+                card["parameters"] = info.get("parameters") or {}
+                if isinstance(info.get("description"), str) and info["description"]:
+                    card["description"] = info["description"]
+                card["detail"] = info.get("detail") or "full"
 
     statuses = [None] * len(selected)
     if user_id is not None:
@@ -189,14 +541,17 @@ async def search_tools(query: str, limit: Optional[int] = None, user_id: Optiona
                     missing = _missing_configuration_labels(status)
                     missing_text = ", ".join(missing) if missing else "required configuration"
                     description = f"{description}\n\n[Missing configuration: {missing_text}. Configure at /configuration]"
-        results.append({
+        card = {
             "name": c["name"],
             "description": description,
             "parameters": c["parameters"],
             "configured": configured,
             "status": c["status"],
             "source": c["source"],
-        })
+        }
+        if "detail" in c:
+            card["detail"] = c["detail"]
+        results.append(card)
     return results
 
 
@@ -281,14 +636,19 @@ async def execute_whitelisted_tool(
     get_hub_client_fn=None,
     get_external_mcp_client_fn=None,
     call_edge_mcp_fn=None,
+    principal: Optional[str] = None,
 ) -> Any:
-    """Shared use_tool execution flow: whitelist check -> configuration check -> dispatch -> output extraction.
+    """Shared use_tool execution flow: whitelist check -> authorization check -> configuration check -> dispatch -> output extraction.
 
     Returns the raw structured tool output, or a 'SYSTEM: ...' error string. Callers inject
     their own module-level seams (`is_configured`, hub/external client getters, the edge
     MCP caller) so existing monkeypatch targets keep working; `identity_manager` defaults
     to this module's `identity_mgr` (the `is_configured` default binds this module's name
     at def time).
+
+    `principal` is the authorization principal for `tools:call`; when omitted it is
+    resolved from the caller's context. Any failure of the authorization engine fails
+    closed (the call is denied) because this is a security boundary, not observability.
     """
     mgr = identity_manager or identity_mgr
 
@@ -299,6 +659,20 @@ async def execute_whitelisted_tool(
         return f"SYSTEM: Error checking tool access for '{tool_name}'. Please try again later."
     if not whitelisted:
         return f"SYSTEM: Access denied. Tool '{tool_name}' is internal and not exposed for direct execution."
+
+    try:
+        from core import tool_authz
+
+        def _authorized_call() -> bool:
+            authz_principal = principal or tool_authz.resolve_current_principal()
+            return tool_authz.allowed(authz_principal, tool_name, "tools:call")
+
+        permitted = await asyncio.to_thread(_authorized_call)
+    except Exception:
+        logger.exception("Tool authorization check failed for %r", tool_name)
+        return f"SYSTEM: Error checking tool access for '{tool_name}'. Please try again later."
+    if not permitted:
+        return f"SYSTEM: Access denied. Tool '{tool_name}' is not permitted for this principal."
 
     try:
         status = await is_configured(tool_name, user_id)

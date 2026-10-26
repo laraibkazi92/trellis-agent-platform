@@ -2266,3 +2266,629 @@ def test_a_token_with_control_characters_is_a_400():
 
     assert response.status_code == 400
     assert conn.ws.sent == []
+
+
+# --- lazy catalog detail cache (P6) -----------------------------------------
+
+
+class _DetailRegistry(FakeEdgeRegistry):
+    """FakeEdgeRegistry plus the per-record reads the detail cache performs."""
+
+    def get_tool_config(self, name):
+        return self.tools.get(name)
+
+    def get_mcp_config(self, name):
+        return self.mcps.get(name)
+
+
+@pytest.fixture()
+def detail_registry(monkeypatch):
+    """Point the relay's registry at the detail-aware fake (no etcd, no embedder)."""
+    fake = _DetailRegistry()
+    monkeypatch.setattr(app_module, "_identity_manager", lambda: fake)
+    return fake
+
+
+def _remote_tool_record(*, detail="full", inputs=None):
+    """A ``<site>__<tool>`` record shaped like the relay's own publish."""
+    config = {
+        "name": "site-a__echo",
+        "description": "Echoes the input.",
+        "runtime": "remote",
+        "inputs": (
+            {"q": {"type": "string", "required": True}} if inputs is None else inputs
+        ),
+        "remote": {"site": "site-a", "tool": "echo"},
+        "managed_by": "edge-relay",
+        "public": False,
+    }
+    if detail is not None:
+        config["detail"] = detail
+    return config
+
+
+def _stored_tool(mgr, *, detail="full", inputs=None):
+    config = _remote_tool_record(detail=detail, inputs=inputs)
+    mgr.tools["site-a__echo"] = config
+    return config
+
+
+def _lazy_mcp_record(mgr):
+    """One lazy server: two summary entries, neither carrying a schema."""
+    config = {
+        "name": "site-a__devops-cli",
+        "description": "",
+        "transport": "remote",
+        "remote": {"site": "site-a", "mcp": "devops-cli"},
+        "managed_by": "edge-relay",
+        "public": False,
+        "public_tools": [],
+        "detail": "lazy",
+        "tools": [
+            {"name": "tenant_account_tools", "description": "manage tenants"},
+            {"name": "sibling_tool", "description": "never fetched"},
+        ],
+    }
+    mgr.mcps["site-a__devops-cli"] = config
+    return config
+
+
+def test_a_lazy_publish_writes_a_summary_record():
+    mgr = _DetailRegistry()
+
+    published = app_module.registry.publish_catalog(
+        mgr,
+        "site-a",
+        [protocol.EdgeTool(name="echo", description="Echoes the input.")],
+        "0.6.2",
+        lazy_catalog=True,
+    )
+
+    assert published == ["site-a__echo"]
+    config = mgr.tools["site-a__echo"]
+    assert config["detail"] == "lazy"
+    assert config["inputs"] == {}
+    assert config["remote"] == {"site": "site-a", "tool": "echo"}
+    assert config["managed_by"] == "edge-relay"
+
+
+def test_a_full_publish_keeps_the_pre_lazy_record_shape():
+    """No cap: the record has no ``detail`` key at all (absent reads as "full")."""
+    mgr = _DetailRegistry()
+
+    app_module.registry.publish_catalog(
+        mgr,
+        "site-a",
+        [protocol.EdgeTool(name="echo", inputs={"q": {"type": "string"}})],
+        "0.6.2",
+    )
+
+    assert "detail" not in mgr.tools["site-a__echo"]
+    assert mgr.tools["site-a__echo"]["inputs"] == {"q": {"type": "string"}}
+
+
+def test_a_lazy_publish_that_still_carries_inputs_is_a_full_record():
+    mgr = _DetailRegistry()
+
+    app_module.registry.publish_catalog(
+        mgr,
+        "site-a",
+        [protocol.EdgeTool(name="echo", inputs={"q": {"type": "string"}})],
+        "0.6.2",
+        lazy_catalog=True,
+    )
+
+    config = mgr.tools["site-a__echo"]
+    assert config["detail"] == "full"
+    assert config["inputs"] == {"q": {"type": "string"}}
+
+
+def test_a_lazy_mcp_publish_marks_the_server_when_a_schema_is_missing():
+    mgr = _DetailRegistry()
+    mcp = protocol.EdgeMcp(
+        name="devops-cli",
+        tools=[
+            protocol.EdgeMcpTool(name="summary_only"),
+            protocol.EdgeMcpTool(name="with_schema", input_schema={"type": "object"}),
+        ],
+    )
+
+    app_module.registry.publish_mcp_catalog(
+        mgr, "site-a", [mcp], "0.6.2", lazy_catalog=True
+    )
+
+    config = mgr.mcps["site-a__devops-cli"]
+    assert config["detail"] == "lazy"
+    assert [tool["name"] for tool in config["tools"]] == ["summary_only", "with_schema"]
+
+
+def test_fetch_tool_detail_serves_a_cached_full_record_without_the_edge():
+    mgr = _DetailRegistry()
+    _stored_tool(mgr)
+    calls = []
+
+    async def requester(mcp, tool):
+        calls.append((mcp, tool))
+        raise AssertionError("a cached full detail must not reach the edge")
+
+    result = asyncio.run(
+        app_module.registry.fetch_tool_detail(mgr, "site-a", "echo", requester)
+    )
+
+    assert result["cached"] is True
+    assert result["detail_state"] == "full"
+    assert result["detail"] == {"q": {"type": "string", "required": True}}
+    assert result["description"] == "Echoes the input."
+    assert "stale" not in result
+    assert calls == []
+
+
+def test_fetch_tool_detail_fetches_validates_and_caches_a_lazy_record():
+    mgr = _DetailRegistry()
+    _stored_tool(mgr, detail="lazy", inputs={})
+    calls = []
+
+    async def requester(mcp, tool):
+        calls.append((mcp, tool))
+        return {
+            "name": tool,
+            "description": "Echoes the input, fully.",
+            "inputs": {"q": {"type": "string", "required": True}},
+        }
+
+    result = asyncio.run(
+        app_module.registry.fetch_tool_detail(mgr, "site-a", "echo", requester)
+    )
+
+    assert calls == [(None, "echo")]
+    assert result["cached"] is False
+    assert result["detail"] == {"q": {"type": "string", "required": True}}
+    stored = mgr.tools["site-a__echo"]
+    assert stored["detail"] == "full"
+    assert stored["description"] == "Echoes the input, fully."
+    assert stored["inputs"] == {"q": {"type": "string", "required": True}}
+    # The merge is additive: routing fields from the summary survive.
+    assert stored["remote"] == {"site": "site-a", "tool": "echo"}
+    assert stored["managed_by"] == "edge-relay"
+
+    # The next read is a cache hit, with no second round trip.
+    again = asyncio.run(
+        app_module.registry.fetch_tool_detail(mgr, "site-a", "echo", requester)
+    )
+    assert again["cached"] is True
+    assert calls == [(None, "echo")]
+
+
+def test_fetch_tool_detail_rejects_an_invalid_detail_and_degrades():
+    mgr = _DetailRegistry()
+    _stored_tool(mgr, detail="lazy", inputs={})
+
+    async def requester(mcp, tool):
+        return {"name": tool, "description": "d", "inputs": ["not", "an", "object"]}
+
+    result = asyncio.run(
+        app_module.registry.fetch_tool_detail(mgr, "site-a", "echo", requester)
+    )
+
+    assert result["unavailable"] is True
+    assert "ProtocolError" in result["reason"]
+    # Nothing invalid is cached: the record is still the lazy summary.
+    assert mgr.tools["site-a__echo"]["detail"] == "lazy"
+
+
+class _RacyDetailRegistry(_DetailRegistry):
+    """First read misses, later reads see a full record (a concurrent publish)."""
+
+    def __init__(self):
+        super().__init__()
+        self.reads = 0
+
+    def get_tool_config(self, name):
+        self.reads += 1
+        config = super().get_tool_config(name)
+        if config is None or self.reads > 1:
+            return config
+        return {**config, "detail": "lazy"}
+
+
+def test_fetch_tool_detail_falls_back_to_a_stale_copy_when_the_edge_fails():
+    mgr = _RacyDetailRegistry()
+    _stored_tool(mgr)
+
+    async def requester(mcp, tool):
+        raise RuntimeError("tunnel dropped")
+
+    result = asyncio.run(
+        app_module.registry.fetch_tool_detail(mgr, "site-a", "echo", requester)
+    )
+
+    assert result.get("stale") is True
+    assert result["cached"] is True
+    assert result["detail"] == {"q": {"type": "string", "required": True}}
+    assert mgr.reads == 2
+
+
+def test_fetch_tool_detail_degrades_to_unavailable_without_a_cache():
+    mgr = _DetailRegistry()
+
+    async def requester(mcp, tool):
+        raise RuntimeError("tunnel dropped")
+
+    result = asyncio.run(
+        app_module.registry.fetch_tool_detail(mgr, "site-a", "echo", requester)
+    )
+
+    assert result["unavailable"] is True
+    assert result["detail"] is None
+    assert result["detail_state"] == "unavailable"
+    assert "RuntimeError" in result["reason"]
+    assert "tunnel dropped" in result["reason"]
+
+
+def test_fetch_mcp_tool_detail_round_trips_the_schema():
+    """The MCP payload's ``detail`` is the ``inputSchema`` itself, not the entry."""
+    mgr = _DetailRegistry()
+    _lazy_mcp_record(mgr)
+    schema = {"type": "object", "properties": {"action": {"type": "string"}}}
+    calls = []
+
+    async def requester(mcp, tool):
+        calls.append((mcp, tool))
+        return {
+            "name": "tenant_account_tools",
+            "description": "manage tenants",
+            "inputSchema": schema,
+        }
+
+    first = asyncio.run(
+        app_module.registry.fetch_tool_detail(
+            mgr, "site-a", "tenant_account_tools", requester, mcp="devops-cli"
+        )
+    )
+
+    assert calls == [("devops-cli", "tenant_account_tools")]
+    assert first["cached"] is False
+    assert first["detail"] == schema
+    assert first["description"] == "manage tenants"
+
+    second = asyncio.run(
+        app_module.registry.fetch_tool_detail(
+            mgr, "site-a", "tenant_account_tools", requester, mcp="devops-cli"
+        )
+    )
+
+    assert second["cached"] is True
+    assert second["detail"] == schema
+    assert calls == [("devops-cli", "tenant_account_tools")]
+
+
+def test_storing_one_mcp_detail_completes_only_that_entry():
+    mgr = _DetailRegistry()
+    _lazy_mcp_record(mgr)
+    schema = {"type": "object", "properties": {"action": {"type": "string"}}}
+
+    config = app_module.registry.store_mcp_tool_detail(
+        mgr,
+        "site-a",
+        "devops-cli",
+        {
+            "name": "tenant_account_tools",
+            "description": "manage tenants",
+            "inputSchema": schema,
+        },
+    )
+
+    # The server flag flips to "full"; `detail_tools` is what proves which entries did.
+    assert config["detail"] == "full"
+    assert config["detail_tools"] == ["tenant_account_tools"]
+    fetched = next(t for t in config["tools"] if t["name"] == "tenant_account_tools")
+    assert fetched["inputSchema"] == schema
+    sibling = next(t for t in config["tools"] if t["name"] == "sibling_tool")
+    assert not sibling.get("inputSchema")
+
+    assert (
+        app_module.registry.get_mcp_tool_detail(
+            mgr, "site-a", "devops-cli", "tenant_account_tools"
+        )["inputSchema"]
+        == schema
+    )
+    # Never fetched, so still a summary: unavailable rather than an empty schema.
+    assert (
+        app_module.registry.get_mcp_tool_detail(
+            mgr, "site-a", "devops-cli", "sibling_tool"
+        )
+        is None
+    )
+
+
+def test_request_tool_detail_correlates_on_the_sent_id():
+    async def _scenario():
+        ws = FakeWebSocket()
+        conn = EdgeConn(ws, "site-a", {"echo": _tool()}, caps=["tools", "lazy_catalog"])
+        task = asyncio.create_task(conn.request_tool_detail("echo"))
+        await _wait_for_frames(ws)
+
+        frame = ws.sent[0]
+        assert frame == {"t": "tool_detail", "id": frame["id"], "tool": "echo"}
+
+        detail = {
+            "name": "echo",
+            "description": "Echoes.",
+            "inputs": {"q": {"type": "string", "required": True}},
+        }
+        payload = {"id": frame["id"], "ok": True, "detail": detail}
+        assert conn.resolve(frame["id"], payload) is True
+        assert await task == detail
+        assert conn.inflight == {}
+
+    asyncio.run(_scenario())
+
+
+def test_request_mcp_tool_detail_correlates_on_the_sent_id():
+    async def _scenario():
+        ws = FakeWebSocket()
+        conn = EdgeConn(
+            ws, "site-a", mcps={"devops-cli": _mcp()},
+            caps=["tools", "mcp", "lazy_catalog"],
+        )
+        task = asyncio.create_task(
+            conn.request_mcp_tool_detail("devops-cli", "tenant_account_tools")
+        )
+        await _wait_for_frames(ws)
+
+        frame = ws.sent[0]
+        assert frame == {
+            "t": "mcp_tool_detail",
+            "id": frame["id"],
+            "mcp": "devops-cli",
+            "tool": "tenant_account_tools",
+        }
+
+        detail = {
+            "name": "tenant_account_tools",
+            "description": "manage tenants",
+            "inputSchema": {"type": "object"},
+        }
+        assert conn.resolve(frame["id"], {"id": frame["id"], "ok": True, "detail": detail})
+        assert await task == detail
+
+    asyncio.run(_scenario())
+
+
+def test_a_detail_refusal_raises_edge_detail_error_with_the_code():
+    async def _scenario():
+        ws = FakeWebSocket()
+        conn = EdgeConn(ws, "site-a", {"echo": _tool()}, caps=["tools", "lazy_catalog"])
+        task = asyncio.create_task(conn.request_tool_detail("echo"))
+        await _wait_for_frames(ws)
+
+        frame = ws.sent[0]
+        conn.resolve(
+            frame["id"],
+            {
+                "id": frame["id"],
+                "ok": False,
+                "error": {"code": "unknown_tool", "message": "tool not published"},
+            },
+        )
+
+        with pytest.raises(app_module.EdgeDetailError) as exc:
+            await task
+        assert exc.value.code == "unknown_tool"
+        assert exc.value.message == "tool not published"
+        assert conn.inflight == {}
+
+    asyncio.run(_scenario())
+
+
+def test_a_detail_reply_without_a_detail_object_is_refused():
+    async def _scenario():
+        ws = FakeWebSocket()
+        conn = EdgeConn(ws, "site-a", {"echo": _tool()}, caps=["tools", "lazy_catalog"])
+        task = asyncio.create_task(conn.request_tool_detail("echo"))
+        await _wait_for_frames(ws)
+
+        frame = ws.sent[0]
+        conn.resolve(frame["id"], {"id": frame["id"], "ok": True, "result": {}})
+
+        with pytest.raises(app_module.EdgeDetailError) as exc:
+            await task
+        assert exc.value.code == "detail_missing"
+
+    asyncio.run(_scenario())
+
+
+def test_an_unknown_tool_or_mcp_is_never_asked_for_detail():
+    async def _scenario():
+        ws = FakeWebSocket()
+        conn = EdgeConn(
+            ws, "site-a", {"echo": _tool()}, {"devops-cli": _mcp()},
+            caps=["tools", "mcp", "lazy_catalog"],
+        )
+
+        with pytest.raises(EdgeUnknownTool):
+            await conn.request_tool_detail("nope")
+        with pytest.raises(app_module.EdgeUnknownMcp):
+            await conn.request_mcp_tool_detail("nope", "tenant_account_tools")
+
+        # Refused before anything was written to the tunnel.
+        assert ws.sent == []
+        assert conn.inflight == {}
+
+    asyncio.run(_scenario())
+
+
+def test_tool_detail_endpoint_serves_the_edge_and_caches_the_answer(detail_registry):
+    conn = _install_conn()
+    entry = {
+        "name": "echo",
+        "description": "Echoes the input.",
+        "inputs": {"q": {"type": "string", "required": True}},
+    }
+    calls = []
+
+    async def _detail(tool):
+        calls.append(tool)
+        return entry
+
+    conn.request_tool_detail = _detail
+    client = TestClient(app_module.app)
+
+    first = client.post("/v1/sites/site-a/tool_detail", json={"tool": "echo"})
+
+    assert first.status_code == 200
+    assert first.json() == {
+        "site": "site-a",
+        "tool": "echo",
+        "detail": entry["inputs"],
+        "description": "Echoes the input.",
+        "detail_state": "full",
+        "cached": False,
+    }
+
+    second = client.post("/v1/sites/site-a/tool_detail", json={"tool": "echo"})
+
+    assert second.status_code == 200
+    assert second.json()["cached"] is True
+    assert second.json()["detail"] == entry["inputs"]
+    assert calls == ["echo"]
+
+
+def test_tool_detail_endpoint_503s_for_an_offline_site_without_a_cache(
+    monkeypatch, detail_registry
+):
+    events = []
+    monkeypatch.setattr(
+        app_module.audit, "record", lambda event, **kw: events.append({"event": event, **kw})
+    )
+    client = TestClient(app_module.app)
+
+    response = client.post("/v1/sites/ghost/tool_detail", json={"tool": "echo"})
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "edge_offline"
+    assert [event["event"] for event in events] == ["detail"]
+    assert events[0]["outcome"] == "edge_offline"
+    assert events[0]["site"] == "ghost"
+    assert events[0]["tool"] == "echo"
+
+
+def test_tool_detail_audit_line_records_shape_not_schema(monkeypatch, detail_registry):
+    events = []
+    monkeypatch.setattr(
+        app_module.audit, "record", lambda event, **kw: events.append({"event": event, **kw})
+    )
+    marker = "SCHEMA-CONTENT-MARKER"
+    conn = _install_conn()
+
+    async def _detail(tool):
+        return {
+            "name": "echo",
+            "description": "Echoes the input.",
+            "inputs": {"q": {"type": "string", "description": marker}},
+        }
+
+    conn.request_tool_detail = _detail
+    client = TestClient(app_module.app)
+
+    response = client.post("/v1/sites/site-a/tool_detail", json={"tool": "echo"})
+
+    assert response.status_code == 200
+    assert len(events) == 1
+    event = events[0]
+    assert event["event"] == "detail"
+    assert event["outcome"] == "ok"
+    assert event["site"] == "site-a"
+    assert event["tool"] == "echo"
+    assert isinstance(event["ms"], int)
+    # ``audit.record`` drops a None field; the intercepted call still carries it.
+    assert event.get("mcp") is None
+    # Same rule as a call: names, outcome and timing only.
+    assert "detail" not in event
+    assert "description" not in event
+    assert marker not in json.dumps(events)
+
+
+def test_an_offline_site_still_serves_a_cached_detail(monkeypatch, detail_registry):
+    """The cache is the point: a schema read keeps working while the edge is away."""
+    _stored_tool(detail_registry)
+    client = TestClient(app_module.app)
+
+    response = client.post("/v1/sites/site-a/tool_detail", json={"tool": "echo"})
+
+    assert response.status_code == 200
+    assert response.json()["cached"] is True
+    assert response.json()["detail"] == {"q": {"type": "string", "required": True}}
+
+
+# --- Lazy-catalog execution path --------------------------------------------
+
+
+def test_a_lazy_published_tool_is_still_callable_with_arguments(monkeypatch):
+    # The hello carried only a summary, so the relay's in-memory EdgeTool has no
+    # inputs. Strict unknown-key validation would make every argument 400 before the
+    # edge (which validates its real manifest) ever sees it.
+    summary = protocol.EdgeTool(name="boiler_status", description="status", inputs={})
+    conn = _install_conn(tools={"boiler_status": summary}, caps=["tools", "lazy_catalog"])
+    sent = {}
+
+    async def fake_request(tool, args, *a, **k):
+        sent["tool"] = tool
+        sent["args"] = args
+        return {"id": "x", "ok": True, "result": {"ok": True}}
+
+    conn.request = fake_request
+    client = TestClient(app_module.app)
+
+    response = client.post(
+        "/v1/sites/site-a/call",
+        json={"tool": "boiler_status", "args": {"room": "kitchen"}},
+    )
+
+    assert response.status_code == 200
+    assert sent == {"tool": "boiler_status", "args": {"room": "kitchen"}}
+
+
+def test_fetching_a_detail_refreshes_the_connection_catalog():
+    async def _scenario():
+        ws = FakeWebSocket()
+        conn = EdgeConn(
+            ws, "site-a", {"echo": protocol.EdgeTool(name="echo", description="e", inputs={})},
+            caps=["tools", "lazy_catalog"],
+        )
+        task = asyncio.create_task(conn.request_tool_detail("echo"))
+        await _wait_for_frames(ws)
+        frame = ws.sent[0]
+        detail = {
+            "name": "echo",
+            "description": "Echoes.",
+            "inputs": {"q": {"type": "string", "required": True}},
+        }
+        conn.resolve(frame["id"], {"id": frame["id"], "ok": True, "detail": detail})
+        assert await task == detail
+
+        # The next call validates against the real schema, not the summary.
+        assert conn.tools["echo"].inputs == detail["inputs"]
+        args = protocol.args_for_tool(conn.tools["echo"], {"q": "hi"})
+        assert args == {"q": "hi"}
+
+    asyncio.run(_scenario())
+
+
+def test_a_prelazy_schemaless_mcp_tool_is_a_cache_hit():
+    # A record from before lazy publishing has no `detail` key; an empty inputSchema is
+    # legal for a schema-less tool, so asking the edge would send a detail frame to a
+    # peer that cannot decode it (and closes the tunnel on an unknown frame type).
+    class Mgr:
+        def get_mcp_config(self, name):
+            return {
+                "managed_by": app_module.registry.MANAGED_BY,
+                "name": name,
+                "tools": [{"name": "ping", "description": "ping", "inputSchema": {}}],
+            }
+
+    entry = app_module.registry.get_mcp_tool_detail(
+        Mgr(), "site-a", "devops-cli", "ping"
+    )
+    assert entry is not None
+    assert entry["name"] == "ping"

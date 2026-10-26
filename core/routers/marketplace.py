@@ -5,6 +5,7 @@ import os
 import json
 import re
 import asyncio
+import logging
 import yaml
 from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -17,7 +18,22 @@ from core.models import Identity, IdentityType
 from core.tunables import resolve as resolve_tunable
 from core.workspace_io import write_repo_file
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(route_class=CSRFRoute)
+
+
+def _agent_latency(agent_name: str) -> dict:
+    """Best-effort latency summary for one agent (worker-thread etcd read).
+
+    Metrics are supplementary: a failing read renders no latency line for that card.
+    """
+    try:
+        return identity_mgr.get_agent_latency(agent_name) or {}
+    except Exception as e:
+        logger.debug("Agent latency read failed for '%s': %s", agent_name, e)
+        return {}
+
 
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -72,6 +88,14 @@ async def agents(request: Request):
         operational = compute_agent_operational_status(cfg, agent.get("health"), tool_healths)
         agent["health"] = {**(agent.get("health") or {}), "status": operational["status"]}
         agent["offline_tools"] = operational["offline_tools"]
+
+    # Latency rollups: one concurrent etcd read per agent, failures degrade to {} so a
+    # metrics problem can never take down the agents page.
+    latencies = await asyncio.gather(
+        *(asyncio.to_thread(_agent_latency, agent["name"]) for agent in agents)
+    )
+    for agent, latency in zip(agents, latencies):
+        agent["latency"] = latency or {}
 
     flash_msg = request.session.pop("flash_msg", None)
     

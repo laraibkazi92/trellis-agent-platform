@@ -33,6 +33,10 @@ def prune_agent(identity_mgr: IdentityManager, agent_name: str, keep: int, dry_r
     try:
         for value, metadata in client.get_prefix(prefix):
             key_str = metadata.key.decode("utf-8")
+            # A run record is exactly /runs/{agent}/{run_id}; events and the
+            # heartbeat live deeper and must never be counted or deleted as records.
+            if "/" in key_str[len(prefix):]:
+                continue
             val_len = len(value) if value else 0
             total_bytes += val_len
             ts = ""
@@ -71,6 +75,9 @@ def prune_agent(identity_mgr: IdentityManager, agent_name: str, keep: int, dry_r
     for key_str, _, _ in to_delete:
         try:
             client.delete(key_str)
+            # Trailing slash: a bare prefix delete would also hit sibling runs
+            # whose id starts with this one's.
+            client.delete_prefix(f"{key_str}/")
             deleted += 1
         except Exception as err:
             print(f"Failed to delete {key_str}: {err}")

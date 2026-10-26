@@ -1298,3 +1298,502 @@ def test_remote_mcp_spec_uses_the_same_name_pattern_as_remote_tools():
     for good in ("devops-cli", "tenant_account_tools", "a_b", "a_"):
         assert RemoteMcpSpec(site=SITE, mcp=good).mcp == good
         assert RemoteToolSpec(site=SITE, tool=good).tool == good
+
+
+# --- describe_tool_entry + lazy tool-search cards (P6) -------------------------
+
+D_LOCAL_TOOL = "text_stats"
+D_LOCAL_INPUTS = {
+    "text": {"type": "string", "description": "Text to measure.", "required": True},
+    "unit": {"type": "string"},
+}
+D_CENTRAL_SRV = "central-srv"
+D_CENTRAL_TOOL = "do"
+D_EDGE_SITE = "dc1"
+D_EDGE_TOOL = "echo"
+D_EDGE_TOOL_KEY = f"{D_EDGE_SITE}__{D_EDGE_TOOL}"
+D_EDGE_MCP_KEY = f"{D_EDGE_SITE}__{MCP}"
+D_EDGE_MCP_PREFIXED = f"mcp__{D_EDGE_SITE}__{MCP}__{TOOL}"
+
+
+class DetailIdentity:
+    """The registry reads ``describe_tool_entry``/``search_tools`` perform."""
+
+    def __init__(self, tool_configs=None, mcp_configs=None):
+        self.tool_configs = tool_configs or {}
+        self.mcp_configs = mcp_configs or {}
+        self.edge_configs = {}
+
+    def get_tool_config(self, name):
+        return self.tool_configs.get(name)
+
+    def get_mcp_config(self, name):
+        return self.mcp_configs.get(name)
+
+    def get_edge_config(self, site):
+        return self.edge_configs.get(site)
+
+
+def install_detail_relay(monkeypatch, handler):
+    """``core.tool_search`` builds its own client, so patch its module's ``httpx``."""
+    requests = []
+
+    def wrapped(request):
+        requests.append(request)
+        return handler(request)
+
+    def factory(*args, **kwargs):
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(wrapped), timeout=kwargs.get("timeout")
+        )
+
+    monkeypatch.setattr(tool_search, "httpx", SimpleNamespace(AsyncClient=factory))
+    monkeypatch.setenv(tool_search.RELAY_URL_ENV, RELAY_URL)
+    return requests
+
+
+def _edge_tool_config(tool=D_EDGE_TOOL, *, detail="lazy", inputs=None, site=D_EDGE_SITE):
+    return {
+        "name": f"{site}__{tool}",
+        "description": f"{tool} summary",
+        "runtime": "remote",
+        "inputs": {} if inputs is None else inputs,
+        "remote": {"site": site, "tool": tool},
+        "managed_by": "edge-relay",
+        "public": True,
+        "detail": detail,
+    }
+
+
+def _edge_tool_detail_response(tool=D_EDGE_TOOL, *, site=D_EDGE_SITE):
+    return {
+        "site": site,
+        "tool": tool,
+        "detail": {"q": {"type": "string", "required": True}},
+        "description": f"{tool} full description",
+        "detail_state": "full",
+        "cached": False,
+    }
+
+
+def test_describe_local_tool_reads_parameters_from_tool_yaml(monkeypatch):
+    mgr = DetailIdentity(
+        tool_configs={
+            D_LOCAL_TOOL: {
+                "name": D_LOCAL_TOOL,
+                "description": "Count words in a string.",
+                "inputs": D_LOCAL_INPUTS,
+            }
+        }
+    )
+    requests = install_detail_relay(
+        monkeypatch, lambda request: pytest.fail("a local tool never touches the relay")
+    )
+
+    info = asyncio.run(tool_search.describe_tool_entry(D_LOCAL_TOOL, identity_manager=mgr))
+
+    assert info == {
+        "name": D_LOCAL_TOOL,
+        "description": "Count words in a string.",
+        "parameters": {
+            "text": {
+                "type": "string",
+                "description": "Text to measure.",
+                "required": True,
+            },
+            "unit": {"type": "string", "description": "", "required": False},
+        },
+        "source": "local",
+        "detail": "full",
+    }
+    assert requests == []
+
+
+def test_describe_central_mcp_tool_reads_parameters_from_its_schema(monkeypatch):
+    mgr = DetailIdentity(
+        mcp_configs={
+            D_CENTRAL_SRV: {
+                "name": D_CENTRAL_SRV,
+                "transport": "stdio",
+                "tools": [
+                    {
+                        "name": D_CENTRAL_TOOL,
+                        "description": "Do the thing.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "n": {"type": "integer", "description": "How many."},
+                                "label": {"type": "string"},
+                            },
+                            "required": ["n"],
+                        },
+                    }
+                ],
+            }
+        }
+    )
+    requests = install_detail_relay(
+        monkeypatch, lambda request: pytest.fail("a central MCP never touches the relay")
+    )
+
+    info = asyncio.run(
+        tool_search.describe_tool_entry(
+            f"mcp__{D_CENTRAL_SRV}__{D_CENTRAL_TOOL}", identity_manager=mgr
+        )
+    )
+
+    assert info["parameters"] == {
+        "n": {"type": "integer", "description": "How many.", "required": True},
+        "label": {"type": "string", "description": "", "required": False},
+    }
+    assert info["source"] == D_CENTRAL_SRV
+    assert info["detail"] == "full"
+    assert requests == []
+
+
+def test_describe_edge_tool_posts_the_bare_name(monkeypatch):
+    mgr = DetailIdentity(tool_configs={D_EDGE_TOOL_KEY: _edge_tool_config()})
+    requests = install_detail_relay(
+        monkeypatch, lambda request: httpx.Response(200, json=_edge_tool_detail_response())
+    )
+
+    info = asyncio.run(
+        tool_search.describe_tool_entry(D_EDGE_TOOL_KEY, identity_manager=mgr)
+    )
+
+    assert len(requests) == 1
+    assert str(requests[0].url) == f"{RELAY_URL}/v1/sites/{D_EDGE_SITE}/tool_detail"
+    assert json.loads(requests[0].content) == {"tool": D_EDGE_TOOL}
+    assert info["name"] == D_EDGE_TOOL_KEY
+    assert info["description"] == "echo full description"
+    assert info["source"] == "local"
+    assert info["detail"] == "full"
+    assert info.get("unavailable") is not True
+
+
+def test_describe_edge_tool_maps_the_inputs_to_parameters(monkeypatch):
+    mgr = DetailIdentity(tool_configs={D_EDGE_TOOL_KEY: _edge_tool_config()})
+    install_detail_relay(
+        monkeypatch, lambda request: httpx.Response(200, json=_edge_tool_detail_response())
+    )
+
+    info = asyncio.run(
+        tool_search.describe_tool_entry(D_EDGE_TOOL_KEY, identity_manager=mgr)
+    )
+
+    assert info["parameters"] == {
+        "q": {"type": "string", "description": "", "required": True}
+    }
+
+
+def test_describe_edge_mcp_tool_posts_the_server_and_bare_tool(monkeypatch):
+    """The relay's MCP payload carries the ``inputSchema`` itself as ``detail``."""
+    schema = {"type": "object", "properties": {"action": {"type": "string"}}}
+    mgr = DetailIdentity(
+        mcp_configs={
+            D_EDGE_MCP_KEY: edge_mcp_payload(
+                public=True,
+                detail="lazy",
+                tools=[{"name": TOOL, "description": "Tenant account tools."}],
+            )
+        }
+    )
+    requests = install_detail_relay(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "site": D_EDGE_SITE,
+                "mcp": MCP,
+                "tool": TOOL,
+                "detail": schema,
+                "description": "Tenant account tools.",
+                "detail_state": "full",
+                "cached": False,
+            },
+        ),
+    )
+
+    info = asyncio.run(
+        tool_search.describe_tool_entry(D_EDGE_MCP_PREFIXED, identity_manager=mgr)
+    )
+
+    assert len(requests) == 1
+    assert str(requests[0].url) == f"{RELAY_URL}/v1/sites/{D_EDGE_SITE}/mcp_tool_detail"
+    assert json.loads(requests[0].content) == {"mcp": MCP, "tool": TOOL}
+    assert info["detail"] == "full"
+    assert info["description"] == "Tenant account tools."
+
+
+def test_describe_edge_mcp_tool_maps_the_relay_schema_to_parameters(monkeypatch):
+    schema = {
+        "type": "object",
+        "properties": {"action": {"type": "string", "description": "What to do."}},
+        "required": ["action"],
+    }
+    mgr = DetailIdentity(
+        mcp_configs={
+            D_EDGE_MCP_KEY: edge_mcp_payload(
+                public=True,
+                detail="lazy",
+                tools=[{"name": TOOL, "description": "Tenant account tools."}],
+            )
+        }
+    )
+    install_detail_relay(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "site": D_EDGE_SITE,
+                "mcp": MCP,
+                "tool": TOOL,
+                "detail": schema,
+                "description": "Tenant account tools.",
+                "detail_state": "full",
+                "cached": False,
+            },
+        ),
+    )
+
+    info = asyncio.run(
+        tool_search.describe_tool_entry(D_EDGE_MCP_PREFIXED, identity_manager=mgr)
+    )
+
+    assert info["parameters"] == {
+        "action": {"type": "string", "description": "What to do.", "required": True}
+    }
+
+
+def test_describe_edge_tool_maps_a_503_edge_offline_to_unavailable(monkeypatch):
+    mgr = DetailIdentity(tool_configs={D_EDGE_TOOL_KEY: _edge_tool_config()})
+    install_detail_relay(
+        monkeypatch,
+        lambda request: httpx.Response(
+            503,
+            json={"error": {"code": "edge_offline", "message": "edge 'dc1' is not connected"}},
+        ),
+    )
+
+    info = asyncio.run(tool_search.describe_tool_entry(D_EDGE_TOOL_KEY, identity_manager=mgr))
+
+    assert info == {
+        "name": D_EDGE_TOOL_KEY,
+        "unavailable": True,
+        "reason": "edge_offline",
+    }
+
+
+def test_describe_edge_tool_maps_a_connection_error_to_unavailable(monkeypatch):
+    mgr = DetailIdentity(tool_configs={D_EDGE_TOOL_KEY: _edge_tool_config()})
+
+    def handler(request):
+        raise httpx.ConnectError("refused", request=request)
+
+    install_detail_relay(monkeypatch, handler)
+
+    info = asyncio.run(tool_search.describe_tool_entry(D_EDGE_TOOL_KEY, identity_manager=mgr))
+
+    assert info["unavailable"] is True
+    assert info["reason"] == "edge_unavailable"
+
+
+def test_describe_edge_tool_degrades_on_malformed_json(monkeypatch):
+    mgr = DetailIdentity(tool_configs={D_EDGE_TOOL_KEY: _edge_tool_config()})
+    install_detail_relay(monkeypatch, lambda request: httpx.Response(200, text="not json"))
+
+    info = asyncio.run(tool_search.describe_tool_entry(D_EDGE_TOOL_KEY, identity_manager=mgr))
+
+    assert info == {
+        "name": D_EDGE_TOOL_KEY,
+        "unavailable": True,
+        "reason": "edge_unavailable",
+    }
+
+
+def install_search_registry(
+    monkeypatch, tool_configs, mcp_configs=None, embeddings=None
+):
+    """Point the process-wide ``tool_search.identity_mgr`` at in-memory records."""
+    mcp_configs = mcp_configs or {}
+    embeddings = embeddings or {}
+    mgr = tool_search.identity_mgr
+    monkeypatch.setattr(mgr, "get_all_tool_configs", lambda: tool_configs)
+    monkeypatch.setattr(mgr, "get_all_mcp_configs", lambda: mcp_configs)
+    monkeypatch.setattr(mgr, "get_all_tool_embeddings", lambda: embeddings)
+    monkeypatch.setattr(mgr, "get_all_health_statuses", lambda kind: {})
+    monkeypatch.setattr(mgr, "get_tool_config", lambda name: tool_configs.get(name))
+    monkeypatch.setattr(mgr, "get_mcp_config", lambda name: mcp_configs.get(name))
+    monkeypatch.setattr(
+        mgr, "get_edge_config", lambda site: {"name": site, "enabled": True}
+    )
+    monkeypatch.setattr(tool_search, "embed_text", lambda text, task_type: [1.0, 0.0])
+
+
+def test_search_tools_renders_a_lazy_edge_card_summary_only(monkeypatch):
+    tool_configs = {
+        "dc1__lazy_tool": _edge_tool_config(
+            "lazy_tool", detail="lazy", inputs={}
+        ),
+        "dc1__full_tool": _edge_tool_config(
+            "full_tool", detail="full", inputs={"q": {"type": "string"}}
+        ),
+    }
+    install_search_registry(
+        monkeypatch,
+        tool_configs,
+        embeddings={"dc1__lazy_tool": [1.0, 0.0], "dc1__full_tool": [0.5, 0.5]},
+    )
+    requests = install_detail_relay(
+        monkeypatch, lambda request: pytest.fail("detail=False must not read the relay")
+    )
+
+    results = asyncio.run(tool_search.search_tools("tool", limit=0))
+
+    by_name = {card["name"]: card for card in results}
+    assert by_name["dc1__lazy_tool"]["detail"] == "lazy"
+    assert by_name["dc1__lazy_tool"]["parameters"] == {}
+    assert by_name["dc1__lazy_tool"]["description"] == "lazy_tool summary"
+    assert by_name["dc1__full_tool"]["detail"] == "full"
+    assert by_name["dc1__full_tool"]["parameters"] == {
+        "q": {"type": "string", "description": "", "required": False}
+    }
+    assert requests == []
+
+
+def test_search_tools_detail_fetches_only_the_selected_lazy_cards(monkeypatch):
+    tool_configs = {
+        "dc1__lazy_a": _edge_tool_config("lazy_a", detail="lazy", inputs={}),
+        "dc1__lazy_b": _edge_tool_config("lazy_b", detail="lazy", inputs={}),
+        "dc1__full_c": _edge_tool_config(
+            "full_c", detail="full", inputs={"q": {"type": "string"}}
+        ),
+    }
+    install_search_registry(
+        monkeypatch,
+        tool_configs,
+        embeddings={
+            "dc1__lazy_a": [1.0, 0.0],
+            "dc1__lazy_b": [1.0, 0.0],
+            "dc1__full_c": [0.0, 1.0],
+        },
+    )
+    requests = install_detail_relay(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json=_edge_tool_detail_response(json.loads(request.content)["tool"]),
+        ),
+    )
+
+    summary_cards = asyncio.run(tool_search.search_tools("tool", limit=3, detail=False))
+    lazy_count = sum(1 for card in summary_cards if card["detail"] == "lazy")
+    assert lazy_count == 2
+
+    detailed = asyncio.run(tool_search.search_tools("tool", limit=3, detail=True))
+
+    # One relay read per lazy card in the returned window -- no more.
+    assert len(requests) == lazy_count
+    assert sorted(json.loads(request.content)["tool"] for request in requests) == [
+        "lazy_a",
+        "lazy_b",
+    ]
+    by_name = {card["name"]: card for card in detailed}
+    for name in ("dc1__lazy_a", "dc1__lazy_b"):
+        # The card is upgraded from the fetched detail: flag and description.
+        assert by_name[name]["detail"] == "full"
+        assert by_name[name]["description"] == f"{name.partition('__')[2]} full description"
+    # The already-full card is served from the registry, never fetched.
+    assert by_name["dc1__full_c"]["detail"] == "full"
+    assert by_name["dc1__full_c"]["parameters"]["q"]["type"] == "string"
+
+
+def test_search_tools_detail_fills_a_lazy_card_parameters(monkeypatch):
+    tool_configs = {"dc1__lazy_a": _edge_tool_config("lazy_a", detail="lazy", inputs={})}
+    install_search_registry(monkeypatch, tool_configs)
+    install_detail_relay(
+        monkeypatch,
+        lambda request: httpx.Response(200, json=_edge_tool_detail_response("lazy_a")),
+    )
+
+    cards = asyncio.run(tool_search.search_tools("tool", limit=1, detail=True))
+
+    assert cards[0]["detail"] == "full"
+    assert cards[0]["parameters"] == {
+        "q": {"type": "string", "description": "", "required": True}
+    }
+
+
+def test_search_tools_detail_is_bounded_by_the_limit(monkeypatch):
+    tool_configs = {
+        "dc1__lazy_a": _edge_tool_config("lazy_a", detail="lazy", inputs={}),
+        "dc1__lazy_b": _edge_tool_config("lazy_b", detail="lazy", inputs={}),
+    }
+    install_search_registry(
+        monkeypatch,
+        tool_configs,
+        embeddings={"dc1__lazy_a": [1.0, 0.0], "dc1__lazy_b": [1.0, 0.0]},
+    )
+    requests = install_detail_relay(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json=_edge_tool_detail_response(json.loads(request.content)["tool"]),
+        ),
+    )
+
+    cards = asyncio.run(tool_search.search_tools("tool", limit=1, detail=True))
+
+    assert [card["name"] for card in cards] == ["dc1__lazy_a"]
+    assert len(requests) == 1
+    assert json.loads(requests[0].content) == {"tool": "lazy_a"}
+
+
+def test_search_tools_a_failed_detail_fetch_leaves_the_card_lazy(monkeypatch):
+    tool_configs = {"dc1__lazy_a": _edge_tool_config("lazy_a", detail="lazy", inputs={})}
+    install_search_registry(monkeypatch, tool_configs)
+    install_detail_relay(
+        monkeypatch,
+        lambda request: httpx.Response(
+            503, json={"error": {"code": "edge_offline", "message": "gone"}}
+        ),
+    )
+
+    cards = asyncio.run(tool_search.search_tools("tool", limit=1, detail=True))
+
+    assert cards[0]["name"] == "dc1__lazy_a"
+    assert cards[0]["detail"] == "lazy"
+    assert cards[0]["parameters"] == {}
+
+
+def test_search_tools_keeps_an_unfetched_mcp_sibling_lazy(monkeypatch):
+    """After one per-tool fetch, the sibling has no schema and must stay summary-only."""
+    mcp_configs = {
+        D_EDGE_MCP_KEY: edge_mcp_payload(
+            public=True,
+            detail="full",
+            detail_tools=[TOOL],
+            tools=[
+                {
+                    "name": TOOL,
+                    "description": "Tenant account tools.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"action": {"type": "string"}},
+                    },
+                },
+                {"name": "sibling_tool", "description": "Never fetched."},
+            ],
+        )
+    }
+    install_search_registry(monkeypatch, {}, mcp_configs=mcp_configs)
+    install_detail_relay(
+        monkeypatch, lambda request: pytest.fail("a full-flagged record reads no detail")
+    )
+
+    cards = asyncio.run(tool_search.search_tools("tenant", limit=0))
+
+    by_name = {card["name"]: card for card in cards}
+    sibling = by_name[f"mcp__{D_EDGE_SITE}__{MCP}__sibling_tool"]
+    assert sibling["detail"] == "lazy"
+    assert sibling["parameters"] == {}

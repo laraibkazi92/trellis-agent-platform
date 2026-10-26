@@ -15,6 +15,7 @@ Everything here is synchronous etcd I/O; callers run it via ``asyncio.to_thread`
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -23,6 +24,7 @@ from typing import Any, Dict, List, Optional
 
 from core.health import HealthMonitor
 from core.tool_index import delete_tool, index_tool
+from services.edge_relay import protocol
 from services.edge_relay.protocol import EdgeCredentials, EdgeMcp, EdgeTool, tool_name
 
 logger = logging.getLogger(__name__)
@@ -115,14 +117,20 @@ def _embedding_changed(previous: Dict[str, Any], current: Dict[str, Any]) -> boo
     )
 
 
-def _tool_config(site: str, tool: EdgeTool, site_config: Dict[str, Any]) -> Dict[str, Any]:
+def _tool_config(
+    site: str,
+    tool: EdgeTool,
+    site_config: Dict[str, Any],
+    *,
+    lazy_catalog: bool = False,
+) -> Dict[str, Any]:
     """The registry shape of one remote tool.
 
     Deliberately no ``secrets``, ``variables``, ``entrypoint`` or ``rel_path``: the
     tool executes on the edge with the edge's own credentials, and there is no local
     artifact for either field to point at.
     """
-    return {
+    config: Dict[str, Any] = {
         "name": tool_name(site, tool.name),
         "description": tool.description,
         "runtime": "remote",
@@ -138,6 +146,13 @@ def _tool_config(site: str, tool: EdgeTool, site_config: Dict[str, Any]) -> Dict
         "retry_on_transient": False,
         "version": "0.1.0",
     }
+    # `detail` says whether this record can be executed from as-is. Only a lazy edge
+    # can publish a summary (`inputs` omitted), so only a lazy publish writes the key:
+    # without the cap the record keeps the exact shape earlier relays wrote, and an
+    # absent key reads as "full" (those edges always sent their inputs).
+    if lazy_catalog:
+        config["detail"] = "lazy" if not tool.inputs else "full"
+    return config
 
 
 def _save_status(
@@ -215,6 +230,7 @@ def publish_catalog(
     mcps: Optional[List[EdgeMcp]] = None,
     proto: Optional[int] = None,
     caps: Optional[List[str]] = None,
+    lazy_catalog: bool = False,
 ) -> List[str]:
     """Write a site's published tool catalog to the registry and refresh its status.
 
@@ -228,6 +244,10 @@ def publish_catalog(
 
     ``mcps``/``proto``/``caps`` are status-only: they let one write carry the whole
     handshake, so the admin page never shows a connected site with its MCP half missing.
+
+    ``lazy_catalog`` is the caller's reading of the ``lazy_catalog`` capability: when
+    set, the edge may publish summaries and the record says so in ``detail``. Any stale
+    full detail is *replaced* by this write -- a republish is the cache invalidation.
     """
     site_config = effective_site_config(identity_mgr, site)
     if site_config and not identity_mgr.get_edge_config(site):
@@ -269,7 +289,7 @@ def publish_catalog(
                 tool.name,
             )
             continue
-        config = _tool_config(site, tool, site_config)
+        config = _tool_config(site, tool, site_config, lazy_catalog=lazy_catalog)
         identity_mgr.save_tool_config(name, config)
         if config["public"]:
             # The relay owns these embeddings; sync never sees the tool on disk and
@@ -372,7 +392,13 @@ def _mcp_visibility(
     return False, selected
 
 
-def _mcp_config(site: str, mcp: EdgeMcp, site_config: Dict[str, Any]) -> Dict[str, Any]:
+def _mcp_config(
+    site: str,
+    mcp: EdgeMcp,
+    site_config: Dict[str, Any],
+    *,
+    lazy_catalog: bool = False,
+) -> Dict[str, Any]:
     """The registry shape of one remote MCP server.
 
     ``tools`` carries each tool's ``inputSchema`` verbatim (L6: root-level ``oneOf`` and
@@ -384,7 +410,7 @@ def _mcp_config(site: str, mcp: EdgeMcp, site_config: Dict[str, Any]) -> Dict[st
     to widen its own public surface by publishing a flag.
     """
     public, public_tools = _mcp_visibility(site, mcp, site_config)
-    return {
+    config: Dict[str, Any] = {
         "name": mcp_registry_name(site, mcp.name),
         # EdgeMcp carries no server description yet; keep the key populated for the
         # day it does, and for readers that assume a central-shaped config.
@@ -400,6 +426,13 @@ def _mcp_config(site: str, mcp: EdgeMcp, site_config: Dict[str, Any]) -> Dict[st
         "edge_transport": mcp.transport,
         "version": "0.1.0",
     }
+    # Same rule as the tool half, one level up: the flag is present (and "lazy") only
+    # when a lazy edge actually withheld a schema. A full server is stored exactly as
+    # published, and a missing key reads as "full" for records written before the cap.
+    if lazy_catalog:
+        missing_schema = any(not tool.input_schema for tool in mcp.tools)
+        config["detail"] = "lazy" if missing_schema else "full"
+    return config
 
 
 def _index_mcp_tools(
@@ -454,6 +487,7 @@ def publish_mcp_catalog(
     allow_empty: bool = False,
     proto: Optional[int] = None,
     caps: Optional[List[str]] = None,
+    lazy_catalog: bool = False,
 ) -> List[str]:
     """Write a site's exported MCP servers and their tool embeddings.
 
@@ -461,6 +495,9 @@ def publish_mcp_catalog(
     local MCP with the same name wins, an edge may never hijack one), same empty-catalog
     guard. The status record keeps the tool half written by the preceding
     ``publish_catalog`` call, so the pair reads as one handshake.
+
+    ``lazy_catalog`` is passed through to ``_mcp_config``; a republish replaces any
+    cached tool detail the same way the tool half does.
     """
     site_config = effective_site_config(identity_mgr, site)
     if site_config and not identity_mgr.get_edge_config(site):
@@ -492,7 +529,9 @@ def publish_mcp_catalog(
                 mcp.name,
             )
             continue
-        identity_mgr.save_mcp_config(name, _mcp_config(site, mcp, site_config))
+        identity_mgr.save_mcp_config(
+            name, _mcp_config(site, mcp, site_config, lazy_catalog=lazy_catalog)
+        )
         _index_mcp_tools(identity_mgr, site, mcp, current)
         published.append(name)
 
@@ -543,6 +582,246 @@ def publish_mcp_catalog(
         len(published),
     )
     return published
+
+
+# --- lazy detail cache -------------------------------------------------------------
+#
+# A ``lazy_catalog`` edge publishes summaries and answers ``tool_detail`` /
+# ``mcp_tool_detail`` frames on demand. There is no separate cache to invalidate: the
+# detail is merged into the record the publish wrote, and the next publish replaces
+# that record wholesale with a fresh summary. A site that reconnects therefore starts
+# lazy again, which is correct -- its catalog may have changed while it was away.
+
+
+def get_tool_detail(identity_mgr: Any, site: str, tool: str) -> Optional[Dict[str, Any]]:
+    """The stored record of one edge tool when it is complete, else ``None``."""
+    config = identity_mgr.get_tool_config(tool_registry_name(site, tool))
+    if not config or config.get("managed_by") != MANAGED_BY:
+        return None
+    # A missing key is a record from before lazy publishing; those edges always sent
+    # their inputs, so it counts as complete.
+    return config if config.get("detail", "full") == "full" else None
+
+
+def store_tool_detail(
+    identity_mgr: Any, site: str, tool: str, entry: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Merge one tool's full detail into its record and return the saved config.
+
+    The merge is additive on purpose: a lazy record already carries everything a caller
+    needs to route a call (``remote``, ``public``, ``retry_on_transient``); only its
+    description and inputs were withheld. The edge's description can be richer than the
+    catalog summary, so the embedding is rebuilt when the text actually changed.
+    """
+    detail = protocol.validate_tool_detail(entry)
+    if detail.name != tool:
+        raise ValueError(
+            f"edge answered detail for {detail.name!r}, expected {tool!r}"
+        )
+    name = tool_registry_name(site, tool)
+    previous = identity_mgr.get_tool_config(name)
+    config = dict(previous or {})
+    config.setdefault("name", name)
+    config.setdefault("remote", {"site": site, "tool": tool})
+    config.setdefault("runtime", "remote")
+    config.setdefault("managed_by", MANAGED_BY)
+    config["description"] = detail.description
+    config["inputs"] = detail.inputs
+    config["detail"] = "full"
+    identity_mgr.save_tool_config(name, config)
+    if config.get("public") and (not previous or _embedding_changed(previous, config)):
+        if not index_tool(identity_mgr, name, detail.description, detail.inputs):
+            logger.warning(
+                "could not re-index tool '%s' after a detail fetch (embeddings "
+                "unavailable); it will rank last in tool search",
+                name,
+            )
+    return config
+
+
+def _mcp_tool_entry(
+    config: Optional[Dict[str, Any]], tool: str
+) -> Optional[Dict[str, Any]]:
+    for entry in (config or {}).get("tools") or []:
+        if isinstance(entry, dict) and entry.get("name") == tool:
+            return entry
+    return None
+
+
+def get_mcp_tool_detail(
+    identity_mgr: Any, site: str, mcp: str, tool: str
+) -> Optional[Dict[str, Any]]:
+    """The cached full entry of one MCP tool, or ``None`` while it is a summary.
+
+    Gated twice: the server flag (written by the publish) and the entry itself. The
+    flag flips to "full" after the *first* per-tool store, so on its own it would let a
+    still-lazy sibling be served with an empty schema -- ``detail_tools`` is what marks
+    the entries that were really fetched.
+    """
+    config = identity_mgr.get_mcp_config(mcp_registry_name(site, mcp))
+    if not config or config.get("managed_by") != MANAGED_BY:
+        return None
+    entry = _mcp_tool_entry(config, tool)
+    if entry is None:
+        return None
+    if "detail" not in config:
+        # A record from before lazy publishing always carried its schemas -- an empty
+        # one is legal for a schema-less tool, so it counts as complete here. Treating
+        # it as a miss would send a detail frame to an edge that cannot decode it.
+        return entry
+    if config.get("detail") == "lazy":
+        return None
+    if tool in (config.get("detail_tools") or []):
+        return entry
+    return entry if entry.get("inputSchema") else None
+
+
+def store_mcp_tool_detail(
+    identity_mgr: Any, site: str, mcp: str, entry: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Replace/insert one MCP tool entry with its full detail and return the config.
+
+    ``detail_tools`` is relay bookkeeping, not catalog data: it records which entries
+    have a real schema so one fetch cannot make the server's other lazy entries look
+    complete. The next publish drops it with the rest of the record.
+    """
+    detail = protocol.validate_mcp_tool_detail(entry)
+    tool = str(detail.get("name") or "")
+    name = mcp_registry_name(site, mcp)
+    previous = identity_mgr.get_mcp_config(name)
+    config = dict(previous or {})
+    config.setdefault("name", name)
+    config.setdefault("remote", {"site": site, "mcp": mcp})
+    config.setdefault("transport", "remote")
+    config.setdefault("managed_by", MANAGED_BY)
+
+    tools = [dict(item) for item in (config.get("tools") or []) if isinstance(item, dict)]
+    replaced = False
+    for index, item in enumerate(tools):
+        if item.get("name") == tool:
+            tools[index] = {**item, **detail}
+            replaced = True
+            break
+    if not replaced:
+        tools.append(dict(detail))
+    config["tools"] = tools
+    config["detail"] = "full"
+    fetched = [
+        str(item) for item in (config.get("detail_tools") or []) if isinstance(item, str)
+    ]
+    if tool and tool not in fetched:
+        fetched.append(tool)
+    config["detail_tools"] = fetched
+    identity_mgr.save_mcp_config(name, config)
+
+    description = str(detail.get("description") or "")
+    previous_entry = _mcp_tool_entry(previous, tool) if tool else None
+    if tool and (previous_entry is None or previous_entry.get("description") != description):
+        embedding_name = f"mcp__{site}__{mcp}__{tool}"
+        if not index_tool(
+            identity_mgr, embedding_name, description, None, embedding_name=embedding_name
+        ):
+            logger.warning(
+                "could not re-index mcp tool '%s' after a detail fetch (embeddings "
+                "unavailable); it will rank last in tool search",
+                embedding_name,
+            )
+    return config
+
+
+def _tool_detail_payload(config: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "detail": config.get("inputs") or {},
+        "description": config.get("description") or "",
+        "detail_state": "full",
+    }
+
+
+def _mcp_detail_payload(entry: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "detail": entry.get("inputSchema") or {},
+        "description": entry.get("description") or "",
+        "detail_state": "full",
+    }
+
+
+async def _read_cached_detail(
+    identity_mgr: Any, site: str, tool: str, mcp: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """The servable detail already in the registry, or ``None``."""
+    if mcp is None:
+        config = await asyncio.to_thread(get_tool_detail, identity_mgr, site, tool)
+        return _tool_detail_payload(config) if config else None
+    entry = await asyncio.to_thread(get_mcp_tool_detail, identity_mgr, site, mcp, tool)
+    return _mcp_detail_payload(entry) if entry else None
+
+
+async def fetch_tool_detail(
+    identity_mgr: Any,
+    site: str,
+    tool: str,
+    requester: Any,
+    *,
+    mcp: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Serve one tool's full detail from the cached record, else from the edge.
+
+    ``requester(mcp_or_none, tool)`` is awaited and may raise anything (offline edge,
+    timeout, refusal). A degraded edge is a *payload*, never an exception: the caller
+    gets the stale cached detail when one survives, otherwise ``unavailable``.
+
+    Returns ``{detail, description, detail_state, cached[, stale]}`` on success and
+    ``{detail: None, unavailable: True, reason}`` when the edge could not answer.
+    """
+    payload = await _read_cached_detail(identity_mgr, site, tool, mcp)
+    if payload is not None:
+        return {**payload, "cached": True}
+
+    try:
+        entry = await requester(mcp, tool)
+        if isinstance(entry, dict) and entry.get("name") not in (None, tool):
+            raise ValueError(
+                f"edge answered detail for {entry.get('name')!r}, expected {tool!r}"
+            )
+        if mcp is not None and isinstance(entry, dict) and not entry.get("name"):
+            # The frame already named the tool; the entry may be the bare schema.
+            entry = {**entry, "name": tool}
+        if mcp is None:
+            config = await asyncio.to_thread(
+                store_tool_detail, identity_mgr, site, tool, entry
+            )
+            payload = _tool_detail_payload(config)
+        else:
+            config = await asyncio.to_thread(
+                store_mcp_tool_detail, identity_mgr, site, mcp, entry
+            )
+            stored = _mcp_tool_entry(config, tool)
+            payload = _mcp_detail_payload(stored) if stored else None
+    except Exception as exc:  # noqa: BLE001 - a degraded edge must not raise here
+        reason = f"{type(exc).__name__}: {exc}".strip()[:200]
+        logger.warning(
+            "edge detail unavailable site=%s mcp=%s tool=%s (%s)", site, mcp, tool, reason
+        )
+        stale = await _read_cached_detail(identity_mgr, site, tool, mcp)
+        if stale is not None:
+            return {**stale, "cached": True, "stale": True}
+        return {
+            "detail": None,
+            "description": "",
+            "detail_state": "unavailable",
+            "unavailable": True,
+            "reason": reason,
+        }
+
+    if payload is None:
+        return {
+            "detail": None,
+            "description": "",
+            "detail_state": "unavailable",
+            "unavailable": True,
+            "reason": "the edge returned no usable detail for this tool",
+        }
+    return {**payload, "cached": False}
 
 
 def publish_edge_credentials(
