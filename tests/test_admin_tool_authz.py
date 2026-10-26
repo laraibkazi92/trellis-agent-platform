@@ -28,6 +28,7 @@ class FakeAuthzIdentityManager:
     def __init__(self):
         self.tool_authz_modes = []
         self.bound_tools_modes = []
+        self.hub_call_modes = []
         self.saved_policies = []
 
     def set_tool_authz_mode(self, mode):
@@ -35,6 +36,9 @@ class FakeAuthzIdentityManager:
 
     def set_bound_tools_mode(self, mode):
         self.bound_tools_modes.append(mode)
+
+    def set_hub_call_mode(self, mode):
+        self.hub_call_modes.append(mode)
 
     def save_tool_policies(self, policy):
         self.saved_policies.append(policy)
@@ -81,6 +85,7 @@ def authz(monkeypatch):
     monkeypatch.setattr(tool_authz, "load_policy", lambda: {"default_action": "deny", "rules": []})
     monkeypatch.setattr(tool_authz, "get_mode", lambda: "shadow")
     monkeypatch.setattr(tool_authz, "get_bound_tools_mode", lambda: "off")
+    monkeypatch.setattr(tool_authz, "get_hub_call_mode", lambda: "off")
     monkeypatch.setattr(tool_authz, "shadow_denies", lambda: [])
     monkeypatch.setattr(tool_authz, "reset_cache", lambda: resets.append(1))
     fake.resets = resets
@@ -104,9 +109,23 @@ def test_page_renders_both_modes(authz):
     html = response.body.decode()
     assert "/admin/tool-authz/mode" in html
     assert "/admin/tool-authz/bound-mode" in html
+    assert "/admin/tool-authz/hub-mode" in html
     assert "Bound tools" in html
+    assert "Direct hub calls" in html
     assert "CURRENT: shadow" in html
     assert "CURRENT: off" in html
+    # The old "not gated yet" caveat must be gone now that the surface has a switch.
+    assert "not gated yet" not in html
+
+
+def test_page_shows_the_hub_call_mode(monkeypatch, authz):
+    monkeypatch.setattr(tool_authz, "get_hub_call_mode", lambda: "enforcing")
+
+    response = asyncio.run(admin.admin_tool_authz_page(FakeRequest(session=_admin_session())))
+
+    html = response.body.decode()
+    assert "CURRENT: enforcing" in html
+    assert 'value="enforcing" class="peer sr-only" checked' in html
 
 
 def test_page_shows_the_denial_surface(monkeypatch, authz):
@@ -204,6 +223,66 @@ def test_bound_mode_is_independent_of_the_use_tool_mode(authz):
 
     assert authz.bound_tools_modes == ["enforcing"]
     assert authz.tool_authz_modes == []
+
+
+# --- POST /admin/tool-authz/hub-mode ----------------------------------------
+
+def test_hub_mode_enforcing_needs_confirmation(authz):
+    session = _admin_session()
+    request = FakeRequest(session=session, form_data=_form([("mode", "enforcing")]))
+
+    response = asyncio.run(admin.save_hub_call_mode(request))
+
+    assert response.status_code == 303
+    assert authz.hub_call_modes == []
+    assert authz.resets == []
+    assert "Confirmation required" in session["flash_msg"]
+
+
+def test_hub_mode_enforcing_with_confirmation_is_saved(authz):
+    session = _admin_session()
+    request = FakeRequest(
+        session=session, form_data=_form([("mode", "enforcing"), ("confirm", "on")])
+    )
+
+    response = asyncio.run(admin.save_hub_call_mode(request))
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin/tool-authz"
+    assert authz.hub_call_modes == ["enforcing"]
+    assert authz.resets == [1]  # the cached snapshot is dropped after the write
+    assert "set to 'enforcing'" in session["flash_msg"]
+
+
+@pytest.mark.parametrize("mode", ["shadow", "off"])
+def test_hub_mode_shadow_and_off_need_no_confirmation(authz, mode):
+    request = FakeRequest(session=_admin_session(), form_data=_form([("mode", mode)]))
+
+    asyncio.run(admin.save_hub_call_mode(request))
+
+    assert authz.hub_call_modes == [mode]
+
+
+def test_hub_mode_rejects_an_unknown_value(authz):
+    session = _admin_session()
+    request = FakeRequest(session=session, form_data=_form([("mode", "enforcin")]))
+
+    asyncio.run(admin.save_hub_call_mode(request))
+
+    assert authz.hub_call_modes == []
+    assert "Unknown hub-call mode" in session["flash_msg"]
+
+
+def test_hub_mode_is_independent_of_the_other_two_modes(authz):
+    request = FakeRequest(
+        session=_admin_session(), form_data=_form([("mode", "enforcing"), ("confirm", "on")])
+    )
+
+    asyncio.run(admin.save_hub_call_mode(request))
+
+    assert authz.hub_call_modes == ["enforcing"]
+    assert authz.tool_authz_modes == []
+    assert authz.bound_tools_modes == []
 
 
 # --- POST /admin/tool-authz/bootstrap ---------------------------------------

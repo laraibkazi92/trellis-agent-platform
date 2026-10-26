@@ -1404,6 +1404,33 @@ class IdentityManager:
             )
         self.set_config("bound_tools_mode", mode)
 
+    def get_hub_call_mode(self) -> str:
+        """Retrieve the direct hub ``/tools/call`` rollout mode.
+
+        An absent key means ``off`` (ships dark). A *present but unrecognized* value
+        fails closed to ``enforcing`` and logs: a typo must not silently disable the
+        gate. Not itself @retry_etcd()-decorated: get_config() already retries -- see
+        get_disabled_standard_agents above for the single-retry-layer rationale."""
+        value = self.get_config("hub_call_mode", None)
+        if value is None or value == "":
+            return "off"
+        if value in ("off", "shadow", "enforcing"):
+            return value
+        logger.error(
+            "Unrecognized hub_call_mode %r; failing closed to 'enforcing'", value
+        )
+        return "enforcing"
+
+    def set_hub_call_mode(self, mode: str) -> None:
+        """Set the direct hub ``/tools/call`` rollout mode (off | shadow | enforcing).
+
+        Not itself @retry_etcd()-decorated -- see get_hub_call_mode above."""
+        if mode not in ("off", "shadow", "enforcing"):
+            raise ValueError(
+                f"invalid hub_call_mode {mode!r}: expected one of off, shadow, enforcing"
+            )
+        self.set_config("hub_call_mode", mode)
+
     def get_principal_groups(self) -> Dict[str, List[str]]:
         """Retrieve the principal -> group mapping ({} when absent or malformed).
 

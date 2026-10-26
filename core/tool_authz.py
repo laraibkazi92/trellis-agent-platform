@@ -13,9 +13,10 @@ Denials are logged as structured JSON (principal, tool, scope, rule index) and
 never include tool arguments.
 
 Surfaces share this engine but not their rollout switch: ``use_tool``/``search_tools``
-are governed by ``tool_authz_mode``, while tools bound directly to an agent call
-``allowed(..., surface="bound_tool")`` and follow the separate ``bound_tools_mode``
-key (see ``mode_for_surface``).
+are governed by ``tool_authz_mode``, tools bound directly to an agent call
+``allowed(..., surface="bound_tool")`` and follow ``bound_tools_mode``, and direct hub
+``/tools/call`` traffic uses ``hub_call_mode`` via ``surface="hub_direct"`` (see
+``mode_for_surface``).
 
 Two operational caveats: (1) if the very first policy read fails, the cache falls
 back to the cold snapshot (mode ``off``) until a read succeeds -- authz fails open
@@ -42,19 +43,33 @@ SHADOW_DENY_CAP = 200
 
 # Denial-ring tag for the gate that produced an entry. Bound tools (registered straight
 # onto an agent from `allowed_tools`/`allowed_mcps`) never reach `use_tool`, so their
-# wrappers run the same evaluator under their own rollout mode.
+# wrappers run the same evaluator under their own rollout mode. Direct hub `/tools/call`
+# requests are the other untagged surface: they carry a principal only because the hub
+# verifies the agent token on the call itself.
 BOUND_TOOL_SURFACE = "bound_tool"
+HUB_DIRECT_SURFACE = "hub_direct"
 
 POLICY_PATH = "/registry/tool_policies"
 MODE_KEY = "tool_authz_mode"
 BOUND_TOOLS_MODE_KEY = "bound_tools_mode"
+HUB_CALL_MODE_KEY = "hub_call_mode"
 GROUPS_KEY = "principal_groups"
 _WATCH_PREFIXES = (
     POLICY_PATH,
     f"/config/framework/{MODE_KEY}",
     f"/config/framework/{BOUND_TOOLS_MODE_KEY}",
+    f"/config/framework/{HUB_CALL_MODE_KEY}",
     f"/config/framework/{GROUPS_KEY}",
 )
+
+# Which snapshot field holds each surface's rollout mode. A surface missing from this
+# map is a bug in the caller, not a reason to inherit someone else's rollout state.
+_SURFACE_MODE_KEYS = {
+    None: "mode",
+    BOUND_TOOL_SURFACE: "bound_mode",
+    HUB_DIRECT_SURFACE: "hub_mode",
+}
+
 
 CACHE_TTL_S = 30.0
 CACHE_ERROR_TTL_S = 5.0
@@ -89,7 +104,13 @@ _watch_ids: Optional[List[Any]] = None
 
 
 def _cold_snapshot() -> Dict[str, Any]:
-    return {"policy": {}, "mode": "off", "bound_mode": "off", "groups": {}}
+    return {
+        "policy": {},
+        "mode": "off",
+        "bound_mode": "off",
+        "hub_mode": "off",
+        "groups": {},
+    }
 
 
 def _snapshot_values(attempt: int = 0) -> Dict[str, Any]:
@@ -110,11 +131,14 @@ def _snapshot_values(attempt: int = 0) -> Dict[str, Any]:
         # out" (off); a real manager that returns junk fails closed, as above.
         read_bound_mode = getattr(mgr, "get_bound_tools_mode", None)
         bound_mode = read_bound_mode() if callable(read_bound_mode) else "off"
+        read_hub_mode = getattr(mgr, "get_hub_call_mode", None)
+        hub_mode = read_hub_mode() if callable(read_hub_mode) else "off"
         groups = mgr.get_principal_groups()
         fresh = {
             "policy": policy if isinstance(policy, dict) else {},
             "mode": mode if mode in MODES else "off",
             "bound_mode": bound_mode if bound_mode in MODES else "enforcing",
+            "hub_mode": hub_mode if hub_mode in MODES else "enforcing",
             "groups": groups if isinstance(groups, dict) else {},
         }
     except Exception as e:
@@ -161,18 +185,31 @@ def get_bound_tools_mode() -> str:
     return mode if mode in MODES else "off"
 
 
+def get_hub_call_mode() -> str:
+    """Current direct-hub-call rollout mode (``off`` when unset or unreadable)."""
+    mode = _snapshot_values().get("hub_mode")
+    return mode if mode in MODES else "off"
+
+
 def cached_mode_for_surface(surface: Optional[str] = None) -> Optional[str]:
     """The mode from the last snapshot, without any etcd I/O; ``None`` when cold.
 
-    Bound tools need this: ``off`` (the default) must stay free of authz reads, and a
-    full snapshot load under an etcd outage blocks for the retry budget. A caller that
-    gets ``None`` must fall back to :func:`mode_for_surface` (one blocking read).
+    Bound tools and hub calls need this: ``off`` (the default) must stay free of authz
+    reads, and a full snapshot load under an etcd outage blocks for the retry budget. A
+    caller that gets ``None`` must fall back to :func:`mode_for_surface` (one blocking
+    read). An unknown surface fails closed to ``enforcing`` here too, so a caller that
+    never teaches this map about its surface cannot inherit the ``use_tool`` switch.
     """
     with _snapshot_lock:
         snapshot = _snapshot
     if snapshot is None:
         return None
-    key = "bound_mode" if surface == BOUND_TOOL_SURFACE else "mode"
+    key = _SURFACE_MODE_KEYS.get(surface)
+    if key is None:
+        logger.error(
+            "tool_authz: unknown surface %r; failing closed to 'enforcing'", surface
+        )
+        return "enforcing"
     mode = snapshot.get(key)
     return mode if mode in MODES else None
 
@@ -180,13 +217,15 @@ def cached_mode_for_surface(surface: Optional[str] = None) -> Optional[str]:
 def mode_for_surface(surface: Optional[str] = None) -> str:
     """The rollout mode governing ``surface``.
 
-    ``bound_tool`` has its own key so the bound-tool gate can be promoted on its own
-    schedule; ``None`` is the ``use_tool``/``search_tools`` gate and uses
+    ``bound_tool`` and ``hub_direct`` have their own keys so each gate can be promoted
+    on its own schedule; ``None`` is the ``use_tool``/``search_tools`` gate and uses
     ``tool_authz_mode``. A surface with no configured switch fails closed: a new
     enforcement point must never silently inherit someone else's rollout state.
     """
     if surface == BOUND_TOOL_SURFACE:
         return get_bound_tools_mode()
+    if surface == HUB_DIRECT_SURFACE:
+        return get_hub_call_mode()
     if surface is None:
         return get_mode()
     logger.error("tool_authz: unknown surface %r; failing closed to 'enforcing'", surface)
@@ -459,6 +498,29 @@ def _is_background_agent(name: str) -> bool:
     return is_background
 
 
+def principal_for(claims: Optional[Any], user_id: Optional[str]) -> str:
+    """Classify one caller from verified token claims plus the resolved user id.
+
+    Shared by both enforcement paths so they cannot disagree about who is calling:
+    :func:`resolve_current_principal` feeds it the run context's token, and the hub's
+    direct ``/tools/call`` gate feeds it the token verified off the request. Ordering
+    is fixed -- background run/agent (``workflow:<agent>``), gateway-with-user
+    (``user:<id>``), any other token (``agent:<name>``), then the user id alone, then
+    ``anonymous``.
+    """
+    if claims is not None:
+        # Background runs are classified by the named agent's config type, not just
+        # the `svc_agent_` identity convention (webhook runs use `user_id="webhook"`).
+        if (claims.user_id and str(claims.user_id).startswith("svc_agent_")) or _is_background_agent(
+            claims.agent
+        ):
+            return f"workflow:{claims.agent}"
+        if claims.agent == "gateway" and user_id:
+            return f"user:{user_id}"
+        return f"agent:{claims.agent}"
+    return f"user:{user_id}" if user_id else "anonymous"
+
+
 def resolve_current_principal() -> str:
     """Classify the current caller from the run token plus user context."""
     try:
@@ -471,17 +533,7 @@ def resolve_current_principal() -> str:
         logger.debug("Principal resolution unavailable", exc_info=True)
         return "anonymous"
 
-    if claims is not None:
-        # Background runs are classified by the named agent's config type, not just
-        # the `svc_agent_` identity convention (webhook runs use `user_id="webhook"`).
-        if (claims.user_id and str(claims.user_id).startswith("svc_agent_")) or _is_background_agent(
-            claims.agent
-        ):
-            return f"workflow:{claims.agent}"
-        if claims.agent == "gateway" and user_id:
-            return f"user:{user_id}"
-        return f"agent:{claims.agent}"
-    return f"user:{user_id}" if user_id else "anonymous"
+    return principal_for(claims, user_id)
 
 
 def _mcp_names_for_server(server: str, config: Any) -> Set[str]:

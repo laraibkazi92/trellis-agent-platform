@@ -1004,6 +1004,7 @@ async def admin_tool_authz_page(request: Request):
     policy = await asyncio.to_thread(tool_authz.load_policy)
     mode = await asyncio.to_thread(tool_authz.get_mode)
     bound_mode = await asyncio.to_thread(tool_authz.get_bound_tools_mode)
+    hub_mode = await asyncio.to_thread(tool_authz.get_hub_call_mode)
     shadow_denies = await asyncio.to_thread(tool_authz.shadow_denies)
     principal_groups = await asyncio.to_thread(identity_mgr.get_principal_groups)
 
@@ -1016,6 +1017,7 @@ async def admin_tool_authz_page(request: Request):
             "policy_yaml": yaml.safe_dump(policy, sort_keys=False),
             "mode": mode,
             "bound_mode": bound_mode,
+            "hub_mode": hub_mode,
             "shadow_denies": shadow_denies,
             "principal_groups": principal_groups,
             "principal_groups_yaml": yaml.safe_dump(principal_groups, sort_keys=False),
@@ -1096,6 +1098,33 @@ async def save_bound_tools_mode(request: Request):
     request.session["flash_msg"] = (
         f"Bound-tool authorization mode set to '{mode}'. It is a separate switch from the "
         "use_tool mode; rollback is immediate (set it back to shadow/off)."
+    )
+    return RedirectResponse(url='/admin/tool-authz', status_code=303)
+
+
+@router.post("/admin/tool-authz/hub-mode")
+async def save_hub_call_mode(request: Request):
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    form = await request.form()
+    mode = str(form.get("mode") or "").strip().lower()
+    if mode not in _TOOL_AUTHZ_MODES:
+        request.session["flash_msg"] = (
+            f"Unknown hub-call mode '{mode}'. Use one of: {', '.join(_TOOL_AUTHZ_MODES)}."
+        )
+        return RedirectResponse(url='/admin/tool-authz', status_code=303)
+    if mode == "enforcing" and form.get("confirm") != "on":
+        request.session["flash_msg"] = (
+            "Confirmation required to enforce direct hub call authorization."
+        )
+        return RedirectResponse(url='/admin/tool-authz', status_code=303)
+
+    await asyncio.to_thread(identity_mgr.set_hub_call_mode, mode)
+    _tool_authz().reset_cache()
+    request.session["flash_msg"] = (
+        f"Direct hub call mode set to '{mode}'. It is a separate switch from the use_tool "
+        "and bound-tool modes; rollback is immediate (set it back to shadow/off)."
     )
     return RedirectResponse(url='/admin/tool-authz', status_code=303)
 

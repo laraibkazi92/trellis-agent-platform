@@ -422,11 +422,14 @@ Principals are `user:<sub>`, `agent:<name>`, `workflow:<name>`, `group:<name>` o
 `group:` membership comes from `/config/framework/principal_groups` (a
 `principal: [group, ...]` map); OIDC group claims are not propagated to tool calls yet.
 Agent-driven calls resolve to `agent:<name>`/`workflow:<name>`, so user-scoped rules only
-apply to direct gateway calls.
+apply where the caller is a user: a gateway call on a user's behalf, or a direct hub call that
+carries a user id.
 
 **Scope:** the boundary covers `use_tool` (gateway and supervisor/agent) and `search_tools`.
-Tools bound directly to an agent are gated separately — see **Bound tools** below. Direct hub
-`/tools/call` traffic is not gated yet.
+Tools bound directly to an agent are gated separately — see **Bound tools** below — and every
+call the hub dispatches is gated by its own switch — see **Direct hub calls** below. That last
+switch sits on the hub's last mile, so it also re-checks traffic that the other two surfaces
+already let through.
 Denials are logged as structured JSON (`event: tool_authz_deny`) with the principal, tool,
 scope and mode — never tool arguments.
 
@@ -458,3 +461,44 @@ switch on the same page: **Bound tools**, stored at
 - Rollback is immediate: set the mode back to `shadow`/`off`; the etcd watch invalidates every
   process's cache without a restart.
 
+### Direct hub calls
+
+`/tools/call` on the hub (`core/hub.py`, port 8001) is its own entry point: a caller there
+does not have to pass through `use_tool` or a bound-tool wrapper. It has a third switch on the
+same page — **Direct hub calls**, stored at `/config/framework/hub_call_mode` — that gates every
+tool call before the tool is dispatched (locally or to an edge).
+
+| Mode | Behavior |
+| --- | --- |
+| `off` (default) | No-op: no token verification, no policy evaluation. Current v0.7 behavior. |
+| `shadow` | Evaluates each call, records would-be denials in the shared ring (`surface: hub_direct`), still runs the tool. |
+| `enforcing` | A call with no matching rule returns `SYSTEM: Access denied. Tool '<name>' is not permitted for this principal.` and the tool does not run. |
+
+- **It gates every hub call, not only "direct" ones.** The switch sits where the hub
+  dispatches, so agent and bound-tool traffic passes it too. Promoting it to `enforcing`
+  therefore denies agent calls with no matching rule *regardless of* `tool_authz_mode` and
+  `bound_tools_mode`. Promote it last, after the other two surfaces are settled.
+- **The principal comes from the agent token the framework forwards.** Every agent-driven hub
+  call already carries `__agent_token` (the run's short-lived token, `core/agent_token.py`). The
+  hub verifies it and resolves the principal exactly as the other surfaces do:
+  `workflow:<agent>` for a background run, `user:<id>` for a gateway call on behalf of a user,
+  `agent:<name>` otherwise, then `user:<id>` from `__user_id` alone, then `anonymous`.
+  An invalid or expired token is *not* a call failure here: it simply contributes no claims, so
+  the call falls back to the user id (agent-token rejection is the separate
+  `ENFORCE_AGENT_TOKENS` gate). A failure inside the check itself fails closed with
+  `SYSTEM: Error checking tool access for '<name>'. Please try again later.`
+- **Network isolation is the assumption.** The hub is meant to be reachable only from the
+  framework (compose network, no published port). A caller that can reach `/tools/call` directly
+  *and* present a user id but no token resolves to `user:<id>` — the policy, not the network, is
+  what stops it once the mode is `enforcing`. Keep the hub port unpublished; the gate is
+  defense in depth, not a substitute for the network boundary.
+- **`DEV_MODE` has no authz bypass on this path.** The hub has never skipped tool authz for
+  dev; `DEV_MODE` only supplies the well-known fallback agent-token signing key, so tokens still
+  verify and the gate still applies. Default `off` is what keeps local development unchanged.
+- Rules for this surface are ordinary policy rules (`tools:call`); the bootstrap generator's
+  public-tool rules (`allow_principals: ["*"]`) already cover public tools for it.
+- **All three surfaces share one 200-entry ring.** The persist throttle is per surface, but the
+  ring is a single list, so a noisy surface can evict another's entries. Don't soak two
+  surfaces at once; run one at a time and review before promoting it.
+- Rollback is immediate: set the mode back to `shadow`/`off`; the etcd watch invalidates every
+  process's cache without a restart.

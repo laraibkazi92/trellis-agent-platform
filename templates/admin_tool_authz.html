@@ -31,9 +31,9 @@
             Scope: this gate covers calls that go through <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">use_tool</code>
             (direct gateway use, and agent <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">use_tool</code>)
             and the <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">search_tools</code> listing. Tools bound
-            directly to an agent are gated separately below (<strong>Bound tools</strong>); direct hub
+            directly to an agent are gated separately below (<strong>Bound tools</strong>), and direct hub
             <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">/tools/call</code>
-            traffic is not gated yet. Agent-driven calls resolve to
+            traffic has its own switch (<strong>Direct hub calls</strong>). Agent-driven calls resolve to
             <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">agent:&lt;name&gt;</code> /
             <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">workflow:&lt;name&gt;</code>, not the end user.
         </p>
@@ -172,6 +172,77 @@
         </form>
     </div>
 
+    <!-- Direct hub call mode selector -->
+    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm space-y-4 mb-6">
+        <div class="flex flex-wrap items-center gap-3">
+            <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Direct hub calls</h2>
+            <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-mono font-bold uppercase rounded border {{ mode_styles.get(hub_mode, mode_styles['off']) }}">
+                {% if hub_mode == 'enforcing' %}<i data-lucide="shield-alert" class="w-3 h-3 mr-1"></i>{% elif hub_mode == 'shadow' %}<i data-lucide="eye" class="w-3 h-3 mr-1"></i>{% else %}<i data-lucide="shield-off" class="w-3 h-3 mr-1"></i>{% endif %}
+                CURRENT: {{ hub_mode }}
+            </span>
+        </div>
+        <p class="font-mono text-xs text-neutral-500 dark:text-neutral-400">
+            Every call the hub dispatches passes this switch &mdash; including traffic that already went through
+            <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">use_tool</code> or a bound tool. The other two modes
+            decide whether <em>that</em> surface lets a call reach the hub; this one decides whether the hub executes it, so
+            promoting it enforces for agent traffic regardless of their state. The principal comes from the agent token the
+            framework forwards on the call (the same token agents already use), falling back to the caller's user id and then
+            to <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">anonymous</code>; an unverifiable token is not an
+            error, it just contributes no claims. This assumes the hub port stays reachable only from the framework.
+            {% if hub_mode == 'enforcing' %}
+            Enforcing &mdash; a direct call with no matching rule returns an access-denied error and the tool does not run.
+            {% elif hub_mode == 'shadow' %}
+            Shadow &mdash; would-be denials are recorded below with <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">surface=hub_direct</code>, and the tool still runs.
+            {% else %}
+            Off &mdash; direct hub calls run without an authorization check. Default for this release.
+            {% endif %}
+        </p>
+
+        <form action="/admin/tool-authz/hub-mode" method="POST" class="space-y-4">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            {% set mode_options = [
+                ('off', 'Off', 'No checks for direct hub calls.'),
+                ('shadow', 'Shadow', 'Evaluate and log would-be denials, still run the tool.'),
+                ('enforcing', 'Enforcing', 'Deny direct hub calls with no matching rule.')
+            ] %}
+            <div class="grid gap-2 sm:grid-cols-3">
+                {% for value, label, description in mode_options %}
+                <label class="cursor-pointer block">
+                    <input type="radio" name="mode" value="{{ value }}" class="peer sr-only" {% if hub_mode == value %}checked{% endif %}>
+                    <span class="block h-full border border-neutral-200 dark:border-neutral-800 rounded px-4 py-3 transition-colors text-neutral-900 dark:text-neutral-100 peer-checked:border-accent dark:peer-checked:border-accent-dark peer-checked:bg-accent/5 dark:peer-checked:bg-accent-dark/10 peer-focus-visible:ring-2 peer-focus-visible:ring-accent">
+                        <span class="block font-mono font-bold text-xs uppercase tracking-widest">{{ label }}</span>
+                        <span class="block font-mono text-[10px] text-neutral-500 dark:text-neutral-400 mt-1">{{ description }}</span>
+                    </span>
+                </label>
+                {% endfor %}
+            </div>
+
+            <div class="border border-red-500/40 bg-red-50 dark:bg-red-950/20 rounded p-4 space-y-2">
+                <label class="inline-flex items-start gap-2 cursor-pointer select-none">
+                    <input type="checkbox" name="confirm" value="on" class="mt-0.5 accent-current">
+                    <span class="font-mono text-xs text-red-700 dark:text-red-300">
+                        I understand that switching the hub to <strong>enforcing</strong> denies every hub call without a
+                        matching rule &mdash; including agent traffic &mdash; regardless of the use_tool and bound-tool modes.
+                    </span>
+                </label>
+                <p class="font-mono text-[11px] text-red-700/80 dark:text-red-300/80">
+                    Only required for enforcing. Run shadow first and confirm the principals read
+                    <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">agent:&lt;name&gt;</code> /
+                    <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">workflow:&lt;name&gt;</code> &mdash; an
+                    unverifiable agent token resolves to <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">user:&lt;id&gt;</code>
+                    or <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">anonymous</code> and no
+                    <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">agent:</code> rule can match it.
+                </p>
+            </div>
+
+            <div class="flex justify-end">
+                <button type="submit" class="bg-accent hover:bg-accent-dark text-white font-mono font-bold text-sm uppercase py-2.5 px-6 transition-colors rounded">
+                    Save hub-call mode
+                </button>
+            </div>
+        </form>
+    </div>
+
     <!-- Policy editor -->
     <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm space-y-4 mb-6">
         <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
@@ -227,8 +298,9 @@
                 <span class="font-mono text-[11px] text-neutral-500 dark:text-neutral-400">
                     Newest first &mdash; denials from every service process (sampled at most one per second per
                     process, capped at 200). Shadow entries are would-be denials; enforcing entries were denied.
-                    The surface column names the gate: <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">use_tool</code>
-                    or <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">bound_tool</code>.
+                    The surface column names the gate: <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">use_tool</code>,
+                    <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">bound_tool</code> or
+                    <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">hub_direct</code>.
                 </span>
             </div>
             {% if shadow_denies %}
@@ -272,7 +344,7 @@
         <div class="border border-dashed border-neutral-300 dark:border-neutral-700 rounded p-8 text-center">
             <p class="font-mono text-sm font-bold uppercase tracking-widest text-neutral-700 dark:text-neutral-300">No shadow denials recorded</p>
             <p class="font-mono text-xs text-neutral-500 dark:text-neutral-400 mt-2">
-                Switch either mode (use_tool or bound tools) to <span class="font-bold">shadow</span> to log calls that the current policy would deny, without blocking them.
+                Switch any mode (use_tool, bound tools or direct hub calls) to <span class="font-bold">shadow</span> to log calls that the current policy would deny, without blocking them.
             </p>
         </div>
         {% endif %}

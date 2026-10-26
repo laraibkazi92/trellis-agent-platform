@@ -592,6 +592,66 @@ async def _run_remote(
     return {"error": error}
 
 
+_HUB_CALL_DENIED = (
+    "SYSTEM: Access denied. Tool '{name}' is not permitted for this principal."
+)
+_HUB_CALL_CHECK_FAILED = (
+    "SYSTEM: Error checking tool access for '{name}'. Please try again later."
+)
+
+
+async def _authorize_hub_call(
+    config: ToolConfig, raw_token: Optional[str], user_id: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """Default-deny check for a direct hub ``/tools/call`` (``hub_call_mode``).
+
+    Agent-driven calls already carry the run's agent token, so this resolves the same
+    principal ``use_tool`` would and runs the same evaluator under its own rollout key
+    and its own ``surface="hub_direct"`` ring tag. Returns the result dict to send back
+    or ``None`` when the tool may run.
+
+    ``off`` (the default) is a no-I/O fast path once the authz snapshot is warm: no
+    token verification, no policy evaluation. A malformed or expired token is not an
+    error here -- the caller keeps its ``__user_id`` and the principal falls back to
+    that (or ``anonymous``), because rejecting tokens belongs to the agent-token gate
+    above, not to this one. Everything else fails closed: an exception inside the check
+    never runs the tool.
+
+    Note the same caveat as the other surfaces: if the authz state has never been
+    readable, the cold snapshot says ``off`` and the gate fails open until a read
+    succeeds.
+    """
+    from core import tool_authz
+
+    surface = tool_authz.HUB_DIRECT_SURFACE
+
+    def _verdict() -> Optional[Dict[str, Any]]:
+        mode = tool_authz.cached_mode_for_surface(surface)
+        if mode is None:
+            mode = tool_authz.mode_for_surface(surface)
+        if mode == "off":
+            return None
+        claims = agent_token_module.verify_or_none(raw_token)
+        if claims is None and raw_token:
+            logger.warning(
+                "hub: agent token presented for %r did not verify; resolving the "
+                "principal without claims (agent:/workflow: rules cannot match)",
+                config.name,
+            )
+        principal = tool_authz.principal_for(claims, user_id)
+        if tool_authz.allowed(
+            principal, config.name, "tools:call", surface=surface, mode=mode
+        ):
+            return None
+        return {"error": _HUB_CALL_DENIED.format(name=config.name)}
+
+    try:
+        return await asyncio.to_thread(_verdict)
+    except Exception:
+        logger.exception("Hub tool authorization check failed for %r", config.name)
+        return {"error": _HUB_CALL_CHECK_FAILED.format(name=config.name)}
+
+
 async def run_tool(config: ToolConfig, tool_dir: Optional[Path], arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Executes a tool locally (container) or remotely (edge relay)."""
     # stamina re-invokes with the same dict — never mutate the caller's arguments.
@@ -604,6 +664,11 @@ async def run_tool(config: ToolConfig, tool_dir: Optional[Path], arguments: Dict
     try:
         if denial is not None:
             return denial
+        # Direct hub traffic has no principal until the call proves one: gate it before
+        # anything is executed (locally or on an edge).
+        hub_denial = await _authorize_hub_call(config, raw_token, user_id)
+        if hub_denial is not None:
+            return hub_denial
         if config.remote is not None:
             return await _run_remote(
                 config, arguments, user_id, agent_token=raw_token, claims=claims

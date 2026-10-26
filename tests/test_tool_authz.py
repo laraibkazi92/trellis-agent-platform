@@ -32,10 +32,11 @@ class FakeAuthzManager:
     which is how a warm-cache etcd outage is simulated without a network.
     """
 
-    def __init__(self, *, policy=None, mode="off", bound_mode="off", groups=None, fail_from=None):
+    def __init__(self, *, policy=None, mode="off", bound_mode="off", hub_mode="off", groups=None, fail_from=None):
         self.policy = {} if policy is None else policy
         self.mode = mode
         self.bound_mode = bound_mode
+        self.hub_mode = hub_mode
         self.groups = {} if groups is None else groups
         self.fail_from = fail_from
         self.policy_reads = 0
@@ -52,6 +53,9 @@ class FakeAuthzManager:
 
     def get_bound_tools_mode(self):
         return self.bound_mode
+
+    def get_hub_call_mode(self):
+        return self.hub_mode
 
     def get_principal_groups(self):
         return self.groups
@@ -582,11 +586,12 @@ def test_watch_install_is_idempotent_and_cancellable(monkeypatch):
         "/registry/tool_policies",
         "/config/framework/tool_authz_mode",
         "/config/framework/bound_tools_mode",
+        "/config/framework/hub_call_mode",
         "/config/framework/principal_groups",
     ]
 
     tool_authz.cancel_tool_authz_watch()
-    assert client.cancelled == [1, 2, 3, 4]
+    assert client.cancelled == [1, 2, 3, 4, 5]
     tool_authz.cancel_tool_authz_watch()  # idempotent
 
 
@@ -645,15 +650,70 @@ def test_unrecognized_bound_tools_mode_fails_closed_to_enforcing(caplog):
     assert "Unrecognized bound_tools_mode" in caplog.text
 
 
+@pytest.mark.parametrize("stored", [pytest.param(None, id="absent"), pytest.param("", id="empty")])
+def test_hub_call_mode_is_off_when_unset(stored):
+    store = {} if stored is None else {"hub_call_mode": stored}
+
+    assert _mode_manager(store).get_hub_call_mode() == "off"
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforcing"])
+def test_hub_call_mode_set_get_round_trip(mode):
+    store = {}
+    mgr = _mode_manager(store)
+
+    mgr.set_hub_call_mode(mode)
+
+    assert store == {"hub_call_mode": mode}
+    assert mgr.get_hub_call_mode() == mode
+
+
+def test_hub_call_mode_rejects_unknown_values():
+    mgr = _mode_manager({})
+
+    with pytest.raises(ValueError):
+        mgr.set_hub_call_mode("enforcin")
+
+
+def test_unrecognized_hub_call_mode_fails_closed_to_enforcing(caplog):
+    mgr = _mode_manager({"hub_call_mode": "enforcin"})
+
+    with caplog.at_level(logging.ERROR, logger="core.auth"):
+        assert mgr.get_hub_call_mode() == "enforcing"
+
+    assert "Unrecognized hub_call_mode" in caplog.text
+
+
 def test_mode_for_surface_picks_each_gates_own_key(use_registry):
-    use_registry(policy=_policy(), mode="enforcing", bound_mode="off")
+    use_registry(policy=_policy(), mode="enforcing", bound_mode="off", hub_mode="shadow")
 
     assert tool_authz.get_mode() == "enforcing"
     assert tool_authz.get_bound_tools_mode() == "off"
+    assert tool_authz.get_hub_call_mode() == "shadow"
     # None is the use_tool/search_tools gate (unchanged default argument).
     assert tool_authz.mode_for_surface() == "enforcing"
     assert tool_authz.mode_for_surface("use_tool") == "enforcing"
     assert tool_authz.mode_for_surface(tool_authz.BOUND_TOOL_SURFACE) == "off"
+    assert tool_authz.mode_for_surface(tool_authz.HUB_DIRECT_SURFACE) == "shadow"
+
+
+def test_cached_mode_for_surface_picks_each_gates_own_key(use_registry):
+    use_registry(policy=_policy(), mode="enforcing", bound_mode="off", hub_mode="shadow")
+    tool_authz.get_mode()  # warm the snapshot
+
+    assert tool_authz.cached_mode_for_surface() == "enforcing"
+    assert tool_authz.cached_mode_for_surface(tool_authz.BOUND_TOOL_SURFACE) == "off"
+    assert tool_authz.cached_mode_for_surface(tool_authz.HUB_DIRECT_SURFACE) == "shadow"
+
+
+def test_cached_mode_for_an_unknown_surface_fails_closed(use_registry, caplog):
+    use_registry(policy=_policy(), mode="off")
+    tool_authz.get_mode()
+
+    with caplog.at_level(logging.ERROR, logger="core.tool_authz"):
+        assert tool_authz.cached_mode_for_surface("not_a_surface") == "enforcing"
+
+    assert "unknown surface" in caplog.text
 
 
 def test_bound_surface_off_never_evaluates_or_records(use_registry, caplog):
@@ -737,9 +797,106 @@ def test_registry_without_the_bound_mode_accessor_is_off(monkeypatch):
     tool_authz.reset_cache()
 
     assert tool_authz.get_bound_tools_mode() == "off"
+    assert tool_authz.get_hub_call_mode() == "off"
     assert tool_authz.allowed(
         "agent:supervisor", LOCAL_TOOL, "tools:call", surface="bound_tool"
     ) is True
+    assert tool_authz.allowed(
+        "agent:supervisor", LOCAL_TOOL, "tools:call", surface=tool_authz.HUB_DIRECT_SURFACE
+    ) is True
+
+
+# --- 10. hub-direct surface (v0.7.1 Phase 2) ---------------------------------
+
+
+def test_hub_surface_off_never_evaluates_or_records(use_registry, caplog):
+    use_registry(policy=_policy(), mode="enforcing", hub_mode="off")
+
+    with caplog.at_level(logging.WARNING, logger="core.tool_authz"):
+        assert tool_authz.allowed(
+            "user:alice", LOCAL_TOOL, "tools:call", surface=tool_authz.HUB_DIRECT_SURFACE
+        ) is True
+
+    assert tool_authz.shadow_denies() == []
+    assert "tool_authz_deny" not in caplog.text
+
+
+def test_hub_surface_shadow_allows_and_tags_the_shared_ring(use_registry, monkeypatch):
+    monkeypatch.setattr(tool_authz, "_DENY_PERSIST_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(tool_authz, "_last_deny_persist", {})
+    fake = use_registry(policy=_policy(), mode="off", hub_mode="shadow")
+
+    assert tool_authz.allowed(
+        "user:alice", LOCAL_TOOL, "tools:call", surface=tool_authz.HUB_DIRECT_SURFACE
+    ) is True
+
+    entry = fake.persisted[0]
+    assert entry["surface"] == "hub_direct"
+    assert entry["mode"] == "shadow"
+    assert entry["principal"] == "user:alice"
+    assert entry["tool"] == LOCAL_TOOL
+
+
+def test_hub_surface_enforcing_denies(use_registry):
+    use_registry(
+        policy=_policy(_rule([LOCAL_TOOL], ["agent:supervisor"])), mode="off", hub_mode="enforcing"
+    )
+
+    assert tool_authz.allowed(
+        "agent:supervisor", LOCAL_TOOL, "tools:call", surface=tool_authz.HUB_DIRECT_SURFACE
+    ) is True
+    assert tool_authz.allowed(
+        "user:alice", LOCAL_TOOL, "tools:call", surface=tool_authz.HUB_DIRECT_SURFACE
+    ) is False
+
+
+def test_unrecognized_hub_mode_in_the_registry_fails_closed(use_registry):
+    use_registry(policy=_policy(), mode="off", hub_mode="not-a-mode")
+
+    assert tool_authz.get_hub_call_mode() == "enforcing"
+
+
+# --- 11. shared principal derivation -----------------------------------------
+
+
+class _Claims:
+    """Minimal stand-in for ``core.agent_token.Claims`` (only what classification reads)."""
+
+    def __init__(self, agent, user_id=None):
+        self.agent = agent
+        self.user_id = user_id
+
+
+@pytest.mark.parametrize(
+    "claims,user_id,expected",
+    [
+        (_Claims("nightly", "svc_agent_nightly"), None, "workflow:nightly"),
+        (_Claims("gateway", "alice"), "alice", "user:alice"),
+        (_Claims("gateway", None), None, "agent:gateway"),
+        (_Claims("supervisor", "alice"), "alice", "agent:supervisor"),
+        (None, "bob", "user:bob"),
+        (None, None, "anonymous"),
+    ],
+)
+def test_principal_for_classifies_claims_and_user(claims, user_id, expected):
+    """Both enforcement paths share this helper, so its ordering is pinned here."""
+    assert tool_authz.principal_for(claims, user_id) == expected
+
+
+def test_principal_for_uses_the_agent_config_type_for_background_runs(monkeypatch):
+    monkeypatch.setattr(tool_authz, "_agent_type_cache", {})
+    fake = FakeAuthzManager(mode="off")
+    fake.get_agent_config = lambda name: {"nightly": {"type": "background_script"}}.get(name)
+    monkeypatch.setattr(auth, "get_identity_manager", lambda: fake)
+
+    # Webhook runs carry an ordinary user id, so only the config type can classify them.
+    assert tool_authz.principal_for(_Claims("nightly", "webhook"), "webhook") == "workflow:nightly"
+
+
+def test_resolve_current_principal_still_delegates_to_the_helper(run_context, monkeypatch):
+    monkeypatch.setattr(tool_authz, "principal_for", lambda claims, user_id: "agent:stub")
+
+    assert tool_authz.resolve_current_principal() == "agent:stub"
 
 
 # --- v0.7.1: per-agent bootstrap rules + surface safety -----------------------
@@ -786,7 +943,7 @@ def test_bootstrap_without_agent_configs_keeps_the_public_only_shape():
 
 
 def test_unknown_surface_fails_closed(monkeypatch):
-    assert tool_authz.mode_for_surface("hub_direct") == "enforcing"
+    assert tool_authz.mode_for_surface("not_a_surface") == "enforcing"
     assert tool_authz.mode_for_surface(None) in tool_authz.MODES
 
 
