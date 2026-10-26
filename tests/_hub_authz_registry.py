@@ -24,6 +24,7 @@ class FakeAuthzRegistry:
         bound_mode="off",
         hub_mode="off",
         groups=None,
+        users=None,
         agent_configs=None,
     ):
         self.policy = {} if policy is None else policy
@@ -31,6 +32,7 @@ class FakeAuthzRegistry:
         self.bound_mode = bound_mode
         self.hub_mode = hub_mode
         self.groups = {} if groups is None else groups
+        self.users = {} if users is None else users
         self.agent_configs = {} if agent_configs is None else agent_configs
         self.denies = []
         self.policy_reads = 0
@@ -50,6 +52,9 @@ class FakeAuthzRegistry:
 
     def get_principal_groups(self):
         return self.groups
+
+    def get_user(self, user_id):
+        return self.users.get(user_id)
 
     def get_agent_config(self, name):
         return self.agent_configs.get(name)

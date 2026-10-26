@@ -614,8 +614,10 @@ async def _authorize_hub_call(
     token verification, no policy evaluation. A malformed or expired token is not an
     error here -- the caller keeps its ``__user_id`` and the principal falls back to
     that (or ``anonymous``), because rejecting tokens belongs to the agent-token gate
-    above, not to this one. Everything else fails closed: an exception inside the check
-    never runs the tool.
+    above, not to this one. The token's user id also supplies the caller's stored groups:
+    this process has no request for the middleware to publish them from, and without
+    them a ``group:`` rule would match on the host and deny here for the same call.
+    Everything else fails closed: an exception inside the check never runs the tool.
 
     Note the same caveat as the other surfaces: if the authz state has never been
     readable, the cold snapshot says ``off`` and the gate fails open until a read
@@ -638,12 +640,26 @@ async def _authorize_hub_call(
                 "principal without claims (agent:/workflow: rules cannot match)",
                 config.name,
             )
-        principal = tool_authz.principal_for(claims, user_id)
-        if tool_authz.allowed(
-            principal, config.name, "tools:call", surface=surface, mode=mode
+        if (
+            claims is not None
+            and claims.user_id
+            # Service identities (`svc_agent_*`) never have a profile record, and a
+            # synthetic one must not grant a workflow groups the host would not see.
+            and not str(claims.user_id).startswith("svc_agent_")
         ):
-            return None
-        return {"error": _HUB_CALL_DENIED.format(name=config.name)}
+            tool_authz.set_request_groups(tool_authz.stored_user_groups(claims.user_id))
+        try:
+            principal = tool_authz.principal_for(claims, user_id)
+            if tool_authz.allowed(
+                principal, config.name, "tools:call", surface=surface, mode=mode
+            ):
+                return None
+            return {"error": _HUB_CALL_DENIED.format(name=config.name)}
+        finally:
+            # `to_thread` copies the context, so the copy would be discarded anyway;
+            # clear it so a future non-threaded caller cannot leak one verdict's groups
+            # into the next.
+            tool_authz.clear_request_groups()
 
     try:
         return await asyncio.to_thread(_verdict)

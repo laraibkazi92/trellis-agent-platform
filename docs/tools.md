@@ -400,7 +400,14 @@ rolled out in stages:
 
 1. Click **Bootstrap** to generate one explicit rule per currently-public tool with
    `allow_principals: ["*"]` and both scopes — day-one compatibility, tightened by deleting
-   lines.
+   lines. It also emits one rule per agent covering every tool the agent binds directly
+   (`allowed_tools` / `allowed_mcps`), granted to that agent's own principal
+   (`agent:<name>`, or `workflow:<name>` for a background type), so the bound-tool and hub
+   surfaces have something to match from the start. It enumerates an `allowed_mcps`
+   server's tools as they are registered when it runs, so re-run it (or hand-add the
+   missing rule) after a server gains a tool. **Bootstrap replaces the whole document**:
+   on an already-tuned policy prefer adding the one rule by hand, since re-running resets
+   the deletions that tightened it.
 2. Switch to `shadow` and let normal traffic run. Review the denial table (shared across
    services, sampled, capped at 200) and reconcile every entry.
 3. Switch to `enforcing`. Rollback is immediate: set the mode back to `shadow`/`off` — the etcd
@@ -476,8 +483,10 @@ switch on the same page: **Bound tools**, stored at
 | `enforcing` | A bound call with no matching rule returns an access-denied message to the model and the tool does not run. |
 
 - **Default off.** Nothing changes until an operator promotes the mode, and promotion to
-  `enforcing` requires the confirmation checkbox. Use `shadow` first: the policy was written
-  for `use_tool` traffic and rarely has rules for `agent:<name>` / `workflow:<name>` yet.
+  `enforcing` requires the confirmation checkbox. Use `shadow` first: a policy written by
+  hand for `use_tool` traffic may not have rules for `agent:<name>` / `workflow:<name>` yet.
+  A freshly bootstrapped one does — Bootstrap emits a rule per agent for its bound tools —
+  but only for the bindings that existed when it ran.
 - The evaluator, scope (`tools:call`), principal resolution and rule language are the same as
   `use_tool` — one policy document, one deny ring, only the rollout key and the
   `surface` tag differ. MCP tools are matched by their registry name
@@ -506,10 +515,29 @@ tool call before the tool is dispatched (locally or to an edge).
 - **It gates every hub call, not only "direct" ones.** The switch sits where the hub
   dispatches, so agent and bound-tool traffic passes it too. Promoting it to `enforcing`
   therefore denies agent calls with no matching rule *regardless of* `tool_authz_mode` and
-  `bound_tools_mode`. Promote it last, after the other two surfaces are settled. Note that a
-  call the host allowed through a `user:`/`group:` rule is re-evaluated in the hub process,
-  where the principal is `agent:<name>` / `workflow:<name>` — the policy needs rules for
-  those principals too (the shadow ring shows exactly which).
+  `bound_tools_mode`. Promote it last, after the other two surfaces are settled.
+- **It resolves the same principal and groups the host did.** The hub re-derives the
+  principal from the token the framework forwards, never from an `agent:` / `workflow:`
+  string the caller supplies, so for framework traffic it is the principal the host already
+  evaluated: `user:<id>` for a gateway call on a user's behalf, `agent:<name>` /
+  `workflow:<name>` otherwise. It resolves `group:` membership from that token's user record
+  too — the same record the host's middleware publishes from — so a `group:` rule reaches
+  the same verdict on both sides instead of matching on the host and denying at the last
+  mile. `workflow:` runs carry a service user id with no record, so the record contributes
+  no groups there — only `/config/framework/principal_groups` can grant a workflow a group
+  (as on every other surface). Given the same policy, enforcing therefore does not change a
+  decision the other gates already made; what it closes is the path that met none of them,
+  a direct `/tools/call`.
+- **The fallback is a different principal.** A token that cannot be verified (a key
+  mismatch, an expired token) contributes no claims, so the principal falls back to
+  `__user_id` or `anonymous`: `agent:` / `workflow:` rules cannot match, and the call is
+  denied unless a `user:`, `group:` or `*` rule covers the fallback. A supplied `__user_id`
+  also inherits that user's stored groups, so a `group:` rule is reachable from this path.
+  The hub logs a warning when a token was presented and did not verify; a call with no token
+  at all falls back silently.
+  Check the shadow ring for `hub_direct` rows before promoting — an entry means some
+  caller's principal has no rule. The ring is sampled and rate-limited per surface, so
+  absence only means nothing was denied in the window.
 - **The principal comes from the agent token the framework forwards.** Every agent-driven hub
   call already carries `__agent_token` (the run's short-lived token, `core/agent_token.py`). The
   hub verifies it and resolves the principal exactly as the other surfaces do:

@@ -16,7 +16,7 @@ import logging
 
 import pytest
 
-from core import agent_token, auth, tool_authz
+from core import allowlist, agent_token, auth, tool_authz
 
 SECRET = "tool-authz-unit-secret-0123456789abcdef"
 
@@ -951,6 +951,55 @@ def test_bootstrap_adds_one_rule_per_agent_for_bound_tools():
     # Console tools are capabilities, not policy targets; a spec-less agent adds nothing.
     assert all("ls" not in tools for tools, _ in rules)
     assert len(doc["rules"]) == 2
+
+
+def test_bootstrap_covers_every_tool_the_hub_allowlist_permits(use_registry):
+    """The invariant that makes ``hub_call_mode=enforcing`` safe on day one.
+
+    With ``ENFORCE_AGENT_TOKENS=enforce`` a hub call only reaches the authz gate after
+    ``_authorize_call`` has accepted the tool into the agent's effective allowlist, so
+    every tool that allowlist permits must resolve to a rule for that agent's principal
+    -- otherwise the last mile denies a call the host (and the hub's own allowlist gate)
+    already allowed. Console tools are the deliberate exception: they never reach the hub
+    and are absent from the policy language.
+    """
+    tool_configs = {"soak_probe": {"name": "soak_probe", "public": False}}
+    mcp_configs = {"srv": {"tools": [{"name": "a"}, {"name": "b"}]}}
+    agent_configs = {
+        "chat": {
+            "type": "user_agent",
+            "allowed_tools": ["soak_probe", "mcp__srv__a", "execute"],
+        },
+        "site": {"type": "user_agent", "allowed_mcps": ["srv"]},
+        "wf": {"type": "background_agent", "allowed_tools": ["soak_probe"]},
+    }
+    doc = tool_authz.bootstrap_policy(tool_configs, mcp_configs, agent_configs)
+    use_registry(policy=doc)
+
+    candidates = {"soak_probe", "mcp__srv__a", "mcp__srv__b"}
+    for name, config in agent_configs.items():
+        kind = "workflow" if config["type"].startswith("background") else "agent"
+        principal = f"{kind}:{name}"
+        permitted = {
+            tool
+            for tool in candidates
+            if allowlist.permits_tool(allowlist.resolve(config), tool)
+        }
+        assert permitted, name
+        for tool in permitted:
+            assert tool_authz.evaluate(principal, tool, "tools:call")[0] == "allow", (
+                principal,
+                tool,
+            )
+
+    # Exclusivity: the rules are granted to that agent's principal only (no public tool
+    # in this fixture, so a "*" rule would mean the per-agent grants had been widened).
+    assert all(rule["allow_principals"] != ["*"] for rule in doc["rules"])
+    assert tool_authz.evaluate("agent:chat", "mcp__srv__b", "tools:call")[0] == "deny"
+
+    # The console exclusion, asserted against a *bound* console tool so it is load-bearing.
+    assert allowlist.permits_tool(allowlist.resolve({"allowed_tools": ["execute"]}), "execute")
+    assert all("execute" not in rule["tools"] for rule in doc["rules"])
 
 
 def test_bootstrap_without_agent_configs_keeps_the_public_only_shape():

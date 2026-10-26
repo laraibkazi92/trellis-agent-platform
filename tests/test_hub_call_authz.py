@@ -69,6 +69,7 @@ def _authz_isolation(monkeypatch):
     monkeypatch.setattr(tool_authz, "_DENY_PERSIST_MIN_INTERVAL_S", 0.0)
     monkeypatch.setattr(tool_authz, "_last_deny_persist", {})
     monkeypatch.setattr(tool_authz, "_agent_type_cache", {})
+    monkeypatch.setattr(tool_authz, "_user_groups_cache", {})
     yield
     tool_authz.reset_cache()
     tool_authz.clear_shadow_denies()
@@ -440,3 +441,56 @@ def test_hub_mode_promoted_after_the_snapshot_ttl_is_honoured(executions, regist
     assert call({}) == {"ok": True}          # shadow records, never blocks
     assert [entry["surface"] for entry in tool_authz.shadow_denies()] == ["hub_direct"]
     assert fake.policy_reads > reads_when_warm
+
+
+# --- groups: the last mile resolves what the host published -------------------
+
+
+def _group_policy():
+    return {
+        "default_action": "deny",
+        "rules": [
+            {
+                "tools": ["opsctl"],
+                "allow_principals": ["group:ops"],
+                "scopes": ["tools:call"],
+            }
+        ],
+    }
+
+
+def test_group_rule_matches_through_the_token_user(executions, registry):
+    """The hub has no middleware to publish a group claim; it resolves the token's user
+    record, which is the source the host's middleware publishes from. A `group:` rule
+    must reach the same verdict on both sides of the boundary."""
+    fake = registry(
+        policy=_group_policy(),
+        hub_mode="enforcing",
+        users={"alice": {"sub": "alice", "groups": ["ops"]}},
+    )
+
+    assert call({"__agent_token": mint("supervisor", "alice")}) == {"ok": True}
+    assert fake.denies == []
+    # A later call with no token at all must not inherit the previous caller's groups:
+    # `anonymous` matches no `group:ops` rule unless the publish leaked.
+    assert call({}) == {"error": DENIED.format(name="opsctl")}
+
+
+def test_group_rule_does_not_grant_a_background_run(executions, registry):
+    """Background runs resolve to `workflow:<name>`, which has no record groups. Even a
+    profile planted under the service user id must not widen them: the host cannot see
+    it either, so the last mile must not either."""
+    registry(
+        policy=_group_policy(),
+        hub_mode="enforcing",
+        users={
+            "alice": {"sub": "alice", "groups": ["ops"]},
+            "svc_agent_nightly": {"sub": "svc_agent_nightly", "groups": ["ops"]},
+        },
+        agent_configs={"nightly": {"type": "background_agent"}},
+    )
+
+    result = call({"__agent_token": mint("nightly", "svc_agent_nightly")})
+
+    assert result == {"error": DENIED.format(name="opsctl")}
+    assert executions == []

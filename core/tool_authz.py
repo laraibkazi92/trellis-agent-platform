@@ -390,6 +390,19 @@ def _stored_user_groups(principal: str) -> Set[str]:
     return set(values)
 
 
+def stored_user_groups(user_id: Optional[str]) -> Tuple[str, ...]:
+    """IdP groups stored on ``user_id``'s record (cached), for a caller holding a
+    verified token but no request context -- the hub's last mile.
+
+    The host's auth middleware publishes the same record's groups for the duration of a
+    request, so resolving them here keeps ``group:`` rules matching identically on both
+    sides of the boundary.
+    """
+    if not user_id:
+        return ()
+    return tuple(sorted(_stored_user_groups(f"user:{user_id}")))
+
+
 def _groups_for(principal: str) -> Set[str]:
     """Caller groups: the request claim (else the stored IdP groups) ∪ the etcd mapping.
 
