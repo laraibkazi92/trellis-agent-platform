@@ -126,6 +126,18 @@ jobs:
           ADMIN_USERS=dev-user@local.host
           TRELLIS_UID=$(id -u)
           TRELLIS_GID=$(id -g)
+          # Compose refuses to start without these three since v0.6: the runner's
+          # bearer token, the agent-token HMAC key (>= 32 bytes), and the HOST path
+          # of the workspace that every tool bind mount resolves against -- the
+          # checkout's workspace/ dir, mounted at /app/workspace by this compose file.
+          RUNNER_TOKEN=0123456789abcdef0123456789abcdef
+          AGENT_TOKEN_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          TRELLIS_HOST_WORKSPACE=$(pwd)/workspace
+          # GitHub runners have no gVisor. This job proves the hub's own sandbox
+          # (bwrap / Landlock), not the runner's runsc isolation, so pin runc here:
+          # otherwise the runner fails its runtime preflight and every service that
+          # depends_on it healthy never starts.
+          CONTAINER_DEFAULT_RUNTIME=runc
           ENV
 
       - name: Allow unprivileged user namespaces on the bwrap leg
@@ -290,6 +302,18 @@ jobs:
           ADMIN_USERS=dev-user@local.host
           TRELLIS_UID=$(id -u)
           TRELLIS_GID=$(id -g)
+          # Compose refuses to start without these three since v0.6: the runner's
+          # bearer token, the agent-token HMAC key (>= 32 bytes), and the HOST path
+          # of the workspace that every tool bind mount resolves against -- the
+          # checkout's workspace/ dir, mounted at /app/workspace by this compose file.
+          RUNNER_TOKEN=0123456789abcdef0123456789abcdef
+          AGENT_TOKEN_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          TRELLIS_HOST_WORKSPACE=$(pwd)/workspace
+          # GitHub runners have no gVisor. This job proves the hub's own sandbox
+          # (bwrap / Landlock), not the runner's runsc isolation, so pin runc here:
+          # otherwise the runner fails its runtime preflight and every service that
+          # depends_on it healthy never starts.
+          CONTAINER_DEFAULT_RUNTIME=runc
           ENV
 
       - name: Allow unprivileged user namespaces (bwrap leg)
@@ -301,6 +325,12 @@ jobs:
         # The allowlist is generated from tool.yaml, so the stack needs a tool
         # that declares the mock's name. It is never executed; db-sync registers
         # it and the harness reads the generated ACL from the proxy.
+        #
+        # No `network:` key on purpose: the ACL comes from `egress:` alone, while
+        # any non-none network declaration makes the runner require
+        # `trellis-tools-internet` at startup (it is deliberately not a compose
+        # network -- scripts/setup-network-profiles.sh owns it) and this leg never
+        # runs the tool, only the hub-side egress probes.
         run: |
           mkdir -p workspace/tools/egress-fixture
           cat > workspace/tools/egress-fixture/tool.yaml <<'YAML'
@@ -309,7 +339,6 @@ jobs:
             description: "CI fixture: declares the domains the egress smoke exercises."
             runtime: python
             entrypoint: main.py
-            network: allow
             egress:
               - api.egress-allowed.test
           YAML
@@ -487,6 +516,18 @@ jobs:
           ADMIN_USERS=dev-user@local.host
           TRELLIS_UID=$(id -u)
           TRELLIS_GID=$(id -g)
+          # Compose refuses to start without these three since v0.6: the runner's
+          # bearer token, the agent-token HMAC key (>= 32 bytes), and the HOST path
+          # of the workspace that every tool bind mount resolves against -- the
+          # checkout's workspace/ dir, mounted at /app/workspace by this compose file.
+          RUNNER_TOKEN=0123456789abcdef0123456789abcdef
+          AGENT_TOKEN_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+          TRELLIS_HOST_WORKSPACE=$(pwd)/workspace
+          # GitHub runners have no gVisor. This job proves the hub's own sandbox
+          # (bwrap / Landlock), not the runner's runsc isolation, so pin runc here:
+          # otherwise the runner fails its runtime preflight and every service that
+          # depends_on it healthy never starts.
+          CONTAINER_DEFAULT_RUNTIME=runc
           ENV
 
       - name: Build and start the stack under apparmor=trellis-hub

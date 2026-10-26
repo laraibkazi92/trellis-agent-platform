@@ -49,6 +49,7 @@ EXPECTED_KEYS = {
     "env_passthrough",
     "sandbox",
     "runner_socket",
+    "lazy_catalog",
 }
 
 
