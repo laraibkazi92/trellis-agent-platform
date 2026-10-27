@@ -43,11 +43,18 @@ services:
 
   taskiq-worker:
     volumes:
-      - ../acme-trellis-workspace/workspace:/app/workspace
+      # v0.7.1: the worker's workspace is read-only (background scripts run in runner
+      # containers now, not in the worker). Only reports/ stays read-write, for a
+      # background agent's in-process file tools. Override BOTH mounts, or the base
+      # file's reports/ mount keeps pointing at the other workspace.
+      - ../acme-trellis-workspace/workspace:/app/workspace:ro
+      - ../acme-trellis-workspace/workspace/reports:/app/workspace/reports:rw
 
   taskiq-scheduler:
     volumes:
-      - ../acme-trellis-workspace/workspace:/app/workspace
+      # v0.7.1: read-only. The scheduler only enqueues jobs; it never runs a
+      # pipeline or touches the workspace.
+      - ../acme-trellis-workspace/workspace:/app/workspace:ro
 
   ui:
     volumes:

@@ -72,7 +72,7 @@ SOCKET_READY_TIMEOUT_S = 10.0
 
 # Containers no client may re-adopt after a runner restart.
 SESSION_KINDS = frozenset({"mcp_session", "discovery"})
-ONE_SHOT_KINDS = frozenset({"tool", "console", "canary"})
+ONE_SHOT_KINDS = frozenset({"tool", "console", "workflow", "canary"})
 
 # Total bytes buffered per session before the reader stops draining the attach
 # socket. The container then blocks on its pipe -- that IS the backpressure.
@@ -268,6 +268,34 @@ def resolve_target(name: str) -> Optional[Target]:
             if config.name == name and config.remote is None:
                 return Target(config=config, suite=suite, path=path)
     return None
+
+
+def workflow_tool_suites(names: Sequence[str]) -> list[str]:
+    """Local tool suites to mount for a workflow's ``allowed_tools``.
+
+    A workflow container has no tool registry and no token: the *only* enforcement
+    is that an undeclared tool is not on the filesystem. So the set of mounted
+    suites is derived here, from the same manifest scan a tool call uses, and only
+    for names this runner can actually execute as a local tool.
+
+    An edge tool (``<site>__<tool>``), an edge MCP server or a central MCP tool is a
+    registry/network reference with no directory under ``workspace/tools``, so it
+    contributes no mount. Declaring one in ``allowed_tools`` stays legal -- that list
+    is also the workflow's allowlist -- it simply has no files to mount.
+
+    The list is caller-declared, and that is not a widening: the pre-container worker
+    ran the pipeline with the whole workspace mounted read-write (``cwd`` = the
+    workflow dir, engine network reachable), so a read-only suite mount can only take
+    capability away. There is no agent token inside a workflow container, so nothing
+    there can be escalated with either.
+    """
+    suites: list[str] = []
+    for name in names:
+        target = resolve_target(str(name))
+        if target is None or target.suite in suites:
+            continue
+        suites.append(target.suite)
+    return sorted(suites)
 
 
 @dataclass(frozen=True)
@@ -597,10 +625,17 @@ def _authorize(payload: Any) -> Optional[JSONResponse]:
 
     The runner has no registry and no agent manifests, so it cannot resolve an
     allowlist. Every authorization decision is made *before* the request reaches this
-    process: the hub authorizes tool calls, and the process that owns the agent
-    runtime authorizes the sessions and console containers it asks for
-    (``core.tool_gate``, surface ``host``, in v0.7.1 Phase 4). Re-deriving a verdict
-    here from a workspace manifest only ever denied calls that were already allowed.
+    process: the hub authorizes tool calls, the process that owns the agent runtime
+    authorizes the sessions and console containers it asks for (``core.tool_gate``,
+    surface ``host``, in v0.7.1 Phase 4), and the taskiq worker decides whether a
+    workflow may run at all (guardrails, disabled list) before it asks for one.
+    Re-deriving a verdict here from a workspace manifest only ever denied calls that
+    were already allowed.
+
+    A workflow request is verified like any other: it is a run of a real agent
+    identity (``svc_agent_<workflow>``), never an exempt path. What its container
+    contains is decided by the mounts (``workflow_tool_suites``), not by a verdict
+    here.
 
     The one non-agent path is a ``kind: "discovery"`` catalog read, which carries no
     agent run at all and is gated by the runner bearer token on the control socket.
@@ -1054,12 +1089,38 @@ async def exec_tool(request: Request, payload: ExecRequest):
             ),
         )
 
+    if payload.kind == "workflow":
+        # One `background_script` pipeline, one container. The target IS the
+        # workflow name (its directory under workspace/workflows), so the capacity
+        # bucket and the container labels name the workflow. Everything the caller
+        # sends describes the pipeline; the container itself is derived here.
+        return await _execute_one_shot(
+            payload.target,
+            payload,
+            lambda: spec.build_workflow_spec(
+                name=payload.target,
+                entrypoint=payload.entrypoint or "",
+                runtime=payload.runtime,
+                args=payload.args,
+                # Only local suites: see workflow_tool_suites.
+                tool_suites=workflow_tool_suites(payload.tools),
+                env=payload.env,
+                host_workspace=_host_workspace(),
+                workspace_root=_workspace_root(),
+                run_id=claims.run_id if claims else None,
+                user_id=claims.user_id if claims else None,
+                user_email=claims.user_email if claims else None,
+                network=payload.network,
+                limits=payload.limits,
+            ),
+        )
+
     if payload.kind != "tool":
         return _error(
             400,
             "invalid_request",
-            f"/v1/exec accepts kind='tool' or kind='console' (got {payload.kind!r}); "
-            "sessions use /v1/sessions",
+            f"/v1/exec accepts kind='tool', 'console' or 'workflow' (got "
+            f"{payload.kind!r}); sessions use /v1/sessions",
         )
 
     target = resolve_target(payload.target)

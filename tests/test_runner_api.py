@@ -21,7 +21,7 @@ from core.execution import backend as backend_module
 from core.execution import canary as canary_module
 from core.execution import runner as runner_module
 from core.execution.backend import BackendError
-from core.execution.spec import manifest_digest
+from core.execution.spec import DEFAULT_NETWORK_MODE, manifest_digest
 from core.models import ToolConfig
 from fixtures.fake_backend import FakeBackend, RawExec
 
@@ -422,17 +422,79 @@ def test_a_session_without_a_token_is_refused(env, monkeypatch):
     assert response.json()["detail"]["code"] == "access_denied"
 
 
+def test_a_leftover_workflow_container_is_reaped_like_any_one_shot(env):
+    """A SIGKILLed runner leaves one-shot containers behind: workflows included."""
+    from core.execution.spec import ContainerSpec
+
+    def leftover(kind: str, install: str = "default") -> ContainerSpec:
+        return ContainerSpec(
+            image="trellis-agent-platform:test",
+            runtime="runsc",
+            cmd=["python3", "/app/workspace/workflows/demo-inventory/pipeline.py"],
+            working_dir="/app/workspace/workflows/demo-inventory",
+            env={},
+            labels={"trellis.install": install, "trellis.kind": kind},
+            kind=kind,
+        )
+
+    async def seed():
+        workflow = await env.backend.create(leftover("workflow"))
+        tool = await env.backend.create(leftover("tool"))
+        foreign = await env.backend.create(leftover("workflow", install="other"))
+        return workflow, tool, foreign
+
+    workflow, tool, foreign = asyncio.run(seed())
+
+    removed = asyncio.run(runner_module.reap_one_shot(env.backend))
+
+    assert removed == 2
+    assert {workflow, tool} <= set(env.backend.removed)
+    assert foreign not in env.backend.removed
+
+
+def test_a_workflow_run_is_a_first_class_exec_kind(env):
+    """``kind='workflow'`` runs one pipeline container (matrix: test_workflow_container)."""
+    workflow = env.root / "workflows" / "demo-inventory"
+    workflow.mkdir(parents=True)
+    (workflow / "pipeline.py").write_text("print('{}')\n", encoding="utf-8")
+    env.backend.queue(RawExec(exit_code=0, stdout=b"done\n"))
+
+    body = {
+        "kind": "workflow",
+        "target": "demo-inventory",
+        "entrypoint": "pipeline.py",
+        "input": "inventory",
+        "deadline_ms": 5000,
+        "agent_token": _token("demo-inventory"),
+    }
+    response = asyncio.run(_call("POST", "/v1/exec", json_body=body))
+
+    assert response.status_code == 200, response.json()
+    assert response.json()["stdout"] == "done\n"
+    container_spec = env.backend.specs[0]
+    assert container_spec.kind == "workflow"
+    assert container_spec.working_dir == "/app/workspace/workflows/demo-inventory"
+    assert container_spec.mounts[0].source == f"/host{workflow}"
+    # Egress unless the workflow asks for `none` -- Docker's own default.
+    assert container_spec.network_mode == DEFAULT_NETWORK_MODE
+    assert container_spec.env["TRELLIS_RUN_ID"] == "run-1"
+    first, _, payload = env.backend.stdin[0][1].partition(b"\n")
+    assert json.loads(first)["env"] == {}
+    assert payload == b"inventory"
+
+
 def test_the_wire_contract_refuses_an_unrecognized_exec_kind(env, monkeypatch):
     """``ExecKind`` is a closed Literal, so an unknown kind cannot reach the runner at
     all; if one ever does (a future kind added to the contract), ``_authorize`` denies
-    it -- see ``tests/test_enforcement_matrix.py``."""
+    it -- see ``tests/test_enforcement_matrix.py``. ``workflow`` is a *known* kind
+    since v0.7.1 Phase 6 (``tests/test_workflow_container.py``)."""
     monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
 
     response = asyncio.run(
         _call(
             "POST",
             "/v1/exec",
-            json_body=_body(env.root, kind="workflow", agent_token=_token("supervisor")),
+            json_body=_body(env.root, kind="batch", agent_token=_token("supervisor")),
         )
     )
 

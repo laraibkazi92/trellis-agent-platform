@@ -76,6 +76,10 @@ def _error_from_response(response: httpx.Response) -> RunnerCallError:
 def _code_for_status(status: int) -> str:
     return {
         400: "invalid_request",
+        # FastAPI/pydantic's own validation failure. Without it a caller bug (an
+        # unknown `limits` key, a workflow field on a tool call) surfaced as
+        # `internal`, i.e. "the runner broke" -- false, and it hid the real cause.
+        422: "invalid_request",
         403: "access_denied",
         404: "unknown_target",
         409: "manifest_stale",

@@ -16,16 +16,24 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from core import tool_access
 from core.auth import IdentityManager
 from core.embeddings import embed_text
+from core.execution.contract import (
+    WORKFLOW_LIMIT_KEYS,
+    WORKFLOW_RUNTIMES,
+)
 from core.execution.env import INVALID_ENV_NAME_HELP, declared_names, invalid_env_names
+from core.execution.spec import is_plain_relative
 from core.models import (
     BACKGROUND_AGENT_TYPES,
     EDGE_MCP_REF_RE,
     EDGE_MCP_TOOL_REF_RE,
     EDGE_MCP_WILDCARD_RE,
+    KNOWN_NETWORK_POLICIES,
+    ContainerLimits,
     coerce_bool_flag,
     AgentRule,
     GlobalRule,
     RoutingRulesConfig,
+    workflow_limits,
 )
 from core.tool_index import delete_tool, index_tool
 
@@ -191,6 +199,111 @@ def validate_declared_env_names() -> list[str]:
                 errors.extend(
                     _declared_env_name_errors(config, f"{label} '{name}' ({manifest})")
                 )
+    return errors
+
+
+def _workflow_manifest_errors(config: dict, directory, label: str) -> list[str]:
+    """Problems with a workflow's container-relevant keys, as printable lines.
+
+    A workflow config is a raw registry document: nothing validates it on the way in,
+    so a misspelled ``limits`` knob, an unknown ``runtime`` or an ``entrypoint`` that
+    does not exist used to sync happily and fail one scheduled run at a time, hours
+    later (the worker runs it, the container exits 2). Same rule as a declared env
+    name: reject it at the sync, before anything is written.
+    """
+    errors: list[str] = []
+    script = str(config.get("type") or "") == "background_script"
+
+    tools = config.get("allowed_tools")
+    if tools is not None and (
+        not isinstance(tools, list)
+        or not all(isinstance(tool, str) and tool.strip() for tool in tools)
+    ):
+        errors.append(
+            f"{label}: allowed_tools must be a list of tool names (got {tools!r})"
+        )
+
+    # `runtime`/`entrypoint`/`limits`/`network` only mean something to a container,
+    # i.e. to a background_script. A background_agent ignores them, so validating
+    # them there would fail a healthy agent workflow over a decorative key.
+    if not script:
+        return errors
+
+    runtime = config.get("runtime")
+    if runtime is not None:
+        normalized = str(runtime).strip().lower()
+        if normalized not in WORKFLOW_RUNTIMES:
+            errors.append(
+                f"{label}: runtime {runtime!r} is not one of "
+                f"{', '.join(WORKFLOW_RUNTIMES)}; the pipeline would never start"
+            )
+
+    entrypoint = config.get("entrypoint")
+    if entrypoint is None or not str(entrypoint).strip():
+        errors.append(f"{label}: background_script requires an entrypoint")
+    elif not is_plain_relative(str(entrypoint)):
+        errors.append(
+            f"{label}: entrypoint {entrypoint!r} must be a plain relative path inside "
+            "the workflow directory (no leading '/', no '..')"
+        )
+    elif not (directory / str(entrypoint)).is_file():
+        errors.append(
+            f"{label}: entrypoint {entrypoint!r} does not exist "
+            f"(looked at {directory / str(entrypoint)})"
+        )
+
+    network = config.get("network")
+    if network is not None and str(network).strip().lower() not in KNOWN_NETWORK_POLICIES:
+        errors.append(
+            f"{label}: network {network!r} is not one of "
+            f"{', '.join(sorted(KNOWN_NETWORK_POLICIES))}"
+        )
+
+    limits = config.get("limits")
+    if limits is not None:
+        if not isinstance(limits, dict):
+            errors.append(f"{label}: limits must be a mapping of {', '.join(sorted(WORKFLOW_LIMIT_KEYS))}")
+        else:
+            unknown = sorted(str(key) for key in limits if str(key) not in WORKFLOW_LIMIT_KEYS)
+            if unknown:
+                errors.append(
+                    f"{label}: unknown limits key(s) {', '.join(unknown)} "
+                    f"(expected {', '.join(sorted(WORKFLOW_LIMIT_KEYS))})"
+                )
+            else:
+                try:
+                    ContainerLimits(**{**workflow_limits().model_dump(), **limits})
+                except Exception as err:
+                    errors.append(f"{label}: limits are invalid: {err}")
+    return errors
+
+
+def validate_workflow_manifests() -> list[str]:
+    """Every workflow-manifest problem of that kind, as printable lines.
+
+    Runs before any write, like :func:`validate_declared_env_names`, so a bad
+    ``config.yaml`` aborts the sync instead of publishing a workflow whose first run
+    is guaranteed to fail.
+    """
+    errors: list[str] = []
+    if not WORKFLOWS_DIR.exists():
+        return errors
+    for config_path in sorted(WORKFLOWS_DIR.glob("*/config.yaml")):
+        try:
+            with open(config_path, "r") as handle:
+                config = yaml.safe_load(handle)
+        except (OSError, yaml.YAMLError) as e:
+            # An unreadable config is the loader's business (it skips it with a warning).
+            print(f"  WARNING: cannot read {config_path} for workflow validation: {e}")
+            continue
+        if not isinstance(config, dict):
+            continue
+        name = config.get("name") or config_path.parent.name
+        errors.extend(
+            _workflow_manifest_errors(
+                config, config_path.parent, f"workflow '{name}' ({config_path})"
+            )
+        )
     return errors
 
 
@@ -544,6 +657,15 @@ def main(argv=None):
     if env_name_errors:
         print("\nREFUSING TO SYNC: invalid declared env names, nothing was written.")
         for error in env_name_errors:
+            print(f"  ERROR: {error}")
+        return 2
+
+    # 0c. Workflow manifests. A workflow config is an unvalidated registry document and
+    #     a bad key there only fails a scheduled run hours later, so refuse it here too.
+    workflow_errors = validate_workflow_manifests()
+    if workflow_errors:
+        print("\nREFUSING TO SYNC: invalid workflow manifest keys, nothing was written.")
+        for error in workflow_errors:
             print(f"  ERROR: {error}")
         return 2
     

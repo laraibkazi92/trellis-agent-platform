@@ -91,10 +91,41 @@ def test_exec_parses_a_200_result():
     assert result.container_id == "abc123"
 
 
+def test_a_422_is_a_caller_error_not_an_internal_runner_failure():
+    """FastAPI's own validation body (no `code` field) must not read as `internal`.
+
+    A workflow request with an unknown `limits` key is refused on the wire by pydantic
+    -- 422 with a `detail: [...]` list. Mapping that to `internal` told every caller the
+    runner had broken and hid the real cause.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422,
+            json={
+                "detail": [
+                    {
+                        "type": "value_error",
+                        "loc": ["body", "limits"],
+                        "msg": "Value error, unknown workflow limit(s): memmory_mb",
+                    }
+                ]
+            },
+        )
+
+    with pytest.raises(RunnerCallError) as excinfo:
+        exec_with(handler)
+
+    assert excinfo.value.code == "invalid_request"
+    assert excinfo.value.status == 422
+    assert excinfo.value.retryable is False
+
+
 @pytest.mark.parametrize(
     "status,code",
     [
         (400, "invalid_request"),
+        (422, "invalid_request"),
         (404, "unknown_target"),
         (409, "manifest_stale"),
         (429, "capacity_exhausted"),

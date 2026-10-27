@@ -3,16 +3,17 @@
 
 import os
 import asyncio
-import subprocess
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from taskiq_redis import ListQueueBroker
 from pydantic_ai import Agent
 
-from core.auth import user_id_var
-from core.agent_token import mint_for_run
+from core.auth import agent_token_var, user_id_var
+from core.agent_token import mint_for_run, refresh
 from core.models import Identity, IdentityType
-from core.env_sanitize import sanitized_env
+from core.execution.client import RunnerCallError, RunnerClient, RunnerUnavailable
+from core.execution.contract import WORKFLOW_RUNTIMES, ExecRequest
+from core.execution.spec import RESTRICTED_ENV_VARS
 from core.tunables import resolve as resolve_tunable
 from core.agent_factory import (
     build_agent,
@@ -25,7 +26,27 @@ from core.agent_factory import (
 from core.llm_defaults import provider_for_config, warm_defaults_cache
 from core.llm_factory import warm_key_cache
 
-RESTRICTED_ENV_VARS = {"PATH", "PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "BASH_ENV", "ENV", "HOSTALIASES"}
+# Entrypoint interpreters a workflow container can start, defined once in
+# ``core.execution.contract`` (the wire Literal) and imported here so the worker's
+# config check and the runner's argv map can never drift apart. `exec` runs the file
+# as given (a shebang script or a binary), which is what the pre-container worker did
+# for any runtime it did not recognize.
+
+
+def _workflow_runtime(config_data: Dict[str, Any]) -> str:
+    """The workflow's runtime, mapped onto what the runner can start.
+
+    v0.7's worker ran an unrecognized `runtime:` as a bare executable; keep that
+    (as `exec`) instead of turning a working pipeline into a failure, but say so.
+    """
+    raw = str(config_data.get("runtime") or "python").strip().lower()
+    if raw in WORKFLOW_RUNTIMES:
+        return raw
+    print(
+        f"Workflow {config_data.get('name')!r} declares runtime {raw!r}, which is not "
+        f"one of {', '.join(WORKFLOW_RUNTIMES)}; running its entrypoint directly (exec)."
+    )
+    return "exec"
 
 
 def _truncate_output(text: Optional[str], max_chars: Optional[int] = None) -> str:
@@ -38,6 +59,14 @@ def _truncate_output(text: Optional[str], max_chars: Optional[int] = None) -> st
     half = max(1, (max_chars - 100) // 2)
     omitted = max(0, len(text) - (half * 2))
     return f"{text[:half]}\n\n[... Truncated {omitted} characters ...]\n\n{text[-half:]}"
+
+
+# A pipeline that outruns the runner's per-stream cap (8 MiB stdout) used to come back
+# as a silently halved report. Pick up where `_truncate_output` leaves off: no length is
+# known here (the runner cut the stream), so say what happened instead of a count.
+WORKFLOW_OUTPUT_TRUNCATION_MARKER = (
+    "\n\n[... Truncated output: the runner's per-stream limit was reached ...]"
+)
 
 
 async def _record_run_state(identity_mgr, agent_name: str, task_id: str, state: str, metadata: Dict[str, Any]) -> bool:
@@ -113,7 +142,7 @@ async def _check_input_guardrails(
     Shared by the agent and script paths so both record the same state and event on a
     hit. Fail-open: any evaluation failure leaves the prompt untouched, and only an
     explicit "block" stops the run. Callers decide what "stopped" means (no LLM call
-    for an agent, no subprocess for a script).
+    for an agent, no runner container for a script).
     """
     input_action, checked_prompt, input_hits = "allow", prompt, []
     try:
@@ -207,6 +236,12 @@ async def enqueue_workflow_run(
 
     await _append_run_event(identity_mgr, name, task.task_id, "run_enqueued", {"user_id": agent_identity.to_legacy_string()})
     return task.task_id
+
+
+# How often a running background task re-reads its run record to notice a cancellation.
+# Module-level so tests can shorten it without patching asyncio.sleep process-wide.
+CANCELLATION_POLL_INTERVAL_S = 15.0
+
 
 # Redis broker configuration
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -585,7 +620,15 @@ async def run_background_script(
     user_id: str,
     context: Context = TaskiqDepends(),
 ) -> str:
-    """Executes a script in the background as a Taskiq task."""
+    """Executes a script in the background as a Taskiq task.
+
+    Since v0.7.1 the pipeline runs as ONE runner container per run (mounts: the
+    workflow's own tree, ``shared/`` and only the tool suites its ``allowed_tools``
+    names -- all read-only -- plus ``output/<name>`` and ``reports/<name>``
+    read-write and a ``/tmp`` tmpfs). What still happens here in the worker: the
+    guardrail evaluation on the input (a blocked run never creates a container), the
+    config/registry lookups, the run record/event writes and the heartbeat.
+    """
     token = user_id_var.set(user_id)
     task_id = context.message.task_id if (context and context.message) else "unknown"
     # Background runs act as `svc_agent_<name>`; the token carries the agent name so
@@ -624,14 +667,16 @@ async def run_background_script(
 
         # Same input guardrail the agent path applies, over the rendered prompt (the
         # event payload that becomes the script's stdin). A hit fails the run before
-        # anything is spawned; an empty prompt has nothing to check.
+        # a container is created; an empty prompt has nothing to check.
         if prompt:
             blocked, prompt = await _check_input_guardrails(
                 identity_mgr, agent_name, task_id, user_id, prompt, config_data)
             if blocked:
                 return "SYSTEM: Input blocked by guardrail policy."
 
-        # Prepare execution environment
+        # Config sanity checks, before anything is created. The container's own
+        # working directory is workspace/workflows/<name>, so the entrypoint is a path
+        # *inside* that tree -- never a path on this worker's filesystem.
         base_dir = Path(__file__).parent.parent
         rel_path = config_data.get("rel_path")
         if not rel_path:
@@ -646,23 +691,22 @@ async def run_background_script(
             
         entrypoint_path = (script_dir / entrypoint).resolve()
         
-        if not str(entrypoint_path).startswith(str(script_dir)) or not entrypoint_path.is_file():
+        if not entrypoint_path.is_relative_to(script_dir) or not entrypoint_path.is_file():
             raise ValueError(f"Invalid entrypoint {entrypoint_path}")
 
-        runtime = config_data.get("runtime", "python")
-        if runtime == "python":
-            import sys
-            cmd = [sys.executable, str(entrypoint_path)]
-        elif runtime == "node":
-            cmd = ["node", str(entrypoint_path)]
-        elif runtime == "bash":
-            cmd = ["bash", str(entrypoint_path)]
-        else:
-            cmd = [str(entrypoint_path)]
+        # Pass the entrypoint the way the runner expects it: a plain relative path
+        # inside the workflow directory. Normalizing here keeps a config written as
+        # "./pipeline.py" (or "scripts/run.py") working, and the check above already
+        # proved the resolved file really is inside the workflow's tree.
+        entrypoint_relative = entrypoint_path.relative_to(script_dir).as_posix()
 
-        env = sanitized_env()
         from core.discovery import get_agent_required_secrets, get_agent_required_variables
-        
+
+        # Declared keys ONLY. The container no longer inherits this worker's
+        # environment (v0.7.1 Phase 6), so a secret the workflow never declared is
+        # absent -- and so is every framework secret the worker itself holds.
+        env: Dict[str, str] = {}
+
         # Scoped Secret Injection (Aggregated from config + allowed tools/mcps)
         secret_keys = await get_agent_required_secrets(config_data, strict=True)
         if secret_keys:
@@ -677,21 +721,40 @@ async def run_background_script(
             safe_vars = {str(k): str(v) for k, v in variables.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
             env.update(safe_vars)
 
-        # v0.6: no framework loopback credentials are injected into executed
-        # scripts. A script that needs the API must be given a declared secret.
+        # The workflow's own name, so a pipeline -- and any tool it launches with its
+        # own environment -- can address reports/<name>/ (mounted read-write). A
+        # workflow container carries no agent token, so the name travels in the
+        # environment; nothing in the framework reads it back.
+        env["TRELLIS_AGENT_NAME"] = agent_name
 
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=str(script_dir),
-            env=env
+        # One pipeline, one container: the runner derives image, mounts, user and
+        # limits from its own workspace view. `target` is the workflow NAME (the
+        # runner resolves workspace/workflows/<name>), `env` is the declared set
+        # above, `tools` is both the mount list and the token's allowlist, and
+        # `limits` stays partial so unnamed knobs keep the workflow defaults instead
+        # of a single tool's.
+        request = ExecRequest(
+            kind="workflow",
+            target=agent_name,
+            entrypoint=entrypoint_relative,
+            runtime=_workflow_runtime(config_data),
+            args=[],
+            tools=list(config_data.get("allowed_tools") or []),
+            env=env,
+            network=config_data.get("network"),
+            limits=config_data.get("limits"),
+            # The runner prefixes the environment preamble line; this is the
+            # pipeline's own stdin, byte for byte.
+            input=prompt or "",
+            agent_token=refresh(agent_token_var.get()),
+            deadline_ms=max(1, int(resolve_tunable("workflow_run_timeout") * 1000)),
         )
 
         cancelled_by_poller = False
 
-        async def _poll_for_cancellation(proc, check_interval: int = 15):
+        async def _poll_for_cancellation(
+            check_interval: float = CANCELLATION_POLL_INTERVAL_S,
+        ):
             nonlocal cancelled_by_poller
             if task_id == "unknown":
                 return
@@ -700,21 +763,29 @@ async def run_background_script(
                     await _write_heartbeat(identity_mgr, agent_name, task_id)
                     rec = await asyncio.to_thread(identity_mgr.get_agent_run, agent_name, task_id)
                     if rec and rec.get("state") == "cancelled":
-                        print(f"Task {task_id} for {agent_name} cancelled mid-execution. Killing subprocess.")
-                        try:
-                            proc.kill()
-                        except (ProcessLookupError, PermissionError, OSError):
-                            pass
+                        # The container belongs to the runner and there is no cancel
+                        # call, so it runs to its deadline. Record the cancellation
+                        # once the result is in -- never claim the run was stopped.
+                        print(
+                            f"Task {task_id} for {agent_name} cancelled mid-execution; "
+                            "the workflow container runs to its deadline."
+                        )
                         cancelled_by_poller = True
                         return
                 except Exception:
                     pass
                 await asyncio.sleep(check_interval)
 
-        cancel_monitor = asyncio.create_task(_poll_for_cancellation(process))
-        input_data = prompt.encode() if prompt else b""
+        cancel_monitor = asyncio.create_task(_poll_for_cancellation())
         try:
-            stdout, stderr = await process.communicate(input=input_data)
+            async with RunnerClient() as runner:
+                result = await runner.exec(request)
+        except RunnerCallError as err:
+            raise RuntimeError(
+                f"Workflow container failed ({err.code}): {err.message}"
+            ) from err
+        except RunnerUnavailable as err:
+            raise RuntimeError(f"Runner is unreachable: {err}") from err
         finally:
             cancel_monitor.cancel()
             try:
@@ -722,17 +793,37 @@ async def run_background_script(
             except asyncio.CancelledError:
                 pass
 
-        output_str = ""
-        if stdout:
-            output_str += stdout.decode()
-        if stderr:
-            output_str += "\n" + stderr.decode()
+        output_str = result.stdout or ""
+        if result.stderr:
+            output_str += "\n" + result.stderr
+        truncated = bool(
+            getattr(result, "stdout_truncated", False)
+            or getattr(result, "stderr_truncated", False)
+        )
+        if truncated:
+            output_str += WORKFLOW_OUTPUT_TRUNCATION_MARKER
 
-        if process.returncode != 0:
-            if cancelled_by_poller:
-                await _append_run_event(identity_mgr, agent_name, task_id, "run_cancelled", {"reason": "cancelled_mid_run"})
-                return "Cancelled."
-            raise RuntimeError(f"Script exited with status {process.returncode}:\n{output_str}")
+        if cancelled_by_poller:
+            await _append_run_event(
+                identity_mgr, agent_name, task_id, "run_cancelled",
+                {"reason": "cancelled_mid_run", "container_stopped": False},
+            )
+            return "Cancelled."
+
+        if result.exit_code != 0:
+            raise RuntimeError(f"Script exited with status {result.exit_code}:\n{output_str}")
+
+        if truncated:
+            # Visible in the run record, not just in the text: an operator reading the
+            # Workflows list must not believe a cut-off report is the whole output.
+            await _append_run_event(
+                identity_mgr, agent_name, task_id, "run_output_truncated",
+                {
+                    "stdout_truncated": bool(getattr(result, "stdout_truncated", False)),
+                    "stderr_truncated": bool(getattr(result, "stderr_truncated", False)),
+                    "output_chars": len(output_str),
+                },
+            )
 
         completed = await _record_run_state(
             identity_mgr,
@@ -742,7 +833,8 @@ async def run_background_script(
             {
                 "prompt": _truncate_output(prompt, max_chars=8192),
                 "user_id": user_id,
-                "output": _truncate_output(output_str.strip())
+                "output": _truncate_output(output_str.strip()),
+                "output_truncated": truncated,
             }
         )
 
@@ -834,7 +926,9 @@ async def run_background_agent(
         agent = await build_agent(agent_name)
 
         # 4. Execute the run with a concurrent cancellation monitor
-        async def _poll_for_agent_cancellation(agent_task_ref, check_interval: int = 15):
+        async def _poll_for_agent_cancellation(
+            agent_task_ref, check_interval: float = CANCELLATION_POLL_INTERVAL_S
+        ):
             if task_id == "unknown":
                 return
             while True:

@@ -27,6 +27,7 @@ from core.execution.spec import (
     declared_env_keys,
     manifest_digest,
     runtime_for,
+    workflow_network_mode,
 )
 from core.models import (
     ContainerLimits,
@@ -158,6 +159,46 @@ def test_mount_paths_cannot_escape_the_workspace(workspace, overrides):
 
     with pytest.raises(InvalidRequest):
         build(workspace, config, **overrides)
+
+
+def test_a_symlinked_suite_directory_is_refused(workspace, tmp_path):
+    """A relative path can still resolve outside: the bind source must be inside.
+
+    ``tools/<suite> -> /etc`` has no ``..`` in it, so the string check passes while the
+    container would get a directory the workspace never contained (Docker follows the
+    mount source).
+    """
+    outside = tmp_path / "outside-suite"
+    outside.mkdir()
+    (workspace.root / "tools" / "linked").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(InvalidRequest) as excinfo:
+        build(workspace, make_config(), suite_rel="tools/linked")
+
+    assert "outside the workspace" in excinfo.value.message
+
+
+def test_a_symlinked_shared_directory_is_refused(workspace, tmp_path):
+    (workspace.root / "shared").rmdir()
+    outside = tmp_path / "outside-shared"
+    outside.mkdir()
+    (workspace.root / "shared").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(InvalidRequest) as excinfo:
+        build(workspace, make_config())
+
+    assert "outside the workspace" in excinfo.value.message
+
+
+def test_a_symlink_inside_a_suite_is_not_a_mount_source(workspace, tmp_path):
+    """Only the source is checked; a symlink beneath it is a container concern."""
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (workspace.suite / "data").symlink_to(outside, target_is_directory=True)
+
+    spec = build(workspace, make_config())
+
+    assert spec.mounts[0].source == str(workspace.suite)
 
 
 # --------------------------------------------------------------------------- #
@@ -406,6 +447,22 @@ def test_egress_containers_get_no_resolv_conf_mount(workspace, declared):
 
     assert all(mount.target != "/etc/resolv.conf" for mount in spec.mounts)
     assert not (workspace.root / ".runner-dns").exists()
+
+
+@pytest.mark.parametrize(
+    "declared", [None, "", "egress", "allow", "internet", "internal", "none", "deny", "junk"]
+)
+def test_a_workflow_network_maps_exactly_like_a_tool_manifest(workspace, declared):
+    """One vocabulary, one mapping: workflow containers cannot drift from tools.
+
+    A workflow config is a raw registry document (no manifest model normalizes it),
+    so the same helper has to produce the same ``NetworkMode`` for both.
+    """
+    tool = build(workspace, make_config(network=declared)) if declared is not None else build(
+        workspace, make_config()
+    )
+
+    assert workflow_network_mode(declared) == tool.network_mode
 
 
 # --------------------------------------------------------------------------- #

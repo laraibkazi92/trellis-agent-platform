@@ -16,6 +16,11 @@ Network: there are no network profiles. A manifest either denies the network
 (``network: none``) or gets ordinary Docker egress on the **default bridge**,
 which is Docker's own default NetworkMode -- so an egress container carries no
 network override in its create payload at all.
+
+Workflows (``background_script``) are one container per run:
+:func:`build_workflow_spec` freezes the old taskiq-worker layout into mounts, with
+the pipeline's own directory as the working directory so relative paths keep
+working.
 """
 
 import hashlib
@@ -23,15 +28,24 @@ import json
 import os
 import shlex
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
+from pydantic import ValidationError
+
+from core.execution.contract import WORKFLOW_RUNTIMES as WORKFLOW_RUNTIME_NAMES
 from core.execution.env import (
     INVALID_ENV_NAME_HELP,
     declared_names,
     invalid_env_names,
     split_env,
 )
-from core.models import MCPConfig, ToolConfig, normalize_network_policy
+from core.models import (
+    MCPConfig,
+    ContainerLimits,
+    ToolConfig,
+    normalize_network_policy,
+    workflow_limits,
+)
 
 CONTAINER_WORKSPACE = "/app/workspace"
 CONTAINER_TMP = "/tmp"
@@ -72,6 +86,26 @@ RESTRICTED_ENV_VARS = frozenset(
 
 OUTPUT_DIRS = ("reports", "output")
 KNOWN_RUNTIMES = ("runsc", "runsc-variant", "runc")
+
+# Workflows live one directory per workflow, exactly like a tool suite or an MCP
+# server: ``workspace/workflows/<name>/`` is the pipeline's tree and, inside the
+# container, its working directory.
+WORKFLOW_DIR = "workflows"
+# runtime -> argv prefix. The vocabulary itself lives in ``core.execution.contract``
+# (the wire Literal); this map is built from it, so a runtime the contract accepts but
+# this map forgot fails at import instead of in a container that exits 127.
+_WORKFLOW_INTERPRETERS = {
+    # ``exec`` has none: the entrypoint itself is the command (a shebang script or a
+    # binary), which was the v0.7 worker's fallback.
+    "python": ["python3"],
+    "node": ["node"],
+    "bash": ["bash"],
+    "exec": [],
+}
+WORKFLOW_RUNTIMES: dict[str, list[str]] = {
+    name: _WORKFLOW_INTERPRETERS[name] for name in WORKFLOW_RUNTIME_NAMES
+}
+DEFAULT_WORKFLOW_RUNTIME = "python"
 
 # Manifest network policies. ``none`` means no network at all; ``egress`` means
 # normal Docker egress. Docker's default bridge is the only network whose DNS
@@ -163,6 +197,18 @@ def network_mode_for(config: Any) -> str:
     sent, so the create payload only ever names a network to take it away.
     """
     policy = normalize_network_policy(getattr(config, "network", None), "manifest")
+    return POLICY_NONE if policy == POLICY_NONE else DEFAULT_NETWORK_MODE
+
+
+def workflow_network_mode(network: Optional[str] = None) -> str:
+    """Docker ``NetworkMode`` for a workflow run: ``none`` or the default bridge.
+
+    Same vocabulary and same default as a tool/MCP manifest (``egress``), applied
+    again here so a runner handed a raw registry value cannot drift from
+    ``network_mode_for``. ``normalize_network_policy`` is idempotent, so a value the
+    caller already normalized warns once, not twice.
+    """
+    policy = normalize_network_policy(network, "workflow")
     return POLICY_NONE if policy == POLICY_NONE else DEFAULT_NETWORK_MODE
 
 
@@ -285,6 +331,19 @@ def _mcp_cmd(config: MCPConfig) -> list[str]:
     return argv
 
 
+def is_plain_relative(value: str) -> bool:
+    """True when ``value`` is a plain relative path: no absolute, no ``..``/empty parts.
+
+    The rule the runner applies to every manifest/caller-supplied path, exposed so the
+    registry sync can reject a workflow's ``entrypoint`` with the same test instead of
+    discovering it when the run starts.
+    """
+    text = str(value or "")
+    return bool(text) and not text.startswith("/") and not any(
+        part in ("", ".", "..") for part in text.split("/")
+    )
+
+
 def _relative_path(value: str, what: str) -> str:
     """Reject anything but a plain relative path (no absolute, no ``..``/empty parts).
 
@@ -294,11 +353,7 @@ def _relative_path(value: str, what: str) -> str:
     that resolves outside ``/app/workspace``.
     """
     text = str(value or "")
-    if (
-        not text
-        or text.startswith("/")
-        or any(part in ("", ".", "..") for part in text.split("/"))
-    ):
+    if not is_plain_relative(text):
         raise InvalidRequest(f"{what} must be a plain relative path: {text!r}")
     return text
 
@@ -326,6 +381,12 @@ def _append_mount(
     target = _relative_path(target_suffix, "mount target")
     local_path = os.path.join(workspace_root, rel)
     host_path = os.path.join(host_workspace, rel)
+    # Before anything is created: a plain relative path is not enough, because a
+    # symlink (``workspace/workflows/x -> /etc``) resolves outside the workspace and
+    # Docker follows the bind source. The check is on the mount SOURCE only -- a
+    # symlink *inside* a mounted tree is not a mount source and stays a container
+    # problem, not this one.
+    _require_inside_workspace(workspace_root, local_path, rel)
     if mkdir:
         try:
             os.makedirs(local_path, exist_ok=True)
@@ -345,6 +406,46 @@ def _append_mount(
     mount = Mount(host_path, f"{CONTAINER_WORKSPACE}/{target}", read_only)
     mounts.append(mount)
     return mount
+
+
+def _require_inside_workspace(
+    workspace_root: str, local_path: str, what: str
+) -> str:
+    """Refuse a path whose *real* location is outside the workspace.
+
+    :func:`_relative_path` only proves the string has no ``..``/absolute parts. A
+    symlink under the workspace (``workflows/<name>`` -> ``/``, ``tools/<suite>`` ->
+    ``/etc``) still passes that test while the bind mount would hand the container a
+    directory the workspace never contained. ``realpath`` resolves the existing part
+    of the path (the leaf may not exist yet for an output dir), so this catches a
+    symlinked ancestor as well.
+    """
+    real_root = os.path.realpath(workspace_root)
+    real_path = os.path.realpath(local_path)
+    try:
+        contained = os.path.commonpath([real_root, real_path]) == real_root
+    except ValueError:  # different drives / mixed absolute-relative: treat as escape
+        contained = False
+    if not contained:
+        raise InvalidRequest(
+            f"{what} resolves outside the workspace: {real_path} is not under {real_root}"
+        )
+    return local_path
+
+
+def _append_shared_mount(
+    mounts: list[Mount], workspace_root: str, host_workspace: str
+) -> None:
+    """Mount ``workspace/shared`` read-only, when it exists (tools and workflows).
+
+    Same rule as any other source, so it goes through the containment check instead
+    of appending a :class:`Mount` directly.
+    """
+    if not os.path.isdir(os.path.join(workspace_root, "shared")):
+        return
+    _append_mount(
+        mounts, workspace_root, host_workspace, "shared", "shared", read_only=True
+    )
 
 
 def _uid_gid() -> tuple[Optional[int], Optional[int]]:
@@ -420,14 +521,7 @@ def build_spec(
     _append_mount(
         mounts, workspace_root, host_workspace, suite_rel, suite_rel, read_only=True
     )
-    if os.path.isdir(os.path.join(workspace_root, "shared")):
-        mounts.append(
-            Mount(
-                os.path.join(host_workspace, "shared"),
-                f"{CONTAINER_WORKSPACE}/shared",
-                True,
-            )
-        )
+    _append_shared_mount(mounts, workspace_root, host_workspace)
 
     output_dirs = set(getattr(config, "output_dirs", None) or [])
     if kind == "tool" and agent:
@@ -531,4 +625,197 @@ def build_console_spec(
         labels=_labels("console", "console", run=run_id),
         user=_require_user(),
         kind="console",
+    )
+
+
+def _workflow_limits(
+    overrides: Optional[Mapping[str, Any]] = None,
+) -> tuple[int, float, int, int]:
+    """``(memory_mb, cpus, pids, tmpfs_mb)`` with workflow-sized defaults.
+
+    A workflow config names only the knobs it cares about; everything else keeps
+    :func:`core.models.workflow_limits` (4 GiB / 2 CPUs / 1024 pids / 1 GiB tmpfs),
+    so a partial block can never silently drop the pipeline to a single tool's
+    512 MiB. ``ContainerLimits`` re-checks the tmpfs-vs-memory ratio: tmpfs pages are
+    charged to the container's cgroup, so a tmpfs at the memory limit turns the
+    pipeline's first temp file into an OOM kill.
+    """
+    merged = workflow_limits().model_dump()
+    for key, value in (overrides or {}).items():
+        if value is None:
+            continue
+        merged[str(key)] = value
+    try:
+        limits = ContainerLimits(**merged)
+    except ValidationError as exc:
+        raise InvalidRequest(f"workflow limits are invalid: {exc}") from None
+    return limits.memory_mb, limits.cpus, limits.pids, limits.tmpfs_mb
+
+
+def _workflow_env(
+    requested: Mapping[str, str],
+    *,
+    run_id: Optional[str],
+    user_id: Optional[str],
+    user_email: Optional[str],
+) -> dict[str, str]:
+    """The pipeline's environment, before the container/preamble split.
+
+    ``requested`` is the workflow's own resolved credentials and variables --
+    declared keys only, resolved by the caller from the registry. The runner cannot
+    intersect with a manifest here (a workflow has none on disk), so it enforces the
+    two rules it does own: a reserved control-plane name is refused outright, and a
+    name no process environment can carry fails instead of being handed to a shim
+    that would reject the whole preamble line.
+    """
+    env = _base_env()
+    blocked = sorted(set(requested) & RESTRICTED_ENV_VARS)
+    if blocked:
+        raise InvalidRequest(f"env keys are reserved: {', '.join(blocked)}")
+    for key, value in requested.items():
+        if value is None:
+            continue
+        env[str(key)] = str(value)
+    env.update(
+        {
+            "HOME": CONTAINER_TMP,
+            "TMPDIR": CONTAINER_TMP,
+            "TMP": CONTAINER_TMP,
+            "TEMP": CONTAINER_TMP,
+        }
+    )
+    # Identity, not secrets: these stay in the container configuration so the
+    # pipeline and every tool it shells out to can attribute what they do.
+    if user_id:
+        env["TRELLIS_USER_ID"] = str(user_id)
+    if user_email:
+        env["TRELLIS_USER_EMAIL"] = str(user_email)
+    if run_id:
+        env["TRELLIS_RUN_ID"] = str(run_id)
+    _require_carriable_env_names(env)
+    return env
+
+
+def _workflow_cmd(
+    container_workflow: str,
+    entrypoint: str,
+    runtime: Optional[str],
+    args: Sequence[str],
+) -> list[str]:
+    """``[interpreter, <workflow dir>/<entrypoint>, *args]`` inside the container."""
+    runtime = runtime or DEFAULT_WORKFLOW_RUNTIME
+    prefix = WORKFLOW_RUNTIMES.get(str(runtime).strip().lower())
+    if prefix is None:
+        raise InvalidRequest(
+            f"unsupported workflow runtime {runtime!r} "
+            f"(expected {', '.join(sorted(WORKFLOW_RUNTIMES))})"
+        )
+    return [*prefix, f"{container_workflow}/{entrypoint}", *(str(a) for a in args)]
+
+
+def build_workflow_spec(
+    *,
+    name: str,
+    entrypoint: str,
+    env: Mapping[str, str],
+    host_workspace: str,
+    workspace_root: Optional[str] = None,
+    runtime: Optional[str] = None,
+    args: Sequence[str] = (),
+    tool_suites: Sequence[str] = (),
+    run_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    user_email: Optional[str] = None,
+    network: Optional[str] = None,
+    limits: Optional[Mapping[str, Any]] = None,
+    image: Optional[str] = None,
+    default_runtime: Optional[str] = None,
+) -> ContainerSpec:
+    """Spec for one ``background_script`` run: a whole pipeline in one container.
+
+    The mounts are the v0.7 taskiq-worker layout, frozen so the pipeline sees the
+    same paths it always did and reads only what it declared:
+
+    * ``workspace/workflows/<name>`` -- read-only. Also the container's working
+      directory, so a pipeline that uses relative paths keeps working.
+    * ``workspace/shared`` -- read-only, when it exists (same rule as a tool).
+    * ``workspace/tools/<suite>`` -- read-only, one per suite that contains a tool
+      the workflow declared in ``allowed_tools``. A tool that is *not* declared is
+      simply not on the filesystem, which is the whole enforcement for workflows:
+      no token, no hub round trip. Only local suites can be mounted -- an edge tool
+      or a central/edge MCP tool is a registry/network reference with no directory
+      here, so it mounts nothing (a workflow may still declare it for its token's
+      allowlist; it just will not find files for it).
+    * ``workspace/output/<name>`` and ``workspace/reports/<name>`` -- read-write,
+      created if missing, so a report tool writing ``reports/<name>/`` works.
+    * ``/tmp`` -- tmpfs, the only writable scratch space (rootfs is read-only).
+
+    ``tool_suites`` are plain suite directory names (``demo``), resolved by the
+    runner from the same manifest scan it uses for tool calls; this function never
+    reads a manifest.
+
+    Environment: the caller's declared credentials and variables go through the
+    Phase 5 split, so a secret is never in the create body. Network: ``none`` or
+    ``egress`` (default) from the workflow config. Limits: workflow defaults, with
+    whatever the config overrides.
+    """
+    name = _relative_path(name, "workflow name")
+    entrypoint = _relative_path(entrypoint, "workflow entrypoint")
+    workspace_root = workspace_root or host_workspace
+    workflow_rel = f"{WORKFLOW_DIR}/{name}"
+    container_workflow = f"{CONTAINER_WORKSPACE}/{workflow_rel}"
+
+    mounts: list[Mount] = []
+    _append_mount(
+        mounts, workspace_root, host_workspace, workflow_rel, workflow_rel,
+        read_only=True,
+    )
+    # Fail before a container exists: a typo in the entrypoint must be a 400 with
+    # the path the runner looked at, not an empty container that exits 2.
+    if not os.path.isfile(os.path.join(workspace_root, workflow_rel, entrypoint)):
+        raise InvalidRequest(
+            f"workflow {name!r} has no entrypoint {entrypoint!r} "
+            f"(looked at {workflow_rel}/{entrypoint})"
+        )
+
+    _append_shared_mount(mounts, workspace_root, host_workspace)
+
+    suite_rels = {
+        f"tools/{_relative_path(suite, 'tool suite')}" for suite in tool_suites
+    }
+    for rel in sorted(suite_rels):
+        _append_mount(mounts, workspace_root, host_workspace, rel, rel, read_only=True)
+
+    for output in OUTPUT_DIRS:
+        rel = f"{output}/{name}"
+        _append_mount(
+            mounts, workspace_root, host_workspace, rel, rel, read_only=False, mkdir=True
+        )
+
+    memory, cpus, pids, tmpfs_mb = _workflow_limits(limits)
+    merged = _workflow_env(
+        env, run_id=run_id, user_id=user_id, user_email=user_email
+    )
+    # One split at the end: declared credentials/variables ride the stdin preamble,
+    # never the container's configuration.
+    config_env, preamble = split_env(merged)
+
+    return ContainerSpec(
+        image=_image(image),
+        # A workflow has no manifest to pin a runtime; the deployment default
+        # (CONTAINER_DEFAULT_RUNTIME) applies, like a console container.
+        runtime=runtime_for(None, default_runtime),
+        cmd=_workflow_cmd(container_workflow, entrypoint, runtime, args),
+        working_dir=container_workflow,
+        env=config_env,
+        preamble_env=preamble,
+        mounts=mounts,
+        tmpfs={CONTAINER_TMP: tmpfs_mb},
+        memory_mb=memory,
+        cpus=cpus,
+        pids=pids,
+        network_mode=workflow_network_mode(network),
+        labels=_labels("workflow", name, run=run_id),
+        user=_require_user(),
+        kind="workflow",
     )

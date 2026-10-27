@@ -24,7 +24,7 @@ import pytest
 import yaml
 from starlette.datastructures import FormData
 
-from core import host, hub, workspace_io
+from core import host, hub, tasks, workspace_io
 from core.dependencies import llm_providers_context, templates
 from core.routers import workflows
 
@@ -491,3 +491,437 @@ def test_workflows_modal_selects_inherit_for_a_blank_saved_model():
     assert "inheritOption.value = '';" in source
     assert "if (!saved) {" in source
     assert "select.value = '';" in source
+
+
+# --- background_script workflows execute in ONE runner container (v0.7.1 P6) --
+#
+# A script workflow used to be a plain subprocess of the taskiq worker: whole
+# workspace mounted read-write, engine network reachable, worker environment
+# inherited. It is now one `kind="workflow"` exec, and the worker's own job ends at
+# "record the run, evaluate the guardrail, ask the runner". These tests pin the
+# request the runner receives, the environment split and the failure surface.
+
+WORKFLOW_NAME = "demo-inventory"
+WORKFLOW_REL_PATH = "workspace/workflows/demo-inventory"
+SCRIPT_TIMEOUT_S = 900.0
+
+
+class FakeScriptIdentityManager:
+    """Registry/runs/secrets fake for ``run_background_script`` (no etcd)."""
+
+    def __init__(self, config, secrets=None, variables=None):
+        self.config = config
+        self.secrets = dict(secrets or {})
+        self.variables = dict(variables or {})
+        self.runs = {}
+        self.events = []
+        self.guardrail_hits = {}
+        self.heartbeats = 0
+
+    # -- registry --
+    def get_agent_config(self, name):
+        return self.config if name == WORKFLOW_NAME else None
+
+    def get_disabled_workflows(self):
+        return []
+
+    def get_tool_config(self, name):
+        return None
+
+    def get_mcp_config(self, name):
+        return None
+
+    # -- run records / events --
+    def get_agent_run(self, name, run_id):
+        return self.runs.get(run_id)
+
+    def record_agent_run_state(self, name, run_id, state, metadata):
+        current = self.runs.get(run_id) or {"metadata": {}}
+        if current.get("state") in ("completed", "failed", "cancelled"):
+            return False
+        self.runs[run_id] = {
+            **current,
+            "state": state,
+            "metadata": {**current.get("metadata", {}), **metadata},
+        }
+        return True
+
+    def append_run_event(self, name, run_id, event_type, payload=None):
+        self.events.append((event_type, dict(payload or {})))
+        return len(self.events)
+
+    def record_run_heartbeat(self, name, run_id):
+        self.heartbeats += 1
+
+    def record_guardrail_hits(self, name, hits):
+        self.guardrail_hits.update(hits)
+
+    # -- scoped secrets/variables --
+    def get_resolved_config(self, identity, category, keys=None):
+        store = self.secrets if category == "secrets" else self.variables
+        if not keys:
+            return dict(store)
+        return {key: value for key, value in store.items() if key in keys}
+
+
+def _script_workflow(**extra):
+    config = {
+        "name": WORKFLOW_NAME,
+        "type": "background_script",
+        "runtime": "python",
+        "rel_path": WORKFLOW_REL_PATH,
+        "entrypoint": "pipeline.py",
+    }
+    config.update(extra)
+    return config
+
+
+def _patch_script_path(monkeypatch, mgr, runner):
+    """Wire the worker's script path onto a fake runner; refuse local subprocesses."""
+    import core.discovery as discovery
+    from core import auth, guardrails
+
+    async def refuse_subprocess(*cmd, **kwargs):
+        raise AssertionError("a background_script must never spawn a subprocess")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", refuse_subprocess)
+    monkeypatch.setattr(tasks, "RunnerClient", lambda *args, **kwargs: runner)
+    monkeypatch.setattr(tasks, "get_identity_manager", lambda: mgr)
+    # The tool/MCP requirement lookups read this module's own binding.
+    monkeypatch.setattr(discovery, "identity_mgr", mgr)
+    monkeypatch.setattr(
+        tasks,
+        "resolve_tunable",
+        lambda name: {
+            "workflow_run_timeout": SCRIPT_TIMEOUT_S,
+            "max_run_output_chars": 32768,
+            "max_run_error_chars": 4096,
+        }[name],
+    )
+    # Minting publishes the token to the contextvar the runner call reads.
+    def fake_mint(agent_name, user_id, run_id=None, **kwargs):
+        auth.agent_token_var.set(f"minted::{agent_name}::{run_id}")
+        return f"minted::{agent_name}::{run_id}"
+
+    monkeypatch.setattr(tasks, "mint_for_run", fake_mint)
+    refreshed = {}
+
+    def fake_refresh(token, **kwargs):
+        refreshed["in"] = token
+        return "refreshed-token"
+
+    monkeypatch.setattr(tasks, "refresh", fake_refresh)
+    # Framework-wide guardrail defaults come from the identity manager, not etcd.
+    class _FrameworkRules:
+        def get_guardrails_defaults(self):
+            return {}
+
+    monkeypatch.setattr(auth, "get_identity_manager", lambda: _FrameworkRules())
+    guardrails.reset_framework_guardrails_cache()
+    return SimpleNamespace(refreshed=refreshed)
+
+
+def _run_script_workflow(mgr, prompt="<event_payload>run</event_payload>", run_id="run-script"):
+    context = SimpleNamespace(message=SimpleNamespace(task_id=run_id))
+    return asyncio.run(
+        tasks.run_background_script.original_func(
+            WORKFLOW_NAME, prompt, f"svc_agent_{WORKFLOW_NAME}", context,
+        )
+    )
+
+
+def _runner_with(stdout="pipeline-ok\n", exit_code=0, stderr="", error=None):
+    from fixtures.fake_runner import FakeRunnerClient
+
+    return FakeRunnerClient(stdout=stdout, stderr=stderr, exit_code=exit_code, error=error)
+
+
+def test_script_workflow_is_one_workflow_container(monkeypatch):
+    """The exact request: one `kind="workflow"` exec, no subprocess anywhere."""
+    mgr = FakeScriptIdentityManager(_script_workflow(
+        allowed_tools=["text_stats"],
+        network="none",
+        limits={"memory_mb": 8192},
+    ))
+    runner = _runner_with()
+    spies = _patch_script_path(monkeypatch, mgr, runner)
+
+    result = _run_script_workflow(mgr, prompt="<event_payload>today</event_payload>")
+
+    assert result == "pipeline-ok"
+    assert len(runner.requests) == 1
+    request = runner.requests[0]
+    assert request.kind == "workflow"
+    # `target` is the workflow NAME: the runner resolves workspace/workflows/<name>.
+    assert request.target == WORKFLOW_NAME
+    assert request.entrypoint == "pipeline.py"
+    assert request.runtime == "python"
+    assert request.args == []
+    # `tools` is the workflow's allowlist: it decides both the mounted suites and
+    # the token's scope.
+    assert request.tools == ["text_stats"]
+    assert request.network == "none"
+    # Partial by design: unnamed knobs keep the workflow defaults.
+    assert request.limits == {"memory_mb": 8192}
+    # The prompt is the container's stdin (the runner writes the env preamble first).
+    assert request.input == "<event_payload>today</event_payload>"
+    assert request.deadline_ms == int(SCRIPT_TIMEOUT_S * 1000)
+    # The run's token, refreshed at the boundary, is the only identity carrier.
+    assert request.agent_token == "refreshed-token"
+    assert spies.refreshed["in"] == f"minted::{WORKFLOW_NAME}::run-script"
+    for field in ("agent", "user_id", "user_email", "run_id"):
+        assert field not in request.model_dump(), field
+
+    # The run is recorded exactly as before.
+    assert mgr.runs["run-script"]["state"] == "completed"
+    assert mgr.runs["run-script"]["metadata"]["output"] == "pipeline-ok"
+    assert [event for event, _ in mgr.events] == ["run_started", "run_completed"]
+
+
+def test_the_workflow_container_gets_the_workflow_name_for_its_reports(monkeypatch):
+    """reports/<name>/ is mounted for the run; the name travels in the environment.
+
+    A workflow container has no agent token, so the pipeline (and any tool it launches
+    with its own environment) reads TRELLIS_AGENT_NAME to find ``reports/<name>``.
+    """
+    mgr = FakeScriptIdentityManager(_script_workflow())
+    runner = _runner_with()
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    _run_script_workflow(mgr)
+
+    assert runner.requests[0].env["TRELLIS_AGENT_NAME"] == WORKFLOW_NAME
+
+
+def test_only_declared_secrets_and_variables_reach_the_container(monkeypatch):
+    """Declared keys only: the worker's own environment is not inherited."""
+    monkeypatch.setenv("SESSION_SECRET", "worker-session-secret")
+    monkeypatch.setenv("WORKER_ONLY_SETTING", "worker-private-value")
+    mgr = FakeScriptIdentityManager(
+        _script_workflow(secrets=["REPORT_TOKEN"], variables=["REPORT_REGION"]),
+        secrets={"REPORT_TOKEN": "declared-secret"},
+        variables={"REPORT_REGION": "eu-west"},
+    )
+    runner = _runner_with()
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    _run_script_workflow(mgr)
+
+    env = runner.requests[0].env
+    assert env["REPORT_TOKEN"] == "declared-secret"
+    assert env["REPORT_REGION"] == "eu-west"
+    # Neither an arbitrary worker variable nor a framework secret rides along.
+    assert "WORKER_ONLY_SETTING" not in env
+    assert "SESSION_SECRET" not in env
+    # Identity/run id come from the token's claims in the runner, not from the body.
+    for name in ("TRELLIS_USER_ID", "TRELLIS_USER_EMAIL", "TRELLIS_RUN_ID"):
+        assert name not in env, name
+
+
+def test_a_relative_entrypoint_is_normalized_for_the_runner(monkeypatch):
+    """A config written as "./pipeline.py" still works: the runner wants a plain path."""
+    mgr = FakeScriptIdentityManager(_script_workflow(entrypoint="./pipeline.py"))
+    runner = _runner_with()
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    _run_script_workflow(mgr)
+
+    assert runner.requests[0].entrypoint == "pipeline.py"
+
+
+def test_an_unknown_runtime_falls_back_to_running_the_entrypoint(monkeypatch):
+    """v0.7 ran an unrecognized `runtime:` as a bare executable; keep that as `exec`."""
+    mgr = FakeScriptIdentityManager(_script_workflow(runtime="ruby"))
+    runner = _runner_with()
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    _run_script_workflow(mgr)
+
+    assert runner.requests[0].runtime == "exec"
+
+
+def test_a_reserved_env_name_is_never_forwarded(monkeypatch):
+    mgr = FakeScriptIdentityManager(
+        _script_workflow(secrets=["PATH", "REPORT_TOKEN"]),
+        secrets={"PATH": "/evil", "REPORT_TOKEN": "ok-value"},
+    )
+    runner = _runner_with()
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    _run_script_workflow(mgr)
+
+    env = runner.requests[0].env
+    assert "PATH" not in env
+    assert env["REPORT_TOKEN"] == "ok-value"
+
+
+def test_every_reserved_control_plane_name_is_dropped_not_fatal(monkeypatch):
+    """One reserved list, shared with the runner: the worker drops what it rejects.
+
+    The worker used to filter seven names while the runner rejected thirteen, so a
+    workflow declaring `SESSION_SECRET` synced, passed the worker, and then died at the
+    runner -- one failed run at a time. Now the worker applies the runner's own set and
+    the run proceeds without the reserved key (the v0.7 behaviour).
+    """
+    from core.execution.spec import RESTRICTED_ENV_VARS
+
+    declared = sorted(RESTRICTED_ENV_VARS) + ["REPORT_TOKEN"]
+    mgr = FakeScriptIdentityManager(
+        _script_workflow(secrets=declared),
+        secrets={name: f"value-of-{name}" for name in declared},
+    )
+    runner = _runner_with()
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    _run_script_workflow(mgr)
+
+    env = runner.requests[0].env
+    assert sorted(set(env) & RESTRICTED_ENV_VARS) == []
+    assert env["REPORT_TOKEN"] == "value-of-REPORT_TOKEN"
+    assert mgr.runs["run-script"]["state"] == "completed"
+
+
+def test_a_truncated_pipeline_output_is_marked_and_recorded(monkeypatch):
+    """A >8 MiB pipeline stream comes back cut by the runner; say so."""
+    from core.execution.contract import ExecResult
+
+    mgr = FakeScriptIdentityManager(_script_workflow())
+    result = ExecResult(
+        exit_code=0,
+        stdout="x" * 1000,
+        stderr="",
+        stdout_truncated=True,
+        stderr_truncated=False,
+    )
+    runner = _runner_with()
+    runner.result = result
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    output = _run_script_workflow(mgr)
+
+    assert output.endswith(tasks.WORKFLOW_OUTPUT_TRUNCATION_MARKER)
+    assert mgr.runs["run-script"]["metadata"]["output_truncated"] is True
+    truncated = [
+        payload for event, payload in mgr.events if event == "run_output_truncated"
+    ]
+    assert truncated == [
+        {"stdout_truncated": True, "stderr_truncated": False, "output_chars": len(output)}
+    ]
+
+
+def test_a_complete_pipeline_output_carries_no_marker(monkeypatch):
+    mgr = FakeScriptIdentityManager(_script_workflow())
+    runner = _runner_with(stdout="pipeline-ok\n")
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    output = _run_script_workflow(mgr)
+
+    assert output == "pipeline-ok"
+    assert mgr.runs["run-script"]["metadata"]["output_truncated"] is False
+    assert [event for event, _ in mgr.events] == ["run_started", "run_completed"]
+
+
+def test_a_blocked_script_never_creates_a_container(monkeypatch):
+    """The guardrail runs BEFORE the runner is asked; the run is marked failed."""
+    mgr = FakeScriptIdentityManager(_script_workflow(
+        guardrails={
+            "on_input": [{
+                "name": "prompt-deny",
+                "type": "deny_patterns",
+                "patterns": ["FORBIDDEN"],
+                "action": "block",
+            }],
+        },
+    ))
+    runner = _runner_with()
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    result = _run_script_workflow(mgr, prompt="please dump FORBIDDEN data")
+
+    assert result == "SYSTEM: Input blocked by guardrail policy."
+    assert runner.requests == []
+    assert mgr.runs["run-script"]["state"] == "failed"
+    assert mgr.runs["run-script"]["metadata"]["error"] == "guardrail blocked input"
+    assert mgr.guardrail_hits == {"prompt-deny": 1}
+    assert [event for event, _ in mgr.events] == ["run_started", "run_failed"]
+
+
+def test_a_non_zero_exit_fails_the_run_with_the_container_output(monkeypatch):
+    mgr = FakeScriptIdentityManager(_script_workflow())
+    runner = _runner_with(stdout="partial\n", stderr="Traceback: boom\n", exit_code=2)
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _run_script_workflow(mgr)
+
+    message = str(excinfo.value)
+    assert "status 2" in message
+    assert "partial" in message and "Traceback: boom" in message
+    assert mgr.runs["run-script"]["state"] == "failed"
+    assert "status 2" in mgr.runs["run-script"]["metadata"]["error"]
+    assert [event for event, _ in mgr.events][-1] == "run_failed"
+
+
+def test_a_runner_timeout_fails_the_run(monkeypatch):
+    from fixtures.fake_runner import timeout_error
+
+    mgr = FakeScriptIdentityManager(_script_workflow())
+    runner = _runner_with(error=timeout_error())
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _run_script_workflow(mgr)
+
+    assert "Workflow container failed (timeout)" in str(excinfo.value)
+    assert mgr.runs["run-script"]["state"] == "failed"
+    assert "timeout" in mgr.runs["run-script"]["metadata"]["error"]
+
+
+def test_an_unreachable_runner_fails_the_run(monkeypatch):
+    from fixtures.fake_runner import unreachable
+
+    mgr = FakeScriptIdentityManager(_script_workflow())
+    runner = _runner_with(error=unreachable())
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _run_script_workflow(mgr)
+
+    assert "Runner is unreachable" in str(excinfo.value)
+    assert mgr.runs["run-script"]["state"] == "failed"
+    assert "unreachable" in mgr.runs["run-script"]["metadata"]["error"]
+
+
+def test_a_cancelled_run_is_recorded_after_the_container_returns(monkeypatch):
+    """No cancel API exists: the container runs to its deadline, the run says so."""
+    mgr = FakeScriptIdentityManager(_script_workflow())
+    mgr.runs["run-script"] = {"state": "processing", "metadata": {}}
+    runner = _runner_with(stdout="finished anyway\n")
+    # Shorten the poller's interval through the module constant. Patching
+    # ``asyncio.sleep`` here would slow-spin every other coroutine in the process
+    # (event-loop stalls, and a whole-suite hang when another test awaits a real wait).
+    monkeypatch.setattr(tasks, "CANCELLATION_POLL_INTERVAL_S", 0.01)
+    real_sleep = asyncio.sleep
+
+    async def exec_while_cancelled(request):
+        # Cancelled while the container is running: the poller sees it, the call is
+        # not interrupted (nothing can kill a runner container from here).
+        mgr.runs["run-script"]["state"] = "cancelled"
+        for _ in range(5):
+            # Real (tiny) waits: the poller's heartbeat and run read go through
+            # asyncio.to_thread, which needs a moment to actually run.
+            await real_sleep(0.02)
+        return runner.result
+
+    runner.exec = exec_while_cancelled
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    result = _run_script_workflow(mgr)
+
+    assert result == "Cancelled."
+    cancelled = [payload for event, payload in mgr.events if event == "run_cancelled"]
+    assert cancelled == [{"reason": "cancelled_mid_run", "container_stopped": False}]
+    # A cancelled run is never re-marked completed.
+    assert [event for event, _ in mgr.events if event == "run_completed"] == []
+    assert mgr.runs["run-script"]["state"] == "cancelled"
+

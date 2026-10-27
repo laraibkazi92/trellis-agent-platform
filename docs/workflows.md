@@ -6,9 +6,12 @@ Background Workflows are asynchronous tasks that run without direct human intera
 > `runner` container, and a workflow's per-manifest `network:` is only `egress` (the
 > default: Docker's default bridge) or `none` — the `internal`/`internet`/`allow` profile
 > names load as `egress` with one deprecation warning per value, and
-> `SANDBOX_BACKEND`/`TRELLIS_INTERNAL_CIDRS` no longer exist. Script workflows still run
-> their tools as subprocesses today; moving each run into one sandboxed container is
-> tracked for this release, as is the full rewrite of this page. Cross-check with
+> `SANDBOX_BACKEND`/`TRELLIS_INTERNAL_CIDRS` no longer exist. A `background_script` run is
+> now ONE sandboxed `runner` container (the workflow dir, `shared/` and only the tool
+> suites its `allowed_tools` names, read-only; `output/<name>` and `reports/<name>`
+> read-write; a `/tmp` tmpfs), and it sees only the secrets/variables it declares. See
+> [upgrading.md → v0.7.1](upgrading.md#background_script-workflows-run-in-one-sandboxed-container-per-run).
+> A full rewrite of this page is tracked for the same release. Cross-check with
 > [upgrading.md → v0.7.1](upgrading.md#v071--in-development-breaking).
 
 ---
@@ -72,11 +75,16 @@ trigger:
   expression: "0 18 * * *"   # Daily at 6:00 PM UTC
 ```
 
-The `pipeline.py` is a **standard Python script** — not an agent, not stdin/stdout JSON. It runs as a normal process with access to all environment variables injected for the `background` secret context.
+The `pipeline.py` is a **standard Python script** — not an agent, not stdin/stdout JSON. It runs as a normal process inside ONE sandboxed `runner` container per run, with access to exactly the secrets and variables it declares (nothing is inherited from the worker).
+
+`allowed_tools` is optional here and it is a **mount list**, not a per-call gate: only the
+suites holding the tools it names are mounted (read-only). A suite with none of them is
+absent from the container; a tool that shares a suite with a listed one is still present
+and still runnable.
 
 The rendered trigger payload is evaluated against the workflow's `guardrails` before the script
 starts, exactly like a `background_agent`'s input: a blocking rule marks the run `failed`
-(`guardrail blocked input`) and the process is never spawned. The rule format is the same one
+(`guardrail blocked input`) and no container is ever created. The rule format is the same one
 documented for agents in the [Agent Guide](agents.md). Two consequences worth knowing: rules in
 `/config/framework/guardrails_defaults` apply here too (a workflow with no `guardrails` key is
 not exempt), and a `redact` rule rewrites the payload the script receives — scripts parse their
@@ -133,7 +141,7 @@ version: 0.1.0                   # Required. Semantic version.
 author: user@example.com         # Required.
 description: "Does X on schedule." # Required.
 type: background_script          # Required. One of: background_script, background_agent.
-runtime: python                  # Required for background_script. One of: python, ts, go, bash.
+runtime: python                  # Required for background_script. One of: python, node, bash, exec.
 entrypoint: pipeline.py          # Required for background_script. Main file to execute.
 model: gemini-3-flash-preview    # Required for background_agent. LLM model identifier.
 thinking_level: low              # Required for background_agent. One of: none, low, medium, high.

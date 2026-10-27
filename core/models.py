@@ -324,6 +324,18 @@ def mcp_limits() -> "ContainerLimits":
     return ContainerLimits(memory_mb=2048, cpus=2.0, pids=512, tmpfs_mb=512)
 
 
+def workflow_limits() -> "ContainerLimits":
+    """Defaults for one ``background_script`` workflow container.
+
+    A workflow is not one tool: it runs an interpreter plus the tools it shells out
+    to and writes its report, all in the same container, so it gets 4 GiB / 2 CPUs /
+    1024 pids / 1 GiB tmpfs -- eight times a tool's memory (4096 vs 512) and eight
+    times its tmpfs (1024 vs 128). A workflow config may lower or raise any of these;
+    only the fields it names.
+    """
+    return ContainerLimits(memory_mb=4096, cpus=2.0, pids=1024, tmpfs_mb=1024)
+
+
 # Manifest network policy. Exactly two values: ``none`` (no network at all) and
 # ``egress`` (ordinary Docker egress on the default bridge).
 DEFAULT_NETWORK_POLICY = "egress"
@@ -352,6 +364,12 @@ def reset_network_policy_warnings() -> None:
     """Forget which deprecations were already logged (tests only)."""
     with _WARNED_NETWORK_POLICY_LOCK:
         _WARNED_NETWORK_POLICIES.clear()
+
+
+# Every accepted ``network:`` value: the two real policies plus the v0.6 aliases that
+# still normalize (with one deprecation warning each). Anything else is a manifest bug
+# -- the loaders normalize it to ``none`` with a warning, and db-sync refuses it.
+KNOWN_NETWORK_POLICIES = frozenset({"none", "egress"}) | frozenset(_LEGACY_NETWORK_ALIASES)
 
 
 def _warn_once(value: str, message: str, *args: Any) -> None:

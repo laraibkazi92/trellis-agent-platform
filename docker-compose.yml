@@ -416,10 +416,10 @@ services:
     image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.0}
     container_name: taskiq-worker
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
-    # NOTE: no `env_file: .env` here on purpose. The worker copies os.environ into
-    # every background-script subprocess it spawns (core/tasks.py), so loading the
-    # whole .env would hand those scripts every framework secret it holds. Only the
-    # variables the worker actually needs are passed explicitly below.
+    # NOTE: no `env_file: .env` here on purpose. A background run resolves only the
+    # secrets/variables its workflow declared and hands those to the runner; the
+    # worker's own environment is never inherited by anything that runs code. Only
+    # the variables the worker actually needs are passed explicitly below.
     environment:
       <<: *common-env
       HOST_URL: http://host:8000
@@ -431,7 +431,8 @@ services:
       # Decrypts identity-scoped secrets for background agents/scripts.
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
       SESSION_SECRET: ${SESSION_SECRET:-}
-      # v0.6: background agents that call local tools go through the runner socket.
+      # The control socket: background agents' tool calls AND background-script
+      # workflows execute in runner containers, never in this process.
       RUNNER_SOCKET: ${RUNNER_SOCKET:-/run/trellis/runner.sock}
       RUNNER_TOKEN: ${RUNNER_TOKEN:-}
       # Phase 3: the worker mints `svc_agent_<name>` tokens per background run.
@@ -439,8 +440,18 @@ services:
       ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
       # The ONE tool-authorization switch (v0.7.1): off | shadow | enforce.
       TOOL_ACCESS_MODE: ${TOOL_ACCESS_MODE:-enforce}
+      # Env-var default the worker reads for a workflow container's deadline; Admin UI
+      # (etcd) overrides still win. Without this pass-through the worker always used the
+      # built-in 3600 s and WORKFLOW_RUN_TIMEOUT in .env had no effect.
+      WORKFLOW_RUN_TIMEOUT: ${WORKFLOW_RUN_TIMEOUT:-}
     volumes:
-      - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace
+      # The workspace is READ-ONLY for the worker since v0.7.1: background scripts run
+      # in runner containers, and a background agent's `execute` shell does too. The
+      # one exception is `reports/` -- the in-process console file tools
+      # (read_file/write_file/edit_file, rooted at reports/<agent> by
+      # core/agent_factory.build_agent) still run here.
+      - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace:ro
+      - ${TRELLIS_WORKSPACE_DIR:-./workspace}/reports:/app/workspace/reports:rw
       - runner-run:/run/trellis
     command: taskiq worker core.tasks:broker --workers 2
     depends_on:
@@ -466,7 +477,9 @@ services:
       <<: *common-env
       REDIS_URL: redis://redis:6379/0
     volumes:
-      - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace
+      # Read-only: the scheduler only enqueues jobs (the worker runs them). It never
+      # spawns a subprocess and never decrypts a secret, so it has no reason to write.
+      - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace:ro
     command: taskiq scheduler core.tasks:scheduler
     depends_on:
       etcd:

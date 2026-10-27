@@ -277,3 +277,129 @@ def test_configure_background_agent_secrets_plain_required_secret_unchanged(monk
 
     saved_secrets = fake_mgr._identity_secrets.get("plain-workflow", {})
     assert saved_secrets.get("SOME_REQUIRED_SECRET") == "the-secret-value"
+
+
+# --- v0.7.1 Phase 6: the aggregated requirement set IS the container's env -------
+#
+# `discovery.get_agent_required_secrets/_variables` is what the workflow UI gates
+# configuration on. Since a background script now runs in a runner container that
+# inherits nothing, that same aggregated set is exactly (and only) what the pipeline
+# sees -- the two must not drift.
+
+RUNNER_WORKFLOW = "runner-workflow"
+
+RUNNER_TOOL_CONFIG = {
+    "name": "netctl",
+    "secrets": ["TOOL_REQUIRED_SECRET"],
+    "variables": ["TOOL_ENDPOINT"],
+    # Optional and grouped keys are informational for configuration: they are never
+    # injected, so a pipeline must not silently start seeing them.
+    "optional_secrets": ["TOOL_OPTIONAL_SECRET"],
+    "secret_groups": NETCTL_LIKE_TOOL_CONFIG["secret_groups"],
+}
+
+RUNNER_WORKFLOW_CONFIG = {
+    "name": RUNNER_WORKFLOW,
+    "type": "background_script",
+    "runtime": "python",
+    "rel_path": "workspace/workflows/demo-inventory",
+    "entrypoint": "pipeline.py",
+    "allowed_tools": ["netctl"],
+    "secrets": ["WORKFLOW_SECRET"],
+    "variables": ["WORKFLOW_VARIABLE"],
+}
+
+
+class FakeIdentityManagerRunner(FakeIdentityManagerWorkflows):
+    """The discovery fake plus the run-record / secret surface the worker uses."""
+
+    def __init__(self, secrets=None, variables=None, **kwargs):
+        super().__init__(**kwargs)
+        self._secrets = dict(secrets or {})
+        self._variables = dict(variables or {})
+        self.runs = {}
+        self.events = []
+
+    def get_agent_config(self, name):
+        return self._agent_configs.get(name)
+
+    def get_resolved_config(self, identity, category, keys=None):
+        store = self._secrets if category == "secrets" else self._variables
+        return {k: v for k, v in store.items() if not keys or k in keys}
+
+    def get_agent_run(self, name, run_id):
+        return self.runs.get(run_id)
+
+    def record_agent_run_state(self, name, run_id, state, metadata):
+        self.runs[run_id] = {"state": state, "metadata": dict(metadata)}
+        return True
+
+    def append_run_event(self, name, run_id, event_type, payload=None):
+        self.events.append(event_type)
+        return len(self.events)
+
+    def record_run_heartbeat(self, name, run_id):
+        return None
+
+
+def test_the_aggregated_requirement_set_is_the_workflow_container_environment(monkeypatch):
+    from fixtures.fake_runner import FakeRunnerClient
+    from core import auth, guardrails, tasks
+
+    fake_mgr = FakeIdentityManagerRunner(
+        agent_configs={RUNNER_WORKFLOW: RUNNER_WORKFLOW_CONFIG},
+        tool_configs={"netctl": RUNNER_TOOL_CONFIG},
+        secrets={
+            "WORKFLOW_SECRET": "workflow-secret-value",
+            "TOOL_REQUIRED_SECRET": "tool-secret-value",
+            # Configured but not injectable: optional/grouped keys stay out.
+            "TOOL_OPTIONAL_SECRET": "not-injected",
+            "EXAMPLE-API_STAGING_USERNAME": "not-injected",
+            "EXAMPLE-API_STAGING_PASSWORD": "not-injected",
+        },
+        variables={"WORKFLOW_VARIABLE": "from-workflow", "TOOL_ENDPOINT": "https://api.test"},
+    )
+    runner = FakeRunnerClient(stdout="ok\n")
+
+    monkeypatch.setattr(discovery, "identity_mgr", fake_mgr)
+    monkeypatch.setattr(tasks, "get_identity_manager", lambda: fake_mgr)
+    monkeypatch.setattr(tasks, "RunnerClient", lambda *a, **k: runner)
+    monkeypatch.setattr(tasks, "mint_for_run", lambda *a, **k: "token")
+    monkeypatch.setattr(tasks, "refresh", lambda token, **kw: "token")
+    monkeypatch.setattr(
+        tasks,
+        "resolve_tunable",
+        # Types matter: max_run_output_chars/max_run_error_chars are ints (one slices a
+        # string with them), workflow_run_timeout is a float. A blanket `600.0` made the
+        # error path raise TypeError and masked the assertion it was there to make.
+        lambda name: {
+            "workflow_run_timeout": 600.0,
+            "max_run_output_chars": 32768,
+            "max_run_error_chars": 4096,
+        }[name],
+    )
+    # Framework-wide guardrail defaults come from the identity manager, not etcd.
+    monkeypatch.setattr(
+        auth, "get_identity_manager",
+        lambda: SimpleNamespace(get_guardrails_defaults=lambda: {}),
+    )
+    guardrails.reset_framework_guardrails_cache()
+
+    context = SimpleNamespace(message=SimpleNamespace(task_id="run-1"))
+    asyncio.run(
+        tasks.run_background_script.original_func(
+            RUNNER_WORKFLOW, "<event_payload/>", f"svc_agent_{RUNNER_WORKFLOW}", context,
+        )
+    )
+
+    assert len(runner.requests) == 1
+    env = runner.requests[0].env
+    assert env["WORKFLOW_SECRET"] == "workflow-secret-value"
+    assert env["TOOL_REQUIRED_SECRET"] == "tool-secret-value"
+    assert env["WORKFLOW_VARIABLE"] == "from-workflow"
+    assert env["TOOL_ENDPOINT"] == "https://api.test"
+    # The same aggregation the UI gates on decides what is injected.
+    assert "TOOL_OPTIONAL_SECRET" not in env
+    assert "EXAMPLE-API_STAGING_USERNAME" not in env
+    assert "EXAMPLE-API_STAGING_PASSWORD" not in env
+

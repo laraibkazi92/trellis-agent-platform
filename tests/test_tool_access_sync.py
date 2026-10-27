@@ -258,3 +258,120 @@ def test_a_bad_mcp_env_block_key_fails_the_sync(tmp_path, monkeypatch, capsys):
     assert len(errors) == 1
     assert "my-key" in errors[0]
     assert "mcp 'demo'" in errors[0]
+
+
+# --------------------------------------------------------------------------- #
+# Workflow manifest keys (scripts/sync_to_db.py)
+# --------------------------------------------------------------------------- #
+# A workflow config is an unvalidated registry document: a misspelled `limits` knob,
+# an unknown `runtime` or a missing `entrypoint` used to sync happily and fail a
+# scheduled run hours later. The sync refuses it before any write, like env names.
+
+
+def _workflow_workspace(tmp_path, monkeypatch, config_text, *, pipeline=True):
+    workspace = tmp_path / "workspace"
+    wf = workspace / "workflows" / "demo"
+    wf.mkdir(parents=True)
+    if pipeline:
+        (wf / "pipeline.py").write_text("print('{}')\n")
+    (wf / "config.yaml").write_text(config_text)
+    monkeypatch.setattr(sync_to_db, "WORKFLOWS_DIR", workspace / "workflows")
+    # Keep the other validation passes out of the way.
+    monkeypatch.setattr(sync_to_db, "TOOLS_DIR", workspace / "tools")
+    monkeypatch.setattr(sync_to_db, "MCPS_DIR", workspace / "mcps")
+    return workspace
+
+
+GOOD_WORKFLOW = """\
+name: demo
+type: background_script
+runtime: python
+entrypoint: pipeline.py
+network: egress
+limits:
+  memory_mb: 8192
+"""
+
+
+def test_a_bad_workflow_limits_key_fails_the_sync(tmp_path, monkeypatch, capsys):
+    _workflow_workspace(
+        tmp_path,
+        monkeypatch,
+        GOOD_WORKFLOW.replace("memory_mb: 8192", "memmory_mb: 8192"),
+    )
+    manager = FakeManager()
+    monkeypatch.setattr(sync_to_db, "IdentityManager", lambda **_kwargs: manager)
+    policy = tmp_path / "tool_access.yaml"
+    policy.write_text("rules: []\n")
+    monkeypatch.setattr(sync_to_db, "TOOL_ACCESS_POLICY_PATH", policy)
+
+    assert sync_to_db.main([]) == 2
+
+    out = capsys.readouterr().out
+    assert "REFUSING TO SYNC" in out
+    assert "memmory_mb" in out
+    assert "memory_mb" in out
+    # No workflow/agent config reached the registry: the sync aborted before the
+    # write pass (only the policy, published earlier, was written).
+    assert not [
+        key for key, _value in manager.client.puts if "/registry/agents/" in key
+    ]
+
+
+def test_a_good_workflow_manifest_passes_validation(tmp_path, monkeypatch):
+    _workflow_workspace(tmp_path, monkeypatch, GOOD_WORKFLOW)
+
+    assert sync_to_db.validate_workflow_manifests() == []
+
+
+@pytest.mark.parametrize(
+    "old,new,expected",
+    [
+        ("runtime: python", "runtime: ts", "runtime 'ts'"),
+        ("entrypoint: pipeline.py", "entrypoint: /etc/passwd", "plain relative path"),
+        ("entrypoint: pipeline.py", "entrypoint: run.py", "does not exist"),
+        ("network: egress", "network: internal-network", "network 'internal-network'"),
+        ("memory_mb: 8192", "memory_mb: 512", "limits are invalid"),
+    ],
+)
+def test_an_invalid_workflow_value_is_rejected(tmp_path, monkeypatch, old, new, expected):
+    _workflow_workspace(tmp_path, monkeypatch, GOOD_WORKFLOW.replace(old, new))
+
+    errors = sync_to_db.validate_workflow_manifests()
+
+    assert len(errors) == 1
+    assert expected in errors[0]
+    assert errors[0].startswith("workflow 'demo'")
+
+
+def test_a_legacy_workflow_network_alias_still_syncs(tmp_path, monkeypatch):
+    """`internal`/`allow` mean egress since v0.7.1; deprecation is a warning, not a stop."""
+    _workflow_workspace(
+        tmp_path, monkeypatch, GOOD_WORKFLOW.replace("network: egress", "network: internal")
+    )
+
+    assert sync_to_db.validate_workflow_manifests() == []
+
+
+def test_a_background_agent_is_not_held_to_container_keys(tmp_path, monkeypatch):
+    """`runtime`/`entrypoint`/`limits` mean nothing to an LLM workflow."""
+    _workflow_workspace(
+        tmp_path,
+        monkeypatch,
+        "name: demo\ntype: background_agent\nruntime: nonsense\nlimits:\n  nope: 1\n",
+    )
+
+    assert sync_to_db.validate_workflow_manifests() == []
+
+
+def test_an_allowed_tools_that_is_not_a_list_is_rejected(tmp_path, monkeypatch):
+    _workflow_workspace(
+        tmp_path,
+        monkeypatch,
+        GOOD_WORKFLOW + "allowed_tools: text_stats\n",
+    )
+
+    errors = sync_to_db.validate_workflow_manifests()
+
+    assert len(errors) == 1
+    assert "allowed_tools" in errors[0]

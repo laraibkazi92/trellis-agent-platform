@@ -10,7 +10,7 @@
 name: demo-inventory
 version: 0.1.0
 author: trellis@example.com
-description: "Example workflow: prints an inventory of the workspace (agents, tools, workflows, and MCP servers) on a daily schedule."
+description: "Example workflow: prints the mount and environment inventory a workflow container can actually see (its own tree, shared/, declared tool suites, reports/, output/ and its declared env), on a daily schedule."
 type: background_script
 runtime: python
 entrypoint: pipeline.py

@@ -38,6 +38,10 @@ TUNABLES: dict[str, Tunable] = {
     "max_run_output_chars": Tunable("MAX_RUN_OUTPUT_CHARS", 32768, int),
     "max_run_error_chars": Tunable("MAX_RUN_ERROR_CHARS", 4096, int),
     "tool_execution_timeout": Tunable("TOOL_EXECUTION_TIMEOUT", 300.0, float),
+    # One `background_script` run is ONE container (v0.7.1 Phase 6): this is both the
+    # deadline the runner kills it at and the worker's own wait, so it has to outlast
+    # a real pipeline -- a tool's 300 s default would cut most of them off.
+    "workflow_run_timeout": Tunable("WORKFLOW_RUN_TIMEOUT", 3600.0, float),
     "tool_search_limit": Tunable("TOOL_SEARCH_LIMIT", 8, int),
     "agent_search_limit": Tunable("AGENT_SEARCH_LIMIT", 8, int),
     "health_failure_threshold": Tunable("HEALTH_FAILURE_THRESHOLD", 10, int),

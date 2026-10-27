@@ -12,15 +12,35 @@ They never describe an image, mount, capability, runtime or network: the runner
 derives all of that from the manifest on disk (``core.execution.spec``).
 """
 
-from typing import Literal, Optional
+from typing import Literal, Optional, get_args
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from core.models import normalize_network_policy
 
 # ``tool``      one-shot tool run (stdin JSON -> stdout JSON)
 # ``console``   ``bash -lc <command>`` in a scratch workspace
 # ``mcp_session`` long-lived stdio MCP server, driven over /sessions/{id}
 # ``discovery`` one-shot MCP discovery (same transport, torn down after)
-ExecKind = Literal["tool", "console", "mcp_session", "discovery"]
+# ``workflow``  one ``background_script`` pipeline in a sandboxed container
+ExecKind = Literal["tool", "console", "mcp_session", "discovery", "workflow"]
+
+# How a workflow's entrypoint is started inside its container. ``exec`` runs the
+# file as given (a shebang script or a binary) -- the v0.7 worker's fallback for an
+# unknown runtime, kept as an explicit choice instead of a silent default.
+#
+# This Literal is the ONE definition of the vocabulary; ``WORKFLOW_RUNTIMES`` below is
+# derived from it, so the runner's argv map (``core.execution.spec``) and the worker's
+# config check (``core.tasks``) import the same names instead of keeping copies that
+# drift (the pre-release docs advertised python/ts/go/bash, none of which runner
+# containers start).
+WorkflowRuntime = Literal["python", "node", "bash", "exec"]
+WORKFLOW_RUNTIMES: tuple[str, ...] = get_args(WorkflowRuntime)
+
+# The cgroup knobs a workflow run may override. The values *not* overridden come
+# from ``core.models.workflow_limits()`` -- a workflow container runs a whole
+# pipeline, so its defaults are deliberately larger than a tool's.
+WORKFLOW_LIMIT_KEYS = frozenset({"memory_mb", "cpus", "pids", "tmpfs_mb"})
 
 RunnerErrorCode = Literal[
     "capacity_exhausted",
@@ -40,23 +60,36 @@ RunnerErrorCode = Literal[
 
 
 class ExecRequest(BaseModel):
-    """One blocking execution: a tool call or an ``execute`` console command.
+    """One blocking execution: a tool call, an ``execute`` console command, or one
+    ``background_script`` workflow run.
 
     Carries NO identity fields: the caller's user id, email, groups, agent name and
     run id all come from the verified ``agent_token`` (v0.7.1 Phase 2). The runner
     derives them itself, so a forged body cannot name another caller.
+
+    The ``workflow`` fields describe *what the pipeline is* (its directory, its
+    entrypoint, the credentials it declared, its network policy and limits). They
+    never describe the container: image, mounts, runtime, user and isolation are the
+    runner's own derivation from its workspace view (``core.execution.spec``).
     """
 
     kind: ExecKind = "tool"
-    # Registry name for ``tool``; literal "console" for ``console``.
+    # Registry name for ``tool``; literal "console" for ``console``; the workflow
+    # name (its directory under ``workspace/workflows``) for ``workflow``.
     target: str
     # sha256 of the canonical manifest; the runner re-derives it from disk and
     # refuses a mismatch so a stale registration cannot run new code silently.
+    # Unused for ``workflow``: a pipeline has no manifest digest, the runner checks
+    # the entrypoint on disk instead.
     manifest_digest: str = ""
     # Declared keys only; the runner intersects with the manifest and rejects
-    # anything it does not declare.
+    # anything it does not declare. For a workflow it rejects reserved names and
+    # otherwise takes them as given: the workflow's declared set lives in the
+    # caller (``core.tasks`` resolves it from the registry), not on disk.
     env: dict[str, str] = Field(default_factory=dict)
-    # stdin payload (utf-8 JSON for tools, unused for console).
+    # stdin payload: utf-8 JSON for tools, the rendered prompt/event for a
+    # workflow, unused for console. The runner prefixes the environment preamble
+    # line, so a workflow's stdin is (preamble, then this).
     input: str = ""
     # console only: the shell command to run.
     command: Optional[str] = None
@@ -64,6 +97,90 @@ class ExecRequest(BaseModel):
     # Short-lived HMAC token minted by the agent runtime; the runner verifies it and
     # takes every identity attribute from its claims.
     agent_token: Optional[str] = None
+
+    # --- kind="workflow" ------------------------------------------------------
+    # Plain relative path inside ``workspace/workflows/<target>/``.
+    entrypoint: Optional[str] = None
+    # Interpreter for the entrypoint. None means ``python`` (the pre-container
+    # default), so an older workflow config keeps running unchanged.
+    runtime: Optional[WorkflowRuntime] = None
+    # Extra argv appended after the entrypoint.
+    args: list[str] = Field(default_factory=list)
+    # The workflow's ``allowed_tools``: only suites of *local* tools in this list are
+    # mounted, and a tool that is not listed is not on the filesystem at all. An
+    # edge tool or an MCP tool has no directory here, so it mounts nothing -- a
+    # workflow may still declare it (that is its token allowlist, not a mount).
+    tools: list[str] = Field(default_factory=list)
+    # None means ``egress`` -- the v0.7.1 default for tools, MCP sessions and
+    # workflows alike. Legacy profile names are normalized (one warning each).
+    network: Optional[str] = None
+    # Partial cgroup overrides; a field left out keeps the workflow default from
+    # ``core.models.workflow_limits()``, never a tool's 512 MiB.
+    limits: Optional[dict[str, float]] = None
+
+    @field_validator("network")
+    @classmethod
+    def _normalize_network(cls, value: Optional[str]) -> Optional[str]:
+        """Accept the manifest vocabulary (``none``/``egress``) on the wire.
+
+        A workflow config is a raw registry document, not a validated model, so a
+        legacy ``internal``/``allow`` value must not become a 422 here: it
+        normalizes to ``egress`` with the same once-per-value warning a tool
+        manifest gets.
+        """
+        if value is None:
+            return None
+        return normalize_network_policy(value, "workflow")
+
+    @field_validator("limits")
+    @classmethod
+    def _known_limit_keys(cls, value: Optional[dict]) -> Optional[dict]:
+        """Refuse a misspelled limit instead of silently ignoring it.
+
+        ``ContainerLimits`` ignores unknown keys, so ``memmory_mb`` would otherwise
+        leave the pipeline on the default with no signal at all.
+        """
+        if value is None:
+            return None
+        unknown = sorted(str(key) for key in value if str(key) not in WORKFLOW_LIMIT_KEYS)
+        if unknown:
+            raise ValueError(
+                f"unknown workflow limit(s): {', '.join(unknown)} "
+                f"(expected {', '.join(sorted(WORKFLOW_LIMIT_KEYS))})"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _workflow_fields_match_the_kind(self) -> "ExecRequest":
+        """Keep the two request shapes disjoint and complete.
+
+        A workflow field on a tool/console call, or a workflow call with nothing to
+        run, is a caller bug; both are louder as a 422 than as a container that
+        starts and does something surprising.
+        """
+        workflow_only = {
+            "entrypoint": self.entrypoint,
+            "runtime": self.runtime,
+            "args": self.args,
+            "tools": self.tools,
+            "network": self.network,
+            "limits": self.limits,
+        }
+        if self.kind != "workflow":
+            stray = sorted(name for name, value in workflow_only.items() if value)
+            if stray:
+                raise ValueError(
+                    f"{', '.join(stray)} only apply to kind='workflow' "
+                    f"(got kind={self.kind!r})"
+                )
+            return self
+        if not (self.entrypoint or "").strip():
+            raise ValueError("kind='workflow' requires the workflow's entrypoint")
+        if self.command:
+            raise ValueError(
+                "kind='workflow' runs its entrypoint; `command` is console-only"
+            )
+        return self
 
 
 class ExecResult(BaseModel):

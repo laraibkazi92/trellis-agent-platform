@@ -309,6 +309,90 @@ The runner never pulls an image itself, so it must already be present locally
 (`docker image inspect "$RUNNER_IMAGE"`). When the shim is what is missing, the canary's
 failure message names the image instead of blaming `TRELLIS_HOST_WORKSPACE`.
 
+#### `background_script` workflows run in one sandboxed container per run
+
+A script workflow used to be an ordinary subprocess of the `taskiq-worker`: it inherited
+the worker's environment, saw the whole workspace read-write and could reach the engine's
+own services by name. It is now **one runner container per run**, created from the same
+image and runtime as a tool (`runsc` by default). Nothing about the pipeline's contract
+changes — it is still a plain process reading its event payload on stdin and printing to
+stdout — but what surrounds it does:
+
+| Mount | Container path | Mode |
+| --- | --- | --- |
+| the workflow's own directory | `/app/workspace/workflows/<name>` | read-only, and the **working directory** |
+| shared code | `/app/workspace/shared` | read-only (when it exists) |
+| the tool suites its `allowed_tools` names | `/app/workspace/tools/<suite>` | read-only |
+| the workflow's output dir | `/app/workspace/output/<name>` | read-write |
+| the workflow's report dir | `/app/workspace/reports/<name>` | read-write |
+| scratch space | `/tmp` | tmpfs (`limits.tmpfs_mb`) |
+
+Everything else is absent: no other workflow, no suite the workflow did not declare, no
+`agents/`, `mcps/`, `.env` or registry state. That *is* the enforcement — a workflow
+container carries no agent token and makes no hub round trip. Enforcement is per
+**suite**, not per tool: a suite holding none of the workflow's `allowed_tools` is not
+mounted at all, while a tool that shares a suite with an allowed one is still on the
+filesystem and still runnable — `allowed_tools` decides which directories appear, not
+which executables inside them may be started. A workflow that declares an edge tool or
+an MCP tool is legal (that list is also the run's allowlist), it just has no files to
+mount.
+
+**Four behaviours that surprise people**
+
+1. **Only declared secrets and variables exist.** The container does not inherit the
+   worker's environment any more. `SESSION_SECRET`, `ENCRYPTION_KEY`, `RUNNER_TOKEN`,
+   provider keys and every operator-defined variable in the worker's own environment are
+   gone; the pipeline sees exactly the keys its `secrets`/`variables` blocks declare
+   (plus whatever the tools it declares require), passed in through the `trellis-exec`
+   preamble so they never appear in `docker inspect`. A pipeline that quietly relied on
+   an undeclared variable now reads nothing.
+2. **The worker no longer writes the workspace, except `reports/`.** `taskiq-worker`
+   mounts the workspace **read-only**; only `workspace/reports/` stays read-write, for a
+   `background_agent`'s in-process file tools. A pipeline that wrote anywhere else in the
+   workspace now fails — write under `output/<name>/` or `reports/<name>/`.
+3. **Cancelling a run mid-flight does not stop the container.** The runner has no cancel
+   API, so the container runs to its deadline; the run is then recorded as cancelled
+   (`run_cancelled`, `container_stopped: false`) without the worker claiming execution
+   stopped. Cancel *before* the run starts, or shorten
+   `WORKFLOW_RUN_TIMEOUT` (Admin → Limits & Tuning, default `3600` s) if a workflow must
+   be bounded.
+4. **One container per run costs latency.** Each scripted run now pays container
+   create/start/teardown (roughly a second, more on a cold `runsc` image), and a run's
+   steps share that one container — so they share its files, its `/tmp` and the single
+   secret set. Nothing is isolated *between* the steps of one pipeline. It also holds
+   one of the runner's **global** container slots (`RUNNER_MAX_CONTAINERS`, default
+   `32`) for the whole run: a pipeline that gets stuck and sits until its deadline keeps
+   that slot, and enough of them push ordinary tool calls into
+   `429 capacity_exhausted`. Keep `WORKFLOW_RUN_TIMEOUT` realistic, and size
+   `RUNNER_MAX_CONTAINERS` for workflows + interactive calls together.
+
+**What to do instead**
+
+- Run each pipeline once by hand after upgrading (Workflows → Run) and check its output
+  and `workspace/reports/<name>/` — a missing declared secret or a write outside
+  `output/`/`reports/` is the failure mode this change introduced.
+- Add every credential and endpoint the pipeline reads to its `config.yaml`
+  (`secrets:`/`variables:`, or via the tools it declares) and set the values in
+  Workflows → Secrets. Undeclared values no longer leak in from the worker.
+- Remove any pipeline dependency on engine hostnames (`HOST_URL`, `HUB_URL`,
+  `http://host:8000`, `http://hub:8001`): a workflow container gets normal Docker egress,
+  not the compose project network. Call the API with an explicit URL (`PUBLIC_HOST_URL`)
+  and a declared token, or do the work through a declared tool.
+- A tool a pipeline shells out to can read `TRELLIS_AGENT_NAME` (the workflow name) to
+  find where it should write `reports/<name>/`. A workflow container has no agent token,
+  so this environment variable is how a pipeline — and any tool it launches with its own
+  environment — learns which workflow it is running for.
+- `db-sync` validates a `background_script`'s `runtime`, `entrypoint`, `network`,
+  `limits` and `allowed_tools` before publishing it: an unknown `limits` knob, a value
+  outside the four runtimes, an `entrypoint` that is not a plain relative path or is not
+  there, or an unknown `network` stops the sync with exit 2 and writes nothing. Those
+  used to sync and fail one scheduled run at a time.
+- `runtime:` accepts `python`, `node`, `bash` and `exec`. A value outside that list stops
+  `db-sync` (exit 2) before the workflow can be published; a config that is already in the
+  registry yet names something else still runs its entrypoint directly (`exec`, the v0.7
+  behaviour) with a warning — pin one of the four.
+- A workflow `limits:` block overrides only the knobs it names; the rest stay at the
+  workflow defaults (4 GiB / 2 CPUs / 1024 pids / 1 GiB tmpfs), never a tool's 512 MiB.
 
 <!-- v0.7.1: further removals are appended below this marker before the tag. -->
 
