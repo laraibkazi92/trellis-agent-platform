@@ -85,6 +85,9 @@ RESTRICTED_ENV_VARS = frozenset(
 )
 
 OUTPUT_DIRS = ("reports", "output")
+# The container env variable each agent/workflow-owned writable dir is announced as
+# (v0.7.2 R2). One map, so the mount matrix and the variables cannot drift apart.
+OUTPUT_DIR_VARS = {"reports": "TRELLIS_REPORTS_DIR", "output": "TRELLIS_OUTPUT_DIR"}
 KNOWN_RUNTIMES = ("runsc", "runsc-variant", "runc")
 
 # Workflows live one directory per workflow, exactly like a tool suite or an MCP
@@ -246,10 +249,11 @@ def _base_env() -> dict[str, str]:
 
     clean = sanitized_env()
     base = {k: clean[k] for k in SAFE_BASE_ENV if k in clean}
-    # No TRELLIS_* names here on purpose: the only ones a tool may see are
-    # TRELLIS_USER_ID/TRELLIS_USER_EMAIL, and those arrive through the declared
-    # env set. Copying the runner's own TRELLIS_* would leak topology
-    # (engine subnets, install id, host paths) to untrusted code.
+    # No TRELLIS_* names here on purpose: the documented run context
+    # (TRELLIS_USER_*/AGENT_NAME/RUN_ID/REPORTS_DIR/OUTPUT_DIR) is applied by the
+    # builder from the identity and the mounts it created. Copying the runner's own
+    # TRELLIS_* would leak topology (engine subnets, install id, host paths) to
+    # untrusted code.
     return base
 
 
@@ -524,6 +528,11 @@ def build_spec(
     _append_shared_mount(mounts, workspace_root, host_workspace)
 
     output_dirs = set(getattr(config, "output_dirs", None) or [])
+    # Which writable dirs this container actually got, so the variables below can
+    # only ever name a mount that exists (an undeclared dir is not mounted and must
+    # not be announced -- a tool that writes there would fail with a confusing ENOENT
+    # instead of falling back).
+    mounted_output_dirs: list[str] = []
     if kind == "tool" and agent:
         for name in OUTPUT_DIRS:
             if name not in output_dirs:
@@ -533,6 +542,7 @@ def build_spec(
                 mounts, workspace_root, host_workspace, rel, rel,
                 read_only=False, mkdir=True,
             )
+            mounted_output_dirs.append(name)
 
     merged = _merge_env(config, env)
     merged.update(
@@ -544,6 +554,20 @@ def build_spec(
             "PATH": f"{container_suite}/bin:{merged.get('PATH', '/usr/local/bin:/usr/bin:/bin')}",
         }
     )
+    # v0.7.2 R2: the run context, applied here and not from the caller's ``env``.
+    # Two reasons: ``_merge_env`` accepts manifest-declared names only (widening that
+    # set would let a caller assert an agent name, a run id or another agent's
+    # directory), and these values are derived -- the name and run id from the
+    # verified identity the runner resolved (a gateway call arrives as the reserved
+    # ``gateway``), the dirs from the mounts just created. They are not secrets, so
+    # they stay in the container configuration: a tool needs them before it reads its
+    # stdin, and subprocesses it spawns inherit them without any plumbing.
+    if agent:
+        merged["TRELLIS_AGENT_NAME"] = str(agent)
+    if run_id:
+        merged["TRELLIS_RUN_ID"] = str(run_id)
+    for name in mounted_output_dirs:
+        merged[OUTPUT_DIR_VARS[name]] = f"{CONTAINER_WORKSPACE}/{name}/{agent}"
 
     memory, cpus, pids, tmpfs_mb = _limits(config)
     user = _require_user()
@@ -655,6 +679,7 @@ def _workflow_limits(
 def _workflow_env(
     requested: Mapping[str, str],
     *,
+    name: str,
     run_id: Optional[str],
     user_id: Optional[str],
     user_email: Optional[str],
@@ -692,6 +717,12 @@ def _workflow_env(
         env["TRELLIS_USER_EMAIL"] = str(user_email)
     if run_id:
         env["TRELLIS_RUN_ID"] = str(run_id)
+    # v0.7.2 R2: the workflow's own writable dirs, at the paths build_workflow_spec
+    # mounts rw for every run. Applied after ``requested`` so a caller cannot
+    # redirect them. No TRELLIS_AGENT_NAME here: the workflow name already arrives
+    # in ``requested`` (core.tasks) and is that variable's value for a pipeline.
+    for output in OUTPUT_DIRS:
+        env[OUTPUT_DIR_VARS[output]] = f"{CONTAINER_WORKSPACE}/{output}/{name}"
     _require_carriable_env_names(env)
     return env
 
@@ -747,7 +778,9 @@ def build_workflow_spec(
       here, so it mounts nothing (a workflow may still declare it for its token's
       allowlist; it just will not find files for it).
     * ``workspace/output/<name>`` and ``workspace/reports/<name>`` -- read-write,
-      created if missing, so a report tool writing ``reports/<name>/`` works.
+      created if missing, so a report tool writing ``reports/<name>/`` works. Each is
+      announced to the pipeline as ``TRELLIS_REPORTS_DIR``/``TRELLIS_OUTPUT_DIR`` at
+      exactly that path, so a pipeline never has to hard-code it.
     * ``/tmp`` -- tmpfs, the only writable scratch space (rootfs is read-only).
 
     ``tool_suites`` are plain suite directory names (``demo``), resolved by the
@@ -794,7 +827,7 @@ def build_workflow_spec(
 
     memory, cpus, pids, tmpfs_mb = _workflow_limits(limits)
     merged = _workflow_env(
-        env, run_id=run_id, user_id=user_id, user_email=user_email
+        env, name=name, run_id=run_id, user_id=user_id, user_email=user_email
     )
     # One split at the end: declared credentials/variables ride the stdin preamble,
     # never the container's configuration.

@@ -52,6 +52,10 @@ echo '{"ticket_id": "FD-456"}' \
 
 Check the tool's `tool.yaml` for required `inputs`, `secrets`, and `variables` before testing.
 
+The framework's own `TRELLIS_*` variables (`TRELLIS_AGENT_NAME`, `TRELLIS_RUN_ID`, the
+output-dir paths) are set by the runner inside the container, so export them yourself when
+a tool reads one and you run it outside a container.
+
 ---
 
 ## Building Tools
@@ -67,7 +71,9 @@ a `runner`, which creates the container from your manifest. What that means for 
   environment.
 - Files the host should see go under a declared `output_dirs` mount
   (`/app/workspace/output/<agent>` or `reports/<agent>`); everything else in the workspace
-  is read-only or absent. Normal Unix permissions still apply, and the tool runs as
+  is read-only or absent. Declaring a dir is also what exports its path to the process
+  (`TRELLIS_REPORTS_DIR` / `TRELLIS_OUTPUT_DIR`); undeclared, the dir is neither mounted
+  nor named in the environment. Normal Unix permissions still apply, and the tool runs as
   `TRELLIS_UID`, the workspace owner.
 - POSIX shared memory and PTY allocation work as they do in any container started from the
   image; size `limits:` around a tool that needs more than the defaults.
@@ -76,8 +82,9 @@ a `runner`, which creates the container from your manifest. What that means for 
 
 Every local tool call is its **own container**, created by the `runner` service from your
 manifest. Container paths are the same ones tools already use, so the JSON stdin/stdout
-protocol, `TRELLIS_USER_ID`/`TRELLIS_USER_EMAIL`, and wrapper scripts do not change; what
-changes is what exists around the process.
+protocol, the `TRELLIS_*` identity variables (`TRELLIS_USER_ID`, `TRELLIS_AGENT_NAME`,
+`TRELLIS_RUN_ID` and the output-dir paths) and wrapper scripts do not change; what changes
+is what exists around the process.
 
 | Mount | Container path | Mode |
 | --- | --- | --- |
@@ -88,9 +95,9 @@ changes is what exists around the process.
 
 Everything else is absent: no other suite, no `agents/`, no manifests, no `.env`, no
 session state, and no engine network. A tool that must leave a file behind declares
-`output_dirs:` and writes under the mounted agent directory; the mount exists only when
-the call carries an agent identity, so an anonymous caller gets none. `stdout` remains
-the way results reach the agent.
+`output_dirs:` and writes under the mounted agent directory; the mount, and the variable
+that names it, exist only when the call carries an agent identity, so an anonymous caller
+gets neither. `stdout` remains the way results reach the agent.
 
 - **`HOME`, `TMPDIR`, `TMP`, `TEMP` are one disposable tmpfs** at `/tmp`, sized by
   `limits.tmpfs_mb`. It is destroyed with the container, so it is scratch space only and
@@ -102,9 +109,11 @@ the way results reach the agent.
   `allow`, `internet` and `internal` still load as `egress` and log **one** deprecation
   warning per value per process; `deny`/`off` load as `none`.
 - **Environment:** only the keys your manifest declares (`secrets`, `optional_secrets`,
-  `variables`, `secret_groups` fields) plus `TRELLIS_USER_ID`/`TRELLIS_USER_EMAIL` are
-  present; the rest of the environment is the image's base (`PATH`, `LANG`, `TZ`, ...).
-  `FRAMEWORK_API_URL` and `FRAMEWORK_EXECUTION_TOKEN` are no longer injected.
+  `variables`, `secret_groups` fields) plus the framework's own identity variables —
+  `TRELLIS_USER_ID`, `TRELLIS_USER_EMAIL`, `TRELLIS_AGENT_NAME`, `TRELLIS_RUN_ID` and the
+  output-dir path `output_dirs:` enables — are present; the rest of the environment is the
+  image's base (`PATH`, `LANG`, `TZ`, ...). `FRAMEWORK_API_URL` and
+  `FRAMEWORK_EXECUTION_TOKEN` are no longer injected.
 - **Secrets never appear in the container's configuration.** The runner hands them over as
   a one-line stdin preamble (`{"env": {...}}`) that the engine image's `trellis-exec`
   shim applies before exec-ing your script, so `docker inspect` on a running tool shows no
@@ -112,7 +121,8 @@ the way results reach the agent.
   container's configuration carries are the fixed allowlist in `core/execution/env.py`:
   `HOME`, `PATH`, `TMPDIR`, `TMP`, `TEMP`, `LANG`, `LANGUAGE`, `LC_ALL`, `LC_CTYPE`, `TZ`,
   `TERM`, `PYTHONUNBUFFERED`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`,
-  `TRELLIS_USER_ID`, `TRELLIS_USER_EMAIL`, `TRELLIS_RUN_ID`. Everything else your manifest
+  `TRELLIS_USER_ID`, `TRELLIS_USER_EMAIL`, `TRELLIS_AGENT_NAME`, `TRELLIS_RUN_ID`,
+  `TRELLIS_REPORTS_DIR`, `TRELLIS_OUTPUT_DIR`. Everything else your manifest
   declares (secrets, `variables`, a literal `env:` block) arrives through the preamble. If
   your manifest pins `image:` to something that is *not* derived from the engine image, that
   image must provide `/usr/local/bin/trellis-exec` (or your own equivalent that reads the
@@ -126,6 +136,42 @@ the way results reach the agent.
 - **Runtime:** `container_runtime` selects `runsc` (default), `runsc-variant`, or `runc`
   for one tool. `runc` forfeits kernel-syscall isolation and needs a per-tool reason.
   `image:` is reserved and ignored.
+
+The container also learns who it is and where it may write:
+
+| Variable | Value | Present when |
+| --- | --- | --- |
+| `TRELLIS_AGENT_NAME` | the agent this run acts as (`gateway` for a front-door MCP call) | always |
+| `TRELLIS_RUN_ID` | the id of this run | always |
+| `TRELLIS_REPORTS_DIR` | `/app/workspace/reports/<agent>` | `output_dirs:` lists `reports` |
+| `TRELLIS_OUTPUT_DIR` | `/app/workspace/output/<agent>` | `output_dirs:` lists `output` |
+
+The runner sets all four from the run identity it verified, never from the call's
+arguments, and none is a secret — they appear in `docker inspect`, unlike the declared
+secrets above, which travel on stdin. The two paths are the **calling** agent's
+directories, created if missing and already writable: no other agent's `reports/` or
+`output/` tree is in the container, so a tool cannot write one. Being ordinary environment
+variables, they are inherited by anything the tool spawns. A manifest that declares no
+matching `output_dirs:` entry gets neither path variable and has no writable workspace path
+at all.
+
+```python
+import json, os, sys
+
+summary = do_work(json.load(sys.stdin))
+
+reports = os.environ["TRELLIS_REPORTS_DIR"]         # /app/workspace/reports/<agent>
+path = os.path.join(reports, f"scan-{os.environ['TRELLIS_RUN_ID']}.json")
+with open(path, "w", encoding="utf-8") as handle:   # already writable, agent-scoped
+    json.dump(summary, handle)
+
+json.dump({"report": path}, sys.stdout)
+```
+
+A `background_script` workflow container gets the same four: `TRELLIS_AGENT_NAME` is the
+workflow name, and both directories are always mounted read-write at
+`/app/workspace/reports/<workflow>` and `/app/workspace/output/<workflow>` — see the
+[workflow guide](workflows.md#how-a-script-workflow-runs).
 
 `limits:` sets the container's cgroup v2 limits:
 

@@ -164,8 +164,11 @@ The pipeline's environment is exactly what the workflow declares:
 - They arrive through the `trellis-exec` stdin preamble, so `docker inspect` on the running
   container shows none of them. The preamble is capped at 64 KiB total and 16 KiB per value.
 - `TRELLIS_AGENT_NAME` carries the workflow name, so a tool the pipeline shells out to can
-  find `reports/<name>/`. `TRELLIS_USER_ID`, `TRELLIS_USER_EMAIL` and `TRELLIS_RUN_ID` are
-  present as container variables when the run has them.
+  find `reports/<name>/`. `TRELLIS_REPORTS_DIR` and `TRELLIS_OUTPUT_DIR` point at
+  `/app/workspace/reports/<name>` and `/app/workspace/output/<name>` — the two read-write
+  mounts above — so a pipeline never hard-codes either path.
+  `TRELLIS_USER_ID`, `TRELLIS_USER_EMAIL` and `TRELLIS_RUN_ID` are present as container
+  variables when the run has them.
 - `network:` is `egress` (default) or `none`. `egress` is Docker's default bridge, so the
   pipeline reaches whatever the host reaches, and **not** the compose project network:
   `http://hub:8001` or `http://etcd:2379` does not resolve. Call the framework API with an

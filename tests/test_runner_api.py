@@ -480,6 +480,13 @@ def test_a_workflow_run_is_a_first_class_exec_kind(env):
     # Egress unless the workflow asks for `none` -- Docker's own default.
     assert container_spec.network_mode == DEFAULT_NETWORK_MODE
     assert container_spec.env["TRELLIS_RUN_ID"] == "run-1"
+    # R2: the workflow's own writable dirs, at the paths it was just given.
+    assert container_spec.env["TRELLIS_REPORTS_DIR"] == (
+        "/app/workspace/reports/demo-inventory"
+    )
+    assert container_spec.env["TRELLIS_OUTPUT_DIR"] == (
+        "/app/workspace/output/demo-inventory"
+    )
     first, _, payload = env.backend.stdin[0][1].partition(b"\n")
     assert json.loads(first)["env"] == {}
     assert payload == b"inventory"
@@ -567,6 +574,59 @@ def test_the_edge_role_takes_identity_from_the_body(env, monkeypatch):
     # No token was needed and none was consulted: agent, run and user all came from
     # the body the edge proxy wrote.
     assert container_spec.labels["trellis.target"] == "echo"
+
+
+def test_the_run_context_reaches_the_container_env_under_both_roles(env, monkeypatch):
+    """R2: agent name, run id and report dir are derived from the *resolved* identity.
+
+    Central: from the token's verified claims. Edge: from the body the proxy wrote.
+    The tool gets the same configuration either way (and cannot tell which posture
+    ran it) -- which is the point: a tool written against ``TRELLIS_REPORTS_DIR``
+    works unchanged on an edge. The declared secret stays on stdin.
+    """
+    env.backend.queue(RawExec(exit_code=0, stdout=b'{"ok": true}\n'))
+    central_response = asyncio.run(_call("POST", "/v1/exec", json_body=_body(env.root)))
+    assert central_response.status_code == 200, central_response.json()
+
+    central = env.backend.specs[0]
+    assert central.env["TRELLIS_AGENT_NAME"] == "demo-assistant"
+    assert central.env["TRELLIS_RUN_ID"] == "run-1"
+    assert central.env["TRELLIS_REPORTS_DIR"] == "/app/workspace/reports/demo-assistant"
+    # The manifest declares `reports` only: no mount, so no variable.
+    assert "TRELLIS_OUTPUT_DIR" not in central.env
+    assert "ECHO_TOKEN" not in central.env
+
+    # The edge body is built BEFORE the key is removed: minting needs the fixture
+    # secret, and only the runner's verification is what we are switching off.
+    edge_body = _tokenless_body(env.root, identity=_identity())
+    _edge(monkeypatch)
+    monkeypatch.delenv("AGENT_TOKEN_SECRET", raising=False)
+    env.backend.queue(RawExec(exit_code=0, stdout=b'{"ok": true}\n'))
+    edge_response = asyncio.run(_call("POST", "/v1/exec", json_body=edge_body))
+    assert edge_response.status_code == 200, edge_response.json()
+
+    edge = env.backend.specs[1]
+    assert edge.env["TRELLIS_AGENT_NAME"] == "demo-assistant"
+    assert edge.env["TRELLIS_RUN_ID"] == "run-edge"
+    assert edge.env["TRELLIS_REPORTS_DIR"] == "/app/workspace/reports/demo-assistant"
+    assert "TRELLIS_OUTPUT_DIR" not in edge.env
+    assert "ECHO_TOKEN" not in edge.env
+
+
+def test_a_gateway_call_runs_as_the_reserved_gateway_identity(env):
+    """``gateway`` has no manifest of its own; its token still names the agent."""
+    env.backend.queue(RawExec(exit_code=0, stdout=b'{"ok": true}\n'))
+
+    response = asyncio.run(
+        _call("POST", "/v1/exec", json_body=_body(env.root, agent_token=_token("gateway")))
+    )
+
+    assert response.status_code == 200, response.json()
+    container_spec = env.backend.specs[0]
+    assert container_spec.env["TRELLIS_AGENT_NAME"] == "gateway"
+    # Everything else follows the name it was given, gateway included.
+    assert container_spec.mounts[2].source == f"/host{env.root}/reports/gateway"
+    assert container_spec.env["TRELLIS_REPORTS_DIR"] == "/app/workspace/reports/gateway"
 
 
 def test_the_edge_role_puts_identity_in_the_console_env(env, monkeypatch):

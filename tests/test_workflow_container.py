@@ -375,6 +375,53 @@ def test_an_empty_email_is_not_invented(workspace):
     assert "TRELLIS_USER_EMAIL" not in spec.preamble_env
 
 
+def test_the_pipeline_is_told_where_it_may_write(workspace):
+    """v0.7.2 R2: both rw mounts, by their in-container path, in the config env.
+
+    A pipeline must not have to hard-code ``reports/<name>``: the runner created the
+    mounts, so it is the only party that knows the path.
+    """
+    spec = build(workspace)
+
+    assert spec.env["TRELLIS_REPORTS_DIR"] == f"{CONTAINER_WORKSPACE}/reports/{WORKFLOW}"
+    assert spec.env["TRELLIS_OUTPUT_DIR"] == f"{CONTAINER_WORKSPACE}/output/{WORKFLOW}"
+    rw_targets = {mount.target for mount in spec.mounts if not mount.read_only}
+    assert {
+        spec.env["TRELLIS_REPORTS_DIR"],
+        spec.env["TRELLIS_OUTPUT_DIR"],
+    } == rw_targets
+    # Not on stdin: the create body carries them, so the pipeline sees them before
+    # it reads anything (subprocesses inherit them too).
+    payload = _create_payload(spec)
+    for name in ("TRELLIS_REPORTS_DIR", "TRELLIS_OUTPUT_DIR"):
+        assert f"{name}={spec.env[name]}" in payload["Env"]
+        assert name not in spec.preamble_env
+
+
+def test_a_caller_cannot_redirect_the_workflow_output_dirs(workspace):
+    """The dirs are set after the caller's values, so they cannot be replaced."""
+    spec = build(
+        workspace, env={"TRELLIS_REPORTS_DIR": "/etc", "TRELLIS_OUTPUT_DIR": "/etc"}
+    )
+
+    assert spec.env["TRELLIS_REPORTS_DIR"] == f"{CONTAINER_WORKSPACE}/reports/{WORKFLOW}"
+    assert spec.env["TRELLIS_OUTPUT_DIR"] == f"{CONTAINER_WORKSPACE}/output/{WORKFLOW}"
+
+
+def test_the_workflow_name_still_arrives_from_the_caller_env(workspace):
+    """``TRELLIS_AGENT_NAME`` is core.tasks' job for a workflow -- not duplicated here.
+
+    A workflow run has no agent identity on the wire, so the name travels in the
+    caller's declared env; the spec must neither add nor drop it.
+    """
+    spec = build(workspace, env={"TRELLIS_AGENT_NAME": WORKFLOW})
+
+    assert spec.env["TRELLIS_AGENT_NAME"] == WORKFLOW
+    # The unmounted-dirs case does not exist for a workflow: both dirs are always
+    # created, so both variables are always present.
+    assert spec.env["TRELLIS_REPORTS_DIR"] == f"{CONTAINER_WORKSPACE}/reports/{WORKFLOW}"
+
+
 def test_a_reserved_control_plane_name_is_refused(workspace):
     with pytest.raises(InvalidRequest) as excinfo:
         build(workspace, env={"RUNNER_TOKEN": "x"})

@@ -17,8 +17,18 @@ may carry. The rule is allowlist-only and deliberately tiny:
 * the process needs a handful of fixed variables before it can start at all
   (``PATH`` to find the interpreter, ``HOME``/``TMPDIR`` for its scratch dirs,
   locale and zone), and
-* the caller's identity (``TRELLIS_USER_*``) is not a secret and is part of the
-  documented tool contract.
+* the *run context* is not a secret and is part of the documented tool contract:
+  who is calling (``TRELLIS_USER_*``), which agent or workflow the container runs
+  for (``TRELLIS_AGENT_NAME``), which run it belongs to (``TRELLIS_RUN_ID``) and
+  where it may write (``TRELLIS_REPORTS_DIR``/``TRELLIS_OUTPUT_DIR``).
+
+That second group is one rule, not four exceptions: every name there is public
+deployment context the process may need before it has read a byte of stdin -- a
+tool that only produces a report never reads its stdin at all. The values are
+still derived runner-side from the verified identity and the mounts that were
+actually created; nothing here lets a caller assert them (``core.execution.spec``
+refuses an undeclared caller key, and the identity vars are applied after that
+merge).
 
 Everything else -- resolved secrets, declared ``variables``, sealed edge credentials,
 the manifest's literal ``env:`` block, per-call values -- travels in the preamble.
@@ -64,13 +74,18 @@ CONTAINER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
         "REQUESTS_CA_BUNDLE",
-        # Documented tool contract: the caller the verified token proves.
+        # Documented tool contract: the caller the verified token proves, the agent
+        # (or workflow) the container runs for and the run it belongs to. An opaque
+        # id and a registered name, not credentials.
         "TRELLIS_USER_ID",
         "TRELLIS_USER_EMAIL",
-        # Run-scoped container identity: the console spec emits it today, and the
-        # workflow containers (v0.7.1 Phase 6) will emit it too. An opaque id, not
-        # a credential.
+        "TRELLIS_AGENT_NAME",
         "TRELLIS_RUN_ID",
+        # The writable output dirs that were actually mounted, at their in-container
+        # path. Paths, not capabilities: an undeclared dir mounts nothing and gets no
+        # variable, so the value can never name a place the tool cannot write.
+        "TRELLIS_REPORTS_DIR",
+        "TRELLIS_OUTPUT_DIR",
     }
 )
 
