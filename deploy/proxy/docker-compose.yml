@@ -17,7 +17,7 @@ services:
     # Must be a build that includes core/proxy.py (anything published after this
     # feature landed). Pin the exact tag the central host runs: the tunnel protocol is
     # versioned and a mismatch is refused at the handshake.
-    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:latest}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.2}
     container_name: trellis-proxy
     # Same non-root posture as the central services: tools run as this uid.
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
@@ -97,7 +97,7 @@ services:
   # Requires the edge host to have runsc registered with its Docker daemon; a dev
   # machine without gVisor sets CONTAINER_DEFAULT_RUNTIME=runc (see docs/proxy.md).
   runner:
-    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:latest}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.2}
     container_name: trellis-edge-runner
     # Root only to open the Docker socket; tool containers run as TRELLIS_UID/GID.
     user: "0:0"
@@ -136,7 +136,7 @@ services:
       # and the runner's version probe reports itself skipped. Forwarded for a
       # deployment that does mount `runsc` and wants the probe to check it.
       RUNSC_BIN: ${RUNSC_BIN:-}
-      RUNNER_IMAGE: ${RUNNER_IMAGE:-${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:latest}}
+      RUNNER_IMAGE: ${RUNNER_IMAGE:-${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.2}}
       TRELLIS_INSTALL_ID: ${TRELLIS_INSTALL_ID:-default}
       # Tool containers get no network override (Docker's default bridge) unless the
       # manifest says `network: none`.
