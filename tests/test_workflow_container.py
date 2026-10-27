@@ -730,3 +730,33 @@ def test_a_tool_manifest_is_still_parsed_as_a_tool_config(workspace):
     """Guard against the suite fixtures drifting from the real manifest schema."""
     raw = yaml.safe_load((workspace.root / "tools" / "reporting" / "tool.yaml").read_text())
     assert ToolConfig(**raw[0]).name == "make_report"
+
+
+def test_stopping_the_task_id_removes_the_workflow_container(runner_env):
+    """R3, end to end: the ``trellis.run`` label IS the run id the worker knows.
+
+    The worker never learns the container id (it never sees one: the runner owns the
+    container), so ``/v1/stop`` has to find it by the label the spec derived from the
+    verified token's claims -- for a workflow, the taskiq task id.
+    """
+    runner_env.backend.queue(RawExec(exit_code=0, stdout=b"ok"))
+    asyncio.run(_call("POST", "/v1/exec", json_body=_body()))
+    spec = runner_env.backend.specs[0]
+    assert spec.labels["trellis.run"] == "run-1"
+
+    async def seed() -> str:
+        container_id = await runner_env.backend.create(spec)
+        await runner_env.backend.start(container_id)
+        return container_id
+
+    container_id = asyncio.run(seed())
+
+    response = asyncio.run(_call("POST", "/v1/stop", json_body={"run_id": "run-1"}))
+
+    assert response.status_code == 200, response.json()
+    assert response.json()["stopped"] == 1
+    assert container_id not in runner_env.backend.containers
+    # The poller can race the run's own exit: a second stop is harmless.
+    again = asyncio.run(_call("POST", "/v1/stop", json_body={"run_id": "run-1"}))
+    assert again.status_code == 200
+    assert again.json()["stopped"] == 0

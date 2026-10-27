@@ -256,6 +256,34 @@ class RunnerError(BaseModel):
     retryable: bool = False
 
 
+class StopRequest(BaseModel):
+    """Stop every container one run left behind.
+
+    The run id is the caller's own (a taskiq task id for a ``background_script``):
+    the spec stamps it on the ``trellis.run`` label from the verified token's claims
+    (``core.execution.spec._labels``), so it is also the only thing needed to find
+    the container of a run whose caller no longer holds an id. Deliberately not
+    validated as non-empty here: an empty id is refused by the endpoint (400) rather
+    than by pydantic (422), because a caller bug should not read as a bad payload.
+    """
+
+    run_id: str = ""
+
+
+class StopResult(BaseModel):
+    """What ``/v1/stop`` removed. ``stopped == 0`` is a success, not a failure.
+
+    A run that already finished has no container left (the one-shot path removes it
+    on every exit), so the call is idempotent: the second call reports 0. ``detail``
+    carries a partial-failure explanation when one container could be listed but not
+    removed -- the caller records it against the run instead of guessing.
+    """
+
+    run_id: str = ""
+    stopped: int = 0
+    detail: str = ""
+
+
 class SessionCreateRequest(BaseModel):
     """Open a long-lived MCP session (or a throwaway discovery run).
 

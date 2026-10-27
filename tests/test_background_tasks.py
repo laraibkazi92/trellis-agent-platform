@@ -576,7 +576,7 @@ def _script_workflow(**extra):
     return config
 
 
-def _patch_script_path(monkeypatch, mgr, runner):
+def _patch_script_path(monkeypatch, mgr, runner, slot_wait=300.0, run_timeout=SCRIPT_TIMEOUT_S):
     """Wire the worker's script path onto a fake runner; refuse local subprocesses."""
     import core.discovery as discovery
     from core import auth, guardrails
@@ -593,7 +593,8 @@ def _patch_script_path(monkeypatch, mgr, runner):
         tasks,
         "resolve_tunable",
         lambda name: {
-            "workflow_run_timeout": SCRIPT_TIMEOUT_S,
+            "workflow_run_timeout": run_timeout,
+            "workflow_slot_wait": slot_wait,
             "max_run_output_chars": 32768,
             "max_run_error_chars": 4096,
         }[name],
@@ -892,8 +893,8 @@ def test_an_unreachable_runner_fails_the_run(monkeypatch):
     assert "unreachable" in mgr.runs["run-script"]["metadata"]["error"]
 
 
-def test_a_cancelled_run_is_recorded_after_the_container_returns(monkeypatch):
-    """No cancel API exists: the container runs to its deadline, the run says so."""
+def test_a_cancelled_run_stops_its_container(monkeypatch):
+    """R3: the poller can now stop the container instead of waiting it out."""
     mgr = FakeScriptIdentityManager(_script_workflow())
     mgr.runs["run-script"] = {"state": "processing", "metadata": {}}
     runner = _runner_with(stdout="finished anyway\n")
@@ -904,10 +905,9 @@ def test_a_cancelled_run_is_recorded_after_the_container_returns(monkeypatch):
     real_sleep = asyncio.sleep
 
     async def exec_while_cancelled(request):
-        # Cancelled while the container is running: the poller sees it, the call is
-        # not interrupted (nothing can kill a runner container from here).
+        # Cancelled while the container is running: the poller sees it and stops it.
         mgr.runs["run-script"]["state"] = "cancelled"
-        for _ in range(5):
+        for _ in range(10):
             # Real (tiny) waits: the poller's heartbeat and run read go through
             # asyncio.to_thread, which needs a moment to actually run.
             await real_sleep(0.02)
@@ -919,9 +919,300 @@ def test_a_cancelled_run_is_recorded_after_the_container_returns(monkeypatch):
     result = _run_script_workflow(mgr)
 
     assert result == "Cancelled."
+    # The stop names the run id the container is labelled with (the taskiq task id).
+    assert runner.stops == ["run-script"]
     cancelled = [payload for event, payload in mgr.events if event == "run_cancelled"]
-    assert cancelled == [{"reason": "cancelled_mid_run", "container_stopped": False}]
+    assert cancelled == [
+        {
+            "reason": "cancelled_mid_run",
+            "container_stopped": True,
+            "containers_stopped": 1,
+        }
+    ]
     # A cancelled run is never re-marked completed.
     assert [event for event, _ in mgr.events if event == "run_completed"] == []
     assert mgr.runs["run-script"]["state"] == "cancelled"
 
+
+def test_a_cancelled_run_whose_stop_fails_says_so_and_still_ends_cancelled(monkeypatch):
+    """A stop failure is recorded against the run; it never becomes the run's error."""
+    from fixtures.fake_runner import FakeRunnerClient, unreachable
+
+    mgr = FakeScriptIdentityManager(_script_workflow())
+    mgr.runs["run-script"] = {"state": "processing", "metadata": {}}
+    runner = FakeRunnerClient(stop_error=unreachable())
+    monkeypatch.setattr(tasks, "CANCELLATION_POLL_INTERVAL_S", 0.01)
+    real_sleep = asyncio.sleep
+
+    async def exec_while_cancelled(request):
+        mgr.runs["run-script"]["state"] = "cancelled"
+        for _ in range(10):
+            await real_sleep(0.02)
+        return runner.result
+
+    runner.exec = exec_while_cancelled
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    result = _run_script_workflow(mgr)
+
+    assert result == "Cancelled."
+    assert runner.stops == ["run-script"]
+    cancelled = [payload for event, payload in mgr.events if event == "run_cancelled"]
+    assert len(cancelled) == 1
+    assert cancelled[0]["reason"] == "cancelled_mid_run"
+    assert cancelled[0]["container_stopped"] is False
+    assert "unreachable" in cancelled[0]["stop_error"]
+    assert mgr.runs["run-script"]["state"] == "cancelled"
+
+
+def test_a_run_that_already_ended_before_the_stop_still_counts_as_stopped(monkeypatch):
+    """`stopped == 0` means nothing was left running -- the goal, not a failure."""
+    from core.execution.contract import StopResult
+    from fixtures.fake_runner import FakeRunnerClient
+
+    mgr = FakeScriptIdentityManager(_script_workflow())
+    mgr.runs["run-script"] = {"state": "processing", "metadata": {}}
+    runner = FakeRunnerClient(stop_result=StopResult(run_id="run-script", stopped=0))
+    monkeypatch.setattr(tasks, "CANCELLATION_POLL_INTERVAL_S", 0.01)
+    real_sleep = asyncio.sleep
+
+    async def exec_while_cancelled(request):
+        mgr.runs["run-script"]["state"] = "cancelled"
+        for _ in range(10):
+            await real_sleep(0.02)
+        return runner.result
+
+    runner.exec = exec_while_cancelled
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    assert _run_script_workflow(mgr) == "Cancelled."
+    cancelled = [payload for event, payload in mgr.events if event == "run_cancelled"]
+    assert cancelled[0]["container_stopped"] is True
+    assert cancelled[0]["containers_stopped"] == 0
+
+
+
+def test_a_worker_deadline_stops_the_container_before_failing(monkeypatch):
+    """R3: the runner's own deadline is minutes away -- end the container now."""
+    from fixtures.fake_runner import timeout_error
+
+    mgr = FakeScriptIdentityManager(_script_workflow())
+    runner = _runner_with(error=timeout_error())
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _run_script_workflow(mgr)
+
+    assert "Workflow container failed (timeout)" in str(excinfo.value)
+    assert runner.stops == ["run-script"]
+    stopped = [
+        payload for event, payload in mgr.events if event == "run_container_stopped"
+    ]
+    assert stopped == [
+        {
+            "reason": "deadline_exceeded",
+            "container_stopped": True,
+            "containers_stopped": 1,
+        }
+    ]
+    # The run itself still fails with the timeout, which stays the visible reason.
+    assert mgr.runs["run-script"]["state"] == "failed"
+    assert "timeout" in mgr.runs["run-script"]["metadata"]["error"]
+
+
+def test_a_deadline_stop_failure_does_not_mask_the_timeout(monkeypatch):
+    from fixtures.fake_runner import FakeRunnerClient, timeout_error, unreachable
+
+    mgr = FakeScriptIdentityManager(_script_workflow())
+    runner = FakeRunnerClient(error=timeout_error(), stop_error=unreachable())
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _run_script_workflow(mgr)
+
+    assert "Workflow container failed (timeout)" in str(excinfo.value)
+    stopped = [
+        payload for event, payload in mgr.events if event == "run_container_stopped"
+    ]
+    assert stopped[0]["container_stopped"] is False
+    assert "unreachable" in stopped[0]["stop_error"]
+    assert "timeout" in mgr.runs["run-script"]["metadata"]["error"]
+
+
+# --- runner capacity: a saturated pool is a wait, not a failure (v0.7.2 R4) ---
+
+
+def _record_slot_waits(monkeypatch) -> list[float]:
+    """Drive the retry loop without real time; returns the sleeps it asked for."""
+    waits: list[float] = []
+
+    async def record(seconds: float) -> None:
+        waits.append(seconds)
+
+    monkeypatch.setattr(tasks, "_slot_wait_sleep", record)
+    return waits
+
+
+def test_a_saturated_runner_pool_is_waited_out(monkeypatch):
+    from fixtures.fake_runner import FakeRunnerClient
+
+    monkeypatch.setattr(tasks, "SLOT_WAIT_JITTER", 0.0)
+    mgr = FakeScriptIdentityManager(_script_workflow())
+    runner = FakeRunnerClient(stdout="pipeline-ok\n", capacity_until_call=2)
+    waits = _record_slot_waits(monkeypatch)
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    result = _run_script_workflow(mgr)
+
+    assert result == "pipeline-ok"
+    # Two 429s, then the run; every attempt carries the same run.
+    assert len(runner.requests) == 3
+    assert waits == [tasks.SLOT_WAIT_INITIAL_S, tasks.SLOT_WAIT_INITIAL_S * 2]
+    events = [event for event, _ in mgr.events]
+    assert events == ["run_started", "run_waiting", "run_slot_acquired", "run_completed"]
+
+    waiting = [payload for event, payload in mgr.events if event == "run_waiting"][0]
+    assert waiting["workflow"] == WORKFLOW_NAME
+    assert waiting["reason"] == "capacity_exhausted"
+    # The runner's own limits travel with the event; no secret is in it.
+    assert "per-target limit" in waiting["detail"]
+    assert waiting["slot_wait_s"] == 300.0
+
+    acquired = [payload for event, payload in mgr.events if event == "run_slot_acquired"][0]
+    assert acquired["waited_s"] == round(sum(waits), 1)
+    assert mgr.runs["run-script"]["state"] == "completed"
+
+
+def test_no_slot_within_the_window_fails_with_runner_capacity(monkeypatch):
+    from fixtures.fake_runner import FakeRunnerClient
+
+    mgr = FakeScriptIdentityManager(_script_workflow())
+    runner = FakeRunnerClient(capacity_until_call=1000)
+    waits = _record_slot_waits(monkeypatch)
+    _patch_script_path(monkeypatch, mgr, runner, slot_wait=0.05)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _run_script_workflow(mgr)
+
+    message = str(excinfo.value)
+    assert "runner_capacity" in message
+    assert f"{sum(waits):.1f}s" in message
+    assert "WORKFLOW_SLOT_WAIT_S" in message
+    # The wait is bounded by the window, not by the number of attempts.
+    assert sum(waits) <= 0.05
+    assert [event for event, _ in mgr.events][:2] == ["run_started", "run_waiting"]
+    assert [event for event, _ in mgr.events][-1] == "run_failed"
+    assert "runner_capacity" in mgr.runs["run-script"]["metadata"]["error"]
+
+
+def test_a_zero_window_fails_the_first_saturation_immediately(monkeypatch):
+    """`WORKFLOW_SLOT_WAIT_S=0` keeps the pre-v0.7.2 behaviour (fail on the 429)."""
+    from fixtures.fake_runner import FakeRunnerClient
+
+    mgr = FakeScriptIdentityManager(_script_workflow())
+    runner = FakeRunnerClient(capacity_until_call=1000)
+    waits = _record_slot_waits(monkeypatch)
+    _patch_script_path(monkeypatch, mgr, runner, slot_wait=0.0)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _run_script_workflow(mgr)
+
+    assert "runner_capacity" in str(excinfo.value)
+    assert waits == []
+
+
+def test_the_wait_eats_into_the_run_timeout(monkeypatch):
+    """Every waited second is taken off the deadline the runner is given."""
+    from fixtures.fake_runner import FakeRunnerClient
+
+    mgr = FakeScriptIdentityManager(_script_workflow())
+    runner = FakeRunnerClient(stdout="ok\n", capacity_until_call=2)
+    waits = _record_slot_waits(monkeypatch)
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    _run_script_workflow(mgr)
+
+    first, second, third = (request.deadline_ms for request in runner.requests)
+    assert first == int(SCRIPT_TIMEOUT_S * 1000)
+    assert second == first - int(waits[0] * 1000)
+    assert third == first - int((waits[0] + waits[1]) * 1000)
+    # Strictly shrinking is what makes the wait cost runtime, not add it.
+    assert third < second < first
+
+
+def test_the_slot_wait_backoff_is_capped(monkeypatch):
+    """Backoff doubles to a ceiling and stops there: no unbounded growth."""
+    from fixtures.fake_runner import FakeRunnerClient
+
+    monkeypatch.setattr(tasks, "SLOT_WAIT_JITTER", 0.0)
+    mgr = FakeScriptIdentityManager(_script_workflow())
+    runner = FakeRunnerClient(stdout="ok\n", capacity_until_call=10)
+    waits = _record_slot_waits(monkeypatch)
+    _patch_script_path(monkeypatch, mgr, runner, slot_wait=10_000.0)
+
+    _run_script_workflow(mgr)
+
+    assert waits == [
+        tasks.SLOT_WAIT_INITIAL_S,
+        2.0,
+        4.0,
+        8.0,
+        16.0,
+        tasks.SLOT_WAIT_MAX_S,
+        tasks.SLOT_WAIT_MAX_S,
+        tasks.SLOT_WAIT_MAX_S,
+        tasks.SLOT_WAIT_MAX_S,
+        tasks.SLOT_WAIT_MAX_S,
+    ]
+    assert max(waits) == tasks.SLOT_WAIT_MAX_S
+
+
+def test_the_slot_wait_never_outlives_the_run_timeout(monkeypatch):
+    """The run's own deadline can be the earlier ceiling: waiting cannot extend a run."""
+    from fixtures.fake_runner import FakeRunnerClient
+
+    mgr = FakeScriptIdentityManager(_script_workflow())
+    runner = FakeRunnerClient(capacity_until_call=1000)
+    waits = _record_slot_waits(monkeypatch)
+    _patch_script_path(monkeypatch, mgr, runner, slot_wait=10_000.0, run_timeout=100.0)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _run_script_workflow(mgr)
+
+    assert "runner_capacity" in str(excinfo.value)
+    # It waited the whole run timeout and not a second of the larger slot window.
+    assert sum(waits) == pytest.approx(100.0)
+    assert "WORKFLOW_RUN_TIMEOUT=100" in str(excinfo.value)
+
+
+def test_a_run_cancelled_while_queued_never_starts_a_container(monkeypatch):
+    """R3 + R4: waiting for a slot must not outlive the cancellation either."""
+    from fixtures.fake_runner import FakeRunnerClient
+
+    mgr = FakeScriptIdentityManager(_script_workflow())
+    mgr.runs["run-script"] = {"state": "processing", "metadata": {}}
+    runner = FakeRunnerClient(capacity_until_call=1000)
+    monkeypatch.setattr(tasks, "SLOT_WAIT_JITTER", 0.0)
+    monkeypatch.setattr(tasks, "CANCELLATION_POLL_INTERVAL_S", 0.01)
+    real_sleep = asyncio.sleep
+    waits: list[float] = []
+
+    async def sleep_and_cancel(seconds: float) -> None:
+        # The wait itself is where the cancel lands: the poller reads the record
+        # while the worker is between attempts.
+        waits.append(seconds)
+        mgr.runs["run-script"]["state"] = "cancelled"
+        for _ in range(5):
+            await real_sleep(0.02)
+
+    monkeypatch.setattr(tasks, "_slot_wait_sleep", sleep_and_cancel)
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    result = _run_script_workflow(mgr)
+
+    assert result == "Cancelled."
+    # Queued, never ran: the 429 that got us here is the only exec attempt.
+    assert len(runner.requests) == 1
+    assert runner.stops == ["run-script"]
+    assert [event for event, _ in mgr.events] == ["run_started", "run_waiting", "run_cancelled"]
+    assert mgr.runs["run-script"]["state"] == "cancelled"

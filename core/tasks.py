@@ -3,6 +3,7 @@
 
 import os
 import asyncio
+import random
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from taskiq_redis import ListQueueBroker
@@ -241,6 +242,122 @@ async def enqueue_workflow_run(
 # How often a running background task re-reads its run record to notice a cancellation.
 # Module-level so tests can shorten it without patching asyncio.sleep process-wide.
 CANCELLATION_POLL_INTERVAL_S = 15.0
+
+
+# --- runner capacity (v0.7.2 R4) ------------------------------------------- #
+# A saturated runner pool answers 429 (`capacity_exhausted`, retryable) instead of
+# queueing, so a workflow that asks for the last slot used to fail one run per
+# saturation. Waiting is bounded by `workflow_slot_wait` and grows the retry interval,
+# so a long saturation does not hammer the socket; every waited second is charged
+# against the run's own deadline (see `_exec_with_slot_wait`).
+SLOT_WAIT_INITIAL_S = 1.0
+SLOT_WAIT_MAX_S = 30.0
+# +/- fraction per step: several workflows can hit one saturation together, and a
+# fixed interval would wake all of them on the same tick. A step is the capped
+# backoff plus/minus this fraction, so the ceiling is SLOT_WAIT_MAX_S * (1 + jitter).
+SLOT_WAIT_JITTER = 0.25
+
+
+def _slot_wait_step(backoff: float) -> float:
+    """One jittered retry step (``backoff`` itself is capped by the caller)."""
+    return backoff * (1.0 + random.uniform(-SLOT_WAIT_JITTER, SLOT_WAIT_JITTER))
+
+
+async def _slot_wait_sleep(seconds: float) -> None:
+    """The retry wait itself. Module-level so tests can drive it without real time."""
+    await asyncio.sleep(seconds)
+
+
+class _RunCancelled(Exception):
+    """The run was cancelled while it was waiting for a runner slot (never started)."""
+
+
+async def _exec_with_slot_wait(
+    runner: RunnerClient,
+    request: ExecRequest,
+    *,
+    identity_mgr,
+    agent_name: str,
+    task_id: str,
+    cancelled=None,
+):
+    """``runner.exec`` a workflow run, waiting out a saturated runner pool.
+
+    Two ceilings apply and the earlier one wins:
+
+    * ``workflow_slot_wait`` -- how long the worker is willing to wait at all;
+    * the run's own deadline (``workflow_run_timeout``) -- every second spent waiting
+      is removed from the ``deadline_ms`` sent with the retry, so a run that queued for
+      minutes cannot then also get its full runtime on top.
+
+    ``run_waiting`` is recorded once, on the first 429, with the runner's own limits
+    (the message names them; no secret is ever in it); ``run_slot_acquired`` records
+    the total wait once the run actually starts -- an operator must be able to tell
+    "queued" from "slow". Any other error is re-raised untouched.
+
+    ``cancelled`` is the poller's flag: a run cancelled while it was still queued must
+    not start a container, so the wait ends with :class:`_RunCancelled` instead.
+    """
+    deadline_ms = request.deadline_ms
+    slot_wait_s = max(0.0, float(resolve_tunable("workflow_slot_wait")))
+    waited = 0.0
+    backoff = SLOT_WAIT_INITIAL_S
+    announced = False
+
+    while True:
+        if cancelled is not None and cancelled():
+            raise _RunCancelled()
+        attempt = request
+        if waited:
+            attempt = request.model_copy(
+                update={"deadline_ms": max(1, deadline_ms - int(waited * 1000))}
+            )
+        try:
+            result = await runner.exec(attempt)
+        except RunnerCallError as err:
+            if err.code != "capacity_exhausted":
+                raise
+            if not announced:
+                announced = True
+                await _append_run_event(
+                    identity_mgr,
+                    agent_name,
+                    task_id,
+                    "run_waiting",
+                    {
+                        "workflow": agent_name,
+                        "reason": err.code,
+                        "detail": str(err.message)[:512],
+                        "slot_wait_s": round(slot_wait_s, 1),
+                        "deadline_ms": attempt.deadline_ms,
+                    },
+                )
+            headroom = min(slot_wait_s - waited, deadline_ms / 1000.0 - waited)
+            if headroom <= 0:
+                raise RuntimeError(
+                    f"runner_capacity: no free runner container slot for workflow "
+                    f"{agent_name!r} after waiting {waited:.1f}s "
+                    f"(WORKFLOW_SLOT_WAIT_S={slot_wait_s:.1f}, "
+                    f"WORKFLOW_RUN_TIMEOUT={deadline_ms / 1000.0:.0f})"
+                ) from err
+            step = min(_slot_wait_step(backoff), headroom)
+            await _slot_wait_sleep(step)
+            waited += step
+            backoff = min(backoff * 2, SLOT_WAIT_MAX_S)
+            continue
+        if waited:
+            await _append_run_event(
+                identity_mgr,
+                agent_name,
+                task_id,
+                "run_slot_acquired",
+                {
+                    "workflow": agent_name,
+                    "waited_s": round(waited, 1),
+                    "deadline_ms": attempt.deadline_ms,
+                },
+            )
+        return result
 
 
 # Redis broker configuration
@@ -751,8 +868,35 @@ async def run_background_script(
         )
 
         cancelled_by_poller = False
+        # What the stop attempt achieved, keyed exactly as the run event reports it.
+        stop_outcome: Dict[str, Any] = {"container_stopped": False}
+
+        async def _stop_container(runner, reason: str) -> Dict[str, Any]:
+            """Stop this run's container; returns the outcome and never raises.
+
+            A stop failure must not mask the run's real outcome (a cancel, a timeout)
+            and must not escape the poller task: the run record says the container
+            could not be stopped, with the reason, and the run ends the normal way.
+            """
+            if task_id == "unknown":
+                return {"container_stopped": False, "stop_error": "no run id"}
+            try:
+                stopped = await runner.stop_run(task_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                print(
+                    f"Task {task_id} for {agent_name}: could not stop the workflow "
+                    f"container ({reason}): {err}"
+                )
+                return {"container_stopped": False, "stop_error": str(err)[:512]}
+            return {
+                "container_stopped": True,
+                "containers_stopped": int(getattr(stopped, "stopped", 0) or 0),
+            }
 
         async def _poll_for_cancellation(
+            runner,
             check_interval: float = CANCELLATION_POLL_INTERVAL_S,
         ):
             nonlocal cancelled_by_poller
@@ -763,35 +907,77 @@ async def run_background_script(
                     await _write_heartbeat(identity_mgr, agent_name, task_id)
                     rec = await asyncio.to_thread(identity_mgr.get_agent_run, agent_name, task_id)
                     if rec and rec.get("state") == "cancelled":
-                        # The container belongs to the runner and there is no cancel
-                        # call, so it runs to its deadline. Record the cancellation
-                        # once the result is in -- never claim the run was stopped.
+                        # Flag FIRST: the exec() in flight is about to lose its
+                        # container, and that failure IS the cancellation taking
+                        # effect -- not a run error.
+                        cancelled_by_poller = True
                         print(
                             f"Task {task_id} for {agent_name} cancelled mid-execution; "
-                            "the workflow container runs to its deadline."
+                            "stopping its workflow container."
                         )
-                        cancelled_by_poller = True
+                        stop_outcome.update(
+                            await _stop_container(runner, "cancelled_mid_run")
+                        )
                         return
                 except Exception:
                     pass
                 await asyncio.sleep(check_interval)
 
-        cancel_monitor = asyncio.create_task(_poll_for_cancellation())
-        try:
-            async with RunnerClient() as runner:
-                result = await runner.exec(request)
-        except RunnerCallError as err:
-            raise RuntimeError(
-                f"Workflow container failed ({err.code}): {err.message}"
-            ) from err
-        except RunnerUnavailable as err:
-            raise RuntimeError(f"Runner is unreachable: {err}") from err
-        finally:
-            cancel_monitor.cancel()
+        async def _record_cancelled() -> str:
+            await _append_run_event(
+                identity_mgr, agent_name, task_id, "run_cancelled",
+                {"reason": "cancelled_mid_run", **stop_outcome},
+            )
+            return "Cancelled."
+
+        # One client for the exec call AND the poller: the poller is the only party
+        # that can notice a cancel while the container runs, so it must be able to
+        # stop that container (v0.7.2 R3).
+        async with RunnerClient() as runner:
+            cancel_monitor = asyncio.create_task(_poll_for_cancellation(runner))
             try:
-                await cancel_monitor
-            except asyncio.CancelledError:
-                pass
+                result = await _exec_with_slot_wait(
+                    runner,
+                    request,
+                    identity_mgr=identity_mgr,
+                    agent_name=agent_name,
+                    task_id=task_id,
+                    cancelled=lambda: cancelled_by_poller,
+                )
+            except _RunCancelled:
+                # Cancelled while it was still queued for a slot: no container ever
+                # ran, so the cancelled path below has nothing to stop.
+                result = None
+            except RunnerCallError as err:
+                if not cancelled_by_poller:
+                    if err.code == "timeout":
+                        # The worker's own wait ran out. Left alone the container
+                        # would keep running to the runner's deadline, so end it here
+                        # and record why; the run still fails with the timeout.
+                        await _append_run_event(
+                            identity_mgr, agent_name, task_id, "run_container_stopped",
+                            {
+                                "reason": "deadline_exceeded",
+                                **(await _stop_container(runner, "deadline_exceeded")),
+                            },
+                        )
+                    raise RuntimeError(
+                        f"Workflow container failed ({err.code}): {err.message}"
+                    ) from err
+                result = None
+            except RunnerUnavailable as err:
+                if not cancelled_by_poller:
+                    raise RuntimeError(f"Runner is unreachable: {err}") from err
+                result = None
+            finally:
+                cancel_monitor.cancel()
+                try:
+                    await cancel_monitor
+                except asyncio.CancelledError:
+                    pass
+
+        if cancelled_by_poller:
+            return await _record_cancelled()
 
         output_str = result.stdout or ""
         if result.stderr:
@@ -802,13 +988,6 @@ async def run_background_script(
         )
         if truncated:
             output_str += WORKFLOW_OUTPUT_TRUNCATION_MARKER
-
-        if cancelled_by_poller:
-            await _append_run_event(
-                identity_mgr, agent_name, task_id, "run_cancelled",
-                {"reason": "cancelled_mid_run", "container_stopped": False},
-            )
-            return "Cancelled."
 
         if result.exit_code != 0:
             raise RuntimeError(f"Script exited with status {result.exit_code}:\n{output_str}")

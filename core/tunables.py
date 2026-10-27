@@ -42,6 +42,10 @@ TUNABLES: dict[str, Tunable] = {
     # deadline the runner kills it at and the worker's own wait, so it has to outlast
     # a real pipeline -- a tool's 300 s default would cut most of them off.
     "workflow_run_timeout": Tunable("WORKFLOW_RUN_TIMEOUT", 3600.0, float),
+    # A saturated runner pool answers 429 (`capacity_exhausted`), which for a workflow
+    # is a wait, not a failure: the worker retries within this window and charges the
+    # wait against `workflow_run_timeout` above (v0.7.2 R4). 0 disables the wait.
+    "workflow_slot_wait": Tunable("WORKFLOW_SLOT_WAIT_S", 300.0, float),
     "tool_search_limit": Tunable("TOOL_SEARCH_LIMIT", 8, int),
     "agent_search_limit": Tunable("AGENT_SEARCH_LIMIT", 8, int),
     "health_failure_threshold": Tunable("HEALTH_FAILURE_THRESHOLD", 10, int),

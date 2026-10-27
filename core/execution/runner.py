@@ -70,6 +70,8 @@ from core.execution.contract import (
     RunIdentity,
     SessionCreateRequest,
     SessionInfo,
+    StopRequest,
+    StopResult,
 )
 from core.models import MCPConfig, ToolConfig
 
@@ -1388,6 +1390,93 @@ async def _execute_one_shot(target_name: str, payload: ExecRequest, build):
         capacity.global_sem.release()
 
     return _result(raw)
+
+
+@app.post("/v1/stop")
+async def stop_run(request: Request, payload: StopRequest):
+    """Kill and remove every container one run left behind. Idempotent.
+
+    The caller is the taskiq worker: a ``background_script`` runs as ONE container,
+    and the runner's own deadline is minutes away, so a run cancelled from the UI (or
+    one whose worker gave up waiting) must be able to end its container *now*.
+
+    Containers are matched by the ``trellis.run`` label -- the run id the spec derives
+    from the verified token's claims, which for a workflow is the taskiq task id. A
+    session and the canary are built with no run id (their label is empty), so neither
+    can be matched by a non-empty ``run_id``. The session kinds are skipped explicitly
+    anyway: a session outlives the run that opened it and is torn down by its owner.
+
+    A kill on an already-exited container is the daemon's to refuse, not a failure:
+    the goal is "nothing of this run is left", and removal is what frees it. So the
+    kill is best-effort, the removal must succeed, and a second call reports 0.
+    """
+    denied = _authenticate(request)
+    if denied is not None:
+        return denied
+
+    run_id = (payload.run_id or "").strip()
+    if not run_id:
+        return _error(
+            400,
+            "invalid_request",
+            "run_id is required: /v1/stop removes the containers labelled with it",
+        )
+
+    backend = get_backend()
+    try:
+        containers = await backend.list_containers({"trellis.run": run_id})
+    except Exception as exc:
+        logger.warning("runner: cannot list the containers of run %r: %s", run_id, exc)
+        return _error(
+            503,
+            "daemon_unavailable",
+            f"cannot list the containers of run {run_id!r} to stop them ({exc})",
+            retryable=True,
+        )
+
+    stopped = 0
+    skipped_sessions = 0
+    for container in containers:
+        labels = (container.get("Config") or {}).get("Labels") or container.get("Labels") or {}
+        if labels.get("trellis.run") != run_id:
+            continue
+        if labels.get("trellis.kind") in SESSION_KINDS:
+            skipped_sessions += 1
+            continue
+        container_id = container.get("Id") or ""
+        if not container_id:
+            continue
+        with suppress(Exception):
+            await backend.kill(container_id)
+        try:
+            await backend.remove(container_id)
+        except Exception as exc:
+            logger.warning(
+                "runner: cannot remove %s of run %r: %s", container_id, run_id, exc
+            )
+            return _error(
+                503,
+                "daemon_unavailable",
+                f"stopped {stopped} container(s) of run {run_id!r} but cannot remove "
+                f"{container_id} ({exc})",
+                retryable=True,
+            )
+        stopped += 1
+
+    if stopped:
+        logger.info("runner: stopped %d container(s) of run %r", stopped, run_id)
+    return StopResult(
+        run_id=run_id,
+        stopped=stopped,
+        # Only reachable when a caller reused a run id for a session: say what was
+        # deliberately left alone instead of reporting a silent shortfall.
+        detail=(
+            f"{skipped_sessions} session container(s) carry this run id and were "
+            "not stopped"
+            if skipped_sessions
+            else ""
+        ),
+    )
 
 
 # --------------------------------------------------------------------------- #

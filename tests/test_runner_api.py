@@ -928,3 +928,113 @@ def test_socket_permissions_land_on_the_rebound_socket(monkeypatch, tmp_path):
 
     assert fixed == [path.stat().st_ino]
     assert fixed[0] != stale_inode
+
+
+# --------------------------------------------------------------------------- #
+# /v1/stop -- a cancelled or expired run must lose its container (v0.7.2 R3)
+# --------------------------------------------------------------------------- #
+
+
+def _seed_container(env, *, kind: str, run_id: str, state: str = "running") -> str:
+    """A container as the runner's own spec would have created it."""
+    from core.execution.spec import ContainerSpec
+
+    spec = ContainerSpec(
+        image="trellis-agent-platform:test",
+        runtime="runsc",
+        cmd=["python3", "/app/workspace/workflows/demo-inventory/pipeline.py"],
+        working_dir="/app/workspace/workflows/demo-inventory",
+        env={},
+        labels={
+            "trellis.install": "default",
+            "trellis.kind": kind,
+            "trellis.run": run_id,
+        },
+        kind=kind,
+    )
+
+    async def create() -> str:
+        container_id = await env.backend.create(spec)
+        env.backend.containers[container_id].state = state
+        return container_id
+
+    return asyncio.run(create())
+
+
+def test_stop_removes_every_container_of_the_run(env):
+    workflow = _seed_container(env, kind="workflow", run_id="run-1")
+    other_run = _seed_container(env, kind="workflow", run_id="run-2")
+    session = _seed_container(env, kind="mcp_session", run_id="")
+    canary = _seed_container(env, kind="canary", run_id="")
+
+    response = asyncio.run(_call("POST", "/v1/stop", json_body={"run_id": "run-1"}))
+
+    assert response.status_code == 200, response.json()
+    assert response.json() == {"run_id": "run-1", "stopped": 1, "detail": ""}
+    assert workflow not in env.backend.containers
+    assert workflow in env.backend.removed
+    # Another run's container, a session and the canary are untouched.
+    assert {other_run, session, canary} <= set(env.backend.containers)
+    assert not {other_run, session, canary} & set(env.backend.removed)
+
+
+def test_stop_is_idempotent(env):
+    """A second call (or one racing the run's own exit) reports 0 and succeeds."""
+    _seed_container(env, kind="workflow", run_id="run-1")
+
+    first = asyncio.run(_call("POST", "/v1/stop", json_body={"run_id": "run-1"}))
+    second = asyncio.run(_call("POST", "/v1/stop", json_body={"run_id": "run-1"}))
+
+    assert first.json()["stopped"] == 1
+    assert second.status_code == 200
+    assert second.json()["stopped"] == 0
+
+
+def test_stop_succeeds_when_the_daemon_refuses_the_kill(env, monkeypatch):
+    """An already-exited container cannot be killed; removing it is what frees it."""
+    dead = _seed_container(env, kind="workflow", run_id="run-1", state="exited")
+
+    async def refused(container_id: str) -> None:
+        raise BackendError("daemon_unavailable", "container is not running")
+
+    monkeypatch.setattr(env.backend, "kill", refused)
+
+    response = asyncio.run(_call("POST", "/v1/stop", json_body={"run_id": "run-1"}))
+
+    assert response.status_code == 200, response.json()
+    assert response.json()["stopped"] == 1
+    assert dead not in env.backend.containers
+
+
+def test_stop_refuses_an_empty_run_id(env):
+    """An empty id would match every unlabelled container: refuse it, don't widen."""
+    _seed_container(env, kind="workflow", run_id="")
+
+    response = asyncio.run(_call("POST", "/v1/stop", json_body={"run_id": "  "}))
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "invalid_request"
+    assert env.backend.removed == []
+
+
+def test_stop_needs_the_runner_bearer_token(env):
+    _seed_container(env, kind="workflow", run_id="run-1")
+
+    response = asyncio.run(
+        _call("POST", "/v1/stop", json_body={"run_id": "run-1"}, headers={})
+    )
+
+    assert response.status_code == 401
+    assert env.backend.removed == []
+
+
+def test_stop_never_touches_a_session_container(env):
+    """A session outlives the run that opened it: its run id must not take it down."""
+    session = _seed_container(env, kind="mcp_session", run_id="run-1")
+
+    response = asyncio.run(_call("POST", "/v1/stop", json_body={"run_id": "run-1"}))
+
+    assert response.status_code == 200
+    assert response.json()["stopped"] == 0
+    assert "session" in response.json()["detail"]
+    assert session in env.backend.containers

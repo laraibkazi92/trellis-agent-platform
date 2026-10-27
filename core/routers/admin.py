@@ -59,6 +59,7 @@ _TUNABLE_LABELS = {
     "max_run_error_chars": ("Max Run Error Chars", "Error trace stored per workflow run (characters)."),
     "tool_execution_timeout": ("Tool Execution Timeout", "Seconds before a hub tool subprocess is killed."),
     "workflow_run_timeout": ("Workflow Run Timeout", "Seconds a background-script container may run before the runner kills it."),
+    "workflow_slot_wait": ("Workflow Slot Wait", "Seconds a workflow waits for a free runner container slot before failing (0 disables the wait)."),
     "tool_search_limit": ("Tool Search Limit", "Max tools returned by search_tools."),
     "agent_search_limit": ("Agent Search Limit", "Max agents returned by search_agents."),
     "health_failure_threshold": ("Health Failure Threshold", "Consecutive failures before an entity trips to Offline."),
