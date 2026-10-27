@@ -466,6 +466,10 @@ def _gateway_call_with_groups(monkeypatch, record):
     monkeypatch.setattr(
         gateway.identity_mgr, "get_user", lambda user_id: record
     )
+    # The front door has no agent record of its own, and the configuration check is a
+    # registry read as well: both are faked so this test never reaches a live etcd.
+    monkeypatch.setattr(gateway.identity_mgr, "get_agent_config", lambda name: None)
+    monkeypatch.setattr(gateway, "is_tool_configured", _configured_ok())
     monkeypatch.setattr(
         gateway.identity_mgr, "get_tool_config", lambda name: {"name": name, "public": True}
     )

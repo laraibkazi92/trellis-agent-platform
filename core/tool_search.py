@@ -676,11 +676,14 @@ async def execute_whitelisted_tool(
     claims = current_claims()
     agent = getattr(claims, "agent", None)
     groups = getattr(claims, "groups", ()) or ()
-    record = (
-        await asyncio.to_thread(mgr.get_agent_config, agent) if agent else None
-    )
 
     try:
+        # Both registry reads and the decision live in one try: a registry that cannot
+        # answer must deny (a security boundary fails closed), never raise out of the
+        # call as an unhandled 500.
+        record = (
+            await asyncio.to_thread(mgr.get_agent_config, agent) if agent else None
+        )
         exposure = False if record else await published_exposure(tool_name, mgr)
         decision = await tool_access.enforce_async(
             await tool_access.authorize_claims_async(

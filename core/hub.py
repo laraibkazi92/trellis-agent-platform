@@ -191,7 +191,20 @@ async def _authorize_call(
             return None, None
         return None, {"error": message}
 
-    record = await asyncio.to_thread(identity_mgr.get_agent_config, claims.agent)
+    try:
+        record = await asyncio.to_thread(identity_mgr.get_agent_config, claims.agent)
+    except Exception as exc:
+        # A registry that cannot answer is a denial, not an exception escaping the
+        # last mile: this is a security boundary, so it fails closed exactly like the
+        # evaluator does when the policy itself is unavailable.
+        logger.error(
+            "hub: cannot resolve the record of agent '%s' for %r: %s",
+            claims.agent, config.name, exc,
+        )
+        return claims, {
+            "error": "access_denied: the caller's agent record could not be "
+            "resolved (registry unavailable)"
+        }
     decision = await tool_access.enforce_async(
         await tool_access.authorize_claims_async(
             claims,

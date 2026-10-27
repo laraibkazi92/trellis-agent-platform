@@ -1175,11 +1175,34 @@ def _patch_tool_search(monkeypatch, mgr):
     return tool_search
 
 
+@pytest.fixture
+def no_group_rules(monkeypatch):
+    """A hermetic, rule-free evaluator snapshot (never a developer's local etcd).
+
+    `execute_whitelisted_tool` reads the group-rule policy through `tool_access._client`;
+    without a fake, a machine with no etcd gets `policy_unavailable` (deny) while a
+    machine with one gets "no rules" (allow). Tests about exposure must pin the latter.
+    """
+    from core import tool_access
+
+    class _NoPolicy:
+        def get(self, key, **_kwargs):
+            return None, None
+
+        def put(self, key, value):
+            raise AssertionError(f"unexpected policy write: {key}")
+
+    monkeypatch.setattr(tool_access, "_client", lambda: _NoPolicy())
+    tool_access.reset_snapshot()
+    yield
+    tool_access.reset_snapshot()
+
+
 def _search(tool_search, query):
     return asyncio.run(tool_search.search_tools(query))
 
 
-def test_a_public_site_opts_its_mcps_into_search_and_use_tool(mgr, monkeypatch):
+def test_a_public_site_opts_its_mcps_into_search_and_use_tool(mgr, monkeypatch, no_group_rules):
     mgr.create_edge(SITE, "Plant floor", "admin@example.com")
     _make_site_public(mgr, public=True, public_tools=[])
     _publish_mcps(mgr, [_mcp()])

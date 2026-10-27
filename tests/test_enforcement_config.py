@@ -51,6 +51,30 @@ def _secret(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _no_live_policy(monkeypatch):
+    """The evaluator's policy read must never reach a developer's local etcd.
+
+    These tests pin wiring, not policy resolution. With no registry the snapshot is
+    `policy_unavailable` and every call is denied, so the result would otherwise depend
+    on whether an etcd happens to be listening on 127.0.0.1:2379 -- which is exactly
+    how this suite passed locally and failed in CI.
+    """
+    from core import tool_access
+
+    class _NoPolicy:
+        def get(self, key, **_kwargs):
+            return None, None
+
+        def put(self, key, value):
+            raise AssertionError(f"unexpected policy write: {key}")
+
+    monkeypatch.setattr(tool_access, "_client", lambda: _NoPolicy())
+    tool_access.reset_snapshot()
+    yield
+    tool_access.reset_snapshot()
+
+
 def _services(path: Path) -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8"))["services"]
 
