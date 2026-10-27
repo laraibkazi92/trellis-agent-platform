@@ -458,9 +458,14 @@ def _mcp_entry(schema=None, **overrides):
     return entry
 
 
-def test_proto_is_two_and_v1_is_still_accepted():
-    assert protocol.PROTO == 2
-    assert protocol.SUPPORTED_PROTOS == {1, 2}
+def test_proto_is_three_and_older_edges_are_refused():
+    """R1 removed the token from the call frame, so only proto 3 is servable.
+
+    A proto-2 edge would answer every call with a 403 while its tunnel looked
+    healthy; refusing the handshake is the failure an operator can act on.
+    """
+    assert protocol.PROTO == 3
+    assert protocol.SUPPORTED_PROTOS == {3}
 
 
 def test_mcp_caps_are_the_documented_values():
@@ -557,8 +562,8 @@ def test_mcp_schema_survives_the_wire_byte_identically():
     schema = _meta_tool_schema()
     frame = {
         "t": "hello",
-        "proto": 2,
-        "edge_version": "0.5.0",
+        "proto": 3,
+        "edge_version": "0.7.2",
         "caps": ["tools", "mcp"],
         "tools": [],
         "mcps": [_mcp_entry(schema)],
@@ -705,40 +710,37 @@ def test_long_mcp_description_is_truncated_not_rejected():
     assert len(tool.description) == protocol.MAX_MCP_DESC_CHARS
 
 
-def test_proto1_hello_is_tools_only():
-    proto, _, tools, mcps, caps = protocol.validate_hello(
-        {"proto": 1, "edge_version": "0.4.1", "tools": [{"name": "echo"}]}
-    )
-
-    assert proto == 1
-    assert [tool.name for tool in tools] == ["echo"]
-    assert mcps == []
-    assert caps == ["tools"]
-
-
 def test_proto2_hello_carries_mcps_and_caps():
     proto, _, _, mcps, caps = protocol.validate_hello(
         {
-            "proto": 2,
-            "edge_version": "0.5.0",
+            "proto": 3,
+            "edge_version": "0.7.2",
             "caps": ["tools", "mcp"],
             "tools": [],
             "mcps": [{"name": "devops-cli", "tools": [{"name": "tenant_account_tools"}]}],
         }
     )
 
-    assert proto == 2
+    assert proto == 3
     assert caps == ["tools", "mcp"]
     assert [mcp.name for mcp in mcps] == ["devops-cli"]
 
 
-def test_proto3_hello_closes_with_4001():
+@pytest.mark.parametrize("proto", [1, 2])
+def test_an_older_proto_hello_closes_with_4001(proto):
+    """A v0.7.1 edge would fail every call (its runner still wants a token)."""
     with pytest.raises(protocol.ProtocolError) as exc:
-        protocol.validate_hello({"proto": 3, "edge_version": "0.6.0"})
+        protocol.validate_hello({"proto": proto, "edge_version": "0.7.1", "tools": []})
     assert exc.value.close_code == protocol.CLOSE_VERSION
 
 
-@pytest.mark.parametrize("proto", ["2", 2.0, True, None, 0])
+def test_proto4_hello_closes_with_4001():
+    with pytest.raises(protocol.ProtocolError) as exc:
+        protocol.validate_hello({"proto": 4, "edge_version": "0.8.0"})
+    assert exc.value.close_code == protocol.CLOSE_VERSION
+
+
+@pytest.mark.parametrize("proto", ["3", 3.0, True, None, 0, 1, 2])
 def test_hello_proto_must_be_a_supported_integer(proto):
     with pytest.raises(protocol.ProtocolError) as exc:
         protocol.validate_hello({"proto": proto})
@@ -748,19 +750,19 @@ def test_hello_proto_must_be_a_supported_integer(proto):
 @pytest.mark.parametrize("caps", [["tools", "ssh"], ["TOOLS"], [1], "tools", {"tools": 1}])
 def test_invalid_caps_are_rejected(caps):
     with pytest.raises(protocol.ProtocolError):
-        protocol.validate_hello({"proto": 2, "caps": caps})
+        protocol.validate_hello({"proto": 3, "caps": caps})
 
 
 def test_duplicate_caps_are_rejected():
     with pytest.raises(protocol.ProtocolError) as exc:
-        protocol.validate_hello({"proto": 2, "caps": ["tools", "tools"]})
+        protocol.validate_hello({"proto": 3, "caps": ["tools", "tools"]})
     assert "duplicate capability" in str(exc.value)
 
 
 def test_mcps_without_the_mcp_capability_are_rejected():
     with pytest.raises(protocol.ProtocolError) as exc:
         protocol.validate_hello(
-            {"proto": 2, "caps": ["tools"], "mcps": [{"name": "srv"}]}
+            {"proto": 3, "caps": ["tools"], "mcps": [{"name": "srv"}]}
         )
     assert "capability" in str(exc.value)
 

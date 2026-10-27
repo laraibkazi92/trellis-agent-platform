@@ -444,8 +444,14 @@ def test_per_user_required_refuses_a_sealed_set_without_a_declared_name(tmp_path
         )
 
 
-def test_per_user_required_refuses_a_missing_identity_but_never_names_a_value(tmp_path):
+def test_per_user_required_refuses_a_missing_identity_before_missing_credentials(tmp_path):
+    """No set and no email: identity, not a credential (R7.1).
+
+    The old order answered ``missing_credentials`` ("no credentials for anonymous"),
+    which reads as "your stored set is incomplete" when the caller has no set at all.
+    """
     store = make_store(tmp_path)
+    write_shared(store, DEVOPS_PASSWORD=SECRET_VALUE)
 
     with pytest.raises(secrets.MissingCredentials) as caught:
         store.resolve(
@@ -456,7 +462,87 @@ def test_per_user_required_refuses_a_missing_identity_but_never_names_a_value(tm
             mode="per_user_required",
         )
 
-    assert caught.value.message == "no credentials for anonymous on edge dc1"
+    assert caught.value.code == secrets.IDENTITY_INCOMPLETE == "identity_incomplete"
+    assert "no email" in caught.value.message
+    assert "export 'devops'" in caught.value.message
+    assert "dc1" in caught.value.message
+    # Never a value, and never the credential code an operator would act on.
+    assert SECRET_VALUE not in caught.value.message
+
+
+def test_per_user_required_serves_a_sealed_set_without_an_email(tmp_path):
+    """A blob that arrived is bound to this caller: email, else user id (R7.1).
+
+    The refusal is about a caller with *nothing sealed*, not about a missing address:
+    ``sealed_identity`` falls back to the user id, so an email-less identity can hold a
+    set legitimately (a webhook run's identity is the literal ``webhook``). Refusing it
+    would reject the one credential that is provably theirs.
+    """
+    store = make_store(tmp_path)
+
+    resolved = store.resolve(
+        tool_config(secrets=["DEVOPS_PASSWORD"]),
+        name="devops",
+        email=None,
+        site="dc1",
+        mode="per_user_required",
+        sealed={"DEVOPS_PASSWORD": "mine"},
+    )
+
+    assert resolved["DEVOPS_PASSWORD"] == "mine"
+
+
+@pytest.mark.parametrize("mode", ["shared", "per_user"])
+def test_a_sealed_set_still_resolves_without_an_email(tmp_path, mode):
+    """A blob is sealed to the email *or* the user id, so no address is needed for it.
+
+    Only ``per_user_required`` **without a blob** has an email requirement (nothing is
+    sealed for a caller without one, and the caller is sent to the identity provider,
+    not to the seal form). A decrypted blob is served in every mode: refusing it would
+    break an identity that is legitimately email-less -- a webhook run's ``webhook``
+    user id, for one.
+    """
+    store = make_store(tmp_path)
+    write_shared(store, DEVOPS_PASSWORD=SECRET_VALUE)
+
+    resolved = store.resolve(
+        tool_config(secrets=["DEVOPS_PASSWORD"]),
+        name="devops",
+        email=None,
+        site="dc1",
+        mode=mode,
+        sealed={"DEVOPS_PASSWORD": "mine"},
+    )
+
+    assert resolved["DEVOPS_PASSWORD"] == "mine"
+
+
+def test_a_blank_email_counts_as_no_email(tmp_path):
+    """Whitespace is not an address, so it must not pass for one in the refusal."""
+    store = make_store(tmp_path)
+
+    with pytest.raises(secrets.MissingCredentials) as caught:
+        store.resolve(
+            tool_config(secrets=["DEVOPS_PASSWORD"]),
+            name="devops",
+            email="   ",
+            site="dc1",
+            mode="per_user_required",
+        )
+
+    assert caught.value.code == "identity_incomplete"
+
+
+def test_shared_mode_without_an_email_still_resolves(tmp_path):
+    """Not a per-user call: nothing is sealed, so no email is needed."""
+    store = make_store(tmp_path)
+    write_shared(store, DEVOPS_PASSWORD=SECRET_VALUE)
+
+    resolved = store.resolve(
+        tool_config(secrets=["DEVOPS_PASSWORD"]), name="devops", email=None, site="dc1"
+    )
+
+    assert resolved == {"DEVOPS_PASSWORD": SECRET_VALUE}
 
 
 # ---------------------------------------------------------------- hygiene
@@ -656,6 +742,40 @@ def test_handle_call_refuses_per_user_required_without_a_sealed_set(tmp_path, mo
         "code": "missing_credentials",
         "message": "no credentials for ops@example.com on edge plant-floor",
     }
+
+
+def test_handle_call_reports_identity_incomplete_for_a_frame_without_an_email(
+    tmp_path, monkeypatch
+):
+    """The reserved code travels to central, so the UI can offer the seal form.
+
+    A frame whose identity has no email and no sealed set is what the relay builds from
+    an email-less token: the edge must not answer ``missing_credentials`` here, because
+    that reads as "your stored set is incomplete" when there is no set at all.
+    """
+    monkeypatch.setattr(proxy.tool_runtime, "execute_tool", _never_called)
+    frame = {
+        "t": "call",
+        "id": "c2",
+        "tool": "devops",
+        "args": {},
+        "deadline_ms": DEADLINE_MS,
+        "user": "u-alice",
+        "user_email": None,
+    }
+
+    result = asyncio.run(
+        proxy.handle_call(
+            {"devops": (tool_config(secrets=["DEVOPS_PASSWORD"]), tmp_path)},
+            frame,
+            proxy_config=edge_config(tmp_path),
+            credential_modes={"devops": "per_user_required"},
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "identity_incomplete"
+    assert "u-alice" not in result["error"]["message"]
 
 
 def test_the_credential_mode_travels_through_the_deadline_wrapper(tmp_path, monkeypatch):

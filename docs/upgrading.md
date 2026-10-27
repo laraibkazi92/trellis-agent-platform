@@ -9,8 +9,334 @@ pointed at by `TRELLIS_WORKSPACE_DIR` (see `.env.example` → *Deployment Layout
 run with the default `./workspace` inside this clone, the same steps apply, but be aware
 that your content is then inside the tree you check out tags into.
 
-The current release, `v0.7.1`, is breaking. Read [its section](#v071-2026-10-26) before
-you upgrade.
+The current release, `v0.7.2`, is breaking for anything that runs an edge: the edge holds
+no signing key any more and speaks a new wire protocol. Read
+[its section](#v072-2026-10-27) before you upgrade. If you are coming from `v0.7.0` or
+older, read the [`v0.7.1` section](#v071-2026-10-26) as well.
+
+---
+
+## v0.7.2 (2026-10-27)
+
+Changes since `v0.7.1`: a hardening release. An **edge holds no token-signing key** any
+more — its runner runs on the identity the relay derived — every tool and workflow
+container **learns its agent, its run and its output directories**, cancelling a workflow
+run **kills its container**, a saturated runner pool **waits** instead of failing the run,
+the startup canary **runs as the tool user** (so a root uid/gid now refuses to start), one
+env-name check **covers every manifest surface**, and three identity rules are tightened.
+
+Four changes can refuse something `v0.7.1` accepted: an edge left on the `v0.7.1` build
+(protocol `proto: 2` is refused at the handshake), a stack whose
+`TRELLIS_UID`/`TRELLIS_GID` is `0`, a manifest whose declared names are not environment
+identifiers, and a `per_user_required` edge export called by an identity with no email
+claim. Two more change behaviour without refusing anything: a body `__user_id` is no
+longer an identity (it is ignored), and a workflow's first saturation is a wait. Nothing
+else needs an action: the tool stdin/stdout protocol and the `workspace/` layout are
+untouched, and the new container variables are additive.
+
+Central keeps its services, ports, volumes and `.env` keys. **An edge is upgraded in the
+same window as central**, because the edge/relay wire protocol moved to `proto: 3`.
+
+**Runtime prerequisite.** The validated minimum is the gVisor release tag
+**`release-20261019.0`**. Upgrade gVisor on every host that runs a `runner` before you
+deploy, and confirm it there with `runsc --version`: the runner's preflight logs a
+**non-fatal warning** when it can read an older version from its own container, and reports
+the check as *skipped* when it cannot see the binary at all — the normal case, since gVisor
+is a host runtime. Why the version matters is unchanged from `v0.7.1`: `runsc` is the
+isolation boundary, and the networking model is validated in the mode described in
+[deploy.md → Prerequisite: gVisor](deploy.md#prerequisite-gvisor-runsc). `runc` remains a
+dev-machine and per-tool escape hatch.
+
+#### Upgrade order
+
+1. **Upgrade gVisor on every runner host** to `release-20261019.0` or newer, then confirm
+   with `runsc --version` on that host.
+2. **Read R1 and R5 before you start.** They are the two changes that break a working
+   stack: an edge left on the old tag never completes the handshake (`proto: 3`), and a root
+   uid/gid pair stops the runner at startup.
+3. **Set a non-root `TRELLIS_UID`/`TRELLIS_GID`** and `chown -R` the workspace if you have
+   been running `0:0`.
+4. **Remove `AGENT_TOKEN_SECRET` and `ENFORCE_AGENT_TOKENS` from every edge service** and
+   set `RUNNER_ROLE=edge` on the edge runner. Do **not** restart an edge between this step
+   and the next one: a `v0.7.1` runner still requires the key and dies in `require_secret`
+   without it. The two steps are one edit window.
+5. **Deploy central and every edge from the same tag, in one window.** `docker compose
+   pull && docker compose up -d` on central (or `up -d --build` from source), then
+   recreate the edge services from the same image tag.
+6. **Check that `db-sync` exited 0.** Exit 2 means a manifest declares a name that cannot
+   be an environment variable; the message names the file, the field and the key.
+7. **Rotate central's `AGENT_TOKEN_SECRET`** if you rotate on a schedule — the edge no
+   longer participates, so this is now a central-only operation (R1).
+8. **Exercise the three paths once**: a tool call (which should see `TRELLIS_AGENT_NAME`),
+   a workflow run you cancel, and one edge call.
+
+#### The edge holds no signing key: `AGENT_TOKEN_SECRET` and `ENFORCE_AGENT_TOKENS` leave it
+
+An edge runner used to verify the agent token the relay forwarded. It no longer receives
+one. The relay puts the identity it derived from the token it verified into the call frame
+(`agent`, `user`, `user_email`, `groups`, `run_id`, `parent_run_id`) and no token at all,
+and the edge runner takes that identity from `trellis-proxy` over the
+`RUNNER_TOKEN`-authenticated Unix socket under **`RUNNER_ROLE=edge`**. It loads no signing
+key; neither does the proxy.
+
+`RUNNER_ROLE` is explicit — `edge` or `central`, default `central` — and is never inferred
+from whether a key happens to be present: a central runner that lost its key would
+otherwise silently downgrade to trusting a body. Each role refuses the *other's* form. An
+edge request that arrives without identity is a `400`; a central runner rejects a request
+body that asserts identity ("central runner refuses body identity"), because a body is not
+something central verifies.
+
+The wire protocol moves to **`proto: 3`**, and only 3 is accepted. A `v0.7.1` edge is
+refused at the handshake with `CLOSE_VERSION` (`4001`) and retries only at the maximum
+backoff, so the mismatch is one log line instead of a healthy-looking tunnel in which
+every call fails `403`. **Central and every edge are upgraded together**; a mixed fleet does
+not connect. Proto 1 and 2 edges are no longer served at all.
+
+**An edge needs a verified caller.** The relay derives the whole identity from the token it
+verified, so a central relay running `ENFORCE_AGENT_TOKENS=off` (or `log` with a token it
+rejected) has no identity to forward, and the edge answers `400` rather than running a tool
+unattributed. Edge deployments assume an enforcing central relay.
+
+**What to do instead**
+
+- Delete `AGENT_TOKEN_SECRET` and `ENFORCE_AGENT_TOKENS` from **every** edge service — the
+  proxy *and* the runner — and from the edge `.env`. A leftover line is harmless (the
+  shipped `deploy/proxy/docker-compose.yml` passes neither variable to any service, so
+  nothing reads it and no warning fires), but delete it so the file stops implying the edge
+  verifies something.
+- Add `RUNNER_ROLE: edge` to the edge `runner` service if you maintain your own compose
+  file. The shipped one already sets it. A runner left in the central posture refuses the
+  body identity the proxy sends and expects a verified token instead.
+- Treat `RUNNER_TOKEN` as a per-host secret. On an edge it is now identity-bearing: whoever
+  holds it can name any caller to that runner, including another agent's output directory.
+- Keep `AGENT_TOKEN_SECRET` on central: `host`, `hub`, `gateway`, `edge-relay`,
+  `taskiq-worker` and `runner` mint or verify tokens and an enforcing stack without it does
+  not start.
+- **Rotate the central key.** The value is still a `;`-separated list: the first entry
+  signs, every entry verifies. Set `NEW;OLD` on all six central services, deploy
+  (`docker compose up -d`), run one agent turn and one edge call to confirm old tokens still
+  verify and new ones are minted, then drop `OLD` in a later change. Because the edge no
+  longer holds the key, that later removal never touches an edge.
+- Rolling an edge back to `v0.7.1` means putting the key back on its runner **and** rolling
+  central back in the same window — a `v0.7.1` edge cannot connect to a `v0.7.2` relay, or
+  the other way round.
+
+#### Every tool and workflow container knows its agent, its run and its output dirs
+
+A **tool** container used to learn only the caller (`TRELLIS_USER_ID`,
+`TRELLIS_USER_EMAIL`) and its run id. It now also learns which agent it runs for and where
+it may write:
+
+| Variable | Value | Present when |
+| --- | --- | --- |
+| `TRELLIS_AGENT_NAME` | the agent the run acts as (`gateway` for a front-door MCP call) | the call carries an agent identity |
+| `TRELLIS_RUN_ID` | the id of this run | the run has a run id |
+| `TRELLIS_REPORTS_DIR` | `/app/workspace/reports/<agent>` | `output_dirs:` lists `reports` |
+| `TRELLIS_OUTPUT_DIR` | `/app/workspace/output/<agent>` | `output_dirs:` lists `output` |
+
+Three details matter when you rely on them:
+
+- They are **container configuration, not the stdin preamble**: they appear in
+  `docker inspect`, and anything the tool spawns inherits them. They are run context, not
+  credentials, which is why they are not delivered on stdin the way a declared secret is.
+- They come from the identity the runner resolved, never from the call's arguments. The
+  names are popped before they are set, so a manifest that declares one of them in
+  `variables:` cannot pin a value (and cannot make an unattributed container announce a
+  directory it was never given).
+- A session container gets `TRELLIS_AGENT_NAME` and **no** run id: a session outlives the
+  run that opened it, and the run id is the label a stop matches. Console (`execute`)
+  containers get none of the four — they mount no workspace tree.
+
+**What to do instead**
+
+- Nothing, unless a tool hard-coded a path. A tool that computed `reports/<agent>` from the
+  agent name can read `os.environ["TRELLIS_REPORTS_DIR"]` instead, which is correct on
+  central, on an edge and for the workflow's own directories.
+- A workflow container gets `TRELLIS_AGENT_NAME` (the workflow name, taken from the
+  validated pipeline directory, so a caller cannot rename it) and both directory variables
+  — its two mounts are always created. See
+  [workflows.md → How a script workflow runs](workflows.md#how-a-script-workflow-runs).
+- The variables are in [tools.md → Container execution contract](tools.md#container-execution-contract)
+  with a report-writing example.
+
+#### Cancelling a workflow run stops its container
+
+`v0.7.1` had no cancel API: a cancelled `background_script` kept running to its deadline and
+the run was recorded as cancelled without claiming the process stopped. The runner now
+serves **`POST /v1/stop`** (same `RUNNER_TOKEN` gate as `/v1/exec`): it kills and removes
+every container labelled with the run id for this install, is idempotent (`stopped: 0` is a
+success — the thing you wanted is gone), and skips session containers on purpose. The
+worker calls it from its cancellation poller, and again when its own wait expires, so a
+timed-out run no longer leaves a container behind.
+
+What a run record now shows:
+
+- `run_cancelled` now carries the stop outcome: `container_stopped` (bool),
+  `containers_stopped` (the count) and a `stop_detail`, or `stop_error` when the stop
+  failed. Its `reason` distinguishes a cancel mid-run (`cancelled_mid_run`), one that
+  arrived while the run was still queued for a slot (`cancelled_while_waiting`), and one
+  recorded before any container existed (`cancelled_before_start`). `container_stopped:
+  false` is honest: there was no labelled container to stop, or the stop genuinely failed.
+- Three new event types exist in this release: `run_container_stopped` (recorded when the
+  worker's deadline stops a container, with `reason: "deadline_exceeded"`), `run_waiting`
+  and `run_slot_acquired` (both from the slot wait below). They are additive: existing run
+  records and their hash chains are untouched, and a run started before the upgrade keeps
+  the events it had.
+
+**What to do instead**
+
+- Nothing is required. If you script against the run event log or the Workflows timeline,
+  handle the three new types.
+- A stop matches the `trellis.run` label, which comes from the verified token's run id. On a
+  development stack with `ENFORCE_AGENT_TOKENS=off` there is no run id, so no label, and the
+  container cannot be stopped (the event says so with `container_stopped: false`). The same
+  applies to a run whose container already exited.
+- Stopping is per install (`trellis.install`), so two runners sharing one Docker daemon
+  cannot stop each other's containers on a colliding run id.
+
+#### A saturated runner pool waits instead of failing the run
+
+In `v0.7.1` a workflow run that hit `429 capacity_exhausted` failed immediately: the runner
+pool was full, so the run was over. The worker now retries the call in-process with a
+capped, jittered backoff for up to **`WORKFLOW_SLOT_WAIT_S`** seconds (default `300`; also on
+Admin → Limits & Tuning as *Workflow Slot Wait*). There is no new queue and no new
+scheduler — the wait lives inside the one run.
+
+- `run_waiting` is recorded once, on the first `429`, naming the runner's limits.
+  `run_slot_acquired` records how long the run actually queued once it starts.
+- Every waited second is **charged against the run's own deadline**: each retry sends a
+  smaller `deadline_ms`, so a run that queued for four minutes does not also get its full
+  `WORKFLOW_RUN_TIMEOUT` on top. If the remaining budget is too small to be worth starting
+  (under 5 s, or under half the deadline, whichever is smaller), the run fails with
+  `runner_capacity` instead of starting a container the runner would kill immediately.
+- If no slot frees inside the window the run fails with reason **`runner_capacity`**, naming
+  the wait, `WORKFLOW_SLOT_WAIT_S` and `WORKFLOW_RUN_TIMEOUT`.
+- A cancel that arrives during the wait wins: the run ends as `run_cancelled` with reason
+  `cancelled_while_waiting` and never starts a container.
+- **Tool calls are unchanged.** A saturated pool is still an immediate `429` for a tool
+  call; only a workflow run waits.
+
+**What to do instead**
+
+- Leave the default if you would rather a queued run succeed late than fail early; set
+  `WORKFLOW_SLOT_WAIT_S=0` (or `0` in Limits & Tuning) to restore the `v0.7.1` behaviour
+  exactly — the first `429` is re-raised untouched, with no `run_waiting` event.
+- Size `RUNNER_MAX_CONTAINERS` for workflows and interactive calls together; the wait makes
+  a saturated pool visible as queue time rather than as run failures.
+- Details: [workflows.md → How a script workflow runs](workflows.md#how-a-script-workflow-runs).
+
+#### Non-root is enforced: `TRELLIS_UID`/`TRELLIS_GID` of `0` refuses to start
+
+`0` is root, and a root tool container owns every file it writes in the bind-mounted
+workspace — including another agent's output directory. Both gates refuse it now:
+
+- The runner's **startup preflight** fails (gate `tool_identity`) when `TRELLIS_UID` or
+  `TRELLIS_GID` is `0`, `00`, non-numeric or missing, with a message that says why.
+- `spec._require_user()` refuses the same pair **when a spec is built** — the last gate
+  before a container exists — so a `0` introduced after startup, or a process that never ran
+  the preflight, still cannot reach Docker.
+- The startup **canary now runs as `TRELLIS_UID:TRELLIS_GID`** instead of the image default
+  (which was root). A passing canary therefore also proves the tool user can traverse and
+  read the workspace — a real new failure mode, but one that already broke tool containers
+  on such a host. The canary marker is created `0644` so a hardened umask cannot fail a
+  healthy start.
+
+**What to do instead**
+
+- If your deployment ran as `0:0` (some dev overrides do), set `TRELLIS_UID`/`TRELLIS_GID`
+  to the workspace owner's **non-root** uid/gid and fix ownership before starting:
+  `sudo chown -R "$TRELLIS_UID:$TRELLIS_GID" ./workspace`. A root *group* is refused as well
+  as uid `0`, so set both.
+- If the canary now fails on a workspace it used to pass, the tool user cannot read the
+  workspace (mode or ownership), not the path: see
+  [deploy.md → `TRELLIS_HOST_WORKSPACE` must be the host path](deploy.md#trellis_host_workspace-must-be-the-host-path).
+
+#### One env-name check covers every manifest, and it can refuse a `v0.7.1` manifest
+
+A declared name is only useful if a process can receive it as an environment variable. One
+validator — the rule `^[A-Za-z_][A-Za-z0-9_]*$` — now covers every surface that declares
+one, at sync time and at parse time:
+
+| Surface | Where |
+| --- | --- |
+| `secrets`, `optional_secrets`, `variables` | `tool.yaml`, `mcp.yaml` |
+| an MCP's literal `env:` block | `mcp.yaml` |
+| `secret_groups` field keys | `tool.yaml`, `mcp.yaml` |
+| the workflow's own `secrets` and `variables` (list or `general`/`user`/`background` form) | workflow `config.yaml` |
+| agent-level `secrets` and `variables` | agent `config.yaml` |
+
+- `db-sync` **exits 2** without writing anything and prints one line per problem naming the
+  manifest, the field and the key — with a hint such as `my-api-key -> MY_API_KEY`.
+- `ToolConfig` rejects the same names at parse time, so a manifest with a bad `secret_groups`
+  key never loads either.
+- A manifest `v0.7.1` accepted can therefore now be refused: a declared name containing `-`
+  or a space, or starting with a digit.
+- Two deliberate gaps: a workflow's `optional_secrets` is not checked (nothing resolves it,
+  so the key is inert rather than a lost credential), and `MCPConfig` has no `secret_groups`
+  field, so for an MCP that surface is checked by the sync only.
+
+**What to do instead**
+
+- Run the sync and read the errors; rename each key in the manifest **and** in the store
+  that holds the value (the edge `edge-secrets/<item>.env`, or the key in the UI). A rename
+  in one place only loses the credential.
+- `grep -rn 'secret_groups\|secrets:\|variables:' workspace/` finds the surfaces.
+
+#### Identity: `identity_incomplete` first, no body `__user_id`, lowercased emails
+
+Three ordering fixes, all fail-closed:
+
+- **`identity_incomplete` is reported before `missing_credentials`.** A
+  `per_user_required` edge export called by a caller with **no sealed set and no email
+  claim** is refused with `identity_incomplete` instead of `missing_credentials`. The edge
+  owns that decision because it is the only side that knows the export's
+  `credential_mode`; central makes no identity decision of its own. Two ways out: seal the
+  declared keys in Configuration → Edge credentials (a set is bound to the email *or*, when
+  there is none, to the user id, so an email-less caller can seal one — `webhook` runs are
+  the shipped example), or fix the email claim at the IdP. A set sealed to an address the
+  caller no longer carries is `credential_rejected`: re-seal it as that identity. Note the
+  direction — once an IdP starts asserting an email, the AAD identity becomes the email, so
+  a set sealed under the bare user id stops opening and has to be re-sealed too.
+- **The body `__user_id` fallback is gone in every mode**, `off` and `log` included. Caller
+  identity comes only from a verified token; a call with no token has no user identity, so
+  it has no user-scoped secrets, no `TRELLIS_USER_*` and no usage row. A custom caller that
+  relied on `__user_id` loses them until it presents a token. Be aware what this means in
+  **`off`**: tokens are not verified there, so nothing is attributed — user-scoped secrets,
+  `TRELLIS_USER_*` and `/usage` counters stop for *every* tool, not just a custom caller.
+  Run `log` or `enforce` if you need attribution; `log` keeps it whenever the token
+  verifies.
+- **Minted emails are lowercased** after trimming, so the token claim, `TRELLIS_USER_EMAIL`,
+  the MCP session key and the sealed-credential AAD all use one normalized form.
+
+**What to do instead**
+
+- Send an agent token from any custom caller into the relay, the hub or `/mcp`; a body is
+  never an identity.
+- If a per-user tool now answers `identity_incomplete`, the caller has no email claim and
+  no sealed set. Have them seal the declared keys in Configuration → Edge credentials
+  (bound to their user id when they have no address) or fix the claim at the IdP.
+- Check any user record or IdP that stores a mixed-case address (`User@Example.com`). It now
+  normalizes to `user@example.com` everywhere, which is also what a sealed set is keyed
+  under.
+
+#### Changes to declare
+
+- **Compose services:** none on central. `deploy/proxy/docker-compose.yml` (edge) drops
+  `AGENT_TOKEN_SECRET` and `ENFORCE_AGENT_TOKENS` from the runner and sets
+  `RUNNER_ROLE: edge` on it.
+- **`.env` keys:** added `WORKFLOW_SLOT_WAIT_S` (default `300`; `0` disables the wait).
+  `RUNNER_ROLE` is read by the runner — `central` by default, `edge` on an edge. Nothing is
+  removed from central; an edge no longer reads `AGENT_TOKEN_SECRET` or
+  `ENFORCE_AGENT_TOKENS`.
+- **Registry sync:** unchanged formats, stricter env-name validation (exit 2, nothing
+  written) across tool, MCP, agent and workflow manifests.
+- **Tool protocol / `workspace/` layout:** unchanged — JSON on `stdin`, JSON on `stdout`, and
+  the same directories. Four additive container environment variables, and the edge/relay
+  wire protocol moves to `proto: 3`.
+- **Data migrations:** none. Run history gains three event types on runs started after the
+  upgrade; existing run records, events and hash chains are untouched.
+- **Image pins:** `TRELLIS_IMAGE` and `RUNNER_IMAGE` → `v0.7.2`, on central **and** on every
+  edge. An edge and its central install must be the same tag.
 
 ---
 
@@ -30,9 +356,11 @@ each removal below names what replaces it. The resulting posture is described in
 [deploy.md](deploy.md#execution-isolation), [tools.md](tools.md#container-execution-contract),
 [workflows.md](workflows.md#how-a-script-workflow-runs) and [proxy.md](proxy.md).
 
-**Runtime prerequisite.** `runsc` is still the isolation boundary. The feature set in this
-release is validated against a `runsc` that reports **runtime-spec 1.2.1** in
-`runsc --version`; run a current gVisor release and confirm that line, as described in
+**Runtime prerequisite.** `runsc` is still the isolation boundary. This release documented
+the minimum as a `runsc` whose `runsc --version` reports **runtime-spec 1.2.1**; `v0.7.2`
+replaces that with the gVisor release tag the feature set is validated against,
+**`release-20261019.0`** (see [the `v0.7.2` notes](#v072-2026-10-27)). Run at least that
+release and confirm the version on the host, as described in
 [deploy.md → Prerequisite: gVisor](deploy.md#prerequisite-gvisor-runsc). `runc` remains a
 dev-machine and per-tool escape hatch.
 
@@ -47,8 +375,10 @@ dev-machine and per-tool escape hatch.
    stack.
 3. **Rebuild or pull the images**, including `RUNNER_IMAGE` and every edge's
    `TRELLIS_IMAGE`: tool containers start through a shim that only v0.7.1 images carry.
-4. **Keep `AGENT_TOKEN_SECRET` on every component that verifies a token**, including each
-   edge **runner**. Tokens are now enforced by default.
+4. **Keep `AGENT_TOKEN_SECRET` on every central component that verifies a token.** Tokens
+   are now enforced by default. This item also named each edge **runner** in `v0.7.1`; a
+   `v0.7.2` edge needs no signing key (see
+   [the edge proxy no longer verifies agent tokens](#the-edge-proxy-no-longer-verifies-agent-tokens)).
 5. **Deploy**: `docker compose pull && docker compose up -d`, or
    `docker compose up -d --build` when you build from source.
 6. **Approve each edge key** in Admin → Edges. Every existing edge becomes pending until
@@ -174,8 +504,9 @@ service identity: `svc_agent_<name>` with no email and no groups.
   and stop sending `user`/`user_email`; the relay logs one warning if it still sees them
   and ignores them, because a body can never assert an identity.
 - A token minted without an email claim has no `TRELLIS_USER_EMAIL` at the edge, and a
-  per-user-credential call from it now fails with **`identity_incomplete`** (a new code,
-  deliberately not `credential_rejected`) instead of guessing an address from the user id.
+  `per_user_required` call from an identity with no sealed set now fails with
+  **`identity_incomplete`** (a new code, deliberately not `credential_rejected`) instead
+  of guessing an address from the user id. A set sealed to the user id still serves it.
   Tools can still branch on whether the variable is present at all: it is absent, not
   empty.
 - Per-user sealed edge credentials need a **mintable** token. A deployment with no
@@ -195,6 +526,15 @@ the output directory from the claims. It makes no authorization decision of its 
 because the relay already made it for the call it forwarded. `RUNNER_AUTHORIZATION` and
 the runner's own manifest allowlist check are gone.
 
+> **Superseded in `v0.7.2`: the edge holds no signing key at all.** The relay stopped
+> sending `agent_token` in call frames, and the edge runner now takes the relay-derived
+> identity (`agent`, `user`, `user_email`, `groups`, `run_id`, `parent_run_id`) from
+> `trellis-proxy` over the `RUNNER_TOKEN`-authenticated Unix socket under
+> `RUNNER_ROLE=edge`, whose default is the central posture. `AGENT_TOKEN_SECRET` and
+> `ENFORCE_AGENT_TOKENS` are read by no edge service, including the runner; the v0.7.1
+> instructions below that put the key on an edge runner no longer apply. Central still
+> needs the key on `host`, `hub`, `gateway`, `edge-relay`, `taskiq-worker` and `runner`.
+
 Catalog publishing is per entry on both sides, so one bad manifest no longer costs the
 tunnel:
 
@@ -213,7 +553,8 @@ tunnel:
 - Keep `AGENT_TOKEN_SECRET` in the edge's `.env`: the sample
   `deploy/proxy/docker-compose.yml` sets it on the **runner** service with `:?`, so compose
   refuses to start without it, and it is not set on `trellis-proxy` at all. It must be the
-  same value central signs with, or every forwarded token fails verification.
+  same value central signs with, or every forwarded token fails verification. *(v0.7.1
+  only: `v0.7.2` removes the key from the edge entirely — see the note above.)*
 - Create the edge and the central install from the same release. Relay frames and edge
   trust changed together; an edge on the new build verifies nothing, an edge on the old
   build still expects its proxy to verify.
@@ -298,9 +639,11 @@ access).
 
 Neither relaxed mode touches the allowlist half, so a shadow window can never execute a
 call outside the agent's manifest. Policy and registry reads **fail closed**: an
-unreadable document, a failed registry read or an expired snapshot denies every call the
-group rules could have decided, and the watch is installed in every enforcing process at
-startup, so an edit lands everywhere within a second or two without a restart.
+unreadable or invalid document, or a registry read that fails, denies every call the group
+rules could have decided. The snapshot cache is not a staleness hole — an expired snapshot
+is re-read before it is used, and only a *failed* re-read produces the deny. The watch is
+installed in every enforcing process at startup, so an edit lands everywhere within a
+second or two without a restart.
 
 Four behaviours to plan around:
 
@@ -366,10 +709,13 @@ Two consequences are intended:
 
 - A supervisor or gateway call outside its manifest is denied, including a tool that used
   to reach through the framework's own identity.
-- A supervisor or gateway **console or MCP session** is refused by design: the runner
-  authorizes those two kinds from an on-disk agent manifest, and neither identity has one.
-  No working path is lost, but do not route `execute` or an MCP session through the
-  gateway.
+- A supervisor or gateway **console or MCP session** is decided the same way, and by the
+  **host**, not the runner: `core/tool_gate.py` resolves the agent record the token names
+  before the runner is asked for a container. A supervisor therefore falls back to its own
+  console/MCP allowlist, and the gateway — the reserved front-door identity, which has no
+  manifest of its own — is granted a session only for an MCP server published whole
+  (`public: true`) and has nothing to reach `execute` through. No working path is lost, but
+  do not route `execute` or an MCP session through the gateway.
 
 Delegation now mints a child token at the `agent_factory` seam (both the supervisor's
 sub-agent toolset and the A2A capability), carrying the parent run id in its `p` claim and
@@ -387,9 +733,11 @@ exact registered tool. An MCP tool needs `allowed_mcps` (whole server) or its fu
 
 - Add `allowed_mcps` (or the full `mcp__...` names) to any agent that relied on a
   same-named MCP tool through `allowed_tools`.
-- Give the supervisor and gateway agents the tools they actually need in their own
-  manifests. A missing binding now fails that call instead of falling back to a framework
-  identity.
+- Give the supervisor the tools it needs in its own manifest; for the gateway front door,
+  mark a tool `public: true` instead. `gateway` is a **reserved identity with no manifest of
+  its own** — the sync refuses an agent directory with that name — so its access is the
+  target's own public exposure and nothing else. A missing binding now fails that call
+  instead of falling back to a framework identity.
 - The `principal` claim (`k`) and the `principal=` argument on `agent_token.mint` /
   `mint_for_run` are **removed**. Existing tokens still verify and the extra claim is
   ignored; delete the argument from your own scripts.
@@ -417,7 +765,10 @@ the process still reads them with `os.getenv()`.
   `LC_CTYPE`, `TZ`, `TERM`, `PYTHONUNBUFFERED`, `SSL_CERT_FILE`, `SSL_CERT_DIR`,
   `REQUESTS_CA_BUNDLE`, `TRELLIS_USER_ID`, `TRELLIS_USER_EMAIL`, `TRELLIS_RUN_ID`) plus
   whatever your own compose `environment:` adds. A name that looks like a credential is
-  refused by the allowlist even if someone adds it there by mistake.
+  refused by the allowlist even if someone adds it there by mistake. *(The count is **21**
+  from `v0.7.2`, which adds `TRELLIS_AGENT_NAME`, `TRELLIS_REPORTS_DIR` and
+  `TRELLIS_OUTPUT_DIR`; the current list is in
+  [tools.md](tools.md#container-execution-contract).)*
 - A declared secret or variable whose name cannot be an environment variable (`my-secret`,
   or one starting with a digit) is now a **sync error**: `db-sync` prints the name and
   exits **2** instead of publishing a manifest that would lose the credential at the last
@@ -461,8 +812,11 @@ record) and a parent run id (`p`) used by delegation.
 **What to do instead**
 
 - Set `AGENT_TOKEN_SECRET` (32+ bytes, `openssl rand -hex 32`) on every service that
-  verifies a token, on central and on each edge runner. With the default `enforce`, a
-  `DEV_MODE=true` stack that has no secret now **exits at startup**.
+  verifies a token, on central and on each edge runner. *(The edge half of that ended in
+  `v0.7.2`, which leaves no signing key on an edge: see the note under
+  [the edge proxy no longer verifies agent tokens](#the-edge-proxy-no-longer-verifies-agent-tokens).)*
+  With the default `enforce`, a `DEV_MODE=true` stack that has no secret now **exits at
+  startup**.
 - For a throwaway local stack you may set `ENFORCE_AGENT_TOKENS=off` together with
   `DEV_MODE=true`. Do not use it on anything shared.
 - If you carry `RUNNER_AUTHORIZATION` in `.env` or an edge config, delete it: nothing
@@ -509,10 +863,12 @@ Four behaviours to plan around:
    the workspace **read-only**; only `workspace/reports/` stays read-write, for a
    `background_agent`'s in-process file tools. A pipeline that wrote anywhere else in the
    workspace now fails, so write under `output/<name>/` or `reports/<name>/`.
-3. **Cancelling a run mid-flight does not stop the container.** The runner has no cancel
-   API, so the container runs to its deadline; the run is then recorded as cancelled
-   (`run_cancelled`, `container_stopped: false`) without the worker claiming execution
-   stopped. Cancel before the run starts, or shorten `WORKFLOW_RUN_TIMEOUT`
+3. **Cancelling a run mid-flight does not stop the container** *(superseded in `v0.7.2`,
+   which adds `POST /v1/stop`: the worker stops the container on cancel and on its own
+   deadline, recording `container_stopped` with the count).* As of `v0.7.1` the runner has
+   no cancel API, so the container runs to its deadline; the run is then recorded as
+   cancelled (`run_cancelled`, `container_stopped: false`) without the worker claiming
+   execution stopped. Cancel before the run starts, or shorten `WORKFLOW_RUN_TIMEOUT`
    (Admin → Limits & Tuning, default `3600` s) if a workflow must be bounded.
 4. **One container per run costs latency and a slot.** Each scripted run pays container
    create/start/teardown (roughly a second, more on a cold `runsc` image), and a run's
@@ -560,7 +916,8 @@ Four behaviours to plan around:
   `SANDBOX_*`, `TRELLIS_INTERNAL_CIDRS`, `TRELLIS_ENGINE_SUBNETS`, `TOOLS_INTERNAL_DNS`,
   `TOOLS_INTERNET_DNS`, `TOOLS_NET_INTERNAL_SUBNET`, `TOOLS_NET_INTERNET_SUBNET`,
   `EGRESS_*`, `RUNNER_AUTHORIZATION`. `AGENT_TOKEN_SECRET` is required on central and on
-  each edge runner, and `RUNNER_IMAGE` must be v0.7.1 or newer.
+  each edge runner (the edge half ends in `v0.7.2` — an edge then needs neither that nor
+  `ENFORCE_AGENT_TOKENS`), and `RUNNER_IMAGE` must be v0.7.1 or newer.
 - **Registry sync:** new `workspace/policies/tool_access.yaml` (published to
   `/registry/tool_access`); an invalid policy file, an invalid workflow config or an agent
   directory named `gateway` (the reserved front-door identity) now aborts the sync with
@@ -1329,13 +1686,20 @@ there is no fallback to `runc`. On such a host, chat-only agents keep working an
 tool call reports `sandbox_unavailable`.
 
 1. Install `runsc` on every host that runs a `runner` (central and each edge), pinned to a
-   version you have tested. On x86_64 (`arm64/` on arm hosts):
+   version you have tested. The validated minimum is the release tag
+   **`release-20261019.0`**; use the GitHub release assets — the
+   per-binary `runsc` / `runsc.sha512` files under
+   `storage.googleapis.com/gvisor/releases/release/latest/...` printed in older guides
+   return 404 for current releases. On x86_64 (`gvisor-aarch64` assets on arm hosts), and
+   note that current releases ship a **`gvisor-bin/` directory next to the binary**:
 
    ```bash
-   curl -fsSLO https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/runsc
-   curl -fsSLO https://storage.googleapis.com/gvisor/releases/release/latest/x86_64/runsc.sha512
-   sha512sum -c runsc.sha512 && chmod +x runsc
-   sudo install -m 0755 runsc /usr/bin/runsc
+   VER=release-20261019.0
+   curl -fsSLO "https://github.com/google/gvisor/releases/download/$VER/gvisor-x86_64.tar.bz2"
+   curl -fsSLO "https://github.com/google/gvisor/releases/download/$VER/SHA512SUMS"
+   grep ' gvisor-x86_64.tar.bz2$' SHA512SUMS | sha512sum -c -
+   sudo tar -xjmf gvisor-x86_64.tar.bz2 -C /usr/bin --no-same-owner
+   sudo chmod 0755 /usr/bin/runsc /usr/bin/containerd-shim-runsc-v1 /usr/bin/gvisor-bin/*
    ```
 
 2. Register it in `/etc/docker/daemon.json`, keeping every existing key:
@@ -1359,10 +1723,11 @@ tool call reports `sandbox_unavailable`.
 
    ```bash
    docker info --format '{{json .Runtimes}}' | grep runsc
+   runsc --version                  # must report release-20261019.0 or newer
    docker run --rm --runtime=runsc hello-world
    ```
 
-   Both must succeed. A per-tool `container_runtime: runc` is the escape hatch for code
+   All three must succeed. A per-tool `container_runtime: runc` is the escape hatch for code
    gVisor cannot run; it forfeits kernel-syscall isolation and needs a reason per tool.
    Full detail: [deploy.md → Prerequisite: gVisor](deploy.md#prerequisite-gvisor-runsc).
 

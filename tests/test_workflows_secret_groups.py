@@ -374,6 +374,7 @@ def test_the_aggregated_requirement_set_is_the_workflow_container_environment(mo
         # error path raise TypeError and masked the assertion it was there to make.
         lambda name: {
             "workflow_run_timeout": 600.0,
+            "workflow_slot_wait": 300.0,
             "max_run_output_chars": 32768,
             "max_run_error_chars": 4096,
         }[name],

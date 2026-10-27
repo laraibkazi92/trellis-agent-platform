@@ -1,4 +1,4 @@
-# trellis-proxy configuration -- one file per edge node (engine 0.6.x).
+# trellis-proxy configuration -- one file per edge node (engine v0.7.x).
 #
 # Copy to proxy.yaml next to this file's docker-compose.yml and edit. It is mounted
 # read-only at /etc/trellis/proxy.yaml; the container paths below (`/etc/trellis/...`,
@@ -84,7 +84,7 @@ exports:
   # Python CLI wrappers (stdin/stdout tool protocol) whose tool.yaml declares its keys
   # through `secret_groups` (one group per target environment: staging | production).
   # Each operator seals their own set in the central UI before this works; without
-  # one, `per_user` falls back to the shared file, then the process env.
+  # one, `per_user` falls back to the shared edge-secrets file and nothing else.
   - name: node_ssh
     credential_mode: per_user
   - name: node_file_transfer
@@ -115,7 +115,8 @@ export_mcps:
   # HOME. Its mcp.yaml declares an explicit `tools:` catalog (8 category meta-tools with
   # top-level oneOf schemas), so publishing needs no live discovery.
   # per_user_required: no sealed set for the caller = fail closed with
-  # `no credentials for <email> on edge dc1`, nothing is spawned.
+  # `no credentials for <email> on edge dc1` (or `identity_incomplete` when the
+  # identity has no email to seal to), nothing is spawned.
   - name: devops-cli
     include_tools:
       - tenant_account_tools
@@ -156,13 +157,19 @@ export_mcps:
 secrets_dir: /etc/trellis/edge-secrets
 #
 # Credential modes, resolved per declared key:
-#   shared             edge-secrets/<name>.env -> process env -> unset
-#   per_user           the caller's sealed set if present; else shared -> process env
+#   shared             secrets: edge-secrets/<name>.env, else unset.
+#                      variables: edge-secrets/<name>.env, then process env.
+#   per_user           the caller's sealed set if present; else the shared mode above.
 #   per_user_required  the caller's sealed set ONLY; nothing sealed for them refuses
-#                      the call (`missing_credentials`) before anything runs
+#                      the call before anything runs (`missing_credentials`, or
+#                      `identity_incomplete` when their identity has no email claim
+#                      and there is nothing to seal to).
 # A sealed set is ALL-OR-NOTHING for secrets: a declared secret it omits stays missing
-# and is never filled from the shared file or the process env. `variables` (endpoints)
-# always come from this edge's shared file / process env, never from a sealed set.
+# and is never filled from the shared file. The process environment is NOT a source for
+# a declared secret (it is visible to every tool in the container and to anyone who
+# inspects it), so a key that lives only in the edge's .env resolves to unset -- put it
+# in the shared file or seal it per user. `variables` (endpoints) always come from this
+# edge's shared file, then the process env, never from a sealed set.
 # An empty value (`KEY=`) in the shared file counts as unset, so a blank template line
 # cannot blank a working credential.
 #
@@ -179,11 +186,13 @@ secrets_dir: /etc/trellis/edge-secrets
 
 # ---------------------------------------------------------------- environment
 #
-# 0.5.0 gives a child process an allowlist base env (PATH, HOME, LANG, TZ, TMPDIR, the
-# proxy vars, LC_*, TRELLIS_*) plus only the keys its manifest declares. Set this to
-# true ONLY for a legacy tool that cannot declare every key it reads: it restores the
-# v0.4 "whole sanitized environment" behaviour (the tunnel token and framework secrets
-# are still stripped). Costs you the isolation between tools.
+# v0.5.0 gave a child process an allowlist base env (PATH, HOME, LANG, TZ, TMPDIR, the
+# proxy vars, LC-*, TRELLIS-*) plus only the keys its manifest declares. The setting is
+# kept and still selects which names are *collected*, but since v0.7.1 it cannot widen
+# what a tool receives: every call runs in a runner container, and both the tool path and
+# the MCP-session path intersect the environment with the manifest's declared keys before
+# the call is sent (the runner answers 400 for anything undeclared that gets through).
+# Treat an undeclared name as unset and declare it.
 # Env equivalent: TRELLIS_EDGE_ENV_PASSTHROUGH=true.
 env_passthrough: false
 
@@ -214,6 +223,16 @@ lazy_catalog: false
 # `proxy-runner` volume.
 # Env equivalent: RUNNER_SOCKET.
 runner_socket: /run/trellis/runner.sock
+#
+# IDENTITY: the relay is the only token verifier on this path. It authenticates the
+# caller, verifies the agent token and derives the frame identity from its claims; the
+# proxy passes that identity (agent, user, user_email, groups, run_id, parent_run_id) to
+# the edge runner over the RUNNER_TOKEN-authenticated socket. Nothing here configures
+# identity, and no service on this host holds a signing key: the sample compose sets
+# `RUNNER_ROLE: edge` on the runner, which is what tells it to take identity from the
+# proxy instead of verifying a token of its own. The role is explicit -- a runner started
+# without it runs in the central posture, which refuses body-supplied identity and expects
+# a verified agent token instead.
 #
 # Session/tool resource use is sized by the manifest's `limits:` block (cgroup v2 on
 # the runner container), not by environment variables.

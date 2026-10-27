@@ -21,6 +21,17 @@ is raw bytes, stdout is re-framed as ``tag(1) + length(4, big-endian) + payload`
 so one stream carries both stdout and stderr. The registry is in-process on purpose
 -- a restart kills every session, which is cheaper and safer than trying to
 re-adopt containers whose stdin socket the old process owned.
+
+Identity has two possible sources, selected by ``RUNNER_ROLE`` (never inferred):
+
+* ``central`` (default) -- the request carries an ``agent_token``; the runner verifies
+  its signature and expiry and takes agent/user/groups/run from its claims. A body
+  that asserts ``identity`` is refused: on this role a forged body must not be able
+  to name another caller.
+* ``edge`` -- this process holds no signing key, so it verifies nothing. Identity comes
+  in the body, relayed by the edge proxy from the relay's verified-claims frame; the
+  proxy authenticated through the Unix socket plus ``RUNNER_TOKEN`` and the relay
+  already authorized the call. A token in the body is ignored, not checked.
 """
 
 import argparse
@@ -29,8 +40,10 @@ import json
 import hmac
 import logging
 import os
+import re
 import signal
 import struct
+import subprocess
 import sys
 import time
 import uuid
@@ -56,8 +69,11 @@ from core.execution.contract import (
     ExecRequest,
     ExecResult,
     HealthInfo,
+    RunIdentity,
     SessionCreateRequest,
     SessionInfo,
+    StopRequest,
+    StopResult,
 )
 from core.models import MCPConfig, ToolConfig
 
@@ -65,6 +81,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_WORKSPACE_ROOT = "/app/workspace"
 DEFAULT_RUNTIME = "runsc"
+# The gVisor release the v0.7.2 feature set is validated against (owner decision).
+# Compared by date, not by the trailing patch number; see ``_release_stamp``.
+MIN_RUNSC_RELEASE = "release-20261019.0"
 DEFAULT_MAX_CONTAINERS = 32
 DEFAULT_MAX_CONTAINERS_PER_TOOL = 8
 DEFAULT_REAP_INTERVAL_S = 300
@@ -143,6 +162,74 @@ def _default_runtime() -> str:
 
 def _runner_image() -> str:
     return (os.getenv("RUNNER_IMAGE") or os.getenv("TRELLIS_IMAGE") or "").strip()
+
+
+# --------------------------------------------------------------------------- #
+# runner role
+# --------------------------------------------------------------------------- #
+
+# ``RUNNER_ROLE`` names which half of the edge split this process is. It is a
+# deployment fact and is NEVER inferred from key presence: a central runner that lost
+# its key would otherwise silently downgrade to trusting body identity, which is the
+# one thing this split exists to prevent.
+DEFAULT_RUNNER_ROLE = "central"
+RUNNER_ROLES = frozenset({"central", "edge"})
+# One line per message per process: the per-request paths would otherwise repeat the
+# same warning on every call.
+_warned: set[str] = set()
+
+
+def _log_once(key: str, level: int, message: str, *args: Any) -> None:
+    if key in _warned:
+        return
+    _warned.add(key)
+    logger.log(level, message, *args)
+
+
+def runner_role() -> str:
+    """``central`` (default) or ``edge`` -- what this process may trust.
+
+    A **central** runner verifies the ``agent_token`` and takes identity from its
+    claims. An **edge** runner holds no signing key at all: it serves the ``identity``
+    the edge proxy puts in the body, having authenticated that proxy with the Unix
+    socket and ``RUNNER_TOKEN``. An unrecognized value falls back to ``central`` --
+    the fail-closed side, which verifies instead of trusting -- and is logged once.
+    """
+    raw = (os.getenv("RUNNER_ROLE") or "").strip().lower()
+    if not raw:
+        return DEFAULT_RUNNER_ROLE
+    if raw in RUNNER_ROLES:
+        return raw
+    _log_once(
+        "role:unrecognized",
+        logging.ERROR,
+        "runner: unrecognized RUNNER_ROLE %r; falling back to %r (expected one of: %s)",
+        raw,
+        DEFAULT_RUNNER_ROLE,
+        ", ".join(sorted(RUNNER_ROLES)),
+    )
+    return DEFAULT_RUNNER_ROLE
+
+
+def _warn_unused_edge_key() -> None:
+    """An edge runner is handed key settings it must not use: say so, exactly once."""
+    configured = [
+        name
+        for name in ("AGENT_TOKEN_SECRET", "ENFORCE_AGENT_TOKENS")
+        if (os.getenv(name) or "").strip()
+    ]
+    if not configured:
+        return
+    _log_once(
+        "role:edge-token-settings",
+        logging.WARNING,
+        "runner: RUNNER_ROLE=edge -- %s %s set but unused on an edge runner: it holds "
+        "no signing key and never verifies a token (identity comes from the edge proxy "
+        "over the runner-token-authenticated socket). Remove %s from this host.",
+        " and ".join(configured),
+        "are" if len(configured) > 1 else "is",
+        "them" if len(configured) > 1 else "it",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -394,19 +481,38 @@ async def _check_image(backend: ContainerBackend) -> Check:
 
 
 async def _check_tool_identity() -> Check:
-    """A container must never inherit the image's default (possibly root) user."""
+    """A container must never inherit the image's default (possibly root) user.
+
+    ``isdigit()`` accepted ``"0"`` and ``"00"``: both are root. Root is not a
+    cosmetic difference here -- the workspace and the per-agent output dirs are
+    bind-mounted from the host, so a root tool owns every file it writes and can
+    write into another agent's output directory, which is exactly the boundary the
+    mounts exist to hold. ``spec._require_user()`` refuses the same values when a
+    spec is built (the last gate before a container exists); this gate is the one
+    that fails the *startup* loudly, before the runner serves anything.
+    """
     uid = (os.getenv("TRELLIS_UID") or "").strip()
     gid = (os.getenv("TRELLIS_GID") or "").strip()
-    if uid.isdigit() and gid.isdigit():
+    if not (uid.isdigit() and gid.isdigit()):
         return Check(
-            "tool_identity", True, f"tool containers run as {uid}:{gid} (non-root)"
+            "tool_identity",
+            False,
+            "TRELLIS_UID and TRELLIS_GID must be set to the workspace owner's numeric "
+            "uid/gid. Without them a tool container would run as the image default, "
+            "which is root.",
+        )
+    if int(uid) == 0 or int(gid) == 0:
+        return Check(
+            "tool_identity",
+            False,
+            "TRELLIS_UID and TRELLIS_GID are 0, which is root. A tool container runs "
+            "with the workspace and per-agent output dirs bind-mounted from the host, "
+            "so a root tool owns every file it writes and could write into another "
+            "agent's output directory. Set them to the workspace owner's non-root "
+            "uid/gid.",
         )
     return Check(
-        "tool_identity",
-        False,
-        "TRELLIS_UID and TRELLIS_GID must be set to the workspace owner's numeric "
-        "uid/gid. Without them a tool container would run as the image default, "
-        "which is root.",
+        "tool_identity", True, f"tool containers run as {uid}:{gid} (non-root)"
     )
 
 
@@ -446,6 +552,87 @@ async def _check_manifest_runtimes(backend: ContainerBackend) -> Check:
     )
 
 
+async def _check_runsc_version() -> Check:
+    """Warn (never fail) when the gVisor runtime is older than the validated release.
+
+    gVisor is host-level: the binary lives on the Docker host and is never installed in
+    this image, so the runner can only read a version when it is either on its own
+    ``PATH`` (an operator who mounted it) or the engine image ships it. When neither is
+    true the check is *informational*: it says the version must be confirmed on the host
+    (``runsc --version``, see docs/deploy.md) and passes, because refusing to serve over
+    something this process cannot observe would take a working stack down.
+
+    Non-fatal either way (owner decision, v0.7.2): a version mismatch is a warning, not
+    a gate. The minimum is the release the feature set is validated against; an older
+    ``runsc`` may start containers and still fail on the networking model.
+    """
+    # In a thread: this can shell out to a host binary, and the runner serves /v1/exec
+    # and /v1/stop on this one event loop. A hung `runsc` must not stall a cancellation.
+    version = await asyncio.to_thread(_runsc_version)
+    if not version:
+        return Check(
+            "runsc_version",
+            True,
+            "skipped: `runsc` is not installed in this container (it is a host "
+            f"runtime); confirm it is {MIN_RUNSC_RELEASE} or newer on the host with "
+            "`runsc --version`",
+            skipped=True,
+        )
+    stamp = _release_stamp(version)
+    minimum = _release_stamp(MIN_RUNSC_RELEASE)
+    if stamp is not None and minimum is not None and stamp < minimum:
+        logger.warning(
+            "runner: runsc %s is older than the validated minimum %s; upgrade gVisor "
+            "on this host (docs/deploy.md -> Prerequisite: gVisor). Container isolation "
+            "stays on -- this is a warning, not a gate.",
+            version,
+            MIN_RUNSC_RELEASE,
+        )
+        return Check(
+            "runsc_version",
+            True,
+            f"runner: runsc {version} is older than the validated minimum "
+            f"{MIN_RUNSC_RELEASE}; upgrade gVisor on this host (isolation stays on)",
+        )
+    return Check("runsc_version", True, f"runsc {version}")
+
+
+def _runsc_version() -> str:
+    """The first non-empty line of ``runsc --version``, or ``""`` when unreadable."""
+    binary = (os.getenv("RUNSC_BIN") or "runsc").strip()
+    try:
+        result = subprocess.run(  # noqa: S603 - a fixed argv, resolved from PATH
+            [binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Not installed here (the normal case: runsc belongs to the host) or too slow
+        # to answer. Neither is worth failing a startup over.
+        return ""
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if line:
+            return line[:200]
+    # Some builds write the version to stderr. A whitespace-only stream is empty, not
+    # a first line -- indexing it raised out of a check documented as never failing.
+    errors = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
+    return errors[0][:200] if errors else ""
+
+
+def _release_stamp(text: str) -> Optional[int]:
+    """``release-20261019.0`` / ``20261019.0`` -> ``20261019`` (or ``None``).
+
+    Compares by release *date*, which is how gVisor tags its releases and what makes
+    "older than ``release-YYYYMMDD.N``" a simple numeric comparison; the trailing
+    ``.N`` patch number is not orderable across dates.
+    """
+    match = re.search(r"(?:release-)?(\d{8})\.\d+", text or "")
+    return int(match.group(1)) if match else None
+
+
 async def run_preflight(backend: Optional[ContainerBackend] = None) -> list[Check]:
     """The startup gates, in order. The host-path canary runs afterwards."""
     backend = backend or get_backend()
@@ -454,6 +641,7 @@ async def run_preflight(backend: Optional[ContainerBackend] = None) -> list[Chec
         await _check_image(backend),
         await _check_tool_identity(),
         await _check_manifest_runtimes(backend),
+        await _check_runsc_version(),
     ]
 
 
@@ -587,7 +775,23 @@ async def reap_one_shot(backend: Optional[ContainerBackend] = None) -> int:
 
 async def startup(backend: Optional[ContainerBackend] = None) -> list[Check]:
     """Fail closed: log every failed gate, then refuse to serve."""
-    agent_token_module.require_secret("runner")
+    role = runner_role()
+    if role == "central":
+        # Only a central runner mints/verifies: it needs the key, and an enforcing
+        # deployment without one must not start.
+        agent_token_module.require_secret("runner")
+        logger.info(
+            "runner: role=central -- identity comes from the verified agent token"
+        )
+    else:
+        # An edge runner never loads a signing key (no require_secret, no
+        # signing_keys): identity arrives from the edge proxy over the
+        # runner-token-authenticated socket.
+        logger.info(
+            "runner: role=edge -- identity comes from the edge proxy over the "
+            "runner-token-authenticated socket; this process holds no signing key"
+        )
+        _warn_unused_edge_key()
     checks = await full_preflight(backend)
     failed = [check for check in checks if not check.ok]
     for check in failed:
@@ -605,12 +809,13 @@ async def startup(backend: Optional[ContainerBackend] = None) -> list[Check]:
 
 
 def _verified_claims(payload: Any) -> Optional[agent_token_module.Claims]:
-    """The caller's verified claims, or ``None`` when the request carries no verified token.
+    """A **central** runner's identity: the caller's verified claims, or ``None``.
 
-    Identity in the runner comes from here and nowhere else -- the wire bodies have no
-    identity fields. ``None`` is the rollout/dev posture (``ENFORCE_AGENT_TOKENS=off``,
-    or ``log`` without a minting secret): the container then runs with no identity
-    attribution rather than an asserted one.
+    Central only. Identity there comes from the token and nowhere else -- the wire
+    body carries no identity fields (``_identity_denial`` refuses a body that asserts
+    one). ``None`` is the rollout/dev posture (``ENFORCE_AGENT_TOKENS=off``, or ``log``
+    without a minting secret): the container then runs with no identity attribution
+    rather than an asserted one. An edge runner never calls this: it has no key.
     """
     if agent_token_module.mode() == "off":
         return None
@@ -620,10 +825,69 @@ def _verified_claims(payload: Any) -> Optional[agent_token_module.Claims]:
         return None
 
 
+def _request_identity(
+    payload: Any,
+) -> Optional[agent_token_module.Claims | RunIdentity]:
+    """The run's identity from whichever source this role owns, or ``None``.
+
+    ``central`` -> the verified token's claims. ``edge`` -> the body's ``identity``,
+    which the edge proxy relayed from the relay's verified-claims frame; a token in
+    that body is silently ignored (there is no key here to check it with, and the
+    proxy has already authenticated). Both objects expose the same attribute names,
+    so every caller below reads ``identity.agent`` / ``.user_id`` / ``.run_id``
+    without caring which one it got.
+    """
+    if runner_role() == "edge":
+        return getattr(payload, "identity", None)
+    return _verified_claims(payload)
+
+
+# Kinds that always run *as somebody*: a one-shot run of code or a pipeline. An edge
+# runner cannot serve one without the identity the edge proxy carries. Sessions are
+# exempt along with ``discovery``: a session's container env is fully described by the
+# request (``env``), so the runner needs no identity to start it (v0.7.2 R2 may change
+# that for the output dirs).
+IDENTITY_REQUIRED_KINDS = frozenset({"tool", "console", "workflow"})
+
+
+def _identity_denial(payload: Any) -> Optional[JSONResponse]:
+    """Refuse the other role's identity form, and a missing one, before dispatch.
+
+    Neither deployment may be talked into trusting a body it does not verify: central
+    verifies the token, so a body that asserts identity is a forgery attempt; edge
+    trusts the proxy, so it must actually receive what the proxy verified.
+    """
+    role = runner_role()
+    identity = getattr(payload, "identity", None)
+    if role == "central":
+        if identity is None:
+            return None
+        return _error(
+            400,
+            "invalid_request",
+            "central runner refuses body identity: identity comes from the verified "
+            "agent token only",
+        )
+    if payload.kind in IDENTITY_REQUIRED_KINDS and identity is None:
+        return _error(
+            400,
+            "invalid_request",
+            f"RUNNER_ROLE=edge: a {payload.kind} run needs the caller's identity in "
+            "the request body; the edge proxy must send it (this host holds no "
+            "token-signing key)",
+        )
+    return None
+
+
 def _authorize(payload: Any) -> Optional[JSONResponse]:
     """Verify the agent token: signature, expiry and shape -- nothing else.
 
-    The runner has no registry and no agent manifests, so it cannot resolve an
+    A **central** runner's gate. An **edge** runner has no key to verify with, so it
+    returns ``None`` for every kind and verifies nothing: the Unix socket plus the
+    ``RUNNER_TOKEN`` bearer authenticate the edge proxy, the relay already authorized
+    the call, and identity arrives in the body (``_request_identity``).
+
+    The central runner has no registry and no agent manifests, so it cannot resolve an
     allowlist. Every authorization decision is made *before* the request reaches this
     process: the hub authorizes tool calls, the process that owns the agent runtime
     authorizes the sessions and console containers it asks for (``core.tool_gate``,
@@ -640,6 +904,8 @@ def _authorize(payload: Any) -> Optional[JSONResponse]:
     The one non-agent path is a ``kind: "discovery"`` catalog read, which carries no
     agent run at all and is gated by the runner bearer token on the control socket.
     """
+    if runner_role() == "edge":
+        return None
     mode = agent_token_module.mode()
     if mode == "off":
         return None
@@ -1046,7 +1312,7 @@ async def healthz(request: Request):
 
 @app.post("/v1/preflight")
 async def preflight(request: Request):
-    """Full diagnostic (four gates + canary); ``ok`` in the body is the verdict."""
+    """Full diagnostic (every gate plus the canary); ``ok`` in the body is the verdict."""
     denied = _authenticate(request)
     if denied is not None:
         return denied
@@ -1072,9 +1338,14 @@ async def exec_tool(request: Request, payload: ExecRequest):
     if denial is not None:
         return denial
 
-    # Identity for the container: the verified claims, and nothing else. A request
-    # with no verified token (off/log rollout) runs unattributed.
-    claims = _verified_claims(payload)
+    denial = _identity_denial(payload)
+    if denial is not None:
+        return denial
+
+    # Identity for the container: the verified claims on a central runner, the edge
+    # proxy's relay-derived identity on an edge runner -- and nothing else. A request
+    # with no identity at all (central off/log rollout) runs unattributed.
+    identity = _request_identity(payload)
 
     if payload.kind == "console":
         return await _execute_one_shot(
@@ -1083,9 +1354,9 @@ async def exec_tool(request: Request, payload: ExecRequest):
             lambda: spec.build_console_spec(
                 payload.command or "",
                 env=payload.env,
-                user_id=claims.user_id if claims else None,
-                user_email=claims.user_email if claims else None,
-                run_id=claims.run_id if claims else None,
+                user_id=identity.user_id if identity else None,
+                user_email=identity.user_email if identity else None,
+                run_id=identity.run_id if identity else None,
             ),
         )
 
@@ -1107,9 +1378,9 @@ async def exec_tool(request: Request, payload: ExecRequest):
                 env=payload.env,
                 host_workspace=_host_workspace(),
                 workspace_root=_workspace_root(),
-                run_id=claims.run_id if claims else None,
-                user_id=claims.user_id if claims else None,
-                user_email=claims.user_email if claims else None,
+                run_id=identity.run_id if identity else None,
+                user_id=identity.user_id if identity else None,
+                user_email=identity.user_email if identity else None,
                 network=payload.network,
                 limits=payload.limits,
             ),
@@ -1152,10 +1423,10 @@ async def exec_tool(request: Request, payload: ExecRequest):
             env=payload.env,
             host_workspace=_host_workspace(),
             workspace_root=_workspace_root(),
-            # Output-directory ownership follows the token's agent, so a tool can
+            # Output-directory ownership follows the caller's agent, so a tool can
             # only be handed `output|reports|data/<its own agent>`.
-            agent=claims.agent if claims else None,
-            run_id=claims.run_id if claims else None,
+            agent=identity.agent if identity else None,
+            run_id=identity.run_id if identity else None,
         ),
     )
 
@@ -1208,6 +1479,104 @@ async def _execute_one_shot(target_name: str, payload: ExecRequest, build):
     return _result(raw)
 
 
+@app.post("/v1/stop")
+async def stop_run(request: Request, payload: StopRequest):
+    """Kill and remove every container one run left behind. Idempotent.
+
+    The caller is the taskiq worker: a ``background_script`` runs as ONE container,
+    and the runner's own deadline is minutes away, so a run cancelled from the UI (or
+    one whose worker gave up waiting) must be able to end its container *now*.
+
+    Containers are matched by the ``trellis.run`` label -- the run id the spec derives
+    from the verified token's claims, which for a workflow is the taskiq task id. A
+    session and the canary are built with no run id (their label is empty), so neither
+    can be matched by a non-empty ``run_id``. The session kinds are skipped explicitly
+    anyway: a session outlives the run that opened it and is torn down by its owner.
+
+    A kill on an already-exited container is the daemon's to refuse, not a failure:
+    the goal is "nothing of this run is left", and removal is what frees it. So the
+    kill is best-effort, the removal must succeed, and a second call reports 0.
+    """
+    denied = _authenticate(request)
+    if denied is not None:
+        return denied
+
+    run_id = (payload.run_id or "").strip()
+    if not run_id:
+        return _error(
+            400,
+            "invalid_request",
+            "run_id is required: /v1/stop removes the containers labelled with it",
+        )
+
+    backend = get_backend()
+    # Scoped to this install like the one-shot reaper: two runners sharing one daemon
+    # must not stop each other's containers on a colliding run id.
+    match = {
+        "trellis.run": run_id,
+        "trellis.install": os.getenv("TRELLIS_INSTALL_ID", "default"),
+    }
+    try:
+        containers = await backend.list_containers(match)
+    except Exception as exc:
+        logger.warning("runner: cannot list the containers of run %r: %s", run_id, exc)
+        return _error(
+            503,
+            "daemon_unavailable",
+            f"cannot list the containers of run {run_id!r} to stop them ({exc})",
+            retryable=True,
+        )
+
+    stopped = 0
+    skipped_sessions = 0
+    for container in containers:
+        # `GET /containers/json` puts labels at the top level; `inspect` nests them
+        # under `Config`. Read both, and re-check the run id exactly: a filter is a
+        # request, not a guarantee.
+        labels = (container.get("Config") or {}).get("Labels") or container.get("Labels") or {}
+        if labels.get("trellis.run") != run_id:
+            continue
+        if labels.get("trellis.install") != match["trellis.install"]:
+            continue
+        if labels.get("trellis.kind") in SESSION_KINDS:
+            skipped_sessions += 1
+            continue
+        container_id = container.get("Id") or ""
+        if not container_id:
+            continue
+        with suppress(Exception):
+            await backend.kill(container_id)
+        try:
+            await backend.remove(container_id)
+        except Exception as exc:
+            logger.warning(
+                "runner: cannot remove %s of run %r: %s", container_id, run_id, exc
+            )
+            return _error(
+                503,
+                "daemon_unavailable",
+                f"stopped {stopped} container(s) of run {run_id!r} but cannot remove "
+                f"{container_id} ({exc})",
+                retryable=True,
+            )
+        stopped += 1
+
+    if stopped:
+        logger.info("runner: stopped %d container(s) of run %r", stopped, run_id)
+    return StopResult(
+        run_id=run_id,
+        stopped=stopped,
+        # Only reachable when a caller reused a run id for a session: say what was
+        # deliberately left alone instead of reporting a silent shortfall.
+        detail=(
+            f"{skipped_sessions} session container(s) carry this run id and were "
+            "not stopped"
+            if skipped_sessions
+            else ""
+        ),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # sessions
 # --------------------------------------------------------------------------- #
@@ -1245,6 +1614,13 @@ async def open_session(request: Request, payload: SessionCreateRequest):
     denial = _authorize(payload)
     if denial is not None:
         return denial
+
+    # Same identity rule as /v1/exec: an edge session is created from the body
+    # identity, a central one from the token's claims.
+    denial = _identity_denial(payload)
+    if denial is not None:
+        return denial
+    identity = _request_identity(payload)
 
     target = resolve_mcp_target(payload.target)
     if target is None:
@@ -1292,9 +1668,10 @@ async def open_session(request: Request, payload: SessionCreateRequest):
                 env=payload.env,
                 host_workspace=_host_workspace(),
                 workspace_root=_workspace_root(),
-                # A session mounts no agent-owned output directory, so there is no
-                # agent name to pass into the spec.
-                agent=None,
+                # A session mounts no agent-owned output directory, so the spec gets
+                # the agent name but no run id: a session outlives the run that
+                # opened it, and ``trellis.run`` is the label /v1/stop matches.
+                agent=identity.agent if identity else None,
                 session_key=payload.session_key,
                 run_id=None,
             )

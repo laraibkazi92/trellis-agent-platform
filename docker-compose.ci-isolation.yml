@@ -6,7 +6,8 @@
 # socket and workspace. No etcd, no redis, no registry -- the runner resolves
 # agents and tools from the workspace files, which is what these tests exercise.
 #
-# Usage on a host with runsc registered and the Docker socket readable:
+# Usage on a host with runsc registered and the Docker socket readable (your uid/gid
+# must be non-zero: the runner refuses root, v0.7.2):
 #   RUNNER_TOKEN=$(openssl rand -hex 32) AGENT_TOKEN_SECRET=$(openssl rand -hex 32) \
 #   TRELLIS_HOST_WORKSPACE=$PWD/workspace TRELLIS_UID=$(id -u) TRELLIS_GID=$(id -g) \
 #   DOCKER_GID=$(getent group docker | cut -d: -f3) \

@@ -12,7 +12,7 @@ They never describe an image, mount, capability, runtime or network: the runner
 derives all of that from the manifest on disk (``core.execution.spec``).
 """
 
-from typing import Literal, Optional, get_args
+from typing import Any, Literal, Mapping, Optional, get_args
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -59,13 +59,66 @@ RunnerErrorCode = Literal[
 ]
 
 
+class RunIdentity(BaseModel):
+    """Who a run is for, as derived by whoever verified the caller's token.
+
+    Two producers, one shape:
+
+    * a **central** runner derives this from the verified ``agent_token`` claims --
+      the request body never carries one, so a forged body cannot name another
+      caller;
+    * an **edge** runner (``RUNNER_ROLE=edge``) receives it from the edge proxy,
+      which got it from the relay's frame. The relay is the only verifier on that
+      path, and the tunnel plus the runner bearer token authenticate the sender.
+
+    The field names mirror :class:`core.agent_token.Claims`, so runner code reads
+    ``identity.agent`` / ``identity.user_id`` / ``identity.run_id`` exactly as it
+    read claims before.
+    """
+
+    agent: str = Field(min_length=1)
+    user_id: Optional[str] = None
+    user_email: Optional[str] = None
+    groups: list[str] = Field(default_factory=list)
+    run_id: Optional[str] = None
+    parent_run_id: Optional[str] = None
+
+    @classmethod
+    def from_frame(
+        cls, identity: Optional[Mapping[str, Any]]
+    ) -> Optional["RunIdentity"]:
+        """A relay call frame's identity as this model, or ``None``.
+
+        The edge proxy holds one mapping per call (``core.proxy._frame_identity``) and
+        hands it to two consumers -- the tool runtime and the MCP stdio transport -- so
+        the translation lives here instead of in both. Two details matter:
+
+        * the frame calls the caller's id ``user`` (the ``TRELLIS_USER_*`` vocabulary
+          the edge env builder already reads); the model calls it ``user_id``;
+        * a frame that names no agent (tokens off, or a relay older than the field) has
+          no identity to carry. It is sent as ``None`` rather than padded: the edge
+          runner then refuses with its own actionable message.
+        """
+        if not identity or not identity.get("agent"):
+            return None
+        return cls(
+            agent=str(identity["agent"]),
+            user_id=identity.get("user"),
+            user_email=identity.get("user_email"),
+            groups=list(identity.get("groups") or []),
+            run_id=identity.get("run_id"),
+            parent_run_id=identity.get("parent_run_id"),
+        )
+
+
 class ExecRequest(BaseModel):
     """One blocking execution: a tool call, an ``execute`` console command, or one
     ``background_script`` workflow run.
 
-    Carries NO identity fields: the caller's user id, email, groups, agent name and
-    run id all come from the verified ``agent_token`` (v0.7.1 Phase 2). The runner
-    derives them itself, so a forged body cannot name another caller.
+    Identity comes from the verified ``agent_token`` on a central runner (v0.7.1
+    Phase 2) or from ``identity`` on an edge runner (v0.7.2 R1) -- never both: each
+    role rejects the other's form, so neither deployment can be talked into trusting
+    a body it does not verify itself.
 
     The ``workflow`` fields describe *what the pipeline is* (its directory, its
     entrypoint, the credentials it declared, its network policy and limits). They
@@ -94,9 +147,13 @@ class ExecRequest(BaseModel):
     # console only: the shell command to run.
     command: Optional[str] = None
     deadline_ms: int = 300_000
-    # Short-lived HMAC token minted by the agent runtime; the runner verifies it and
-    # takes every identity attribute from its claims.
+    # Short-lived HMAC token minted by the agent runtime; a **central** runner
+    # verifies it and takes every identity attribute from its claims. An edge runner
+    # ignores it (it holds no signing key) and uses ``identity`` instead.
     agent_token: Optional[str] = None
+    # Relay-derived identity for an **edge** runner (``RUNNER_ROLE=edge``). A central
+    # runner refuses a request that carries one.
+    identity: Optional[RunIdentity] = None
 
     # --- kind="workflow" ------------------------------------------------------
     # Plain relative path inside ``workspace/workflows/<target>/``.
@@ -199,11 +256,40 @@ class RunnerError(BaseModel):
     retryable: bool = False
 
 
+class StopRequest(BaseModel):
+    """Stop every container one run left behind.
+
+    The run id is the caller's own (a taskiq task id for a ``background_script``):
+    the spec stamps it on the ``trellis.run`` label from the verified token's claims
+    (``core.execution.spec._labels``), so it is also the only thing needed to find
+    the container of a run whose caller no longer holds an id. Deliberately not
+    validated as non-empty here: an empty id is refused by the endpoint (400) rather
+    than by pydantic (422), because a caller bug should not read as a bad payload.
+    """
+
+    run_id: str = Field(default="", max_length=128)
+
+
+class StopResult(BaseModel):
+    """What ``/v1/stop`` removed. ``stopped == 0`` is a success, not a failure.
+
+    A run that already finished has no container left (the one-shot path removes it
+    on every exit), so the call is idempotent: the second call reports 0. ``detail``
+    carries a partial-failure explanation when one container could be listed but not
+    removed -- the caller records it against the run instead of guessing.
+    """
+
+    run_id: str = ""
+    stopped: int = 0
+    detail: str = ""
+
+
 class SessionCreateRequest(BaseModel):
     """Open a long-lived MCP session (or a throwaway discovery run).
 
-    Like :class:`ExecRequest`, identity comes only from the verified
-    ``agent_token``: there are no ``user_id``/``user_email``/``agent`` fields.
+    Like :class:`ExecRequest`, identity comes from the verified ``agent_token`` on a
+    central runner and from ``identity`` on an edge runner (v0.7.2 R1): there are no
+    top-level ``user_id``/``user_email``/``agent`` fields.
     """
 
     kind: Literal["mcp_session", "discovery"] = "mcp_session"
@@ -215,6 +301,7 @@ class SessionCreateRequest(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
     deadline_ms: int = 900_000
     agent_token: Optional[str] = None
+    identity: Optional[RunIdentity] = None
 
 
 class SessionInfo(BaseModel):

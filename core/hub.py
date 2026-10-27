@@ -21,7 +21,7 @@ from core import edge_secrets_central
 from core import tool_access
 from core.models import ToolConfig
 from core.auth import get_identity_manager
-from core.caller_identity import identity_incomplete_error
+from core.caller_identity import is_service_identity
 from core.env_sanitize import sanitized_env
 from core.devmode import enforce_dev_mode_safety
 # The execution core lives in core.tool_runtime so the edge proxy
@@ -295,7 +295,7 @@ async def _build_tool_env(
 
     if user_id:
         from core.discovery import _resolve_requirements
-        is_background = user_id.startswith("svc_agent_")
+        is_background = is_service_identity(user_id)
 
         # Scoped Secret Injection
         secret_keys = _resolve_requirements(config.secrets, is_background)
@@ -438,16 +438,18 @@ async def _run_remote(
         except Exception as exc:
             logger.warning(f"Failed to record health for remote tool {config.name}: {exc}")
 
-    # Identity is the verified token's: nothing is re-read from the registry here (no
-    # record lookup for the email, no body identity), and the caller cannot assert a
-    # different user through the call.
-    user_email = claims.user_email if claims is not None else None
-
     # The caller's browser-sealed credential set for exactly this (site, tool, user).
     # It rides the relay body verbatim and is never logged here: central cannot open
-    # it, and the relay treats it as opaque bytes. Only a verified token has an
-    # identity to seal to -- the relay builds the frame from that same token, so a
+    # it, and the relay treats it as opaque bytes. Identity is the verified token's --
+    # nothing is re-read from the registry for it, and the caller cannot assert a
+    # different user through the call -- so only a token has an identity to seal to: a
     # no-token call has nothing to look up (and the edge's credential_mode decides).
+    #
+    # Central makes no identity decision of its own (v0.7.2 R7.1): a blob is sealed to
+    # the caller's email *or* their user id, so an email-less identity is not a
+    # contradiction, and ``per_user_required`` is the edge's call -- it is the only side
+    # that knows the export's ``credential_mode``. The refusal code travels back from
+    # there (``identity_incomplete``).
     sealed: Optional[Dict[str, Any]] = None
     if claims is not None and claims.user_id:
         try:
@@ -463,14 +465,6 @@ async def _run_remote(
                 site,
                 type(exc).__name__,
             )
-
-    if sealed is not None and (claims is None or not user_email):
-        # Per-user credentials are sealed to the caller's email. Refusing here names
-        # the real problem (identity, not credentials) instead of letting the edge
-        # report credential_rejected for a token that has no email to match.
-        error = identity_incomplete_error(f"tool '{config.name}'", site)["error"]
-        await record_health(False, error)
-        return {"error": error}
 
     try:
         async with _remote_client(timeout_seconds + 35) as client:
@@ -612,40 +606,35 @@ async def _run_remote(
     return {"error": error}
 
 
-def _caller_user_id(
-    claims: Optional[agent_token_module.Claims],
-    presented_token: Optional[str],
-    body_user_id: Optional[str],
-) -> Optional[str]:
-    """Who this tool call acts for, from the token -- never from the request body.
+def _caller_user_id(claims: Optional[agent_token_module.Claims]) -> Optional[str]:
+    """Who this tool call acts for: the verified token's user, never the request body.
 
-    * verified claims -> the token's user (the only authority);
-    * ``off`` mode -> the body's ``__user_id``, which is the documented dev/rollout
-      fallback (nothing is verified in that mode, so there is nothing to prefer);
-    * any other mode with a token that did NOT verify -> no identity at all; the
-      body's assertion is ignored, so a forged or expired token cannot borrow one;
-    * no token presented (``log`` mode, e.g. a deployment with no minting secret) ->
-      the body value, which is the pre-enforcement rollout posture.
+    Identity is the token's alone in **every** mode (v0.7.2 R7.2). ``off`` and ``log``
+    verify nothing, so a body ``__user_id`` there is an unverified assertion -- and it
+    would resolve another user's scoped secrets and book usage against their id. No
+    token (or a token that did not verify) therefore means no user identity at all: no
+    user-scoped secrets, no ``TRELLIS_USER_*``, no usage row.
+
+    A ``__user_id`` that a tool card or ``search_tools`` still sends stays inert: the
+    handler keeps the reserved kwarg so an existing caller's signature parses, and
+    :func:`run_tool` drops it before dispatch.
     """
-    if claims is not None:
-        return claims.user_id
-    if agent_token_module.mode() == "off":
-        return body_user_id
-    if presented_token:
-        return None
-    return body_user_id
+    return claims.user_id if claims is not None else None
 
 
 async def run_tool(config: ToolConfig, tool_dir: Optional[Path], arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Executes a tool locally (container) or remotely (edge relay)."""
     # stamina re-invokes with the same dict — never mutate the caller's arguments.
     arguments = dict(arguments)
-    body_user_id = arguments.pop("__user_id", None)
+    # A reserved handler arg, NOT identity (v0.7.2): older tool cards and `search_tools`
+    # may still send one, so it is popped rather than rejected -- and ignored rather than
+    # trusted. Identity comes only from the verified token, in every mode.
+    arguments.pop("__user_id", None)
     raw_token = agent_token_module.refresh(arguments.pop("__agent_token", None))
     # The former `__agent_name`-in-arguments path is gone: the token's claims are
     # the only source of agent identity (and they are verified, not asserted).
     claims, denial = await _authorize_call(config, raw_token)
-    user_id = _caller_user_id(claims, raw_token, body_user_id)
+    user_id = _caller_user_id(claims)
     try:
         if denial is not None:
             return denial
@@ -721,8 +710,9 @@ def _create_tool_handler(c: ToolConfig, d: Optional[Path]) -> Any:
             )
             annotations[input_name] = py_type
 
-    # Add __user_id: a reserved handler arg that is NOT identity. It is the no-token
-    # dev/rollout fallback only -- once a token verifies, its claims are the identity.
+    # Add __user_id: a reserved handler arg that is NOT identity. It is accepted so an
+    # older caller's kwarg still parses, then dropped by run_tool -- the verified token
+    # is the only identity authority, in every mode (v0.7.2).
     params.append(
         inspect.Parameter(
             "__user_id",

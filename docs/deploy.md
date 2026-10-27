@@ -26,6 +26,13 @@ A rebuild or upgrade replaces the engine only. The content mount and the `etcd-d
 > default bridge (`network: egress`) or no network (`none`). If you are upgrading an
 > existing install, read [upgrading.md → v0.7.1](upgrading.md#v071-2026-10-26) first: it
 > lists every removal with the action to take.
+>
+> **v0.7.2 breaking changes for edges.** An edge no longer holds a token-signing key
+> (`AGENT_TOKEN_SECRET`/`ENFORCE_AGENT_TOKENS` leave the proxy *and* the runner, and the
+> runner runs with `RUNNER_ROLE=edge`), and the edge/relay wire protocol moved to
+> `proto: 3`, so central and every edge are upgraded in the same window. A stack running
+> as `TRELLIS_UID`/`TRELLIS_GID` `0` no longer starts. Read
+> [upgrading.md → v0.7.2](upgrading.md#v072-2026-10-27) before you upgrade an edge.
 
 ## Prerequisites
 
@@ -38,8 +45,8 @@ verdict.
 
 - **Production:** register `runsc` on the host. gVisor is the isolation boundary between a
   tool container and the host kernel, so a production deployment must not run on `runc`.
-  The feature set is validated against a `runsc` that reports runtime-spec 1.2.1 in
-  `runsc --version`; run a current release and confirm that line before deploying.
+  The feature set is validated against the gVisor release **`release-20261019.0`**: run at
+  least that release and confirm it with `runsc --version` on the host before deploying.
 - **A dev machine (a laptop, WSL2, any Docker host without gVisor):** no gVisor needed,
   see [Dev machine](#dev-machine-runc).
 
@@ -63,7 +70,7 @@ docker compose up -d
 
 ### Pinning and verifying a release
 
-`TRELLIS_IMAGE` in `.env` pins a **tag** (`:v0.7.1`) because a tag stays readable in a diff. Tags are mutable, so if you need the image to be byte-identical forever, pin the **digest** published in that release's workflow summary instead:
+`TRELLIS_IMAGE` in `.env` pins a **tag** (`:v0.7.2`) because a tag stays readable in a diff. Tags are mutable, so if you need the image to be byte-identical forever, pin the **digest** published in that release's workflow summary instead:
 
 ```bash
 TRELLIS_IMAGE=ghcr.io/laraibkazi92/trellis-agent-platform@sha256:<digest>
@@ -72,7 +79,7 @@ TRELLIS_IMAGE=ghcr.io/laraibkazi92/trellis-agent-platform@sha256:<digest>
 Every release published after provenance was wired up is attested by GitHub's keyless signer, which proves the image was built by `.github/workflows/publish-images.yml` from the commit its tag points at. Verify a pulled image with the GitHub CLI (no signing key, no registry login — the attestation is stored next to the image):
 
 ```bash
-gh attestation verify oci://ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.1 \
+gh attestation verify oci://ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.2 \
   -R laraibkazi92/trellis-agent-platform
 ```
 
@@ -105,7 +112,7 @@ If the host has no access to GHCR, export the images from a connected machine an
 # connected machine
 docker compose pull
 docker save -o trellis-images.tar \
-  ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.1 \
+  ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.2 \
   ghcr.io/vectorize-io/hindsight:0.9.1-slim \
   gcr.io/etcd-development/etcd:v3.6.15 \
   redis:alpine \
@@ -119,7 +126,7 @@ docker load -i trellis-images.tar
 Alternatively push the same images to a private registry mirror and point the stack at it with `TRELLIS_IMAGE` in `.env`:
 
 ```bash
-TRELLIS_IMAGE=registry.internal.example.com/trellis-agent-platform:v0.7.1
+TRELLIS_IMAGE=registry.internal.example.com/trellis-agent-platform:v0.7.2
 ```
 
 ## Install path B: build from source
@@ -176,7 +183,7 @@ TRELLIS_HOST_WORKSPACE=/absolute/path/to/workspace   # HOST path, not /app/works
 
 ```bash
 # 1. Clone the engine at a release tag
-git clone --branch v0.7.1 https://github.com/laraibkazi92/trellis-agent-platform.git
+git clone --branch v0.7.2 https://github.com/laraibkazi92/trellis-agent-platform.git
 cd trellis-agent-platform
 
 # 2. Seed your environment file
@@ -195,8 +202,8 @@ The variables below are the ones you must touch for a first deployment. Everythi
 | `SESSION_SECRET` | Yes | Signs sessions and seeds the Fernet encryption key (`ENCRYPTION_KEY` falls back to it). |
 | `ADMIN_USERS` | Yes | Comma-separated admin identities (e.g. `ops@example.com`). |
 | `TRELLIS_WORKSPACE_DIR` | Recommended | Workspace bind-mount source. Defaults to `./workspace` inside the clone. Point it at your content repo to keep the engine pristine. |
-| `TRELLIS_IMAGE` | Optional | Pins the engine image tag or digest, e.g. `ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.1`. |
-| `TRELLIS_UID` / `TRELLIS_GID` | Optional | Container uid:gid for workspace file ownership. Defaults to `1000:1000`. |
+| `TRELLIS_IMAGE` | Optional | Pins the engine image tag or digest, e.g. `ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.2`. |
+| `TRELLIS_UID` / `TRELLIS_GID` | Optional | Container uid:gid for workspace file ownership. Defaults to `1000:1000`; both must be non-zero — the runner refuses to start otherwise, because `0` is root and a root tool owns every file it writes (v0.7.2). |
 | `DEV_MODE` | No | Keep `false` for anything shared. `true` disables **all** authentication. |
 | `OIDC_GROUPS_CLAIM` | Optional | Identity-provider claim holding group membership for the tool-access group rules (default `groups`). Accepted as a list or a comma-separated string. |
 | `HOST_BIND` | Optional | Host address published ports bind to. Default `0.0.0.0`. |
@@ -390,10 +397,16 @@ image from this one and override the entrypoint, keep that contract.
 The runner refuses to start when its configured runtime is missing or cannot start a
 trivial container. There is no silent fallback to `runc`.
 
-**Minimum version.** This release is validated against a `runsc` whose `runsc --version`
-reports **runtime-spec 1.2.1**. Use a current gVisor release and confirm that line before
-you deploy; an older `runsc` may start containers and still fail on the networking model
-described in [Network policy](#network-policy).
+**Minimum version.** This release is validated against the gVisor release tag
+**`release-20261019.0`**. Run at least that release and confirm it with `runsc --version`
+before you deploy; an older `runsc` may start containers and still fail on the networking
+model described in [Network policy](#network-policy). The runner checks this itself but
+cannot act on it: `runsc` is a **host** runtime, so when the binary is not reachable from
+the runner's own container (the normal case) the preflight reports the check as *skipped*
+with an instruction to confirm on the host, and when it can read a version older than the
+minimum it logs a **non-fatal warning** and keeps serving. The version is a warning, not a
+gate, so a real incompatibility shows up later as a failed container start, not as a
+startup refusal.
 
 1. Install `runsc` on the **host** (not in a container) from the gVisor release you
    have tested, and pin that version in your own provisioning. Releases since
@@ -411,8 +424,9 @@ described in [Network policy](#network-policy).
    sudo chmod 0755 /usr/bin/runsc /usr/bin/containerd-shim-runsc-v1 /usr/bin/gvisor-bin/*
    ```
 
-   (The `storage.googleapis.com/gvisor/releases/release/latest/...` URLs printed in
-   older guides return 404 for current releases; use the GitHub release assets.)
+   (The per-binary `runsc` / `runsc.sha512` files under
+   `storage.googleapis.com/gvisor/releases/release/latest/...` printed in older guides
+   return 404 for current releases; use the GitHub release assets.)
 
 2. Register it with the Docker daemon and restart Docker:
 

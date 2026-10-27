@@ -116,7 +116,7 @@ edge key. `proxy.yaml` chooses, per exported item, which source a call may read:
 | --- | --- |
 | `shared` (default) | `edge-secrets/<name>.env` → process env → unset |
 | `per_user` | the caller's sealed set if present; else shared → process env → unset |
-| `per_user_required` | the caller's sealed set **only** — nothing sealed refuses the call (`missing_credentials`, `no credentials for <email> on edge <site>`) before anything is spawned |
+| `per_user_required` | the caller's sealed set **only** — nothing sealed refuses the call before anything is spawned: `missing_credentials` (`no credentials for <email> on edge <site>`), or `identity_incomplete` when the caller holds no set and has no email claim to seal one under |
 
 A sealed set is all-or-nothing for **secrets**: a declared secret it omits stays missing
 and is never filled from the shared file or the process env. `variables` (endpoints) are
@@ -212,6 +212,7 @@ tool and one exported MCP tool is the end-to-end proof.
 | **Nothing published** / no tools in Admin → Edges | `exports` is empty (or names do not match `tool.yaml` `name:` fields, or `tools_dir` does not exist in the container) | `exports` is an allowlist and an empty list publishes nothing. List the tools explicitly, then SIGHUP. Publishing an empty catalog keeps the site's existing central tools and flags a warning, so a typo cannot wipe the inventory |
 | Site connected but **no MCP rows** in Admin → Edges | `export_mcps` is empty, a name does not match an `mcp.yaml` under `mcps_dir`, `include_tools` filtered everything, or the catalog did not fit the hello frame budget | Check `docker compose logs trellis-proxy` for the load/publish warning, fix `export_mcps`/the manifest, then SIGHUP |
 | MCP call fails with **`missing_credentials`** | `credential_mode: per_user_required` and the caller has no sealed set (or it lacks a declared secret) | Have the user seal the declared secret keys in Configuration → Edge credentials, or relax the mode to `per_user`/`shared` |
+| MCP call fails with **`identity_incomplete`** | `credential_mode: per_user_required`, the caller holds no sealed set, and their identity carries no email claim | Have them seal the declared keys (bound to their user id when they have no address), or fix the email claim at the identity provider |
 | **`credential_rejected`** on a tool/MCP call | The sealed blob is for another target/user/site, or it was sealed to a key the edge retired | Reload the credential form (it re-fetches the current key) and re-enter the set |
 | Sealed credentials never reach a container | The edge has no key (`No usable edge credential key` at startup), or a rotation dropped the old key too early | Run `edge-keygen --show` and compare the fingerprint with Admin → Edges; generate one if missing |
 | Tool runs but a variable the manifest declares is missing | The key is in the file but **not declared** in `tool.yaml` / `mcp.yaml`, or `KEY=` is empty | Declare it (`secrets`/`optional_secrets`/`variables`/`secret_groups`) and give it a value; `env_passthrough: true` only as a last resort |

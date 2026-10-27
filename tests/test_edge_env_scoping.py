@@ -408,7 +408,9 @@ def test_build_env_strips_the_configured_token_env_name(tmp_path, process_env, m
 def test_handle_call_applies_the_proxy_config_policy(tmp_path, process_env, monkeypatch):
     seen = {}
 
-    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None):
+    async def fake_execute(
+        config, tool_dir, arguments, *, env, on_health=None, identity=None
+    ):
         seen.update(env)
         return {"ok": True}
 
@@ -441,7 +443,9 @@ def test_call_with_deadline_threads_passthrough_into_the_tool_env(
     """The opt-out must survive the real dispatch path, not just ``build_env``."""
     seen = {}
 
-    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None):
+    async def fake_execute(
+        config, tool_dir, arguments, *, env, on_health=None, identity=None
+    ):
         seen.update(env)
         return {"ok": True}
 
@@ -468,7 +472,9 @@ def test_call_with_deadline_strips_the_configured_token(
 ):
     seen = {}
 
-    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None):
+    async def fake_execute(
+        config, tool_dir, arguments, *, env, on_health=None, identity=None
+    ):
         seen.update(env)
         return {"ok": True}
 

@@ -20,10 +20,11 @@ edge-local file per export, plus per-user sets that central stores only as
 ciphertext sealed to this edge's public key (``core.edge_crypto``). Nothing here
 sends a credential value to central, and the private key never leaves this VM.
 
-Trust (v0.7.1): this process verifies **no** agent token and needs no
+Trust (v0.7.2): no process on this host verifies an agent token and none holds
 ``AGENT_TOKEN_SECRET``. The relay authenticated the caller, verified the token and
-built the frame identity from its claims; the edge trusts that identity over the
-authenticated tunnel and uses it unchanged.
+built the frame identity from its claims; this process trusts that identity over the
+authenticated tunnel and passes it on to the edge runner, which does the same over the
+``RUNNER_TOKEN``-authenticated socket.
 """
 
 from __future__ import annotations
@@ -693,8 +694,10 @@ def build_env(
     dropped in both modes, even if something re-adds it to the process environment.
 
     ``credential_mode`` is the operator's policy for this tool and may raise
-    ``MissingCredentials`` (``per_user_required``): callers must turn that into a
-    ``missing_credentials`` error result **without** running the tool.
+    ``MissingCredentials`` (``per_user_required``): callers must turn that into an
+    error result carrying its own ``code`` -- ``missing_credentials``, or
+    ``identity_incomplete`` when the caller has no email to seal to -- **without**
+    running the tool.
 
     ``sealed`` is the decrypted per-user mapping (``None`` = no blob). When it is not
     None the per-user branch is all-or-nothing: only the secret names it carries reach
@@ -847,8 +850,10 @@ def hello_frame(
     so the schema the relay publishes is byte-for-byte what the edge validates
     arguments against.
 
-    ``caps`` always states what this edge can serve: a proto-1 relay has no ``caps``
-    and reads the frame as tools-only, while any MCP catalog makes it ``["tools","mcp"]``.
+    ``caps`` always states what this edge can serve: ``["tools"]``, plus ``mcp`` when
+    any MCP server is exported and ``lazy_catalog`` when summaries are published. A
+    relay older than v0.7.2 reads the frame as tools-only and is refused at the
+    handshake anyway (proto 3), so the caps are informational on this side.
     MCP ``inputSchema`` payloads are carried verbatim (L6).
 
     ``lazy_catalog`` publishes summaries instead: no tool ``inputs``, a description
@@ -981,6 +986,27 @@ def _elapsed_ms(started: float) -> int:
     return max(0, int((time.monotonic() - started) * 1000))
 
 
+def _frame_identity(call: Mapping[str, Any]) -> Dict[str, Any]:
+    """The caller identity a validated call frame carries, keyed the edge's way.
+
+    The relay is the only verifier on this path (v0.7.2 R1): it derived every field
+    from the verified token's claims and no longer sends the token, because the edge
+    holds no key that could check one. The keys stay as ``user``/``user_email`` --
+    what ``build_env``, ``_server_env`` and the sealed-blob owner check already read
+    -- so one mapping feeds the env, the sealed envelope and the runner request.
+    Only the frame is a source: nothing here merges a body, a config or the process
+    environment into it.
+    """
+    return {
+        "user": call.get("user"),
+        "user_email": call.get("user_email"),
+        "agent": call.get("agent"),
+        "groups": call.get("groups") or [],
+        "run_id": call.get("run_id"),
+        "parent_run_id": call.get("parent_run_id"),
+    }
+
+
 def _timeout_frame(frame: Dict[str, Any], deadline_ms: int, started: float) -> Dict[str, Any]:
     """The frame the edge sends when it loses the race with the relay's deadline."""
     call_id = frame.get("id")
@@ -1018,7 +1044,9 @@ async def handle_call(
     serve loop does -- therefore cannot silently downgrade a ``per_user_required`` tool
     to ``shared``; with no ``proxy_config`` at all there is nothing to read and the
     default mode applies. Under ``per_user_required`` a caller with no sealed blob
-    short-circuits to a ``missing_credentials`` result: the tool is never executed.
+    short-circuits to an error result -- ``missing_credentials``, or
+    ``identity_incomplete`` when their identity has no email claim, since there is
+    nothing to seal a set to: the tool is never executed.
 
     ``message["sealed"]`` is the caller's ciphertext for exactly this
     ``(site, tool, identity)``. It is opened here (current key, then the rotation
@@ -1027,9 +1055,11 @@ async def handle_call(
     becomes ``credential_rejected`` and the tool never runs.
 
     The frame's caller identity is **trusted**: the relay built it from the verified
-    agent token's claims and nothing on the edge re-checks a token (v0.7.1). The
-    ``agent_token`` is forwarded unchanged to the runner, which owns the remaining
-    verification.
+    agent token's claims and nothing on the edge re-checks a token (v0.7.1). As of
+    v0.7.2 the frame carries no token at all -- the relay is the only verifier and
+    sends the claims it derived. That identity is what travels to the runner (over
+    the ``RUNNER_TOKEN``-authenticated socket), which is also why the edge runner
+    takes it from the body instead of verifying anything itself.
     """
     started = time.monotonic()
     raw_id = message.get("id")
@@ -1039,8 +1069,6 @@ async def handle_call(
         call = protocol.validate_call(message)
     except protocol.ProtocolError as exc:
         return _result_frame(fallback_id, _elapsed_ms(started), error=("invalid_arguments", str(exc)))
-
-    agent_token = call.get("agent_token")
 
     entry = config_map.get(call["tool"])
     if entry is None:
@@ -1058,7 +1086,7 @@ async def handle_call(
 
     if credential_modes is None:
         credential_modes = proxy_config.export_modes if proxy_config else {}
-    identity = {"user": call.get("user"), "user_email": call.get("user_email")}
+    identity = _frame_identity(call)
     site = proxy_config.site if proxy_config else None
     if call.get("sealed") is not None and (edge_key is None or prev_edge_key is None):
         edge_key, prev_edge_key = _resolve_edge_keys(edge_key, prev_edge_key)
@@ -1102,16 +1130,15 @@ async def handle_call(
 
     try:
         # The tool's own timeout (core.tool_runtime) governs; the relay's
-        # deadline_ms only bounds its wait for this result. The token is omitted
-        # when absent so a pre-v0.6 frame keeps the exact call shape.
-        token_kwargs = {"agent_token": agent_token} if agent_token else {}
+        # deadline_ms only bounds its wait for this result. The caller's identity
+        # rides the request as data: an edge runner has no token to verify.
         result = await tool_runtime.execute_tool(
             config,
             tool_dir,
             arguments,
             env=env,
             on_health=None,
-            **token_kwargs,
+            identity=identity,
         )
     except Exception as exc:
         logger.exception("Tool %r failed on the edge", call["tool"])
@@ -1140,7 +1167,8 @@ async def handle_mcp_call(
     A sealed blob is opened here (kind ``mcp``, the server's name, the caller's
     identity) and the decrypted mapping is handed to the session manager, which uses
     it only when it opens (or reopens) the session. The identity is the frame's, i.e.
-    the verified token's claims on the relay; no token is verified here (v0.7.1).
+    the claims the relay derived from the token it verified; no token is verified --
+    or even sent -- here (v0.7.2 R1).
     """
     started = time.monotonic()
     raw_id = message.get("id")
@@ -1175,9 +1203,8 @@ async def handle_mcp_call(
             call["mcp"],
             call["tool"],
             call["args"],
-            {"user": call.get("user"), "user_email": call.get("user_email")},
+            _frame_identity(call),
             call["deadline_ms"],
-            agent_token=call.get("agent_token"),
             sealed=sealed,
         )
     except proxy_mcp.McpCallError as exc:

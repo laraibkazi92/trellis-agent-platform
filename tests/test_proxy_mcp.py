@@ -1102,7 +1102,7 @@ def test_hello_frame_advertises_the_mcp_capability(tmp_path):
     assert frame["caps"] == ["tools", "mcp"]
     assert [mcp["name"] for mcp in frame["mcps"]] == ["stateful"]
     proto, _version, tools, mcps, caps = protocol.validate_hello(frame)
-    assert proto == protocol.PROTO == 2
+    assert proto == protocol.PROTO == 3
     assert tools == []
     assert caps == ["tools", "mcp"]
     assert [tool.name for tool in mcps[0].tools] == ["set_value", "get_value", "get_home"]
@@ -1465,7 +1465,7 @@ def test_small_results_are_untouched():
 def test_the_session_identity_and_key_come_from_the_frame_never_the_token(
     tmp_path, fake_sessions
 ):
-    """v0.7.1: no token-derived identity on the edge. The frame is the only source."""
+    """v0.7.1/v0.7.2: no token-derived identity on the edge. The frame is the only source."""
     write_mcp(tmp_path / "mcps", tools=SERVER_TOOLS + [ENV_DUMP_TOOL])
     entries = load_one(tmp_path / "mcps")
     manager = proxy_mcp.McpSessionManager()
@@ -1474,14 +1474,14 @@ def test_the_session_identity_and_key_come_from_the_frame_never_the_token(
     async def scenario():
         try:
             manager.set_entries(entries, await catalogs_for(entries))
+            # R1: the call takes no token at all -- the frame's identity is the whole
+            # of what the session and the runner see.
             result = await manager.call(
                 "stateful",
                 "env_dump",
                 {},
                 identity,
                 DEADLINE_MS,
-                # A token for somebody else changes nothing: the edge never reads it.
-                agent_token="t1.forged.signature",
             )
             return result, list(manager._sessions)
         finally:

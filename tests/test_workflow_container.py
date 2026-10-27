@@ -375,6 +375,56 @@ def test_an_empty_email_is_not_invented(workspace):
     assert "TRELLIS_USER_EMAIL" not in spec.preamble_env
 
 
+def test_the_pipeline_is_told_where_it_may_write(workspace):
+    """v0.7.2 R2: both rw mounts, by their in-container path, in the config env.
+
+    A pipeline must not have to hard-code ``reports/<name>``: the runner created the
+    mounts, so it is the only party that knows the path.
+    """
+    spec = build(workspace)
+
+    assert spec.env["TRELLIS_REPORTS_DIR"] == f"{CONTAINER_WORKSPACE}/reports/{WORKFLOW}"
+    assert spec.env["TRELLIS_OUTPUT_DIR"] == f"{CONTAINER_WORKSPACE}/output/{WORKFLOW}"
+    rw_targets = {mount.target for mount in spec.mounts if not mount.read_only}
+    assert {
+        spec.env["TRELLIS_REPORTS_DIR"],
+        spec.env["TRELLIS_OUTPUT_DIR"],
+    } == rw_targets
+    # Not on stdin: the create body carries them, so the pipeline sees them before
+    # it reads anything (subprocesses inherit them too).
+    payload = _create_payload(spec)
+    for name in ("TRELLIS_REPORTS_DIR", "TRELLIS_OUTPUT_DIR"):
+        assert f"{name}={spec.env[name]}" in payload["Env"]
+        assert name not in spec.preamble_env
+
+
+def test_a_caller_cannot_redirect_the_workflow_output_dirs(workspace):
+    """The dirs are set after the caller's values, so they cannot be replaced."""
+    spec = build(
+        workspace, env={"TRELLIS_REPORTS_DIR": "/etc", "TRELLIS_OUTPUT_DIR": "/etc"}
+    )
+
+    assert spec.env["TRELLIS_REPORTS_DIR"] == f"{CONTAINER_WORKSPACE}/reports/{WORKFLOW}"
+    assert spec.env["TRELLIS_OUTPUT_DIR"] == f"{CONTAINER_WORKSPACE}/output/{WORKFLOW}"
+
+
+def test_the_workflow_name_is_derived_not_taken_from_the_caller(workspace):
+    """``TRELLIS_AGENT_NAME`` is the validated pipeline directory, not caller input.
+
+    ``core.tasks`` sends the same value today, but the ground truth is the workflow
+    name ``build_workflow_spec`` already validated: a caller that sends nothing (or
+    something else) must not be able to rename the pipeline's run context.
+    """
+    spec = build(workspace, env={"TRELLIS_AGENT_NAME": "someone-else"})
+
+    assert spec.env["TRELLIS_AGENT_NAME"] == WORKFLOW
+    # Even with no caller value at all.
+    assert build(workspace).env["TRELLIS_AGENT_NAME"] == WORKFLOW
+    # The unmounted-dirs case does not exist for a workflow: both dirs are always
+    # created, so both variables are always present.
+    assert spec.env["TRELLIS_REPORTS_DIR"] == f"{CONTAINER_WORKSPACE}/reports/{WORKFLOW}"
+
+
 def test_a_reserved_control_plane_name_is_refused(workspace):
     with pytest.raises(InvalidRequest) as excinfo:
         build(workspace, env={"RUNNER_TOKEN": "x"})
@@ -680,3 +730,33 @@ def test_a_tool_manifest_is_still_parsed_as_a_tool_config(workspace):
     """Guard against the suite fixtures drifting from the real manifest schema."""
     raw = yaml.safe_load((workspace.root / "tools" / "reporting" / "tool.yaml").read_text())
     assert ToolConfig(**raw[0]).name == "make_report"
+
+
+def test_stopping_the_task_id_removes_the_workflow_container(runner_env):
+    """R3, end to end: the ``trellis.run`` label IS the run id the worker knows.
+
+    The worker never learns the container id (it never sees one: the runner owns the
+    container), so ``/v1/stop`` has to find it by the label the spec derived from the
+    verified token's claims -- for a workflow, the taskiq task id.
+    """
+    runner_env.backend.queue(RawExec(exit_code=0, stdout=b"ok"))
+    asyncio.run(_call("POST", "/v1/exec", json_body=_body()))
+    spec = runner_env.backend.specs[0]
+    assert spec.labels["trellis.run"] == "run-1"
+
+    async def seed() -> str:
+        container_id = await runner_env.backend.create(spec)
+        await runner_env.backend.start(container_id)
+        return container_id
+
+    container_id = asyncio.run(seed())
+
+    response = asyncio.run(_call("POST", "/v1/stop", json_body={"run_id": "run-1"}))
+
+    assert response.status_code == 200, response.json()
+    assert response.json()["stopped"] == 1
+    assert container_id not in runner_env.backend.containers
+    # The poller can race the run's own exit: a second stop is harmless.
+    again = asyncio.run(_call("POST", "/v1/stop", json_body={"run_id": "run-1"}))
+    assert again.status_code == 200
+    assert again.json()["stopped"] == 0

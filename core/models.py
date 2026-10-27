@@ -16,6 +16,10 @@ from core.execution.env import (
     declared_names,
     invalid_env_names,
 )
+# The one flattening of the ``secret_groups`` shape: sync, the edge's manifest
+# check and this validator all read it, so they cannot disagree about which names
+# a manifest declares.
+from core.manifest_keys import _group_keys
 
 logger = logging.getLogger(__name__)
 
@@ -516,6 +520,15 @@ class ToolConfig(BaseModel):
     @classmethod
     def _declared_env_names_are_valid(cls, value, info):
         return _validate_declared_env_names(value, info.field_name)
+
+    @field_validator("secret_groups")
+    @classmethod
+    def _secret_group_keys_are_valid(cls, value):
+        """A group field key is a credential name the user types: same rule as
+        ``secrets``. It reaches the container as an env var exactly like one."""
+        keys = _group_keys({"secret_groups": value})
+        _validate_declared_env_names(keys, "secret_groups")
+        return value
 
     @field_validator("container_runtime")
     @classmethod

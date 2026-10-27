@@ -21,11 +21,15 @@ from core.execution.contract import (
     RunnerError,
     SessionCreateRequest,
     SessionInfo,
+    StopResult,
 )
 
 DEFAULT_SOCKET = "/run/trellis/runner.sock"
 # Structured states the hub maps onto its existing result shapes.
 RETRYABLE_CODES = frozenset({"capacity_exhausted", "daemon_unavailable"})
+# A stop is a cancellation path, not a run: it must return quickly so the caller
+# (the worker's cancellation poller) never blocks on a wedged runner.
+STOP_TIMEOUT_S = 30.0
 
 
 class RunnerUnavailable(RuntimeError):
@@ -184,8 +188,19 @@ class RunnerClient:
             raise _error_from_response(response)
         return ExecResult.model_validate(response.json())
 
-    # --- sessions (phase 2) -------------------------------------------------
+    async def stop_run(self, run_id: str) -> StopResult:
+        """Stop every container of ``run_id``; ``stopped == 0`` means none was left.
 
+        Idempotent by design (the runner matches the run label and returns a count),
+        so a cancellation racing the run's own exit is not an error: nothing left to
+        stop is the outcome the caller wanted.
+        """
+        response = await self._request(
+            "POST", "/v1/stop", json={"run_id": run_id}, timeout=STOP_TIMEOUT_S
+        )
+        return StopResult.model_validate(response.json())
+
+    # --- sessions (phase 2) -------------------------------------------------
     async def open_session(self, request: SessionCreateRequest) -> SessionInfo:
         response = await self._request(
             "POST", "/v1/sessions", json=request.model_dump(exclude_none=True)

@@ -17,13 +17,21 @@ Two sources hold a **secret**, and only one of them is central:
 ``variables`` (endpoints) are the edge's own configuration, not a credential: they
 come from the shared file and then the process environment, in every mode.
 
-``credential_mode`` decides what happens when a sealed set exists:
+``credential_mode`` decides what happens **when the caller has no sealed set**; a
+present one wins in *every* mode, because it is the caller's explicit per-user
+statement and the edge never second-guesses it:
 
 * ``shared`` (default): the shared file for secrets, shared file -> process env for
   variables.
 * ``per_user``: the sealed set if the caller has one, else the same as ``shared``.
 * ``per_user_required``: the sealed set **only**; nothing sealed for this caller is
   a hard refusal (``missing_credentials``) -- the call must not run at all.
+
+One refusal is about *identity*, not credentials: ``per_user_required`` for an
+email-less caller with **no blob** is refused with ``identity_incomplete`` before the
+shared file is even looked at, because re-sealing cannot fix an identity. A blob that
+*did* arrive is never refused for that reason: it was sealed to the caller's email, or
+to their user id when they have none, so it is provably theirs and still opens.
 
 The per-user set is all-or-nothing (plan §5 Phase 4 R8): once a blob is present, a
 declared secret it omits stays missing and is never filled from the shared file.
@@ -46,6 +54,11 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
 from core import edge_env
+
+# Dependency-free by construction (stdlib + ``core.agent_token``): importing the
+# refusal code and message from here keeps the edge, the hub and the gateway on one
+# spelling instead of three copies of a wire contract.
+from core.caller_identity import IDENTITY_INCOMPLETE, identity_incomplete_error
 
 logger = logging.getLogger(__name__)
 
@@ -83,9 +96,12 @@ _WARNED_PERMISSIVE: set[str] = set()
 class MissingCredentials(Exception):
     """No usable credentials for this caller; ``code`` becomes ``result.error.code``.
 
-    Raised by ``per_user_required`` when the caller has no sealed blob. The message is
-    the exact string central surfaces to the agent, so it names the email and the site
-    but never a value.
+    Raised for two different problems, and the code says which: ``missing_credentials``
+    when ``per_user_required`` has no sealed set for this caller (sealing one fixes it),
+    ``identity_incomplete`` when an email-less caller has no set at all, so there is
+    nothing to seal to (nothing the caller seals fixes it). The message is
+    the exact string central surfaces to the agent: it names the identity and the site
+    or export, never a value.
     """
 
     def __init__(self, message: str, *, code: str = MISSING_CREDENTIALS) -> None:
@@ -206,6 +222,24 @@ def _missing(email: Optional[str], site: Optional[str]) -> MissingCredentials:
     )
 
 
+def _caller_email(email: Optional[str]) -> str:
+    """The caller's email as a non-empty string, or ``""`` when the identity has none."""
+    return str(email or "").strip()
+
+
+def _identity_incomplete(name: str, site: Optional[str]) -> MissingCredentials:
+    """The refusal for ``per_user_required`` with no set and no email (v0.7.2 R7.1).
+
+    The code and the wording come from ``core.caller_identity`` so the code stays one
+    wire contract, and the caller is sent to their identity provider rather than to the
+    seal form (which cannot help).
+    """
+    return MissingCredentials(
+        identity_incomplete_error(f"export '{name}'", site or "unknown")["error"],
+        code=IDENTITY_INCOMPLETE,
+    )
+
+
 def _nonempty(values: Mapping[str, str]) -> Dict[str, str]:
     """Drop empty/whitespace values: a blank file/env value is an absent key."""
     return {key: value for key, value in values.items() if str(value).strip()}
@@ -282,7 +316,8 @@ class CredentialStore:
         """The credentials for one call, per ``mode`` and this caller's sealed set.
 
         ``sealed`` is the already-decrypted mapping from ``core.edge_crypto`` (``None``
-        means the caller has no blob). Its presence switches the per-user branch on:
+        means the caller has no blob). Its presence switches the per-user branch on, in
+        **every** mode:
 
         * only declared **secret** names are taken, all-or-nothing -- a missing one is
           not filled from the shared file;
@@ -294,12 +329,36 @@ class CredentialStore:
         **variables**. The process environment is deliberately not a secret source
         (v0.7.1): it is visible to every tool in the container and to any operator
         inspecting it, so a declared secret comes from ``secrets_dir`` or is absent.
-        Side-effect free and synchronous: no directory is created, and the only log
-        lines name files and keys.
+
+        Either way ``per_user_required`` **without a blob** needs the caller's email:
+        nothing is sealed for an identity that never had one, and a mixed-up caller is
+        sent to their identity provider rather than to the seal form. That refusal comes
+        first -- see :func:`_identity_incomplete`. A blob that *did* arrive is not gated
+        on the email: it is bound to this caller's email *or* their user id
+        (``edge_secrets_central.sealed_identity``), so it opens either way. Side-effect
+        free and synchronous: no directory is created, and the only log lines name files
+        and keys.
         """
         declared = edge_env.declared_keys_for(config)
         resolved_mode = _mode(mode)
         variables = declared_variable_keys(config)
+
+        # Identity before credentials (v0.7.2 R7.1). ``per_user_required`` with no blob
+        # can only be satisfied by a set sealed for this caller, and nothing is sealed
+        # for an identity with no subject -- so that IS the refusal, answered before the
+        # ``missing_credentials`` path below, which would send the operator to re-seal a
+        # key that cannot fix a missing address.
+        #
+        # A blob that arrived is the opposite case: it was decrypted above, so it is
+        # bound to this very caller -- their email, else their user id. Gating it on the
+        # email would refuse the one path that is provably theirs (a webhook run's
+        # identity is the literal user id ``webhook`` and has no address by design).
+        if (
+            resolved_mode == "per_user_required"
+            and sealed is None
+            and not _caller_email(email)
+        ):
+            raise _identity_incomplete(name, site)
 
         if sealed is not None:
             secrets = declared_secret_keys(config)

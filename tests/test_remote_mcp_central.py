@@ -13,8 +13,8 @@ Covered contracts:
 - ``core.remote_mcp.call_edge_mcp`` maps every relay status onto the same
   ``{"content", "isError", "structuredContent"}`` / ``{"error": ...}`` dict shape
   ``core.hub::_run_remote`` returns, takes identity from the verified token's claims
-  only, refuses a per-user-credential call whose token has no email with
-  ``identity_incomplete``, and caps oversized results.
+  only, leaves the per-user credential decision to the edge (it knows the export's
+  ``credential_mode``), and caps oversized results.
 - ``discover_external_mcps`` takes an edge MCP's catalog from its static ``tools``.
 - ``build_agent`` registers the 4-part ``mcp__<site>__<mcp>__<tool>`` name.
 - The gateway ``use_tool`` seam dispatches 4-part names to the relay caller.
@@ -340,13 +340,15 @@ def test_call_edge_mcp_service_token_carries_no_email(monkeypatch):
     assert result == {"content": []}
 
 
-def test_call_edge_mcp_per_user_credentials_need_an_email_claim(monkeypatch):
-    """A token with no email cannot serve a sealed per-user set.
+def test_call_edge_mcp_leaves_the_per_user_decision_to_the_edge(monkeypatch):
+    """An email-less token holding a set is dispatched: central has nothing to judge.
 
-    The refusal is ``identity_incomplete`` and never ``credential_rejected``: re-sealing
-    a key cannot fix a caller whose identity has no email.
+    A blob is sealed to the email *or the user id*, so an email-less identity that
+    holds one is a legitimate caller (a webhook run mints the literal id ``webhook``).
+    ``per_user_required`` without a set is the edge's refusal -- it is the only side
+    that knows its ``credential_mode``.
     """
-    install_transport(monkeypatch, json_response(200, {"result": {"content": []}}))
+    requests, _ = install_transport(monkeypatch, json_response(200, {"result": {"content": []}}))
     monkeypatch.setattr(
         remote_mcp.edge_secrets_central,
         "get",
@@ -356,22 +358,9 @@ def test_call_edge_mcp_per_user_credentials_need_an_email_claim(monkeypatch):
 
     result = call_edge(user_id="svc_agent_reporter", token=token)
 
-    assert "identity_incomplete" in result["error"]
-    assert "no email" in result["error"]
-    assert "credential_rejected" not in result["error"]
-
-
-def test_call_edge_mcp_identity_incomplete_is_not_dispatched(monkeypatch):
-    """The refusal happens before the relay sees the call."""
-    requests, _ = install_transport(monkeypatch, json_response(200, {"result": {}}))
-    monkeypatch.setattr(
-        remote_mcp.edge_secrets_central, "get", lambda *args, **kwargs: {"v": 1, "ciphertext": "x"}
-    )
-
-    result = call_edge(token=mint("agent-a", user_id="user-1"))
-
-    assert requests == []
-    assert "identity_incomplete" in result["error"]
+    # Dispatched: the edge owns the per-user decision (it knows its credential_mode).
+    assert requests
+    assert "identity_incomplete" not in str(result)
 
 
 def test_call_edge_mcp_malformed_token_supplies_no_identity(monkeypatch):

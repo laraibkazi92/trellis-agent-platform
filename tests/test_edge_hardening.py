@@ -1,13 +1,17 @@
 # Copyright (C) 2026 Laraib Kazi
 # SPDX-License-Identifier: Apache-2.0
 
-"""P2 hardening tests: per-site rate limiting and the payload-free audit trail."""
+"""P2 hardening tests: per-site rate limiting, the payload-free audit trail, and
+(v0.7.2 R1) the caller identity a call frame is allowed to name."""
 
+import asyncio
 import json
 import logging
 
 import pytest
 
+from core import proxy
+from core.models import ToolConfig
 from services.edge_relay import audit
 from services.edge_relay.ratelimit import (
     DEFAULT_RATE_PER_MIN,
@@ -199,3 +203,111 @@ def test_configure_falls_back_to_stderr_when_the_file_cannot_be_opened(monkeypat
     audit.configure()
 
     assert any(isinstance(h, logging.StreamHandler) for h in audit.logger.handlers)
+
+
+# --- caller identity (v0.7.2 R1) -----------------------------------------------------
+#
+# The relay is the only verifier on this path: it authenticated the caller, checked the
+# token and sends the claims it derived. Everything the edge believes about a caller
+# therefore comes from the frame -- never from the tool's arguments, the edge's own
+# environment, or a token (there is none to read any more).
+
+
+FRAME_IDENTITY = {
+    "user": "frame-user",
+    "user_email": "frame@example.com",
+    "agent": "frame-agent",
+    "groups": ["frame-group"],
+    "run_id": "frame-run",
+    "parent_run_id": "frame-parent",
+}
+
+
+def _identity_tool(tmp_path):
+    """A tool that declares inputs named exactly like the identity fields."""
+    tool_dir = tmp_path / "demo"
+    tool_dir.mkdir()
+    (tool_dir / "main.py").write_text("print('{}')\n", encoding="utf-8")
+    config = ToolConfig(
+        name="demo",
+        description="d",
+        runtime="python",
+        entrypoint="main.py",
+        inputs={
+            "user": {"type": "string"},
+            "agent": {"type": "string"},
+            "groups": {"type": "string"},
+        },
+    )
+    return config, tool_dir
+
+
+def test_the_frame_is_the_only_identity_source(tmp_path, monkeypatch):
+    """Arguments and the edge's own env cannot name a caller."""
+    seen = {}
+
+    async def fake_execute(
+        config, tool_dir, arguments, *, env, on_health=None, identity=None
+    ):
+        seen["identity"] = identity
+        seen["env"] = env
+        return {"ok": True}
+
+    monkeypatch.setattr(proxy.tool_runtime, "execute_tool", fake_execute)
+    # An identity left in the edge process must never become this caller's.
+    monkeypatch.setenv("TRELLIS_USER_ID", "env-user")
+    monkeypatch.setenv("TRELLIS_USER_EMAIL", "env@example.com")
+    config, tool_dir = _identity_tool(tmp_path)
+
+    frame = asyncio.run(
+        proxy.handle_call(
+            {"demo": (config, tool_dir)},
+            {
+                "t": "call",
+                "id": "c1",
+                "tool": "demo",
+                "args": {
+                    "user": "arg-user",
+                    "agent": "arg-agent",
+                    "groups": "arg-groups",
+                },
+                **FRAME_IDENTITY,
+            },
+        )
+    )
+
+    assert frame["ok"] is True
+    assert seen["identity"] == FRAME_IDENTITY
+    # The tool's env is rebuilt from the frame too, so the legacy vars are replaced.
+    assert seen["env"]["TRELLIS_USER_ID"] == "frame-user"
+    assert seen["env"]["TRELLIS_USER_EMAIL"] == "frame@example.com"
+
+
+def test_a_frame_token_is_never_forwarded_to_the_runner(tmp_path, monkeypatch):
+    """A v0.7.1 relay still sends one; R1's edge must not pass it on."""
+    seen = {}
+
+    async def fake_execute(
+        config, tool_dir, arguments, *, env, on_health=None, identity=None
+    ):
+        seen["identity"] = identity
+        return {"ok": True}
+
+    monkeypatch.setattr(proxy.tool_runtime, "execute_tool", fake_execute)
+    config, tool_dir = _identity_tool(tmp_path)
+
+    asyncio.run(
+        proxy.handle_call(
+            {"demo": (config, tool_dir)},
+            {
+                "t": "call",
+                "id": "c1",
+                "tool": "demo",
+                "args": {},
+                "agent_token": "t1.payload.signature",
+                **FRAME_IDENTITY,
+            },
+        )
+    )
+
+    assert "agent_token" not in seen["identity"]

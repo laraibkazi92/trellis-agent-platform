@@ -73,6 +73,35 @@ def test_an_email_is_trimmed(monkeypatch):
     assert identity["user_email"] == "ops@example.com"
 
 
+def test_a_mixed_case_email_is_normalized_at_mint_time(monkeypatch):
+    """One spelling for the token, ``TRELLIS_USER_EMAIL``, the session key and the AAD.
+
+    An OIDC claim can carry ``User@Example.com`` for the same person who sealed under
+    ``user@example.com``; two spellings would be two identities (two MCP sessions, and
+    a sealed set that never opens).
+    """
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", "caller-identity-unit-secret-0123456789")
+    identity, _ = resolve(monkeypatch, {"email": "User@Example.com"})
+
+    assert identity["user_email"] == "user@example.com"
+    # What rides the token -- and therefore TRELLIS_USER_EMAIL on every call.
+    token = agent_token.mint(
+        "supervisor", user_id="user-1", user_email=identity["user_email"]
+    )
+    assert agent_token.verify(token).user_email == "user@example.com"
+
+
+def test_a_mixed_case_dev_email_is_normalized_too(monkeypatch):
+    """The DEV_MODE fallback is an identity like any other: same form, not a second one."""
+    monkeypatch.setenv("DEV_MODE", "true")
+    monkeypatch.setenv("DEV_USER_EMAIL", " Dev@Local.Host ")
+    fake = FakeIdentity(None)
+
+    identity = asyncio.run(resolve_mint_identity(fake, "user-1"))
+
+    assert identity["user_email"] == "dev@local.host"
+
+
 # --------------------------------------------------------------------------- #
 # identities that must resolve to nothing
 # --------------------------------------------------------------------------- #

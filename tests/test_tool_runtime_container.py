@@ -153,6 +153,38 @@ def test_container_call_carries_no_env_when_nothing_is_declared(tmp_path, monkey
     assert fake.requests[0].env == {}
 
 
+def test_the_run_context_is_never_sent_by_the_caller(tmp_path, monkeypatch):
+    """v0.7.2 R2: agent name, run id and the output dirs are derived runner-side.
+
+    The hub/edge sends declared credentials and the run's token, nothing else: the
+    runner resolves the identity (central claims / edge body) and the mounts, and
+    injects ``TRELLIS_AGENT_NAME``/``TRELLIS_RUN_ID``/``TRELLIS_REPORTS_DIR``/
+    ``TRELLIS_OUTPUT_DIR`` into the container's configuration itself. A caller that
+    could set them could point a tool at another agent's report dir, and ``_merge_env``
+    keeps refusing them because ``declared_env_keys`` is unchanged.
+    """
+    config = make_config(output_dirs=["reports"])
+    fake = install_runner(
+        monkeypatch, result=ExecResult(exit_code=0, stdout='{"count": 3}', stderr="")
+    )
+
+    run_tool(
+        tmp_path,
+        config,
+        env={"API_KEY": "a", "TRELLIS_AGENT_NAME": "supervisor"},
+        agent_token="t1.the.run.token",
+    )
+
+    request = fake.requests[0]
+    for name in (
+        "TRELLIS_AGENT_NAME",
+        "TRELLIS_RUN_ID",
+        "TRELLIS_REPORTS_DIR",
+        "TRELLIS_OUTPUT_DIR",
+    ):
+        assert name not in request.env, name
+
+
 # --------------------------------------------------------------------------- #
 # runner error mapping
 # --------------------------------------------------------------------------- #

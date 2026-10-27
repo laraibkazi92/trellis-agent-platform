@@ -21,9 +21,22 @@ from core.agent_token import normalize_groups
 
 logger = logging.getLogger(__name__)
 
-# Stable refusal code for a per-user-credential call it cannot serve: the edge seals
-# credentials per user and needs the caller's email, but the verified token has none.
+# Stable refusal code for a per-user-credential call the edge cannot serve: its
+# ``credential_mode`` is ``per_user_required``, which only a set sealed for the caller
+# satisfies, and this caller holds none and has no email claim to seal one under.
 IDENTITY_INCOMPLETE = "identity_incomplete"
+
+# Background runs act as a service identity (``svc_agent_<agent>``) and are email-less
+# by design: they have no profile record, so there is no address in their claims. The
+# id is still a valid seal subject (``edge_secrets_central.sealed_identity`` falls back
+# to it), so this is not by itself a reason to refuse a per-user credential call: it
+# only decides which scoped secrets a manifest's ``secrets:`` / ``variables:`` resolve.
+SERVICE_IDENTITY_PREFIX = "svc_agent_"
+
+
+def is_service_identity(user_id: Any) -> bool:
+    """Whether ``user_id`` is a background run's service identity."""
+    return str(user_id or "").startswith(SERVICE_IDENTITY_PREFIX)
 
 
 async def resolve_mint_identity(identity_mgr: Any, user_id: Optional[str]) -> dict:
@@ -41,7 +54,7 @@ async def resolve_mint_identity(identity_mgr: Any, user_id: Optional[str]) -> di
     empty: dict = {"user_email": None, "groups": ()}
     if not user_id:
         return empty
-    if str(user_id).startswith("svc_agent_"):
+    if is_service_identity(user_id):
         # Service identity: no email, no groups. A background run must not inherit the
         # groups of the user who triggered it, so nothing is read or asserted here --
         # that is the fail-closed contract for workflows, not an oversight.
@@ -61,26 +74,37 @@ async def resolve_mint_identity(identity_mgr: Any, user_id: Optional[str]) -> di
         record = {}
 
     email = record.get("email")
-    email = email.strip() if isinstance(email, str) and email.strip() else None
+    # One normalized spelling (strip + lowercase) for everything the email feeds: the
+    # minted token claim, ``TRELLIS_USER_EMAIL``, the edge's MCP session key and the
+    # sealed-credential AAD identity. An OIDC claim can arrive as ``Alice@Example.COM``
+    # for the same person who sealed under ``alice@example.com``, and two spellings are
+    # two identities. Deliberately local rather than
+    # ``core.edge_user_secrets.normalize_email``: that one returns a filesystem stem
+    # (slug + hash), not an address, and is edge-only by design.
+    email = email.strip().lower() if isinstance(email, str) and email.strip() else None
     if email is None and os.getenv("DEV_MODE", "false").lower() == "true":
-        # DEV_MODE only: a local login may have no persisted record.
-        email = os.getenv("DEV_USER_EMAIL", "dev-user@local.host")
+        # DEV_MODE only: a local login may have no persisted record. Normalized the same
+        # way, so the dev identity is not a second spelling of itself.
+        email = os.getenv("DEV_USER_EMAIL", "dev-user@local.host").strip().lower() or None
 
     return {"user_email": email, "groups": normalize_groups(record.get("groups"))}
 
 
 def identity_incomplete_error(subject: str, site: str) -> dict:
-    """The refusal for a per-user-credential call whose token carries no email.
+    """The refusal for a ``per_user_required`` call whose caller has no set and no email.
 
-    Never ``credential_rejected``: that code tells an operator to re-seal credentials,
-    which cannot fix a caller whose identity is missing. The message names what is
-    missing, so the operator knows to look at the identity provider, not the seal.
+    Raised by the edge, which is the only side that knows the export's
+    ``credential_mode``. Never ``credential_rejected``: that code tells an operator a
+    stored set went stale, which is not what happened. The message names both ways out,
+    because an email-less caller *can* still seal one -- the seal falls back to their
+    user id -- and the operator should not be sent to the IdP for a fix the UI offers.
     """
     return {
         "error": (
             f"{IDENTITY_INCOMPLETE}: {subject} on edge '{site}' uses per-user "
-            "credentials, which are sealed to the caller's email, and the verified "
-            "agent token carries no email. Sign in with an identity provider that "
-            "asserts one (or use a token minted for a user with an email)."
+            "credentials, which are sealed per caller, and this caller has no sealed "
+            "set and the calling identity has no email claim. Seal the declared keys in "
+            "Configuration -> Edge credentials (such a set is bound to your user id), "
+            "or sign in with an identity provider that asserts an email."
         )
     }

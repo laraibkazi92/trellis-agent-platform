@@ -93,7 +93,11 @@ container created by the local `runner` service, from the manifest on disk:
 - **Only declared env is sent.** The request carries the manifest's declared keys
   (`secrets`, `optional_secrets`, `variables`, the `env:` block) plus
   `TRELLIS_USER_ID`/`TRELLIS_USER_EMAIL`. The runner rejects any other key with `400`, and
-  it builds `PATH` and the rest of the base environment itself.
+  it builds `PATH` and the rest of the base environment itself. It also sets
+  `TRELLIS_AGENT_NAME` from the verified run identity, so a server can attribute the
+  session. A session gets no `TRELLIS_RUN_ID` (it outlives the run that opened it) and no
+  `TRELLIS_REPORTS_DIR`/`TRELLIS_OUTPUT_DIR`: a session container has no writable
+  workspace mount.
 - **`mcp.yaml`'s `network:` is `egress` (default) or `none`.** `egress` is Docker's default
   bridge: the server reaches whatever the host reaches. `none` removes the network
   entirely. There is no bind mount of the workspace beyond the MCP's own directory
@@ -168,9 +172,11 @@ Per tool, the relay also writes a description-only embedding under
 tools like any other.
 
 **Admin → Edges** shows, per site: the exported MCP servers with name, tool count and
-transport, the site's MCP count, and protocol badges — `proto 2` plus one badge per
-capability (`tools`, `mcp`). A v0.4 edge shows `proto 1` and `tools` only. A server the
-edge configured but dropped for size is absent from this table; the edge log says why.
+transport, the site's MCP count, and protocol badges — `proto 3` plus one badge per
+capability (`tools`, `mcp`). Only `proto 3` edges (v0.7.2) connect at all: the call
+frame stopped carrying an agent token, so an older edge is refused at the handshake.
+A server the edge configured but dropped for size is absent from this table; the edge
+log says why.
 
 The registry entry is read-only: the MCP editor renders it as edge-managed and saves/deletes
 are refused. Edit the server on the edge and `SIGHUP` the proxy.
@@ -299,6 +305,7 @@ catalog itself, and a non-google agent sees the discriminated union.
 | Tool error reported by the edge | `200` with `error` → `MCP tool '…' failed on edge '<site>': <reason>`. A server that answers `isError: true` is a normal result and is passed through as such |
 | Session lost (`mcp_session_lost`) | In-call result: the server crashed, or the session hit its TTL/LRU cap. **Recoverable — retry manually**; the next call starts a fresh session (login state is gone) |
 | Missing credentials (`missing_credentials`) | In-call result with exactly `no credentials for <email> on edge <site>` under `per_user_required` (`anonymous` in place of an address when the call carries no identity). **Recoverable** once the user seals the declared secret keys in Configuration → Edge credentials |
+| Missing identity (`identity_incomplete`) | Under `per_user_required`, the caller's identity has **no email claim** and holds no sealed set. **Recoverable**: seal the declared keys in Configuration → Edge credentials (the set is bound to the user id when there is no address), or fix the email claim at the IdP |
 | Credential rejected (`credential_rejected`) | The sealed blob is bound to another target/user/site or to a retired edge key. **Recoverable** after reloading the credential form and re-entering the set; the call never ran |
 
 All of these reach the model as an error string for that one call. Central has no retry

@@ -171,6 +171,13 @@ def test_open_session_derives_a_read_only_session_spec(env):
     ]
     # A session gets no output dir: there is no rw mount at all.
     assert [mount.read_only for mount in container_spec.mounts] == [True, True]
+    # v0.7.2 R2: the agent name, so the server can attribute the session. No run id
+    # (a session outlives the run that opened it) and no dir, since nothing is
+    # writable here.
+    assert container_spec.env["TRELLIS_AGENT_NAME"] == "demo-assistant"
+    assert "TRELLIS_RUN_ID" not in container_spec.env
+    assert "TRELLIS_REPORTS_DIR" not in container_spec.env
+    assert "TRELLIS_OUTPUT_DIR" not in container_spec.env
     assert container_spec.mounts[0].source == f"/host{env.suite}"
     assert container_spec.mounts[1].source == f"/host{env.root}/shared"
 
@@ -204,6 +211,42 @@ def test_discovery_kind_uses_the_same_container_with_its_own_label(env):
 
     assert env.backend.specs[0].kind == "discovery"
     assert env.backend.specs[0].labels["trellis.kind"] == "discovery"
+
+
+def test_an_edge_session_opens_with_no_signing_key_at_all(env, monkeypatch):
+    """R1: the edge role serves an MCP session with `AGENT_TOKEN_SECRET` deleted.
+
+    A session's container env is fully described by the request, so the edge needs no
+    identity to start one -- and, having no key, it must never reach for one.
+    """
+    body = _body(env.root)
+    body.pop("agent_token")
+    body["identity"] = {
+        "agent": "demo-assistant",
+        "user_id": "u-edge",
+        "user_email": "edge@example.test",
+        "run_id": "run-edge",
+    }
+    monkeypatch.setenv("RUNNER_ROLE", "edge")
+    monkeypatch.delenv("AGENT_TOKEN_SECRET", raising=False)
+
+    def never(*_args, **_kwargs):
+        raise AssertionError("an edge runner must never load a signing key")
+
+    monkeypatch.setattr(runner_module.agent_token_module, "signing_keys", never)
+
+    async def scenario():
+        async with _client() as client:
+            response = await client.post("/v1/sessions", json=body, headers=AUTH)
+            assert response.status_code == 200, response.text
+            info = response.json()
+            await _delete(client, info["session_id"])
+            return info
+
+    info = asyncio.run(scenario())
+
+    assert info["state"] == "running"
+    assert env.backend.specs[0].kind == "mcp_session"
 
 
 def test_two_sessions_get_disjoint_containers_and_mounts(env):

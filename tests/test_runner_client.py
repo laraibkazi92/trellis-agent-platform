@@ -243,3 +243,60 @@ def test_no_bearer_without_a_token(monkeypatch):
     exec_with(handler)
 
     assert seen["authorization"] is None
+
+
+def test_stop_run_posts_the_run_id_and_parses_the_count():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"run_id": "task-1", "stopped": 2, "detail": ""})
+
+    async def scenario():
+        async with RunnerClient(transport=httpx.MockTransport(handler), token="tok") as client:
+            return await client.stop_run("task-1")
+
+    result = asyncio.run(scenario())
+
+    assert (seen["method"], seen["path"]) == ("POST", "/v1/stop")
+    assert seen["body"] == {"run_id": "task-1"}
+    assert (result.run_id, result.stopped) == ("task-1", 2)
+
+
+def test_a_stop_that_removed_nothing_is_a_result_not_an_error():
+    """Idempotency is the caller's contract: nothing left to stop is success."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"run_id": "task-1", "stopped": 0, "detail": ""})
+
+    async def scenario():
+        async with RunnerClient(transport=httpx.MockTransport(handler)) as client:
+            return await client.stop_run("task-1")
+
+    assert asyncio.run(scenario()).stopped == 0
+
+
+def test_a_refused_stop_raises_a_structured_call_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            503,
+            json={
+                "detail": {
+                    "code": "daemon_unavailable",
+                    "message": "cannot list the containers of run 'task-1'",
+                    "retryable": True,
+                }
+            },
+        )
+
+    async def scenario():
+        async with RunnerClient(transport=httpx.MockTransport(handler)) as client:
+            await client.stop_run("task-1")
+
+    with pytest.raises(RunnerCallError) as excinfo:
+        asyncio.run(scenario())
+
+    assert excinfo.value.code == "daemon_unavailable"
+    assert excinfo.value.retryable is True

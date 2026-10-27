@@ -356,6 +356,144 @@ def test_path_starts_with_the_suite_bin_directory(workspace):
 
 
 # --------------------------------------------------------------------------- #
+# run context (v0.7.2 R2): the agent, the run and the writable dirs
+# --------------------------------------------------------------------------- #
+#
+# Every one of these is derived runner-side (from the identity the runner resolved
+# and the mounts it just created) and lives in the container's configuration, so a
+# tool -- or a subprocess it spawns -- sees them before it reads its stdin.
+
+
+def test_a_tool_call_knows_its_agent_run_and_report_dir(workspace):
+    config = make_config(output_dirs=["reports"])
+
+    spec = build(workspace, config, agent="demo-assistant", run_id="run-1")
+
+    assert spec.env["TRELLIS_AGENT_NAME"] == "demo-assistant"
+    assert spec.env["TRELLIS_RUN_ID"] == "run-1"
+    # The variable names the mount that was actually created, at its container path.
+    assert spec.env["TRELLIS_REPORTS_DIR"] == f"{CONTAINER_WORKSPACE}/reports/demo-assistant"
+    assert f"{CONTAINER_WORKSPACE}/reports/demo-assistant" in {
+        mount.target for mount in spec.mounts
+    }
+    # Only mounted dirs are announced: `output` was not declared, so writing there
+    # is not an option the tool should be told about.
+    assert "TRELLIS_OUTPUT_DIR" not in spec.env
+    assert "TRELLIS_OUTPUT_DIR" not in spec.preamble_env
+
+
+def test_both_declared_output_dirs_are_announced(workspace):
+    spec = build(
+        workspace,
+        make_config(output_dirs=["reports", "output"]),
+        agent="a1",
+        run_id="run-1",
+    )
+
+    assert spec.env["TRELLIS_REPORTS_DIR"] == f"{CONTAINER_WORKSPACE}/reports/a1"
+    assert spec.env["TRELLIS_OUTPUT_DIR"] == f"{CONTAINER_WORKSPACE}/output/a1"
+
+
+def test_no_mounted_dir_means_no_dir_variable(workspace):
+    """A tool that declared nothing writable is told nothing about writing."""
+    spec = build(workspace, make_config(), agent="demo-assistant", run_id="run-1")
+
+    for name in ("TRELLIS_REPORTS_DIR", "TRELLIS_OUTPUT_DIR"):
+        assert name not in spec.env
+        assert name not in spec.preamble_env
+
+
+def test_without_an_agent_there_is_no_name_and_no_dir(workspace):
+    """Same rule as the mounts: no identity -> no rw mount, no dir variable."""
+    spec = build(
+        workspace, make_config(output_dirs=["reports"]), agent=None, run_id="run-1"
+    )
+
+    assert "TRELLIS_AGENT_NAME" not in spec.env
+    assert "TRELLIS_REPORTS_DIR" not in spec.env
+    assert spec.env["TRELLIS_RUN_ID"] == "run-1"
+
+
+def test_no_run_id_means_no_run_variable(workspace):
+    spec = build(workspace, make_config(), agent="demo-assistant")
+
+    assert "TRELLIS_RUN_ID" not in spec.env
+    assert spec.env["TRELLIS_AGENT_NAME"] == "demo-assistant"
+
+
+def test_a_gateway_call_runs_under_the_reserved_gateway_identity(workspace):
+    """``gateway`` is a reserved agent name: the runner passes it like any other."""
+    spec = build(workspace, make_config(), agent="gateway", run_id="run-gw")
+
+    assert spec.env["TRELLIS_AGENT_NAME"] == "gateway"
+    assert spec.env["TRELLIS_RUN_ID"] == "run-gw"
+
+
+def test_a_caller_cannot_assert_the_run_context(workspace):
+    """The vars are applied after the merge, so even a manifest that declares one
+    cannot let a caller redirect it (and ``_merge_env`` still refuses undeclared
+    keys, so ``declared_env_keys`` stays as it was)."""
+    config = make_config(output_dirs=["reports"], variables=["TRELLIS_REPORTS_DIR"])
+
+    spec = build(
+        workspace,
+        config,
+        agent="demo-assistant",
+        run_id="run-1",
+        env={"TRELLIS_REPORTS_DIR": "/etc"},
+    )
+
+    assert spec.env["TRELLIS_REPORTS_DIR"] == f"{CONTAINER_WORKSPACE}/reports/demo-assistant"
+    with pytest.raises(InvalidRequest) as excinfo:
+        build(workspace, config, agent="demo-assistant", env={"TRELLIS_AGENT_NAME": "x"})
+    assert "TRELLIS_AGENT_NAME" in excinfo.value.message
+
+
+def test_an_unattributed_call_gets_no_run_context_even_if_the_caller_sends_one(workspace):
+    """No identity, no announced dirs -- a declared name must not survive the merge.
+
+    The pop-then-set rule: without it, a manifest that declares one of these names
+    would let an anonymous caller announce ``TRELLIS_REPORTS_DIR=/etc`` in a
+    container that has no writable mount at all.
+    """
+    config = make_config(
+        output_dirs=["reports"], variables=["TRELLIS_REPORTS_DIR", "TRELLIS_RUN_ID"]
+    )
+
+    spec = build(
+        workspace,
+        config,
+        agent=None,
+        env={"TRELLIS_REPORTS_DIR": "/etc", "TRELLIS_RUN_ID": "forged"},
+    )
+
+    for name in ("TRELLIS_AGENT_NAME", "TRELLIS_RUN_ID", "TRELLIS_REPORTS_DIR"):
+        assert name not in spec.env, name
+        assert name not in spec.preamble_env, name
+    assert all(mount.read_only for mount in spec.mounts)
+
+
+def test_a_console_gets_no_run_context_from_its_env(workspace):
+    """A console mounts no workspace tree, so a dir/agent variable would be a lie."""
+    spec = build_console_spec(
+        "echo hi",
+        env={
+            "TRELLIS_REPORTS_DIR": "/etc",
+            "TRELLIS_AGENT_NAME": "someone",
+            "TRELLIS_RUN_ID": "forged",
+        },
+        user_id="u-1",
+        run_id="run-1",
+    )
+
+    for name in ("TRELLIS_AGENT_NAME", "TRELLIS_REPORTS_DIR", "TRELLIS_OUTPUT_DIR"):
+        assert name not in spec.env, name
+        assert name not in spec.preamble_env, name
+    # The runner's own run id is still announced; that one it knows.
+    assert spec.env["TRELLIS_RUN_ID"] == "run-1"
+
+
+# --------------------------------------------------------------------------- #
 # limits
 # --------------------------------------------------------------------------- #
 
@@ -669,3 +807,29 @@ def test_missing_tool_identity_refuses_to_build(workspace, monkeypatch):
     monkeypatch.delenv("TRELLIS_GID", raising=False)
     with pytest.raises(InvalidRequest):
         build(workspace, make_config())
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [("TRELLIS_UID", "0"), ("TRELLIS_GID", "0"), ("TRELLIS_UID", "00"), ("TRELLIS_GID", "00")],
+)
+def test_a_root_tool_identity_refuses_to_build(workspace, monkeypatch, variable, value):
+    """The last gate before a container exists: 0 must not reach Docker as ``0:0``.
+
+    The runner's startup preflight reads the environment once, so a ``TRELLIS_UID``
+    changed after startup would otherwise slip through to the spec builder.
+    """
+    monkeypatch.setenv(variable, value)
+
+    with pytest.raises(InvalidRequest) as excinfo:
+        build(workspace, make_config())
+
+    assert "non-root" in str(excinfo.value)
+
+
+def test_a_root_tool_identity_refuses_a_console_spec(monkeypatch):
+    monkeypatch.setenv("TRELLIS_UID", "0")
+    monkeypatch.setenv("TRELLIS_GID", "1000")
+
+    with pytest.raises(InvalidRequest):
+        build_console_spec("echo hi", env={})

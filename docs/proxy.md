@@ -15,10 +15,11 @@ catalog verbatim and executes `tools/call` against a long-lived per-user session
 the server's credentials staying on the edge. Agents and workflows still run centrally.
 
 > **Status:** the tunnel, native tool registration, and MCP export are implemented
-> (wire protocol v2). Edges enroll from **Admin → Edges**, their tools appear in
-> `/registry/tools` as `<site>__<tool>` and their MCP tools as
-> `mcp__<site>__<mcp>__<tool>`, and the hub/gateway execute both like a central tool.
-> Edge-hosted agents are not part of this release.
+> (wire protocol `proto: 3`, see
+> [Protocol version and compatibility](#protocol-version-and-compatibility)). Edges enroll
+> from **Admin → Edges**, their tools appear in `/registry/tools` as `<site>__<tool>` and
+> their MCP tools as `mcp__<site>__<mcp>__<tool>`, and the hub/gateway execute both like a
+> central tool. Edge-hosted agents are not part of this release.
 
 ## Topology
 
@@ -80,7 +81,6 @@ and in the edge's `.env`:
 ```bash
 RUNNER_TOKEN=<openssl rand -hex 32>            # identical on proxy and runner
 TRELLIS_HOST_WORKSPACE=/srv/trellis/workspace  # HOST path of ./workspace on this VM
-AGENT_TOKEN_SECRET=<same value as central>     # runner only (proxy never verifies)
 MAX_SESSIONS_EDGE=4                            # warm MCP session containers (default 32)
 ```
 
@@ -90,14 +90,31 @@ runner's startup canary and it refuses to serve. The `runner` also mounts the wo
 read-write (it writes the canary and creates output directories) while tool containers
 still see only their read-only mounts.
 
-> **The edge proxy never verifies an agent token.** `trellis-proxy` uses the identity the
-> relay derived over the authenticated tunnel (see [Edge credentials](#edge-credentials)) and
-> takes **no `AGENT_TOKEN_SECRET`**. The edge **runner** keeps the key, and the sample
-> compose sets it there only: it verifies the forwarded token's signature and expiry, then
-> derives the agent and the output dir from that token's claims. It makes no authorization
-> decision, because the relay already made it for the call it forwarded. The edge `.env`
-> must still carry a valid `AGENT_TOKEN_SECRET` (the same value as central), or the runner
-> refuses to start. `ENFORCE_AGENT_TOKENS` defaults to `enforce` there too.
+> **The edge holds no signing key.** `trellis-proxy` verifies no agent token: the relay
+> authenticated the caller, verified the token and derived the frame identity, and the edge
+> trusts that identity over the authenticated tunnel (see
+> [Edge credentials](#edge-credentials)). The edge **runner** verifies nothing either:
+> with `RUNNER_ROLE=edge` it takes the caller's identity (`agent`, `user`, `user_email`,
+> `groups`, `run_id`, `parent_run_id`) from `trellis-proxy` over the
+> `RUNNER_TOKEN`-authenticated Unix socket and never loads `AGENT_TOKEN_SECRET`. The role
+> is explicit; it is never inferred from whether a key happens to be present. Its default
+> is `central`, which expects a verified token instead.
+>
+> The sample compose sets `RUNNER_ROLE: edge` on the runner and passes no signing key to
+> either service. If you maintain your own edge compose file, add that variable — a runner
+> left in the central posture refuses body-supplied identity and expects a verified token
+> instead. An older edge `.env` that still lists `AGENT_TOKEN_SECRET` or
+> `ENFORCE_AGENT_TOKENS` is harmless: the compose file passes neither to a service, so
+> nothing reads them and no warning fires. Delete both lines. `RUNNER_TOKEN` is still
+> required — and it now carries identity: whoever holds it can name any caller to this
+> runner (including another agent's output directory), so treat it as a per-host secret
+> and never share it between hosts.
+>
+> One consequence worth knowing before you upgrade: an edge call must name a verified
+> caller. The relay derives the whole identity from the token it verified, so a central
+> relay running `ENFORCE_AGENT_TOKENS=off` (or `log`, with a token it rejected) has no
+> identity to forward and the edge answers `400` instead of running the tool
+> unattributed. Edge deployments therefore assume an enforcing central relay.
 
 Prerequisites on the edge host are the same as central: Docker, plus `runsc` registered
 with it (proved with `docker run --runtime=runsc hello-world`). A dev machine without
@@ -275,16 +292,19 @@ are set from the frame's identity — the verified token's claims at the relay �
 caller only. A caller with no email claim gets no `TRELLIS_USER_EMAIL` at all (absent, not
 empty), so a tool can branch on presence.
 
-**The escape hatch.** A legacy tool that cannot declare every key it reads can set
-`env_passthrough: true` (or `TRELLIS_EDGE_ENV_PASSTHROUGH=true`), which restores the v0.4
-denylist behaviour — minus the token. It gives up the isolation between tools: every
-exported tool then sees the whole sanitized edge environment. It needs a restart to
-change.
+**The escape hatch.** `env_passthrough: true` (or `TRELLIS_EDGE_ENV_PASSTHROUGH=true`)
+still selects the whole sanitized edge environment instead of the allowlist — minus the
+token — but since `v0.7.1` it cannot widen what a *container* receives: both the tool path
+and the MCP-session path intersect the name set with the manifest's declared keys before
+the call is sent (and the runner answers `400` for anything undeclared that gets through
+anyway). A legacy tool whose keys are not all declared has to declare them; passthrough
+will not deliver them. It needs a restart to change.
 
 **CA bundle gap.** `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` and `SSL_CERT_DIR` are *not* in
 the allowlist. A corporate base image that sets only those will see TLS failures from an
-exported tool or MCP server until the keys are declared in `tool.yaml`/`mcp.yaml` (or
-passthrough is enabled). `SSL_CERT_FILE` is always present.
+exported tool or MCP server until the keys are declared in `tool.yaml`/`mcp.yaml`
+(passthrough does not bypass the declared-key rule either). `SSL_CERT_FILE` is always
+present.
 
 ## Edge credentials
 
@@ -301,9 +321,10 @@ Nothing a user types ever crosses the tunnel or reaches etcd in the clear, and t
 > **Trust boundary.** The edge trusts the relay's identity assertion. The `user` /
 > `user_email` in a call frame are derived **only** from the verified agent token's
 > claims (`u` / `e`) at the relay — the relay is the single verification point — and they
-> arrive over the authenticated tunnel. The edge proxy verifies no token of its own and
-> needs no `AGENT_TOKEN_SECRET`; it uses that identity unchanged for the MCP session key,
-> the sealed envelope's AAD and `TRELLIS_USER_ID`/`TRELLIS_USER_EMAIL`. Because the
+> arrive over the authenticated tunnel. No service on the edge verifies a token of its own
+> or holds a signing key: the proxy hands the identity to the runner over the
+> `RUNNER_TOKEN`-authenticated socket, and uses it unchanged for the MCP session key, the
+> sealed envelope's AAD and `TRELLIS_USER_ID`/`TRELLIS_USER_EMAIL`. Because the
 > identity is part of the AAD, a blob stored for one person cannot be replayed for
 > another, for a different tool/MCP, or for another site: the GCM tag fails and the call
 > returns `credential_rejected` without running. Keep the tunnel token and the relay's internal
@@ -332,7 +353,7 @@ you maintain your own compose file, add the mount
 |---|---|
 | `shared` (default) | the caller's sealed set when one exists (it always wins); otherwise the shared file for secrets, and the shared file → process environment for variables |
 | `per_user` | the caller's sealed set if they have one; otherwise the same as `shared` |
-| `per_user_required` | the caller's sealed set **only**; with no blob for them the call fails closed with `missing_credentials` and **nothing executes** |
+| `per_user_required` | the caller's sealed set **only**; with no blob for them the call fails closed — `identity_incomplete` if their identity has no email, otherwise `missing_credentials` — and **nothing executes** |
 
 A sealed set is **all-or-nothing** for secrets. Once it exists for
 `(site, kind, target, identity)`, only the declared secret names it carries reach the
@@ -351,10 +372,12 @@ then the process environment in every mode. The write endpoint rejects a blob th
 one, and the edge ignores it anyway because it is not in the declared secret set.
 
 Only keys the manifest declares are read out of any source, so an extra key in a file
-cannot reach a child process. An anonymous caller (no `user_email`) has no sealed setup,
-so `per_user` falls back to the shared file and `per_user_required` fails closed. For MCP
-sessions, credentials are resolved once at session creation (see
-[MCP sessions](#mcp-sessions)).
+cannot reach a child process. An anonymous caller (no `user_email`) with no sealed set
+falls back to the shared file under `per_user`, and is refused under `per_user_required`
+with `identity_incomplete` — sealing the declared keys fixes it, since a set is keyed by
+the caller's email *or*, when they have none, their user id. An email-less identity that
+already sealed one is served normally. For MCP sessions, credentials are resolved once at
+session creation (see [MCP sessions](#mcp-sessions)).
 
 ### Shared file format
 
@@ -590,26 +613,30 @@ There is no other limit mechanism: the in-process backends and the `SANDBOX_RLIM
 variables they read were removed in v0.7.1 (see
 [upgrading.md → v0.7.1](upgrading.md#v071-2026-10-26)).
 
-## Protocol v2 and compatibility
+## Protocol version and compatibility
 
-`v0.5.0` bumps the edge/relay protocol to `proto: 2`. The handshake stays strict:
+`v0.7.2` bumps the edge/relay protocol to `proto: 3`. The handshake stays strict:
 
-- The hello frame gains `caps` (`["tools"]`, `["tools", "mcp"]`, plus `lazy_catalog` when
-  `lazy_catalog: true` is set) and `mcps` (the
-  catalogs). A proto-1 hello has neither and is read as tools-only.
-- Calls carry `kind: "tool" | "mcp"` (absent means `"tool"`, so v0.4 frames are
-  unchanged) plus `mcp` for MCP calls. The frame's `user`/`user_email` are **derived from
-  the verified token's claims** at the relay; a request body cannot set them (v0.7.1).
-- **Upgrade central before edges.** A v0.5 edge dialing a v0.4 relay is refused at the
-  handshake with `CLOSE_VERSION` (close code `4001`); the edge logs one terminal
-  "version mismatch — upgrade central first" line and retries only at the maximum backoff
-  (60 s, jittered), so it never reads as a generic disconnect.
-  The reverse — a v0.4 edge against a v0.5 relay — is fully supported: its tools work
-  unchanged and MCP calls to it answer `404` ("edge does not export MCPs").
+- The hello frame carries `caps` (`["tools"]`, plus `mcp` and `lazy_catalog` when the
+  edge serves them) and `mcps` (the catalogs). Calls carry `kind: "tool" | "mcp"`
+  (absent means `"tool"`).
+- The call frame's `user`/`user_email` are **derived from the verified token's claims**
+  at the relay; a request body cannot set them (v0.7.1). Since v0.7.2 the frame also
+  carries the rest of that identity (`agent`, `groups`, `run_id`, `parent_run_id`) and
+  carries **no `agent_token`** at all — the edge needs no signing key to read it (see
+  [Edge runner](#edge-runner)).
+- **Central and edges must be upgraded together.** A `proto: 2` (v0.7.1 or older) edge
+  is refused by a v0.7.2 relay at the handshake with `CLOSE_VERSION` (close code
+  `4001`), and a v0.7.2 edge is refused by an older relay the same way. This is
+  deliberate: a v0.7.1 edge's runner still expects the token the v0.7.2 relay no longer
+  sends, so letting it connect would mean a healthy-looking tunnel where *every* call
+  fails with `403`. Recreate the edge services from the same image tag as central.
+  While a mismatched edge is refused it logs one "version mismatch" line and retries
+  only at the maximum backoff (60 s, jittered), so it never reads as a generic
+  disconnect.
 - **`lazy_catalog` needs a v0.7 relay.** The capability is opt-in; an older relay rejects
-  the unknown cap at handshake (`CLOSE_MALFORMED`), so leave `lazy_catalog: false` until
-  central is upgraded. There is no automatic downgrade-republish: flip the flag off on
-  the edge if you must roll back before upgrading central.
+  the unknown cap at handshake (`CLOSE_MALFORMED`). There is no automatic
+  downgrade-republish: flip the flag off on the edge if you must roll back.
 
 
 ## Failure semantics
@@ -624,7 +651,7 @@ variables they read were removed in v0.7.1 (see
 | MCP server not exported | Relay answers `404 unknown_mcp`; central reports that the site does not export the MCP tool |
 | MCP deadline (`edge_timeout`) | The call fails; the session is **kept** (login state intact) and nothing is replayed |
 | MCP server crashed / session evicted | That call returns `mcp_session_lost`; the next call starts a fresh session |
-| MCP credentials missing (`per_user_required`) | The call returns `missing_credentials` (`no credentials for <email> on edge <site>`); nothing is spawned |
+| MCP credentials missing (`per_user_required`) | The call returns `missing_credentials` (`no credentials for <email> on edge <site>`) or `identity_incomplete` (no email claim and no sealed set); nothing is spawned |
 | Hub → relay timeout | `504` → tool error |
 | Invalid catalog entry | That tool is rejected and logged; the site's other tools still register |
 | Name collision with a local tool | Registration is refused for the colliding tool only, and logged |

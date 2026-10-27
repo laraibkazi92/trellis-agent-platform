@@ -299,8 +299,14 @@ def test_remote_dispatch_forwards_the_callers_sealed_blob(monkeypatch):
     assert json.loads(requests[0].content)["sealed"] == blob
 
 
-def test_remote_dispatch_refuses_a_sealed_call_without_an_email_claim(monkeypatch):
-    """``identity_incomplete``, never ``credential_rejected``: re-sealing cannot fix it."""
+def test_remote_dispatch_forwards_a_sealed_call_for_an_email_less_user(monkeypatch):
+    """A blob is sealed to the email *or* the user id, so an id-only caller works.
+
+    A webhook-triggered run mints the literal user id ``webhook`` with no email and
+    may legitimately hold a set; refusing it centrally (which cannot see the edge's
+    ``credential_mode``) would break a shipped path. ``per_user_required`` without an
+    identity is the edge's refusal to make -- it knows the mode.
+    """
     install_fake_health(monkeypatch)
     blob = {"v": 1, "ciphertext": "opaque", "keys": ["NODE_SSH_USER"]}
     monkeypatch.setattr(hub.edge_secrets_central, "get", lambda *args, **kwargs: dict(blob))
@@ -308,18 +314,46 @@ def test_remote_dispatch_refuses_a_sealed_call_without_an_email_claim(monkeypatc
         monkeypatch, json_response(200, {"tool": TOOL, "result": {"temp": 1}})
     )
 
-    # A verified token whose claims carry no email: the set is opened with that
-    # email, so forwarding it could only end in the edge's ``credential_rejected``.
     result = run_remote(
-        make_remote_config(),
-        {"unit": "1"},
-        claims=claims_for(email=None),
+        make_remote_config(), {"unit": "1"}, claims=claims_for(email=None)
     )
 
-    assert "identity_incomplete" in result["error"]
-    assert "no email" in result["error"]
-    # Nothing was dispatched to the edge.
-    assert requests == []
+    assert result == {"temp": 1}
+    assert json.loads(requests[0].content)["sealed"] == blob
+
+
+def test_remote_dispatch_lets_an_identity_less_call_through_to_the_edge(monkeypatch):
+    """No blob, no email: central has nothing to judge, so the edge decides.
+
+    ``per_user_required`` refuses it there with the same ``identity_incomplete`` code;
+    a ``shared`` export serves it, which is what a webhook run (user id ``webhook``,
+    no email by design) relies on.
+    """
+    install_fake_health(monkeypatch)
+    monkeypatch.setattr(hub.edge_secrets_central, "get", lambda *args, **kwargs: None)
+    requests = install_transport(
+        monkeypatch, json_response(200, {"tool": TOOL, "result": {"temp": 1}})
+    )
+
+    result = run_remote(make_remote_config(), {"unit": "1"}, claims=claims_for(email=None))
+
+    assert result == {"temp": 1}
+    assert json.loads(requests[0].content)["sealed"] is None
+
+
+def test_remote_dispatch_still_serves_a_shared_call_without_a_token(monkeypatch):
+    """No token asserts nothing, so it is not refused on identity: the edge decides.
+
+    Refusing every tokenless call would break the documented ``log``-mode rollout (and
+    a stack with no minting secret), where ``credential_mode`` is the only authority.
+    """
+    install_fake_health(monkeypatch)
+    requests = install_transport(
+        monkeypatch, json_response(200, {"tool": TOOL, "result": {"temp": 1}})
+    )
+
+    assert run_remote(make_remote_config(), {"unit": "1"}) == {"temp": 1}
+    assert json.loads(requests[0].content)["sealed"] is None
 
 
 def test_a_call_without_claims_never_reads_sealed_credentials(monkeypatch):
@@ -668,6 +702,24 @@ def test_register_tools_registers_a_matching_remote_tool(monkeypatch):
 
 
 def test_run_tool_records_usage_once_for_remote_call(monkeypatch):
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", "remote-tools-unit-secret-0123456789abcdef")
+    config = make_remote_config()
+    install_fake_health(monkeypatch)
+    usage = install_fake_usage(monkeypatch)
+    install_transport(monkeypatch, json_response(200, {"tool": TOOL, "result": {"ok": True}}))
+    token = agent_token.mint("agent-a", user_id="user-1", user_email="user-1@corp.example")
+
+    result = asyncio.run(
+        _run_tool_and_drain(config, {"__user_id": "mallory", "__agent_token": token, "unit": "1"})
+    )
+
+    assert result == {"ok": True}
+    # Usage books against the token's user; the body's ``__user_id`` is inert (v0.7.2).
+    assert usage == [("user-1", REGISTRY_NAME)]
+
+
+def test_run_tool_remote_call_without_a_token_books_no_usage(monkeypatch):
+    """No token, no user identity -- so no usage row for the body's ``__user_id``."""
     config = make_remote_config()
     install_fake_health(monkeypatch)
     usage = install_fake_usage(monkeypatch)
@@ -676,7 +728,7 @@ def test_run_tool_records_usage_once_for_remote_call(monkeypatch):
     result = asyncio.run(_run_tool_and_drain(config, {"__user_id": "user-1", "unit": "1"}))
 
     assert result == {"ok": True}
-    assert usage == [("user-1", REGISTRY_NAME)]
+    assert usage == []
 
 
 def test_run_tool_remote_background_agent_posts_no_identity(monkeypatch):

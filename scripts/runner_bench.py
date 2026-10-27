@@ -17,10 +17,12 @@ hub (or runner) image, where ``core/`` and ``/app/workspace`` are available:
     python scripts/runner_bench.py --tool text_stats \
         --input '{"text": "the quick brown fox"}' --runs 30 --concurrency 30
 
-Add ``--agent NAME`` on an enforcing runner (``ENFORCE_AGENT_TOKENS=enforce``):
+Add ``--agent NAME`` on an enforcing CENTRAL runner (``ENFORCE_AGENT_TOKENS=enforce``):
 the bench mints a short-lived token for that agent so the call passes the same
 check every production call passes. Without it an enforcing runner refuses with
-``access_denied: agent token rejected (missing)``.
+``access_denied: agent token rejected (missing)``. On an EDGE runner
+(``RUNNER_ROLE=edge``) no token exists to mint: the bench sends the agent name as
+the run's identity instead, which is exactly what the edge proxy does.
 
 JSON goes to stdout and the human summary goes to stderr, so piping into
 ``jq`` stays clean. Exit codes: 0 every call succeeded, 1 at least one call
@@ -45,7 +47,7 @@ from core.execution.client import (
     RunnerUnavailable,
     socket_path,
 )
-from core.execution.contract import ExecRequest, ExecResult
+from core.execution.contract import ExecRequest, ExecResult, RunIdentity
 from core.execution.spec import manifest_digest
 
 DEFAULT_WORKSPACE_ROOT = "/app/workspace"
@@ -245,10 +247,10 @@ def _parser() -> argparse.ArgumentParser:
         "--agent",
         metavar="NAME",
         help=(
-            "Agent to call as. Required when the runner enforces agent tokens "
-            "(ENFORCE_AGENT_TOKENS=enforce): the bench mints a short-lived token for "
-            "this agent with AGENT_TOKEN_SECRET. The agent must have a manifest under "
-            "WORKSPACE_ROOT/agents, because the runner resolves its allowlist."
+            "Agent to call as. Required when the runner checks identity: a central "
+            "runner (ENFORCE_AGENT_TOKENS=enforce) gets a short-lived token minted "
+            "with AGENT_TOKEN_SECRET, an edge runner (RUNNER_ROLE=edge) gets this "
+            "name as the request's identity, having no key to mint with."
         ),
     )
     return parser
@@ -274,16 +276,27 @@ def _human_line(report: dict[str, Any]) -> str:
     )
 
 
+def _runner_role() -> str:
+    """What the target runner expects: ``central`` (default) or ``edge``."""
+    return (os.getenv("RUNNER_ROLE") or "central").strip().lower()
+
+
 async def _run(
     args: argparse.Namespace, target: Any, input_json: str
 ) -> dict[str, Any]:
+    # Two carriers, one per runner role (v0.7.2 R1), never both: a central runner
+    # takes identity from the token's claims, an edge runner from the body.
+    identity = (
+        RunIdentity(agent=args.agent)
+        if _runner_role() == "edge" and args.agent
+        else None
+    )
     request = ExecRequest(
         kind="tool",
         target=target.config.name,
         manifest_digest=manifest_digest(target.config),
-        # No identity (no agent/user/run) on the wire: the runner derives it from the
-        # token's claims, which is what --agent mints below.
-        agent_token=args.agent_token or None,
+        agent_token=None if identity else (args.agent_token or None),
+        identity=identity,
         env={},
         input=input_json,
         deadline_ms=_deadline_ms(target.config),
@@ -356,7 +369,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     _log(f"resolved {target.config.name} from {target.path}")
 
     args.agent_token = ""
-    if args.agent:
+    # An edge runner holds no signing key: there is nothing to mint, and the agent
+    # name travels as identity (see _run).
+    if args.agent and _runner_role() != "edge":
         try:
             args.agent_token = agent_token.mint(
                 args.agent, user_id=os.getenv("TRELLIS_UID") or "bench"

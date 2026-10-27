@@ -300,7 +300,11 @@ def test_the_container_env_allowlist_is_exactly_the_fixed_non_secret_set():
         "REQUESTS_CA_BUNDLE",
         "TRELLIS_USER_ID",
         "TRELLIS_USER_EMAIL",
+        # v0.7.2 R2 run context: public and derived, never caller-asserted.
+        "TRELLIS_AGENT_NAME",
         "TRELLIS_RUN_ID",
+        "TRELLIS_REPORTS_DIR",
+        "TRELLIS_OUTPUT_DIR",
     }
 
 

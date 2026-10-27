@@ -333,7 +333,7 @@ def test_handle_mcp_call_hands_the_opened_mapping_to_the_manager(edge_key):
         site = SITE
 
         async def call(
-            self, mcp, tool, args, identity, deadline_ms, *, agent_token=None, sealed=None
+            self, mcp, tool, args, identity, deadline_ms, *, sealed=None
         ):
             seen["sealed"] = sealed
             return {"content": [], "isError": False}
@@ -532,7 +532,13 @@ def test_the_aad_identity_is_identical_when_it_comes_from_the_claims(
 
 
 def test_claims_without_an_email_never_open_a_sealed_set(edge_key, tmp_path, monkeypatch):
-    """No ``e`` claim: ``identity_incomplete`` at central, and no AAD match here."""
+    """A blob sealed to an address this identity no longer carries does not open.
+
+    The seal is bound to the email *or* the user id, so an email-less identity can hold
+    a set (next test) -- but one sealed under an address is a stale seal, and the edge
+    answers ``credential_rejected``: re-sealing as the id-only identity is exactly the
+    fix, which is why this is not ``identity_incomplete``.
+    """
     from types import SimpleNamespace
 
     key, _path = edge_key
@@ -552,6 +558,39 @@ def test_claims_without_an_email_never_open_a_sealed_set(edge_key, tmp_path, mon
 
     assert result["ok"] is False
     assert result["error"]["code"] == edge_crypto.CREDENTIAL_REJECTED
+
+
+def test_a_blob_sealed_to_the_user_id_serves_a_per_user_required_call(
+    edge_key, tmp_path, monkeypatch
+):
+    """No email claim is not a contradiction when the set was sealed to the user id.
+
+    ``per_user_required`` refuses an email-less caller only when they have **no set**;
+    a blob that opens is bound to this caller and must run (v0.7.2 R7.1). A webhook
+    run's identity is the literal user id ``webhook`` and has no address by design.
+    """
+    from core.edge_secrets_central import sealed_identity
+
+    key, _path = edge_key
+    seen = capture_env(monkeypatch)
+    config = tool_config(secrets=list(DECLARED))
+    identity = sealed_identity("u-alice", None)
+    assert identity == "u-alice"
+
+    result = asyncio.run(
+        proxy.handle_call(
+            {TOOL: (config, tmp_path)},
+            call_frame(sealed=seal(key, BROWSER_VALUES, identity=identity), user="u-alice", email=None),
+            proxy_config=edge_proxy_config(tmp_path),
+            credential_modes={TOOL: "per_user_required"},
+            edge_key=key,
+        )
+    )
+
+    assert result["ok"] is True
+    assert seen["NODE_SSH_USER"] == BROWSER_VALUES["NODE_SSH_USER"]
+    # No address claim -> the variable is absent, not empty.
+    assert "TRELLIS_USER_EMAIL" not in seen
 
 
 # ---------------------------------------------------------------- hello / site record

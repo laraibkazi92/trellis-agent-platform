@@ -285,3 +285,31 @@ def test_valid_declared_names_still_load_in_both_forms():
 def test_mcp_config_accepts_valid_declared_names():
     config = MCPConfig(name="demo", command="srv", secrets=["API_KEY"], variables=["BASE_URL"])
     assert config.secrets == ["API_KEY"]
+
+
+# A `secret_groups` field key is a credential name the user types into /configuration
+# and the tool receives as an env var, so it follows exactly the same rule.
+
+
+def _secret_group(key):
+    return [
+        {
+            "label": "Environment",
+            "options": [{"value": "prod", "fields": [{"key": key, "label": "API key"}]}],
+        }
+    ]
+
+
+def test_tool_config_rejects_a_secret_group_key_that_is_not_an_env_name():
+    with pytest.raises(ValidationError) as excinfo:
+        ToolConfig(**_tool_kwargs(secret_groups=_secret_group("my-api-key")))
+
+    message = str(excinfo.value)
+    assert "secret_groups" in message
+    assert "my-api-key" in message
+
+
+def test_valid_secret_group_keys_still_load():
+    config = ToolConfig(**_tool_kwargs(secret_groups=_secret_group("PROD_API_KEY")))
+
+    assert config.secret_groups[0]["options"][0]["fields"][0]["key"] == "PROD_API_KEY"

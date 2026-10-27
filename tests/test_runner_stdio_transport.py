@@ -138,8 +138,9 @@ def test_initialize_round_trip_with_a_split_frame_header():
     assert request.manifest_digest == DIGEST
     assert request.env == {"MCP_TOKEN": "s3cret"}
     assert request.deadline_ms == 3_600_000
-    # No identity in the body (v0.7.1 Phase 2): the runner derives the agent, user,
-    # email and groups from the token's claims.
+    # No identity in the body on a central client (v0.7.1 Phase 2): the runner derives
+    # the agent, user, email and groups from the token's claims. ``identity`` exists for
+    # the edge runner (v0.7.2 R1) and stays None here.
     assert set(request.model_dump()) == {
         "kind",
         "target",
@@ -148,7 +149,9 @@ def test_initialize_round_trip_with_a_split_frame_header():
         "env",
         "deadline_ms",
         "agent_token",
+        "identity",
     }
+    assert request.identity is None
 
     # Newline-delimited JSON-RPC, exactly as a local stdio server would see it.
     assert len(client.stdin) == 1
