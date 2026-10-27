@@ -37,7 +37,7 @@ Compose refuses to start until `.env` carries `RUNNER_TOKEN` (`openssl rand -hex
 `AGENT_TOKEN_SECRET` (also 32+ random bytes), `TRELLIS_HOST_WORKSPACE` (the **host** path of
 the workspace directory) and `SESSION_SECRET`. For a local stack, set `DEV_MODE=true` and
 `CONTAINER_DEFAULT_RUNTIME=runc` as well; see
-[docs/deploy.md → Dev machine](docs/deploy.md#dev-machine-docker-desktop).
+[docs/deploy.md → Dev machine](docs/deploy.md#dev-machine-runc).
 
 Set `DEV_MODE=true` in `.env` to run without authentication — it disables all auth
 across host, hub, gateway, and UI. Development only: never expose a `DEV_MODE`

@@ -103,7 +103,7 @@ Prerequisites on the edge host are the same as central: Docker, plus `runsc` reg
 with it (proved with `docker run --runtime=runsc hello-world`). A dev machine without
 gVisor sets `CONTAINER_DEFAULT_RUNTIME=runc` for the edge runner as well. See
 [deploy.md → Execution isolation](deploy.md#execution-isolation) and
-[deploy.md → Dev machine](deploy.md#dev-machine-docker-desktop).
+[deploy.md → Dev machine](deploy.md#dev-machine-runc).
 
 `proxy.yaml` no longer has a sandbox selector. An existing config that still carries a
 `sandbox:` key **loads normally**: the key is ignored, because the edge always runs tools

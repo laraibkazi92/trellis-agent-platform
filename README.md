@@ -64,7 +64,7 @@ docker compose pull && docker compose up -d      # prebuilt image
 ```
 
 A laptop has no gVisor: set `CONTAINER_DEFAULT_RUNTIME=runc` (and `DEV_MODE=true` if you
-want to skip login) and see [docs/deploy.md → Dev machine](docs/deploy.md#dev-machine-docker-desktop).
+want to skip login) and see [docs/deploy.md → Dev machine](docs/deploy.md#dev-machine-runc).
 
 Orgs pin the engine to a release tag, starting with `v0.2.0` (set `TRELLIS_IMAGE` in `.env`), while `main` tracks upstream development.
 

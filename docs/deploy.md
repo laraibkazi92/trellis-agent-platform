@@ -40,8 +40,8 @@ verdict.
   tool container and the host kernel, so a production deployment must not run on `runc`.
   The feature set is validated against a `runsc` that reports runtime-spec 1.2.1 in
   `runsc --version`; run a current release and confirm that line before deploying.
-- **A dev machine (Docker Desktop, WSL2, a laptop):** no gVisor needed, see
-  [Dev machine](#dev-machine-docker-desktop).
+- **A dev machine (a laptop, WSL2, any Docker host without gVisor):** no gVisor needed,
+  see [Dev machine](#dev-machine-runc).
 
 What a tool container can see is proven by the runsc isolation harness
 (`docker-compose.ci-isolation.yml`, self-hosted with `runsc` registered) and, on `runc`, by
@@ -137,15 +137,15 @@ TRELLIS_UID=$(id -u)
 TRELLIS_GID=$(id -g)
 ```
 
-## Dev machine (Docker Desktop)
+## Dev machine (`runc`)
 
-You do not need gVisor to run the whole stack locally. Docker Desktop does not ship or
-support a `runsc` runtime, so run every container on `runc` there:
+You do not need gVisor to run the whole stack locally. A host without gVisor registered
+(most laptops, any VM-based Docker install) runs every container on `runc` instead:
 
 ```bash
 # .env
 DEV_MODE=true                            # no login while you iterate; never expose this
-CONTAINER_DEFAULT_RUNTIME=runc           # the only runtime Docker Desktop can start
+CONTAINER_DEFAULT_RUNTIME=runc           # the runtime to use when gVisor is not installed
 RUNNER_TOKEN=$(openssl rand -hex 32)     # required by the runner and every caller
 AGENT_TOKEN_SECRET=$(openssl rand -hex 32)   # required: tokens are enforced by default
 TRELLIS_HOST_WORKSPACE=/absolute/path/to/workspace   # HOST path, not /app/workspace
@@ -154,10 +154,12 @@ TRELLIS_HOST_WORKSPACE=/absolute/path/to/workspace   # HOST path, not /app/works
 - **`runc` gives up kernel-syscall isolation.** That is fine for a laptop and not fine for
   anything shared, which is why the compose default stays `runsc`. Do not promote a dev
   `.env` to a server.
-- **`TRELLIS_HOST_WORKSPACE` must be a path the Docker daemon can see.** On Docker Desktop
-  that means a directory under the file-sharing roots (for example `/Users/you/...` on
-  macOS, or `/home/you/...` inside WSL2 on Windows). A path outside them makes every tool
-  bind mount resolve to nothing and the runner's startup canary refuses to serve.
+- **`TRELLIS_HOST_WORKSPACE` must be a path the Docker daemon can see.** On Linux with a
+  native daemon that is the ordinary absolute path. On a VM-based Docker install (macOS,
+  Windows, some WSL2 setups) it must sit under a path the daemon shares with the host (for
+  example `/Users/you/...` on macOS, or `/home/you/...` inside WSL2 on Windows). A path
+  outside the shared roots makes every tool bind mount resolve to nothing and the runner's
+  startup canary refuses to serve.
 - **`AGENT_TOKEN_SECRET` is not optional, even in `DEV_MODE`.** Tokens default to
   `ENFORCE_AGENT_TOKENS=enforce`, and a stack that enforces with no signing key exits at
   startup. Setting `ENFORCE_AGENT_TOKENS=off` alongside `DEV_MODE=true` also works; it is
