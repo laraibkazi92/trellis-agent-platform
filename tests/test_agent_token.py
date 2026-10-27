@@ -11,6 +11,7 @@ DEV_MODE-only fixed key. No etcd, no service processes: pure functions plus
 """
 
 import dataclasses
+import json
 
 import pytest
 
@@ -52,6 +53,19 @@ def _signed(encoded: str, key: str) -> str:
 
 def _payload(value: bytes) -> str:
     return _signed(agent_token._b64url(value), agent_token.signing_keys()[0])
+
+
+def _hand_signed(claims: dict) -> str:
+    """A correctly signed token whose payload carries an arbitrary claim override."""
+    base = {
+        "v": 1,
+        "a": "agent-a",
+        "r": "run-1",
+        "i": ISSUED,
+        "x": ISSUED + 60,
+        "j": "j" * 32,
+    }
+    return _payload(json.dumps({**base, **claims}).encode())
 
 
 def _corrupt_signature(token: str) -> str:
@@ -108,6 +122,129 @@ def test_missing_user_id_reads_as_anonymous():
     assert claims.user_id is None
     assert claims.user_email is None
     assert claims.identity() == "anonymous"
+
+
+# --------------------------------------------------------------------------- #
+# groups ("g") and parent run ("p")
+# --------------------------------------------------------------------------- #
+
+
+def test_groups_and_parent_run_round_trip():
+    token = _mint(groups=["sre", "ops"], parent_run_id="parent-1")
+
+    claims = agent_token.verify(token, now=ISSUED)
+
+    # Sorted: the claim is a set, and a stable order keeps tokens comparable.
+    assert claims.groups == ("ops", "sre")
+    assert claims.parent_run_id == "parent-1"
+
+
+def test_groups_are_sorted_deduped_and_trimmed():
+    token = _mint(groups=[" sre ", "ops", "sre", "", "   "])
+
+    claims = agent_token.verify(token, now=ISSUED)
+
+    assert claims.groups == ("ops", "sre")
+
+
+def test_absent_groups_and_parent_read_as_empty():
+    claims = agent_token.verify(_mint(), now=ISSUED)
+
+    assert claims.groups == ()
+    assert claims.parent_run_id is None
+
+
+def test_a_service_identity_token_carries_no_groups_or_email():
+    """Background runs get nothing: a workflow must not inherit a user's groups."""
+    claims = agent_token.verify(
+        agent_token.mint("nightly", user_id="svc_agent_nightly", now=ISSUED), now=ISSUED
+    )
+
+    assert claims.user_id == "svc_agent_nightly"
+    assert claims.user_email is None
+    assert claims.groups == ()
+
+
+def test_empty_groups_are_omitted_from_the_payload():
+    """An empty claim is omitted, so a group-less token matches a pre-groups token."""
+    encoded = _mint(groups=[]).split(".")[1]
+    payload = json.loads(agent_token._b64url_decode(encoded))
+
+    assert "g" not in payload
+    assert "p" not in payload
+
+
+@pytest.mark.parametrize(
+    "claim_value",
+    [
+        "ops",  # a bare string, not a list
+        ["ops", 3],  # a non-string entry
+        [""],  # an empty name
+        ["   "],  # a blank name
+        {"ops": True},  # not a list
+    ],
+)
+def test_malformed_groups_claim_is_refused(claim_value):
+    token = _hand_signed({"g": claim_value})
+
+    assert _code(token, now=ISSUED) == "malformed"
+
+
+def test_a_hand_built_groups_claim_is_normalised_on_read():
+    """``verify`` normalises like ``mint``: trim, sort, de-duplicate."""
+    token = _hand_signed({"g": [" ops ", "ops", "sre", "  sre  "]})
+
+    claims = agent_token.verify(token, now=ISSUED)
+
+    assert claims.groups == ("ops", "sre")
+
+
+def test_an_oversized_groups_claim_is_capped_on_read():
+    from core.auth import MAX_CLAIM_GROUPS
+
+    token = _hand_signed({"g": [f" g{i:04d} " for i in range(MAX_CLAIM_GROUPS + 50)]})
+
+    claims = agent_token.verify(token, now=ISSUED)
+
+    assert len(claims.groups) == MAX_CLAIM_GROUPS
+    # Sorted before the cap, so the same token always verifies to the same tuple.
+    assert claims.groups == tuple(sorted(claims.groups))
+    assert claims.groups[0] == "g0000"
+
+
+@pytest.mark.parametrize("parent_value", [123, "", ["run-1"]])
+def test_malformed_parent_run_claim_is_refused(parent_value):
+    token = _hand_signed({"p": parent_value})
+
+    assert _code(token, now=ISSUED) == "malformed"
+
+
+def test_refresh_preserves_groups_and_parent_run(monkeypatch):
+    # Real clock: refresh() verifies against the current time, and re-mints with it.
+    expiring = agent_token.mint(
+        "agent-a",
+        user_id="user-1",
+        user_email="user@example.test",
+        run_id="run-1",
+        ttl_s=1,
+        groups=["ops"],
+        parent_run_id="parent-1",
+    )
+
+    fresh = agent_token.refresh(expiring, min_validity_s=60)
+
+    assert fresh != expiring
+    claims = agent_token.verify(fresh)
+    assert claims.groups == ("ops",)
+    assert claims.parent_run_id == "parent-1"
+    assert claims.user_email == "user@example.test"
+    assert claims.run_id == "run-1"
+
+
+def test_refresh_leaves_a_comfortably_valid_token_alone():
+    token = agent_token.mint("agent-a", user_id="user-1", run_id="run-1", groups=["ops"])
+
+    assert agent_token.refresh(token, min_validity_s=60) == token
 
 
 def test_ttl_is_clamped_to_at_least_one_second():
@@ -284,13 +421,22 @@ def test_mint_for_run_publishes_the_token_and_run_id():
 
     try:
         token = agent_token.mint_for_run(
-            "agent-a", "user-1", user_email="user@example.test", run_id="run-42"
+            "agent-a",
+            "user-1",
+            user_email="user@example.test",
+            groups=["ops", "sre"],
+            run_id="run-42",
+            parent_run_id="parent-7",
         )
 
         assert agent_token_var.get() == token
         assert run_id_var.get() == "run-42"
         assert agent_token.current_token() == token
-        assert agent_token.verify(token).run_id == "run-42"
+        claims = agent_token.verify(token)
+        assert claims.run_id == "run-42"
+        assert claims.user_email == "user@example.test"
+        assert claims.groups == ("ops", "sre")
+        assert claims.parent_run_id == "parent-7"
     finally:
         agent_token_var.set(None)
         run_id_var.set(None)

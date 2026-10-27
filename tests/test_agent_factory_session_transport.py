@@ -114,15 +114,18 @@ def test_get_external_mcp_client_builds_a_runner_session(monkeypatch):
             secrets=["DEVOPS_PASSWORD"],
         ))
     )
-    assert transport.kwargs["agent"] is None
-    assert transport.kwargs["user_id"] == "user-1"
-    assert transport.kwargs["user_email"] == "user@corp.example"
+    # No identity in the request: the session's identity is the token's claims (the
+    # per-call email/agent lookup is gone, v0.7.1 Phase 2).
+    assert "agent" not in transport.kwargs
+    assert "user_id" not in transport.kwargs
+    assert "user_email" not in transport.kwargs
     assert transport.kwargs["deadline_ms"] == 2_100_000  # 30 min idle TTL + 5 min grace
     # Declared keys only: the literal for an undeclared key never reaches the runner.
     assert transport.kwargs["env"] == {"DEVOPS_PASSWORD": "s3cret"}
 
 
-def test_get_external_mcp_client_names_the_background_agent(monkeypatch):
+def test_get_external_mcp_client_does_not_name_the_background_agent_in_the_body(monkeypatch):
+    """The agent name is a token claim now; the runner derives it, so the body has none."""
     _install(
         monkeypatch,
         {"devops-cli": _config(secrets=["DEVOPS_PASSWORD"])},
@@ -131,7 +134,7 @@ def test_get_external_mcp_client_names_the_background_agent(monkeypatch):
 
     asyncio.run(agent_factory.get_external_mcp_client("devops-cli", "svc_agent_nightly"))
 
-    assert FakeRunnerStdioTransport.created[0].kwargs["agent"] == "nightly"
+    assert "agent" not in FakeRunnerStdioTransport.created[0].kwargs
 
 
 def test_get_external_mcp_client_never_merges_the_host_environment(monkeypatch):

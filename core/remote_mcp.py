@@ -26,9 +26,10 @@ from typing import Any, Dict, Optional
 
 import httpx
 
+from core import agent_token as agent_token_module
 from core import edge_secrets_central
 from core.auth import get_identity_manager
-from core.caller_identity import resolve_user_email
+from core.caller_identity import identity_incomplete_error
 from core.tool_runtime import MAX_RESULT_CHARS
 
 logger = logging.getLogger(__name__)
@@ -119,6 +120,10 @@ async def call_edge_mcp(
     transport or HTTP-status failures: the agent-facing wrappers turn the dict
     into one error string. Calls are never replayed — ``mcp_session_lost`` and
     ``edge_timeout`` are reported, not retried.
+
+    ``user_id`` is ignored: identity (including whose sealed credential set to
+    forward) comes only from the verified token's claims, so a caller argument can
+    never select another user's credentials.
     """
     if timeout_seconds is None:
         # Imported here so a cold central start does not pull the tunables cache.
@@ -136,22 +141,21 @@ async def call_edge_mcp(
     # not a bare client-side read timeout.
     deadline_ms = int(min((timeout_seconds + 30) * 1000, _MAX_DEADLINE_MS))
 
-    # Resolved before the request so a slow (or failing) registry read cannot eat
-    # into the call's timeout budget. Fail-open: an identity lookup hiccup costs
-    # this call its email, not the call itself.
-    try:
-        user_email = await resolve_user_email(identity_mgr, user_id)
-    except Exception as exc:
-        logger.warning(f"Could not resolve the caller email for edge MCP tool {label}: {exc}")
-        user_email = None
+    # Identity travels only in the verified token: central never re-reads the
+    # registry for it, and a call without one has no identity at all (the assertion
+    # in the body cannot stand in for it).
+    claims = agent_token_module.verify_or_none(agent_token) if agent_token else None
+    user_email = claims.user_email if claims is not None else None
 
     # The caller's browser-sealed set for this (site, mcp, user). Central only ever
-    # holds the ciphertext: it is forwarded verbatim and never logged.
+    # holds the ciphertext: it is forwarded verbatim and never logged. Sealing is
+    # per verified identity, so a no-token call has nothing to look up and the edge's
+    # credential_mode decides instead.
     sealed: Optional[Dict[str, Any]] = None
-    if user_id:
+    if claims is not None and claims.user_id:
         try:
             sealed = await asyncio.to_thread(
-                edge_secrets_central.get, identity_mgr, site, user_id, "mcp", mcp
+                edge_secrets_central.get, identity_mgr, site, claims.user_id, "mcp", mcp
             )
         except Exception as exc:
             logger.warning(
@@ -159,6 +163,12 @@ async def call_edge_mcp(
                 label,
                 type(exc).__name__,
             )
+
+    if sealed is not None and (claims is None or not user_email):
+        # Per-user credentials are sealed to the caller's email: refuse with the real
+        # reason (missing identity) rather than let the edge call it
+        # credential_rejected, which would send an operator to re-seal a key.
+        return identity_incomplete_error(f"MCP tool '{label}'", site)
 
     try:
         async with _remote_client(timeout_seconds + 35) as client:
@@ -168,8 +178,8 @@ async def call_edge_mcp(
                     "tool": tool,
                     "args": args,
                     "deadline_ms": deadline_ms,
-                    "user": user_id,
-                    "user_email": user_email,
+                    # The relay verifies this token and builds the edge frame's
+                    # identity from its claims; the body carries no identity.
                     "agent_token": agent_token,
                     "sealed": sealed,
                 },

@@ -37,7 +37,6 @@ from core.auth import (
     user_id_var,
 )
 from core import llm_defaults, llm_factory
-from core.caller_identity import resolve_user_email
 from core.console_backend import RunnerConsoleBackend
 from core.execution.spec import declared_env_keys, manifest_digest
 from core.execution.stdio_transport import RunnerStdioTransport
@@ -404,18 +403,14 @@ async def _open_external_mcp_client(mcp_name: str, user_id: str) -> FastMCPClien
     if config.transport == "stdio":
         # The server runs in a runner session container: only the manifest's
         # declared keys cross the socket (the runner rejects anything else), and
-        # the control plane's own environment stays here.
+        # the control plane's own environment stays here. The session's identity is
+        # the verified token's claims, so nothing identity-shaped is passed.
         declared = declared_env_keys(config)
-        agent = user_id[len("svc_agent_"):] if is_background else None
-        user_email = await resolve_user_email(identity_mgr, user_id)
         transport = RunnerStdioTransport(
             target=config.name,
             session_key=secrets.token_hex(16),
             env={k: v for k, v in env.items() if k in declared},
             manifest_digest=manifest_digest(config),
-            agent=agent,
-            user_id=user_id,
-            user_email=user_email,
             agent_token=agent_token_var.get(),
             # The runner's hard lifetime; the cache TTL is the primary freshness
             # knob, so a session only outlives its useful life by the grace.

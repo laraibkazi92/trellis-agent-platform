@@ -93,7 +93,7 @@ def hub_env(monkeypatch):
 
 def _hub_call(token):
     """``_authorize_call`` is async because it reads the registry off-loop."""
-    return asyncio.run(hub._authorize_call(ECHO, token, "user-1"))
+    return asyncio.run(hub._authorize_call(ECHO, token))
 
 
 def _assert_hub_denied(denial, *, contains: str = "access_denied") -> None:
@@ -182,24 +182,25 @@ def runner_env(tmp_path, monkeypatch):
         runner_module.reset_for_tests()
 
 
-def _session(agent, token, *, target="coralogix", kind="mcp_session"):
+# The requests carry NO identity fields (v0.7.1 Phase 2): the agent, user, email and
+# groups all come from the token's claims, and the runner derives them itself.
+def _session(token, *, target="coralogix", kind="mcp_session"):
     return SessionCreateRequest(
-        kind=kind, target=target, agent=agent, session_key=SESSION_KEY, agent_token=token
+        kind=kind, target=target, session_key=SESSION_KEY, agent_token=token
     )
 
 
-def _console(agent, token):
+def _console(token):
     return ExecRequest(
         kind="console",
         target="console",
-        agent=agent,
         command="echo hi",
         agent_token=token,
     )
 
 
-def _tool(agent, token, target="echo"):
-    return ExecRequest(kind="tool", target=target, agent=agent, agent_token=token)
+def _tool(token, target="echo"):
+    return ExecRequest(kind="tool", target=target, agent_token=token)
 
 
 def _assert_runner_denied(denial) -> None:
@@ -210,26 +211,26 @@ def _assert_runner_denied(denial) -> None:
 
 @pytest.mark.parametrize("case", BAD_TOKEN_CASES)
 def test_runner_enforce_refuses_a_bad_token(runner_env, case):
-    denial = runner_module._authorize(_session("agent-a", _bad_token(case)))
+    denial = runner_module._authorize(_session(_bad_token(case)))
 
     _assert_runner_denied(denial)
 
 
 def test_runner_enforce_refuses_a_session_for_an_mcp_outside_the_allowlist(runner_env):
     """Agent X's token, Y's MCP: agent-b declares no MCPs at all."""
-    denial = runner_module._authorize(_session("agent-b", agent_token.mint("agent-b")))
+    denial = runner_module._authorize(_session(agent_token.mint("agent-b")))
 
     _assert_runner_denied(denial)
 
 
 def test_runner_enforce_allows_the_granted_mcp(runner_env):
-    assert runner_module._authorize(_session("agent-a", agent_token.mint("agent-a"))) is None
+    assert runner_module._authorize(_session(agent_token.mint("agent-a"))) is None
 
 
 def test_runner_console_requires_execute(runner_env):
-    assert runner_module._authorize(_console("agent-a", agent_token.mint("agent-a"))) is None
+    assert runner_module._authorize(_console(agent_token.mint("agent-a"))) is None
     _assert_runner_denied(
-        runner_module._authorize(_console("agent-b", agent_token.mint("agent-b")))
+        runner_module._authorize(_console(agent_token.mint("agent-b")))
     )
 
 
@@ -240,30 +241,41 @@ def test_runner_discovery_needs_no_token(runner_env):
     caller (central MCP registration / edge catalog refresh) has no agent run to
     mint from -- so a missing agent token must not break discovery.
     """
-    assert runner_module._authorize(_session(None, None, target="catalog", kind="discovery")) is None
+    assert runner_module._authorize(_session(None, target="catalog", kind="discovery")) is None
 
 
 def test_runner_discovery_still_accepts_a_valid_token(runner_env):
-    payload = _session("agent-a", agent_token.mint("agent-a"), target="x", kind="discovery")
+    payload = _session(agent_token.mint("agent-a"), target="x", kind="discovery")
 
     assert runner_module._authorize(payload) is None
 
 
-def test_runner_refuses_a_token_for_a_different_agent(runner_env):
-    payload = _session("agent-a", agent_token.mint("agent-b"))
+def test_runner_ignores_a_forged_body_agent(runner_env):
+    """A body cannot name the agent: the token is the only identity authority.
+
+    ``agent`` is a removed field, so pydantic ignores it; agent-b's token stays
+    agent-b's, and agent-b declares no MCPs.
+    """
+    payload = SessionCreateRequest(
+        kind="mcp_session",
+        target="coralogix",
+        session_key=SESSION_KEY,
+        agent="agent-a",
+        agent_token=agent_token.mint("agent-b"),
+    )
 
     _assert_runner_denied(runner_module._authorize(payload))
 
 
 def test_runner_refuses_an_unknown_agent(runner_env):
     _assert_runner_denied(
-        runner_module._authorize(_session("ghost", agent_token.mint("ghost")))
+        runner_module._authorize(_session(agent_token.mint("ghost")))
     )
 
 
 def test_runner_gateway_bypasses_the_allowlist(runner_env):
     # The gateway is a system principal: it has no manifest on disk, by design.
-    assert runner_module._authorize(_console("gateway", agent_token.mint("gateway"))) is None
+    assert runner_module._authorize(_console(agent_token.mint("gateway"))) is None
 
 
 def test_runner_tool_calls_are_the_hubs_decision(runner_env):
@@ -271,12 +283,12 @@ def test_runner_tool_calls_are_the_hubs_decision(runner_env):
 
     `echo` is deliberately absent from agent-a's on-disk manifest here.
     """
-    assert runner_module._authorize(_tool("agent-a", agent_token.mint("agent-a"))) is None
+    assert runner_module._authorize(_tool(agent_token.mint("agent-a"))) is None
 
 
 def test_runner_off_mode_short_circuits(runner_env, monkeypatch):
     monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "off")
     bad = _bad_token("bad_sig")
 
-    assert runner_module._authorize(_session("agent-b", bad)) is None
-    assert runner_module._authorize(_console("agent-b", bad)) is None
+    assert runner_module._authorize(_session(bad)) is None
+    assert runner_module._authorize(_console(bad)) is None

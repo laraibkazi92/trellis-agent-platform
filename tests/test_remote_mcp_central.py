@@ -12,7 +12,9 @@ Covered contracts:
 
 - ``core.remote_mcp.call_edge_mcp`` maps every relay status onto the same
   ``{"content", "isError", "structuredContent"}`` / ``{"error": ...}`` dict shape
-  ``core.hub::_run_remote`` returns, POSTs ``user_email``, and caps oversized results.
+  ``core.hub::_run_remote`` returns, takes identity from the verified token's claims
+  only, refuses a per-user-credential call whose token has no email with
+  ``identity_incomplete``, and caps oversized results.
 - ``discover_external_mcps`` takes an edge MCP's catalog from its static ``tools``.
 - ``build_agent`` registers the 4-part ``mcp__<site>__<mcp>__<tool>`` name.
 - The gateway ``use_tool`` seam dispatches 4-part names to the relay caller.
@@ -32,7 +34,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from core import agent_factory, discovery, gateway, remote_mcp, tool_search
+from core import agent_factory, agent_token, discovery, gateway, remote_mcp, tool_search
 from core.auth import user_id_var
 from core.models import MCPConfig, MCPToolDefinition, RemoteMcpSpec
 
@@ -142,11 +144,16 @@ def relay_error(status, code, message="boom"):
     return json_response(status, {"error": {"code": code, "message": message}})
 
 
-def call_edge(tool=TOOL, args=None, user_id="user-1", timeout_seconds=120):
+def mint(agent, *, user_id=None, user_email=None):
+    return agent_token.mint(agent, user_id=user_id, user_email=user_email)
+
+
+def call_edge(tool=TOOL, args=None, user_id="user-1", timeout_seconds=120, token=None):
     return asyncio.run(
         remote_mcp.call_edge_mcp(
             SITE, MCP, tool, args if args is not None else {"action": "list"}, user_id,
             timeout_seconds=timeout_seconds,
+            agent_token=token,
         )
     )
 
@@ -160,6 +167,7 @@ def _no_real_identity_lookup(monkeypatch):
     """
     monkeypatch.delenv("DEV_MODE", raising=False)
     monkeypatch.delenv("DEV_USER_EMAIL", raising=False)
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", "remote-mcp-central-unit-secret-0123456789")
     monkeypatch.setattr(remote_mcp.identity_mgr, "get_user", lambda user_id: None)
     monkeypatch.setattr(remote_mcp.edge_secrets_central, "get", lambda *args, **kwargs: None)
 
@@ -186,20 +194,22 @@ def test_call_edge_mcp_posts_relay_mcp_endpoint_with_identity(monkeypatch):
         )
 
     requests, timeouts = install_transport(monkeypatch, handler)
+    # The caller's email is a token claim, not a registry read.
     monkeypatch.setattr(
-        remote_mcp.identity_mgr, "get_user", lambda user_id: {"email": "ops@example.com"}
+        remote_mcp.identity_mgr, "get_user", lambda user_id: pytest.fail("per-call identity read")
     )
+    token = mint("agent-a", user_id="user-1", user_email="ops@example.com")
 
-    result = call_edge(args={"action": "list"}, user_id="user-1", timeout_seconds=120)
+    result = call_edge(args={"action": "list"}, user_id="user-1", timeout_seconds=120, token=token)
 
     assert seen["url"] == f"{RELAY_URL}/v1/sites/{SITE}/mcps/{MCP}/call"
+    # No body identity: the relay builds the edge frame's identity from the
+    # verified token, so asserting an identity here could never take effect.
     assert seen["body"] == {
         "tool": TOOL,
         "args": {"action": "list"},
         "deadline_ms": (120 + 30) * 1000,
-        "user": "user-1",
-        "user_email": "ops@example.com",
-        "agent_token": None,
+        "agent_token": token,
         "sealed": None,
     }
     # Same dict shape hub._run_remote returns for a remote tool.
@@ -230,62 +240,123 @@ def test_call_edge_mcp_forwards_the_callers_sealed_blob(monkeypatch):
         )
 
     install_transport(monkeypatch, handler)
+    token = mint("agent-a", user_id="user-1", user_email="ops@example.com")
 
-    call_edge(args={}, user_id="user-1", timeout_seconds=120)
+    call_edge(args={}, user_id="user-1", timeout_seconds=120, token=token)
 
     assert asked == [(SITE, "user-1", "mcp", MCP)]
     assert seen["body"]["sealed"] == blob
 
 
-def test_call_edge_mcp_dev_mode_email(monkeypatch):
-    requests, _ = install_transport(monkeypatch, json_response(200, {"result": {"content": []}}))
-    monkeypatch.setenv("DEV_MODE", "true")
-
-    call_edge()
-
-    assert json.loads(requests[0].content)["user_email"] == "dev-user@local.host"
-
-
-def test_call_edge_mcp_real_profile_email(monkeypatch):
-    requests, _ = install_transport(monkeypatch, json_response(200, {"result": {"content": []}}))
-    monkeypatch.setattr(
-        remote_mcp.identity_mgr, "get_user", lambda user_id: {"email": "dev@acme.com"}
+def test_call_edge_mcp_identity_comes_from_the_token_not_an_argument(monkeypatch):
+    """The ``user_id`` argument cannot override the token's user, and nothing in the
+    body claims an identity at all."""
+    requests, _ = install_transport(
+        monkeypatch, json_response(200, {"result": {"content": []}})
     )
+    token = mint("agent-a", user_id="alice", user_email="alice@example.com")
 
-    call_edge()
-
-    assert json.loads(requests[0].content)["user_email"] == "dev@acme.com"
-
-
-def test_call_edge_mcp_service_agent_has_no_email(monkeypatch):
-    requests, _ = install_transport(monkeypatch, json_response(200, {"result": {"content": []}}))
-    looked_up = []
-    monkeypatch.setattr(
-        remote_mcp.identity_mgr,
-        "get_user",
-        lambda user_id: looked_up.append(user_id) or None,
-    )
-
-    call_edge(user_id="svc_agent_reporter")
+    call_edge(user_id="mallory", token=token)
 
     body = json.loads(requests[0].content)
-    assert body["user"] == "svc_agent_reporter"
-    assert body["user_email"] is None
-    assert looked_up == ["svc_agent_reporter"]
+    assert "user" not in body
+    assert "user_email" not in body
+    assert body["agent_token"] == token
 
 
-def test_call_edge_mcp_identity_lookup_failure_is_fail_open(monkeypatch):
-    requests, _ = install_transport(monkeypatch, json_response(200, {"result": {"content": []}}))
+def test_call_edge_mcp_without_a_token_posts_no_identity(monkeypatch):
+    """No token (dev/rollout): no identity, no sealed lookup.
 
-    def boom(user_id):
-        raise RuntimeError("etcd unavailable")
+    The ``user_id`` argument no longer selects anything: without claims there is no
+    verified caller to seal a credential set to, so central sends ``sealed: null``
+    and the edge's ``credential_mode`` decides.
+    """
+    requests, _ = install_transport(
+        monkeypatch, json_response(200, {"result": {"content": []}})
+    )
+    monkeypatch.setattr(
+        remote_mcp.identity_mgr, "get_user", lambda user_id: pytest.fail("per-call identity read")
+    )
+    monkeypatch.setattr(
+        remote_mcp.edge_secrets_central,
+        "get",
+        lambda *args, **kwargs: pytest.fail("no claims, no sealed lookup"),
+    )
 
-    monkeypatch.setattr(remote_mcp.identity_mgr, "get_user", boom)
+    call_edge()
 
-    result = call_edge()
+    body = json.loads(requests[0].content)
+    assert "user" not in body
+    assert "user_email" not in body
+    assert body["agent_token"] is None
+    assert body["sealed"] is None
 
+
+def test_call_edge_mcp_service_token_carries_no_email(monkeypatch):
+    requests, _ = install_transport(
+        monkeypatch, json_response(200, {"result": {"content": []}})
+    )
+    monkeypatch.setattr(
+        remote_mcp.identity_mgr, "get_user", lambda user_id: pytest.fail("per-call identity read")
+    )
+    token = mint("nightly", user_id="svc_agent_reporter")
+
+    result = call_edge(user_id="svc_agent_reporter", token=token)
+
+    body = json.loads(requests[0].content)
+    # The service principal's lack of an email lives in the token, not the body.
+    assert "user_email" not in body
+    assert body["agent_token"] == token
     assert result == {"content": []}
-    assert json.loads(requests[0].content)["user_email"] is None
+
+
+def test_call_edge_mcp_per_user_credentials_need_an_email_claim(monkeypatch):
+    """A token with no email cannot serve a sealed per-user set.
+
+    The refusal is ``identity_incomplete`` and never ``credential_rejected``: re-sealing
+    a key cannot fix a caller whose identity has no email.
+    """
+    install_transport(monkeypatch, json_response(200, {"result": {"content": []}}))
+    monkeypatch.setattr(
+        remote_mcp.edge_secrets_central,
+        "get",
+        lambda *args, **kwargs: {"v": 1, "ciphertext": "opaque", "keys": ["K"]},
+    )
+    token = mint("nightly", user_id="svc_agent_reporter")
+
+    result = call_edge(user_id="svc_agent_reporter", token=token)
+
+    assert "identity_incomplete" in result["error"]
+    assert "no email" in result["error"]
+    assert "credential_rejected" not in result["error"]
+
+
+def test_call_edge_mcp_identity_incomplete_is_not_dispatched(monkeypatch):
+    """The refusal happens before the relay sees the call."""
+    requests, _ = install_transport(monkeypatch, json_response(200, {"result": {}}))
+    monkeypatch.setattr(
+        remote_mcp.edge_secrets_central, "get", lambda *args, **kwargs: {"v": 1, "ciphertext": "x"}
+    )
+
+    result = call_edge(token=mint("agent-a", user_id="user-1"))
+
+    assert requests == []
+    assert "identity_incomplete" in result["error"]
+
+
+def test_call_edge_mcp_malformed_token_supplies_no_identity(monkeypatch):
+    """A presented-but-invalid token must not borrow the ``user_id`` argument."""
+    requests, _ = install_transport(
+        monkeypatch, json_response(200, {"result": {"content": []}})
+    )
+
+    call_edge(user_id="mallory", token="t1.forged.signature")
+
+    body = json.loads(requests[0].content)
+    assert "user" not in body
+    assert "user_email" not in body
+    # The token is forwarded for the relay to reject; no identity is asserted.
+    assert body["agent_token"] == "t1.forged.signature"
 
 
 def test_call_edge_mcp_caps_oversized_result(monkeypatch):

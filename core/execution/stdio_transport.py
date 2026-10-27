@@ -96,22 +96,22 @@ class RunnerStdioTransport(ClientTransport):
         session_key: str,
         env: Optional[dict[str, str]] = None,
         manifest_digest: str = "",
-        agent: Optional[str] = None,
-        user_id: Optional[str] = None,
-        user_email: Optional[str] = None,
         agent_token: Optional[str] = None,
         token_resolver: Any = None,
         deadline_ms: int = 3_600_000,
         kind: str = "mcp_session",
         client_factory: Any = RunnerClient,
     ) -> None:
+        """The session's identity is the verified token's claims, nothing else.
+
+        v0.7.1 Phase 2 removed identity from the runner request body: the runner
+        derives the agent, user, email and groups from the token, so this transport
+        takes no identity arguments at all.
+        """
         self.target = target
         self.session_key = session_key
         self.env = dict(env or {})
         self.manifest_digest = manifest_digest
-        self.agent = agent
-        self.user_id = user_id
-        self.user_email = user_email
         self.agent_token = agent_token
         # Central clients live in a process-wide cache, so a token captured at
         # construction belongs to whichever run created the cache entry. Resolve
@@ -145,9 +145,6 @@ class RunnerStdioTransport(ClientTransport):
             kind=self.kind,  # type: ignore[arg-type]
             target=self.target,
             manifest_digest=self.manifest_digest,
-            agent=self.agent,
-            user_id=self.user_id,
-            user_email=self.user_email,
             session_key=self.session_key,
             env=self.env,
             agent_token=self._current_token(),

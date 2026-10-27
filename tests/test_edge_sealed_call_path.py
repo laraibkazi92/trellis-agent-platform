@@ -358,7 +358,7 @@ def test_relay_forwards_sealed_verbatim_and_audits_only_presence(monkeypatch):
 
     response = client.post(
         f"/v1/sites/{SITE}/call",
-        json={"tool": "node_ssh", "args": {}, "user": "u1", "user_email": ALICE, "sealed": blob},
+        json={"tool": "node_ssh", "args": {}, "sealed": blob},
     )
 
     assert response.status_code == 200
@@ -395,13 +395,80 @@ def test_the_relay_never_logs_the_sealed_blob(monkeypatch, caplog):
     with caplog.at_level(logging.DEBUG):
         response = client.post(
             f"/v1/sites/{SITE}/call",
-            json={"tool": "node_ssh", "args": {}, "user_email": ALICE, "sealed": blob},
+            json={"tool": "node_ssh", "args": {}, "sealed": blob},
         )
 
     assert response.status_code == 200
     assert blob["ciphertext"] not in caplog.text
     assert blob["wrapped_key"] not in caplog.text
     assert blob["aad"] not in caplog.text
+
+
+def test_the_aad_identity_is_identical_when_it_comes_from_the_claims(
+    edge_key, tmp_path, monkeypatch
+):
+    """Phase 2's blocking property: claims-derived identity must open the same blob.
+
+    The browser seals to the identity central computes for the *user*; the relay now
+    builds the frame identity from the token's ``u``/``e`` claims instead of a request
+    body. The AAD input has to stay byte-identical (normalization included) or every
+    existing sealed set would stop opening.
+    """
+    from types import SimpleNamespace
+
+    from core.edge_secrets_central import sealed_identity
+
+    key, _path = edge_key
+    seen = capture_env(monkeypatch)
+    config = tool_config(secrets=list(DECLARED))
+
+    # A claims object as `core.agent_token.verify` surfaces it -- the email spelled
+    # with capitals, exactly what an OIDC claim can carry.
+    claims = SimpleNamespace(user_id="u-alice", user_email="Alice@Example.COM")
+    user, email = relay_app._claims_identity(claims)
+    assert (user, email) == ("u-alice", "Alice@Example.COM")
+
+    # Central sealed it under the normalized address; the edge must derive the same.
+    assert sealed_identity(user, email) == ALICE
+
+    blob = seal(key, BROWSER_VALUES)  # identity=ALICE, i.e. sealed_identity(...)
+    result = asyncio.run(
+        proxy.handle_call(
+            {TOOL: (config, tmp_path)},
+            call_frame(sealed=blob, user=user, email=email),
+            proxy_config=edge_proxy_config(tmp_path),
+            edge_key=key,
+        )
+    )
+
+    assert result["ok"] is True
+    assert seen["NODE_SSH_PASSWORD"] == BROWSER_VALUES["NODE_SSH_PASSWORD"]
+    # The tool sees the frame identity unchanged (not the normalized AAD form).
+    assert seen["TRELLIS_USER_EMAIL"] == "Alice@Example.COM"
+    assert seen["TRELLIS_USER_ID"] == "u-alice"
+
+
+def test_claims_without_an_email_never_open_a_sealed_set(edge_key, tmp_path, monkeypatch):
+    """No ``e`` claim: ``identity_incomplete`` at central, and no AAD match here."""
+    from types import SimpleNamespace
+
+    key, _path = edge_key
+    never_runs(monkeypatch)
+    config = tool_config(secrets=list(DECLARED))
+    user, email = relay_app._claims_identity(SimpleNamespace(user_id="u-alice", user_email=None))
+
+    assert (user, email) == ("u-alice", None)
+    result = asyncio.run(
+        proxy.handle_call(
+            {TOOL: (config, tmp_path)},
+            call_frame(sealed=seal(key, BROWSER_VALUES), user=user, email=email),
+            proxy_config=edge_proxy_config(tmp_path),
+            edge_key=key,
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == edge_crypto.CREDENTIAL_REJECTED
 
 
 # ---------------------------------------------------------------- hello / site record

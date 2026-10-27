@@ -16,6 +16,7 @@ import httpx
 import pytest
 import yaml
 
+from core import agent_token
 from core.execution import backend as backend_module
 from core.execution import canary as canary_module
 from core.execution import runner as runner_module
@@ -24,6 +25,12 @@ from core.models import MCPConfig
 from fixtures.fake_backend import FakeBackend, RawExec
 
 AUTH = {"authorization": "Bearer test-token"}
+SECRET = "runner-sessions-unit-secret-0123456789abcdef"
+
+
+def _token(agent="demo-assistant", user_id="u-1", email="u@example.test"):
+    """The run's token: the runner's ONLY identity source (no identity in the body)."""
+    return agent_token.mint(agent, user_id=user_id, user_email=email)
 FRAME = struct.Struct(">BI")
 SESSION_KEY = "a" * 32
 
@@ -77,6 +84,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("RUNNER_MAX_CONTAINERS_PER_TOOL", "8")
     monkeypatch.setenv("TRELLIS_INSTALL_ID", "test-install")
     monkeypatch.delenv("DEV_MODE", raising=False)
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", SECRET)
+    monkeypatch.delenv("ENFORCE_AGENT_TOKENS", raising=False)
     monkeypatch.setenv("TRELLIS_UID", "1000")
     monkeypatch.setenv("TRELLIS_GID", "1000")
 
@@ -107,10 +116,8 @@ def _body(root, **overrides) -> dict:
         "kind": "mcp_session",
         "target": "stateful",
         "manifest_digest": _digest(root),
-        "agent": "demo-assistant",
-        "user_id": "u-1",
-        "user_email": "u@example.test",
         "session_key": SESSION_KEY,
+        "agent_token": _token(),
         "env": {"MCP_TOKEN": "s3cret"},
         "deadline_ms": 60_000,
     }
@@ -560,9 +567,7 @@ def _console_body(**overrides) -> dict:
         "command": "echo hi",
         "env": {},
         "deadline_ms": 5000,
-        "user_id": "u-1",
-        "user_email": "u@example.test",
-        "run_id": "run-1",
+        "agent_token": _token(),
     }
     body.update(overrides)
     return body

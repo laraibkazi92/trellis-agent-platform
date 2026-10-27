@@ -19,6 +19,11 @@ tools and MCP servers are resolved by ``core.edge_user_secrets``: one shared,
 edge-local file per export, plus per-user sets that central stores only as
 ciphertext sealed to this edge's public key (``core.edge_crypto``). Nothing here
 sends a credential value to central, and the private key never leaves this VM.
+
+Trust (v0.7.1): this process verifies **no** agent token and needs no
+``AGENT_TOKEN_SECRET``. The relay authenticated the caller, verified the token and
+built the frame identity from its claims; the edge trusts that identity over the
+authenticated tunnel and uses it unchanged.
 """
 
 from __future__ import annotations
@@ -39,7 +44,6 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import yaml
 
-from core import agent_token as agent_token_module
 from core import (
     edge_crypto,
     edge_env,
@@ -410,6 +414,38 @@ def load_config(path: str | Path | None = None) -> ProxyConfig:
     )
 
 
+def _invalid_declared_keys(config: Any) -> List[str]:
+    """Declared ``secrets``/``variables`` names that are not usable env identifiers.
+
+    The relay validates ``hello.credential_keys`` against ``^[A-Za-z_][A-Za-z0-9_]*$``
+    and closes a tunnel that carries anything else -- and the edge would then redial
+    with the same frame forever, taking **every** healthy export offline. So the edge
+    checks its own catalog first and skips only the offending manifest (v0.7.1).
+    """
+    return sorted(
+        key
+        for key in edge_env.declared_keys_for(config)
+        if len(key) > protocol.MAX_ENV_NAME_CHARS or not protocol.ENV_NAME_RE.match(key)
+    )
+
+
+def _skip_invalid_declared_keys(kind: str, name: str, config: Any) -> bool:
+    """Log and report whether this export must be skipped for its declared names."""
+    invalid = _invalid_declared_keys(config)
+    if not invalid:
+        return False
+    logger.warning(
+        "Skipping %s %r: declared key(s) %s are not valid environment variable names "
+        "(expected ^[A-Za-z_][A-Za-z0-9_]*$). The relay refuses a credential list "
+        "carrying them, so publishing this export would close the tunnel for every "
+        "other export. Rename the key(s) in the manifest.",
+        kind,
+        name,
+        ", ".join(repr(key) for key in invalid),
+    )
+    return True
+
+
 def load_tools(tools_dir: Path, exports: List[str]) -> Dict[str, Tuple[ToolConfig, Path]]:
     """Load the tools this edge is allowed to publish.
 
@@ -486,10 +522,15 @@ def load_tools(tools_dir: Path, exports: List[str]) -> Dict[str, Tuple[ToolConfi
 
             # Reject a catalog entry the relay would refuse, now, so one bad
             # input schema cannot break the whole publish.
-            try:
-                protocol.validate_tools([_catalog_entry(config)])
-            except protocol.ProtocolError as exc:
-                logger.warning("Skipping tool %r: %s", name, exc)
+            catalog_entry = protocol.validate_tools([_catalog_entry(config)])
+            if not catalog_entry:
+                logger.warning(
+                    "Skipping tool %r: %s", name, catalog_entry.errors[0].describe()
+                )
+                continue
+            # Same rule for the declared credential names: a name the relay's
+            # credential-key validator refuses would close the tunnel for everything.
+            if _skip_invalid_declared_keys("tool", name, config):
                 continue
 
             # Resolved so core.tool_runtime's entrypoint containment check
@@ -644,7 +685,9 @@ def build_env(
     the env names its ``tool.yaml`` declares -- not whatever the edge container
     carries. Declared keys come from the credential chain
     (``core.edge_user_secrets``): a caller's sealed blob when there is one, else the
-    shared file with the process env last, and an empty/whitespace file value counts
+    shared file -- for a declared **secret** the shared file is the only non-sealed
+    source (v0.7.1: the process environment is not read for one), while a declared
+    **variable** falls back to the process env. An empty/whitespace file value counts
     as unset (so it cannot mask a real one). ``passthrough`` restores the v0.4
     denylist for a tool whose keys are not all declared; the tunnel credential is
     dropped in both modes, even if something re-adds it to the process environment.
@@ -655,9 +698,10 @@ def build_env(
 
     ``sealed`` is the decrypted per-user mapping (``None`` = no blob). When it is not
     None the per-user branch is all-or-nothing: only the secret names it carries reach
-    the env, and any declared secret it omits is removed from the inherited env even
-    with ``passthrough`` -- the shared file and the container never fill the gap.
-    Declared ``variables`` keep coming from the shared file / process env.
+    the env. Either way a declared secret the resolved set omits is removed from the
+    inherited env even with ``passthrough`` -- the process environment and the shared
+    file never fill the gap. Declared ``variables`` keep coming from the shared
+    file / process env.
 
     ``identity`` carries the caller the hub resolved centrally; an absent or empty
     value is dropped rather than exported as ``""`` so a tool can test presence.
@@ -682,12 +726,13 @@ def build_env(
     # Declared credentials win over the process env (``shared`` mode's whole point);
     # only declared names are ever in ``resolved``.
     env.update(resolved)
-    if sealed is not None:
-        # All-or-nothing: a declared secret the caller's blob omits must not survive
-        # from the process env (passthrough) or any other inherited layer.
-        for key in edge_user_secrets.declared_secret_keys(config):
-            if key not in resolved:
-                env.pop(key, None)
+    # A declared secret is never read from the edge process env -- not under
+    # ``passthrough`` and not in ``shared`` mode: a key the store (or the caller's
+    # sealed set) did not supply must stay absent instead of silently surviving from
+    # the container environment.
+    for key in edge_user_secrets.declared_secret_keys(config):
+        if key not in resolved:
+            env.pop(key, None)
     # A credential file must not reintroduce a framework control-plane name.
     edge_env.strip_framework_names(env, token_env=token_env)
     # Caller identity is per frame: never inherit a stale one from ``TRELLIS_*``.
@@ -716,7 +761,12 @@ def _catalog_entry(config: ToolConfig) -> Dict[str, Any]:
 
 def _edge_tool(config: ToolConfig) -> protocol.EdgeTool:
     """The tool as published -- i.e. with the relay's input-schema cleaning applied."""
-    return protocol.validate_tools([_catalog_entry(config)])[0]
+    catalog = protocol.validate_tools([_catalog_entry(config)])
+    if not catalog:
+        # The loader already dropped an unpackable manifest; reaching this means a
+        # caller built a ToolConfig in memory that the relay would refuse.
+        raise protocol.ProtocolError(catalog.errors[0].describe())
+    return catalog[0]
 
 
 def _hello_tool_entry(config: ToolConfig, *, lazy_catalog: bool) -> Dict[str, Any]:
@@ -764,13 +814,23 @@ def credential_keys(
     The relay publishes ``<site>__<name>`` configs without ``secrets``/``variables``
     (the edge owns them), so this hello field is what lets central's pubkey endpoint
     render the right inputs. Names are the bare export names, not registry names.
+
+    Last gate before the frame leaves: a target whose declared names are not valid env
+    identifiers is omitted with a log rather than published, because the relay closes
+    the tunnel over one bad name and the edge would redial into the same refusal
+    forever (v0.7.1). The loaders already skip such an export, so this only fires when
+    a caller bypasses them.
     """
-    keys = {
-        name: _credential_key_lists(config)
-        for name, (config, _dir) in config_map.items()
-    }
+    keys: Dict[str, Dict[str, List[str]]] = {}
+    for name, (config, _dir) in config_map.items():
+        if _skip_invalid_declared_keys("tool", name, config):
+            continue
+        keys[name] = _credential_key_lists(config)
     for name, entry in (mcp_entries or {}).items():
-        keys[name] = _credential_key_lists(getattr(entry, "config", entry))
+        config = getattr(entry, "config", entry)
+        if _skip_invalid_declared_keys("mcp", name, config):
+            continue
+        keys[name] = _credential_key_lists(config)
     return keys
 
 
@@ -932,28 +992,6 @@ def _timeout_frame(frame: Dict[str, Any], deadline_ms: int, started: float) -> D
     )
 
 
-def _token_denial(raw_token: Optional[str]) -> Optional[tuple[str, str]]:
-    """Signature and expiry only: an edge has no agent registry (plan §5 item 5).
-
-    The allowlist decision belongs to the relay, which owns the registry; this check
-    is defense in depth for a compromised relay and for the runner request that
-    follows. Returns the ``(code, message)`` error frame payload for an
-    ``enforce``-mode refusal, and only logs the would-be refusal in ``log`` mode.
-    """
-    mode = agent_token_module.mode()
-    if mode == "off":
-        return None
-    try:
-        agent_token_module.verify(raw_token)
-    except agent_token_module.AgentTokenError as exc:
-        message = f"access_denied: agent token rejected ({exc.code})"
-        if mode == "log":
-            logger.warning("Edge: would refuse a call: %s", message)
-            return None
-        return ("access_denied", message)
-    return None
-
-
 async def handle_call(
     config_map: Mapping[str, Tuple[ToolConfig, Path]],
     message: Dict[str, Any],
@@ -987,6 +1025,11 @@ async def handle_call(
     overlap) and the plaintext mapping travels only into the container env; a
     ``SealedError`` -- another target, another user, another site, a retired key --
     becomes ``credential_rejected`` and the tool never runs.
+
+    The frame's caller identity is **trusted**: the relay built it from the verified
+    agent token's claims and nothing on the edge re-checks a token (v0.7.1). The
+    ``agent_token`` is forwarded unchanged to the runner, which owns the remaining
+    verification.
     """
     started = time.monotonic()
     raw_id = message.get("id")
@@ -998,10 +1041,6 @@ async def handle_call(
         return _result_frame(fallback_id, _elapsed_ms(started), error=("invalid_arguments", str(exc)))
 
     agent_token = call.get("agent_token")
-    denial = _token_denial(agent_token)
-    if denial is not None:
-        logger.warning("Refusing call %r: %s", call["id"], denial[1])
-        return _result_frame(call["id"], _elapsed_ms(started), error=denial)
 
     entry = config_map.get(call["tool"])
     if entry is None:
@@ -1100,7 +1139,8 @@ async def handle_mcp_call(
 
     A sealed blob is opened here (kind ``mcp``, the server's name, the caller's
     identity) and the decrypted mapping is handed to the session manager, which uses
-    it only when it opens (or reopens) the session.
+    it only when it opens (or reopens) the session. The identity is the frame's, i.e.
+    the verified token's claims on the relay; no token is verified here (v0.7.1).
     """
     started = time.monotonic()
     raw_id = message.get("id")
@@ -1110,11 +1150,6 @@ async def handle_mcp_call(
         call = protocol.validate_call(message)
     except protocol.ProtocolError as exc:
         return _result_frame(fallback_id, _elapsed_ms(started), error=("invalid_arguments", str(exc)))
-
-    denial = _token_denial(call.get("agent_token"))
-    if denial is not None:
-        logger.warning("Refusing MCP call %r: %s", call["id"], denial[1])
-        return _result_frame(call["id"], _elapsed_ms(started), error=denial)
 
     if call.get("sealed") is not None and (edge_key is None or prev_edge_key is None):
         edge_key, prev_edge_key = _resolve_edge_keys(edge_key, prev_edge_key)
@@ -1368,8 +1403,17 @@ class _Session:
         whole discovery window (up to 20 s per server), and a rebuild that then
         failed left the manager refusing for good. ``refresh_mcps`` installs the
         two together.
+
+        A server whose manifest declares a key the relay's credential-key validator
+        refuses is dropped here (logged), so it cannot take the tunnel -- and every
+        other export -- down with it.
         """
-        self.mcps = proxy_mcp.load_mcps(config.mcps_dir, config.export_mcps)
+        loaded = proxy_mcp.load_mcps(config.mcps_dir, config.export_mcps)
+        self.mcps = {
+            name: entry
+            for name, entry in loaded.items()
+            if not _skip_invalid_declared_keys("mcp", name, entry.config)
+        }
         self.mcps_generation += 1
 
     async def refresh_mcps(self) -> None:
@@ -1933,10 +1977,9 @@ async def run(
     # execution path.
     os.environ.setdefault("RUNNER_SOCKET", config.runner_socket)
 
-    from core.agent_token import require_secret
-
     _disable_core_dumps()
-    require_secret("trellis-proxy")
+    # No agent-token gate: an edge verifies nothing (v0.7.1). The relay verified the
+    # token and derived the frame identity; AGENT_TOKEN_SECRET is not needed here.
     token = _resolve_and_forget_token(config)
     connect = _connect_factory()
 
@@ -1946,8 +1989,6 @@ async def run(
 
     session = _Session(config, config_path)
     session.reload()
-    # A v0.5 plaintext per-user store is inert now; say so once, with the migration.
-    edge_user_secrets.warn_about_legacy_user_secrets()
     await session.refresh_mcps()
     _active_session = session
     _active_loop = asyncio.get_running_loop()

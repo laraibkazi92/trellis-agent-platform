@@ -81,6 +81,7 @@ and in the edge's `.env`:
 ```bash
 RUNNER_TOKEN=<openssl rand -hex 32>            # identical on proxy and runner
 TRELLIS_HOST_WORKSPACE=/srv/trellis/workspace  # HOST path of ./workspace on this VM
+AGENT_TOKEN_SECRET=<same value as central>     # runner only (proxy never verifies)
 MAX_SESSIONS_EDGE=4                            # warm MCP session containers (default 32)
 ```
 
@@ -89,6 +90,14 @@ MAX_SESSIONS_EDGE=4                            # warm MCP session containers (de
 runner's startup canary and it refuses to serve. The `runner` also mounts the workspace
 read-write (it writes the canary and creates output directories) while tool containers
 still see only their read-only mounts.
+
+> **v0.7.1: the edge proxy never verifies an agent token.** `trellis-proxy` uses the
+> identity the relay derived over the authenticated tunnel — see
+> [Edge credentials](#edge-credentials) — and takes no `AGENT_TOKEN_SECRET`. The edge
+> **runner** keeps the key (the sample compose sets it there only): it verifies nothing
+> today (`ENFORCE_AGENT_TOKENS=off`), and Phase 4 turns enforcement on and derives the
+> agent and the output dir from the token's claims. Until then the edge `.env` must still
+> carry a valid `AGENT_TOKEN_SECRET` — the runner refuses to start without one.
 
 Prerequisites on the edge host are the same as central: `runsc` registered with Docker
 (proved with `docker run --runtime=runsc hello-world`) and the network profiles created
@@ -270,7 +279,9 @@ and a literal `mcp.yaml` `env:`. Provider API keys are the deliberate exception:
 that calls an LLM declares `OPENAI_API_KEY` and it still arrives.
 
 Identity is injected per call, never inherited: `TRELLIS_USER_ID` and `TRELLIS_USER_EMAIL`
-are set from the frame for that caller only.
+are set from the frame's identity — the verified token's claims at the relay — for that
+caller only. A caller with no email claim gets no `TRELLIS_USER_EMAIL` at all (absent, not
+empty), so a tool can branch on presence.
 
 **The escape hatch.** A legacy tool that cannot declare every key it reads can set
 `env_passthrough: true` (or `TRELLIS_EDGE_ENV_PASSTHROUGH=true`), which restores the v0.4
@@ -295,13 +306,16 @@ There are two credential sources, and neither one is a plaintext per-user file:
 Nothing a user types ever crosses the tunnel or reaches etcd in the clear, and the relay
 (which sees the sealed envelope in transit) has no key to open it.
 
-> **Trust boundary.** The edge trusts central's identity assertion. The `user` / `user_email`
-> in a call frame were resolved centrally from the authenticated user and arrive over the
-> authenticated tunnel. They are also part of the sealed envelope's AAD, so a blob stored
-> for one person cannot be replayed for another, for a different tool/MCP, or for another
-> site: the GCM tag fails and the call returns `credential_rejected` without running.
-> Keep the tunnel token and the relay's internal API inside the trust perimeter you
-> already give the central install.
+> **Trust boundary.** The edge trusts the relay's identity assertion. The `user` /
+> `user_email` in a call frame are derived **only** from the verified agent token's
+> claims (`u` / `e`) at the relay — the relay is the single verification point — and they
+> arrive over the authenticated tunnel. The edge proxy verifies no token of its own and
+> needs no `AGENT_TOKEN_SECRET`; it uses that identity unchanged for the MCP session key,
+> the sealed envelope's AAD and `TRELLIS_USER_ID`/`TRELLIS_USER_EMAIL`. Because the
+> identity is part of the AAD, a blob stored for one person cannot be replayed for
+> another, for a different tool/MCP, or for another site: the GCM tag fails and the call
+> returns `credential_rejected` without running. Keep the tunnel token and the relay's internal
+> API inside the trust perimeter you already give the central install.
 
 ### Shared store
 
@@ -324,19 +338,25 @@ your own compose file, add the mount
 
 | Mode | What the call sees |
 |---|---|
-| `shared` (default) | the caller's sealed set when one exists (it always wins); otherwise the shared file → process environment → unset |
-| `per_user` | the caller's sealed set if they have one; otherwise the shared file → process environment |
+| `shared` (default) | the caller's sealed set when one exists (it always wins); otherwise the shared file for secrets, and the shared file → process environment for variables |
+| `per_user` | the caller's sealed set if they have one; otherwise the same as `shared` |
 | `per_user_required` | the caller's sealed set **only**; with no blob for them the call fails closed with `missing_credentials` and **nothing executes** |
 
 A sealed set is **all-or-nothing** for secrets. Once it exists for
 `(site, kind, target, identity)`, only the declared secret names it carries reach the
 container; a declared secret it omits stays missing and is never filled from the shared
-file or the process environment. Partial sets are a user error with a safe result, not a
-silent fallback to the service account.
+file. Partial sets are a user error with a safe result, not a silent fallback to the
+service account.
 
-`variables` (endpoints) are never per-user material: they come from `proxy.yaml`/the
-manifest/process env in every mode. The write endpoint rejects a blob that names one, and
-the edge ignores it anyway because it is not in the declared secret set.
+**Secrets have exactly one non-sealed source: the shared file** (v0.7.1). The edge
+container's environment is no longer read for a declared secret — it is visible to every
+tool in the container and to anyone running `docker inspect`. A key left only in the
+edge's `.env` now resolves to *unset*; move it into `edge-secrets/<tool-or-mcp>.env` or
+seal it per user.
+
+`variables` (endpoints) are never per-user material: they come from the shared file and
+then the process environment in every mode. The write endpoint rejects a blob that names
+one, and the edge ignores it anyway because it is not in the declared secret set.
 
 Only keys the manifest declares are read out of any source, so an extra key in a file
 cannot reach a child process. An anonymous caller (no `user_email`) has no sealed setup,
@@ -361,8 +381,28 @@ CORALOGIX_API_KEY=...
 No interpolation, no quoting shell semantics beyond one layer of matching quotes, no
 `${VAR}` expansion, and no trailing comments — a `#` must be the first non-space
 character. `KEY=` (empty or whitespace-only) counts as **unset**, so a blank template line
-cannot blank a working value. Later duplicates win. An unparseable line is ignored rather
-than failing the file.
+cannot blank a working value. Later duplicates win. A name that is not a plain env
+identifier (for example `my-api-key`) is dropped and **logged with its line number and
+the file path** — a silently ignored key looks exactly like a missing credential at call
+time.
+
+### A bad manifest costs one export, not the tunnel
+
+Manifest-declared credential names and catalog entries are validated one by one, on both
+sides, before anything is published:
+
+- The edge validates every exported tool/MCP before the `hello`: a name that does not
+  match `^[A-Za-z_][A-Za-z0-9_]*$`, an unpublished tool name, an unsupported transport —
+  the affected export is skipped with a `WARNING` naming it and the reason, and every
+  other export stays online.
+- The relay validates the `hello` per entry too, so an edge that still sends something
+  unusable (an older build, a hand-edited frame) loses that entry — logged as
+  `edge hello site=…: not publishing '<name>': <reason>` — while the tunnel and the rest
+  of the catalog stay up.
+
+Only frame-level violations still close the connection (a wrong `proto`, unknown caps, a
+public key whose fingerprint does not match, a frame over the size cap), because there is
+nothing left to salvage.
 
 ### Permissions
 
@@ -385,6 +425,8 @@ browser (central UI)                    edge VM
    `prev_edge_key_fp`). The relay pins them in `/registry/edges/<site>/config`, and the
    configured **declared key names** for every export (`credential_keys`), because the
    relay-published `<site>__<name>` tool configs deliberately omit `secrets`/`variables`.
+   The key is **pending admin approval** until an admin approves the fingerprint (see
+   [Key approval](#key-approval-admin--edges)).
 2. The user opens **Configuration → Edge credentials**, picks a target, and the browser
    encrypts `{"KEY": "VALUE", ...}` to that key. Only `secret_keys` are rendered; the
    `variable_keys` are shown read-only as "configured on the edge". The AAD is
@@ -396,6 +438,48 @@ browser (central UI)                    edge VM
    computes the identity the same way central did, and hands the plaintext only to the
    container env. A failed open is `credential_rejected`; the tool never runs and the blob
    is never retried against a different target.
+
+### Key approval: Admin → Edges
+
+A published key is **not** sealing material until an admin approves its fingerprint. The
+browser encrypts to whatever SPKI central serves, so a key nobody verified (a replaced key
+file, or a site record written by a compromised tunnel) would otherwise receive every
+user's plaintext set.
+
+```text
+edge hello (edge_pubkey, edge_key_fp)
+        │
+        ▼
+site record: edge_key_fp = <new fp>, edge_key_approved = false        ← pending
+        │
+        ▼
+Admin → Edges → Approve key            (records the approver and the timestamp)
+        │
+        ▼
+edge_key_approved_fp = <new fp>, edge_key_approved = true             ← sealing enabled
+```
+
+| Field on `/registry/edges/<site>/config` | Meaning |
+| --- | --- |
+| `edge_key_fp` | the fingerprint the edge currently publishes |
+| `edge_key_approved_fp` | the fingerprint an admin approved |
+| `edge_key_approved` | whether the current fingerprint is that approved one |
+| `edge_key_approved_by` / `_at` | who approved it, and when |
+
+- **Until approval, sealing is off.** The pubkey endpoint answers `409`
+  `key_pending_approval` naming the fingerprint, and Configuration → Edge credentials shows
+  "key fingerprint `<fp>` is pending admin approval; sealing is disabled". Central never
+  serves the SPKI of an unapproved key.
+- **Only sealing is gated.** The edge stays connected: hello, catalog publishing and tool
+  calls are unaffected. Sets already stored keep being forwarded and opened.
+- **A brand-new edge needs one approval.** Its first hello is pending, so approve the key
+  once the site first connects. The relay never approves anything itself: the flag only
+  changes in Admin → Edges.
+- **Rotation.** Publishing a new key keeps `edge_key_approved_fp` on the old one, so the
+  overlap still works: blobs sealed to the old key keep opening and can still be re-sealed
+  to it. The new fingerprint is pending until an admin approves it; only then does the
+  browser start sealing to the new key. Approving a rotated key does not end the overlap —
+  `--drop-old-key` does.
 
 ### `edge-keygen`
 
@@ -426,15 +510,18 @@ bind pins one inode, so the overlap would silently have no previous key.
 trellis-proxy edge-keygen --rotate          # current -> edge-key.old (0600), new key written
 trellis-proxy edge-keygen --show            # the new fingerprint
 docker kill -s HUP trellis-proxy            # reload the pair and republish the hello
+# Admin -> Edges: approve the new fingerprint before anyone seals to it
 # ... the relay re-publishes on the next hello; users re-enter sets sealed to a retired key
 trellis-proxy edge-keygen --drop-old-key    # ends the overlap
 ```
 
 During the overlap the proxy opens with the current key first, then `edge-key.old`; the
-relay records both fingerprints so the UI accepts blobs sealed to either. A blob sealed to
-a key that is neither current nor the retained previous one is inert: central flags the
-record as `retired_key`, the UI asks the user to re-enter the set, and a call that still
-presents it gets `credential_rejected`.
+relay records both fingerprints so the UI accepts blobs sealed to either. The new
+fingerprint is **pending admin approval** (see above), so the approved old key is what the
+browser seals to until an admin approves the new one. A blob sealed to a key that is
+neither current nor the retained previous one is inert: central flags the record as
+`retired_key`, the UI asks the user to re-enter the set, and a call that still presents it
+gets `credential_rejected`.
 
 **Losing the key** (deleted, or rotated away without the old file) means every sealed set
 must be re-entered in the UI. There is no recovery path, by design: central never has the

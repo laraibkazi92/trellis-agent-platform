@@ -160,15 +160,9 @@ class RunnerConsoleBackend(SanitizedLocalBackend):
         root_dir: str | Path | None = None,
         enable_execute: bool = True,
         *,
-        user_id: str | None = None,
-        user_email: str | None = None,
-        run_id: str | None = None,
         client_factory=None,
     ) -> None:
         super().__init__(root_dir=root_dir, enable_execute=enable_execute)
-        self._user_id = user_id
-        self._user_email = user_email
-        self._run_id = run_id
         # Seam for tests; ``RunnerClient`` is imported lazily otherwise so importing
         # the console backend stays cheap.
         self._client_factory = client_factory
@@ -192,12 +186,11 @@ class RunnerConsoleBackend(SanitizedLocalBackend):
     async def _run(self, command: str, timeout: float) -> ExecuteResponse:
         """Send one ``kind="console"`` exec and map it onto the local response shape."""
         from core.agent_token import refresh
-        from core.auth import agent_token_var, user_id_var
+        from core.auth import agent_token_var
         from core.execution.contract import ExecRequest
 
-        # build_agent is user-agnostic, so identity is read per call. Without it a
-        # console container would carry no TRELLIS_USER_* attribution.
-        user_id = self._user_id or user_id_var.get()
+        # No identity in the body: the token carries the caller's user id, email and
+        # run id, and the runner builds TRELLIS_USER_* from its verified claims.
         try:
             client = self._make_client()
             async with client as runner:
@@ -207,10 +200,7 @@ class RunnerConsoleBackend(SanitizedLocalBackend):
                         target="console",
                         command=command,
                         env={},
-                        user_id=user_id,
-                        user_email=self._user_email,
                         agent_token=refresh(agent_token_var.get()),
-                        run_id=self._run_id,
                         deadline_ms=max(1, int(timeout * 1000)),
                     )
                 )

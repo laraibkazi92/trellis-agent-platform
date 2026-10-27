@@ -605,3 +605,91 @@ def test_use_tool_forwards_the_user_principal(monkeypatch):
     assert result == "ok"
     assert seen["principal"] == "user:user-1"
     assert seen["user_id"] == "user-1"
+
+
+# --- use_tool: the minted gateway token carries the caller's identity ---------
+#
+# Identity is minted once, at the run/mint seam, and every downstream hop reads it
+# from the token's claims. The gateway's system token is no exception: it carries the
+# user id, email and groups so the hub/relay/edge can attribute the call without a
+# request body.
+
+GATEWAY_SECRET = "gateway-tool-execution-unit-secret-012345678"
+
+
+def _install_mint_identity(monkeypatch, user_id, record):
+    """Fake the identity-manager read the mint performs, once."""
+    auth.agent_token_var.set(None)
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", GATEWAY_SECRET)
+    # Hermetic: a developer's shell/dev deployment must not turn "no record" into the
+    # DEV_USER_EMAIL fallback.
+    monkeypatch.delenv("DEV_MODE", raising=False)
+    monkeypatch.delenv("DEV_USER_EMAIL", raising=False)
+    seen = []
+
+    def fake_get_user(identity):
+        seen.append(identity)
+        return record
+
+    monkeypatch.setattr(gateway.identity_mgr, "get_user", fake_get_user)
+    return seen
+
+
+def test_use_tool_mints_a_gateway_token_with_the_callers_email_and_groups(monkeypatch):
+    from core import agent_token
+
+    monkeypatch.setattr(
+        gateway.identity_mgr, "get_tool_config",
+        lambda name: {"name": name, "public": True},
+    )
+    seen = _install_mint_identity(
+        monkeypatch, "user-1", {"email": "ops@example.com", "groups": ["ops", "sre", "ops"]}
+    )
+
+    minted = {}
+
+    async def fake_execute(tool_name, arguments, user_id, **kwargs):
+        # Read the contextvar where the run set it (asyncio.run isolates contexts).
+        minted["token"] = auth.agent_token_var.get()
+        return "ok"
+
+    monkeypatch.setattr(gateway, "execute_whitelisted_tool", fake_execute)
+    user_id_var.set("user-1")
+
+    assert asyncio.run(gateway.use_tool(FakeContext(), "opsctl", {"x": 1})) == "ok"
+
+    claims = agent_token.verify(minted["token"])
+    assert claims.agent == "gateway"
+    assert claims.principal == "system"
+    assert claims.user_id == "user-1"
+    assert claims.user_email == "ops@example.com"
+    # Sorted and de-duplicated, exactly as the token claim requires.
+    assert claims.groups == ("ops", "sre")
+    # Resolved ONCE, at mint -- never per call.
+    assert seen == ["user-1"]
+
+
+def test_use_tool_mints_without_email_when_the_record_has_none(monkeypatch):
+    """An unreadable/empty record must not fail the tool call."""
+    from core import agent_token
+
+    monkeypatch.setattr(
+        gateway.identity_mgr, "get_tool_config",
+        lambda name: {"name": name, "public": True},
+    )
+    _install_mint_identity(monkeypatch, "user-1", None)
+
+    minted = {}
+
+    async def fake_execute(tool_name, arguments, user_id, **kwargs):
+        minted["token"] = auth.agent_token_var.get()
+        return "ok"
+
+    monkeypatch.setattr(gateway, "execute_whitelisted_tool", fake_execute)
+    user_id_var.set("user-1")
+
+    assert asyncio.run(gateway.use_tool(FakeContext(), "opsctl", {"x": 1})) == "ok"
+
+    claims = agent_token.verify(minted["token"])
+    assert claims.user_email is None
+    assert claims.groups == ()

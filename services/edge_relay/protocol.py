@@ -170,6 +170,35 @@ def decode(raw: Any, allowed: Iterable[str]) -> Dict[str, Any]:
 
 
 @dataclass(frozen=True)
+class CatalogSkip:
+    """One catalog entry the validator dropped, and why.
+
+    A hello is validated per entry, not as one blob: a single unusable manifest must
+    cost that export, never the tunnel (an edge closed at the handshake redials with
+    the same frame forever, taking every healthy export down with it).
+    """
+
+    name: Optional[str]
+    reason: str
+
+    def describe(self) -> str:
+        return f"{self.name!r}: {self.reason}" if self.name else self.reason
+
+
+class ValidatedCatalog(list):
+    """The entries that passed, plus the per-entry ``CatalogSkip`` errors.
+
+    A plain ``list`` subclass (the ``HelloValidation`` idiom) so every existing
+    unpacking -- ``(tool,) = validate_tools([...])``, ``validate_mcps(...)[0]`` --
+    keeps working; callers that publish a catalog read ``.errors`` and log each one.
+    """
+
+    def __init__(self, entries: Iterable[Any] = (), errors: Iterable[CatalogSkip] = ()) -> None:
+        super().__init__(entries)
+        self.errors: List[CatalogSkip] = list(errors)
+
+
+@dataclass(frozen=True)
 class EdgeCredentials:
     """The credential key material an edge publishes in ``hello``.
 
@@ -205,10 +234,11 @@ class EdgeCredentials:
 
 
 class HelloValidation(tuple):
-    """The v0.5 five-tuple, plus ``credentials`` on the side.
+    """The v0.5 five-tuple, plus ``credentials`` and the per-entry ``errors``.
 
     Existing unpackers (``proto, version, tools, mcps, caps = ...``) keep working
-    unchanged; the relay reads the new material from ``.credentials``.
+    unchanged; the relay reads the new material from ``.credentials`` and logs every
+    entry it had to skip from ``.errors``.
     """
 
     def __new__(
@@ -219,9 +249,11 @@ class HelloValidation(tuple):
         mcps: List[EdgeMcp],
         caps: List[str],
         credentials: EdgeCredentials,
+        errors: Iterable[CatalogSkip] = (),
     ) -> "HelloValidation":
         instance = super().__new__(cls, (proto, version, tools, mcps, caps))
         instance.credentials = credentials
+        instance.errors: List[CatalogSkip] = list(errors)
         return instance
 
 
@@ -254,6 +286,10 @@ def _validate_fingerprint(raw: Any, field_name: str) -> str:
 
 
 def _validate_key_list(raw: Any, field_name: str) -> List[str]:
+    if raw is None:
+        # An export that declares only secrets (or only variables) omits the other
+        # half; that is not an error.
+        return []
     if not isinstance(raw, list):
         raise ProtocolError(f"hello.credential_keys[].{field_name} must be a list")
     if len(raw) > MAX_DECLARED_KEYS:
@@ -278,10 +314,18 @@ def _validate_key_list(raw: Any, field_name: str) -> List[str]:
     return names
 
 
-def _validate_credential_keys(raw: Any) -> Dict[str, Dict[str, List[str]]]:
-    """Names only: every entry must be ``{secret_keys: [...], variable_keys: [...]}``."""
+def _validate_credential_keys(
+    raw: Any,
+) -> Tuple[Dict[str, Dict[str, List[str]]], List[CatalogSkip]]:
+    """Names only: every entry must be ``{secret_keys: [...], variable_keys: [...]}``.
+
+    Per target, not per hello: a manifest that declares a key an edge cannot export
+    (the key name is the operator's, and a hyphen in it is an easy mistake) costs that
+    target's seal form, never the tunnel. Each dropped target is reported so the relay
+    can log the name and the reason.
+    """
     if raw in (None, {}):
-        return {}
+        return {}, []
     if not isinstance(raw, dict):
         raise ProtocolError("hello.credential_keys must be an object")
     if len(raw) > MAX_CREDENTIAL_TARGETS:
@@ -289,47 +333,57 @@ def _validate_credential_keys(raw: Any) -> Dict[str, Dict[str, List[str]]]:
             f"hello.credential_keys exceeds {MAX_CREDENTIAL_TARGETS} targets"
         )
     cleaned: Dict[str, Dict[str, List[str]]] = {}
+    skips: List[CatalogSkip] = []
     for name, entry in raw.items():
         if not isinstance(name, str) or not NAME_RE.match(name):
             raise ProtocolError(f"invalid hello.credential_keys target: {name!r}")
         _check_namespace(name, "credential_keys target")
+
+        def _drop(reason: str) -> None:
+            skips.append(CatalogSkip(name, reason))
+
         if not isinstance(entry, dict):
-            raise ProtocolError(
-                f"hello.credential_keys[{name!r}] must be an object"
-            )
+            _drop("credential_keys entry must be an object")
+            continue
         unknown = set(entry) - {"secret_keys", "variable_keys"}
         if unknown:
-            raise ProtocolError(
-                f"hello.credential_keys[{name!r}] has unknown key(s): "
-                f"{', '.join(sorted(map(str, unknown)))}"
-            )
-        secret = _validate_key_list(entry.get("secret_keys"), "secret_keys")
-        variable = _validate_key_list(entry.get("variable_keys"), "variable_keys")
+            _drop(f"unknown key(s): {', '.join(sorted(map(str, unknown)))}")
+            continue
+        try:
+            secret = _validate_key_list(entry.get("secret_keys"), "secret_keys")
+            variable = _validate_key_list(entry.get("variable_keys"), "variable_keys")
+        except ProtocolError as exc:
+            _drop(str(exc))
+            continue
         # A name in both lists is ambiguous; the write gate treats it as a variable,
         # so the edge must not advertise it as a sealable secret.
         overlap = sorted(set(secret) & set(variable))
         if overlap:
-            raise ProtocolError(
-                f"hello.credential_keys[{name!r}] lists {overlap[0]!r} as both a "
-                "secret and a variable"
-            )
+            _drop(f"lists {overlap[0]!r} as both a secret and a variable")
+            continue
         cleaned[name] = {
             "secret_keys": sorted(secret),
             "variable_keys": sorted(variable),
         }
-    return cleaned
+    return cleaned, skips
 
 
-def _validate_edge_credentials(frame: Dict[str, Any]) -> EdgeCredentials:
-    """Parse the optional key/credential block; a v0.5 edge has none of it."""
+def _validate_edge_credentials(
+    frame: Dict[str, Any],
+) -> Tuple[EdgeCredentials, List[CatalogSkip]]:
+    """Parse the optional key/credential block; a v0.5 edge has none of it.
+
+    The key/fingerprint half stays fatal (bad public material must never be pinned in
+    the registry); the per-export declared-key half is per target.
+    """
     raw_keys = frame.get("credential_keys")
-    credential_keys = _validate_credential_keys(raw_keys)
+    credential_keys, skips = _validate_credential_keys(raw_keys)
 
     pubkey = frame.get("edge_pubkey")
     fingerprint = frame.get("edge_key_fp")
     previous = frame.get("prev_edge_key_fp")
     if pubkey is None and fingerprint is None and previous is None:
-        return EdgeCredentials(credential_keys=credential_keys)
+        return EdgeCredentials(credential_keys=credential_keys), skips
 
     if pubkey is None or fingerprint is None:
         raise ProtocolError(
@@ -344,11 +398,14 @@ def _validate_edge_credentials(frame: Dict[str, Any]) -> EdgeCredentials:
         prev_fp = _validate_fingerprint(previous, "prev_edge_key_fp")
         if hmac.compare_digest(prev_fp.encode("utf-8"), fp.encode("utf-8")):
             raise ProtocolError("hello.prev_edge_key_fp must differ from edge_key_fp")
-    return EdgeCredentials(
-        edge_pubkey=pubkey,
-        edge_key_fp=fp,
-        prev_edge_key_fp=prev_fp,
-        credential_keys=credential_keys,
+    return (
+        EdgeCredentials(
+            edge_pubkey=pubkey,
+            edge_key_fp=fp,
+            prev_edge_key_fp=prev_fp,
+            credential_keys=credential_keys,
+        ),
+        skips,
     )
 
 
@@ -391,52 +448,76 @@ def _validate_inputs(raw: Any) -> Dict[str, Any]:
     return cleaned
 
 
-def validate_tools(raw_tools: Any, *, lazy_catalog: bool = False) -> List[EdgeTool]:
+def validate_tools(raw_tools: Any, *, lazy_catalog: bool = False) -> ValidatedCatalog:
     """Validate a published catalog. Names must be unique and namespace-safe.
 
     With the ``lazy_catalog`` capability an entry is a *summary*: ``inputs`` is
     deferred to a ``tool_detail`` round trip, and the description is capped at
     ``MAX_TOOL_SUMMARY_CHARS`` (refused, not truncated -- a hello that silently
     lost half of a description would publish a catalog the operator never wrote).
+
+    Validation is **per entry**: an unusable tool is dropped with a ``CatalogSkip``
+    naming it and the reason, and the remaining exports are published. Only a
+    frame-level violation (not a list, or more entries than ``MAX_TOOLS``) refuses
+    the whole hello, because then there is no catalog to salvage.
     """
     if raw_tools in (None, []):
-        return []
+        return ValidatedCatalog()
     if not isinstance(raw_tools, list):
         raise ProtocolError("hello.tools must be a list")
     if len(raw_tools) > MAX_TOOLS:
         raise ProtocolError(f"catalog exceeds {MAX_TOOLS} tools")
 
     tools: List[EdgeTool] = []
+    skips: List[CatalogSkip] = []
     seen = set()
     for raw in raw_tools:
         if not isinstance(raw, dict):
-            raise ProtocolError("tool entries must be objects")
+            skips.append(CatalogSkip(None, "tool entries must be objects"))
+            continue
         name = raw.get("name")
+        label = name if isinstance(name, str) and name else None
         if not isinstance(name, str) or not NAME_RE.match(name):
-            raise ProtocolError(f"invalid tool name: {name!r}")
-        _check_namespace(name, "tool name")
+            skips.append(CatalogSkip(label, f"invalid tool name: {name!r}"))
+            continue
+        if "__" in name:
+            skips.append(
+                CatalogSkip(name, f"tool name may not contain '__': {name!r}")
+            )
+            continue
         if name in seen:
-            raise ProtocolError(f"duplicate tool name: {name}")
-        seen.add(name)
+            skips.append(CatalogSkip(name, f"duplicate tool name: {name}"))
+            continue
         description = raw.get("description") or ""
         if not isinstance(description, str):
-            raise ProtocolError(f"tool {name!r} description must be a string")
-        if lazy_catalog and len(description) > MAX_TOOL_SUMMARY_CHARS:
-            raise ProtocolError(
-                f"tool {name!r} description is {len(description)} chars; a "
-                f"lazy_catalog hello carries at most {MAX_TOOL_SUMMARY_CHARS} "
-                "per tool"
+            skips.append(
+                CatalogSkip(name, f"tool {name!r} description must be a string")
             )
+            continue
+        if lazy_catalog and len(description) > MAX_TOOL_SUMMARY_CHARS:
+            skips.append(
+                CatalogSkip(
+                    name,
+                    f"tool {name!r} description is {len(description)} chars; a "
+                    f"lazy_catalog hello carries at most {MAX_TOOL_SUMMARY_CHARS} "
+                    "per tool",
+                )
+            )
+            continue
         if not lazy_catalog:
             description = description[:2000]
+        try:
+            inputs = _validate_inputs(raw.get("inputs"))
+        except ProtocolError as exc:
+            skips.append(CatalogSkip(name, str(exc)))
+            continue
+        # Only a published entry reserves its name: a malformed first entry must not
+        # shadow a valid later one with the same name.
+        seen.add(name)
         tools.append(
-            EdgeTool(
-                name=name,
-                description=description,
-                inputs=_validate_inputs(raw.get("inputs")),
-            )
+            EdgeTool(name=name, description=description, inputs=inputs)
         )
-    return tools
+    return ValidatedCatalog(tools, skips)
 
 
 def validate_tool_detail(entry: Dict[str, Any]) -> EdgeTool:
@@ -543,10 +624,12 @@ def _validate_mcp_tools(server: str, raw_tools: Any) -> List[EdgeMcpTool]:
         _check_namespace(name, "mcp tool name")
         if name in seen:
             raise ProtocolError(f"duplicate mcp tool name: {name}")
-        seen.add(name)
         description = raw.get("description") or ""
         if not isinstance(description, str):
             raise ProtocolError(f"mcp tool {name!r} description must be a string")
+        # Only an entry that survives every check reserves its name (same rule as
+        # ``validate_tools``): a malformed first entry must not mask a valid later one.
+        seen.add(name)
         tools.append(
             EdgeMcpTool(
                 name=name,
@@ -587,42 +670,55 @@ def validate_mcp_tool_detail(entry: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def validate_mcps(raw_mcps: Any) -> List[EdgeMcp]:
-    """Validate an edge's MCP catalog. Names must be unique and namespace-safe."""
+def validate_mcps(raw_mcps: Any) -> ValidatedCatalog:
+    """Validate an edge's MCP catalog. Names must be unique and namespace-safe.
+
+    Per server, like ``validate_tools``: one unreadable or unsafe server is dropped
+    with its reason and the rest are published.
+    """
     if raw_mcps in (None, []):
-        return []
+        return ValidatedCatalog()
     if not isinstance(raw_mcps, list):
         raise ProtocolError("hello.mcps must be a list")
     if len(raw_mcps) > MAX_MCPS:
         raise ProtocolError(f"hello.mcps exceeds {MAX_MCPS} servers")
 
     mcps: List[EdgeMcp] = []
+    skips: List[CatalogSkip] = []
     seen = set()
     for raw in raw_mcps:
         if not isinstance(raw, dict):
-            raise ProtocolError("mcp entries must be objects")
+            skips.append(CatalogSkip(None, "mcp entries must be objects"))
+            continue
         name = raw.get("name")
+        label = name if isinstance(name, str) and name else None
         if not isinstance(name, str) or not NAME_RE.match(name):
-            raise ProtocolError(f"invalid mcp name: {name!r}")
-        _check_namespace(name, "mcp name")
+            skips.append(CatalogSkip(label, f"invalid mcp name: {name!r}"))
+            continue
+        if "__" in name:
+            skips.append(CatalogSkip(name, f"mcp name may not contain '__': {name!r}"))
+            continue
         if name in seen:
-            raise ProtocolError(f"duplicate mcp name: {name}")
-        seen.add(name)
+            skips.append(CatalogSkip(name, f"duplicate mcp name: {name}"))
+            continue
         transport = raw.get("transport", "stdio")
         if transport is None:
             transport = "stdio"
         if transport not in SUPPORTED_MCP_TRANSPORTS:
-            raise ProtocolError(
-                f"mcp {name!r} has unsupported transport {transport!r}"
+            skips.append(
+                CatalogSkip(name, f"mcp {name!r} has unsupported transport {transport!r}")
             )
-        mcps.append(
-            EdgeMcp(
-                name=name,
-                transport=transport,
-                tools=_validate_mcp_tools(name, raw.get("tools")),
-            )
-        )
-    return mcps
+            continue
+        try:
+            tools = _validate_mcp_tools(name, raw.get("tools"))
+        except ProtocolError as exc:
+            skips.append(CatalogSkip(name, str(exc)))
+            continue
+        # As in ``validate_tools``: only a published server reserves its name, so a
+        # malformed first entry cannot shadow a valid later one with the same name.
+        seen.add(name)
+        mcps.append(EdgeMcp(name=name, transport=transport, tools=tools))
+    return ValidatedCatalog(mcps, skips)
 
 
 def _validate_caps(raw: Any) -> List[str]:
@@ -662,6 +758,12 @@ def validate_hello(
     no ``inputSchema``. Both omissions are legal in a full hello too -- an MCP
     server with no declared schema publishes ``{}`` -- so the cap only tightens the
     tool description. Without the cap the frame is validated exactly as before.
+
+    Entries are validated one by one: an unusable tool/MCP/credential target is
+    dropped and reported on ``.errors`` (``CatalogSkip``) instead of refusing the
+    hello, so one bad manifest costs that export and nothing else. The frame-level
+    rules (proto, caps, an MCP catalog without the ``mcp`` capability, the key
+    material) are still fatal.
     """
     proto = frame.get("proto")
     # bool is an int subclass: a JSON ``true`` must not read as proto 1.
@@ -682,15 +784,45 @@ def validate_hello(
         # An edge that publishes catalogs it did not claim is not understood by
         # this relay; refusing beats silently dropping them.
         raise ProtocolError("hello.mcps requires the 'mcp' capability")
-    mcps = validate_mcps(raw_mcps) if "mcp" in caps else []
+    mcps = validate_mcps(raw_mcps) if "mcp" in caps else ValidatedCatalog()
+    credentials, credential_skips = _validate_edge_credentials(frame)
+    tools = validate_tools(frame.get("tools"), lazy_catalog="lazy_catalog" in caps)
     return HelloValidation(
         proto,
         version[:64],
-        validate_tools(frame.get("tools"), lazy_catalog="lazy_catalog" in caps),
+        tools,
         mcps,
         caps,
-        _validate_edge_credentials(frame),
+        credentials,
+        errors=[*getattr(tools, "errors", ()), *getattr(mcps, "errors", ()), *credential_skips],
     )
+
+
+def validate_identity(
+    user: Any, user_email: Any
+) -> Tuple[Optional[str], Optional[str]]:
+    """Validate one frame's caller identity, returning ``(user, user_email)``.
+
+    The identity is **derived**, never supplied: the relay builds it from the verified
+    agent token's claims (``u``/``e``) and the edge trusts it over the authenticated
+    tunnel. Checked on both ends because the email is forwarded verbatim into the
+    edge's tool environment, so a newline or NUL must not get in -- and checked at the
+    relay *before* the frame is sent, because the edge reports a bad value as a
+    tool_error rather than the 400 this path promises.
+    """
+    if user is not None and not isinstance(user, str):
+        raise ProtocolError("call.user must be a string or null")
+
+    if user_email is not None:
+        if not isinstance(user_email, str):
+            raise ProtocolError("call.user_email must be a string or null")
+        if len(user_email) > MAX_USER_EMAIL_CHARS:
+            raise ProtocolError(
+                f"call.user_email exceeds {MAX_USER_EMAIL_CHARS} characters"
+            )
+        if any(ord(char) < 32 for char in user_email):
+            raise ProtocolError("call.user_email must not contain control characters")
+    return user, user_email
 
 
 def validate_call(frame: Dict[str, Any]) -> Dict[str, Any]:
@@ -728,26 +860,14 @@ def validate_call(frame: Dict[str, Any]) -> Dict[str, Any]:
         raise ProtocolError("call.deadline_ms must be an integer")
     deadline = max(1_000, min(deadline, MAX_DEADLINE_MS))
 
-    user = frame.get("user")
-    if user is not None and not isinstance(user, str):
-        raise ProtocolError("call.user must be a string or null")
+    # Caller identity, derived by the relay from the verified agent token's claims
+    # (``u``/``e``) and never taken from a request body. The edge trusts it over the
+    # authenticated tunnel and does not re-verify any token.
+    user, user_email = validate_identity(frame.get("user"), frame.get("user_email"))
 
-    user_email = frame.get("user_email")
-    if user_email is not None:
-        if not isinstance(user_email, str):
-            raise ProtocolError("call.user_email must be a string or null")
-        if len(user_email) > MAX_USER_EMAIL_CHARS:
-            raise ProtocolError(
-                f"call.user_email exceeds {MAX_USER_EMAIL_CHARS} characters"
-            )
-        # The email is forwarded verbatim to the edge's tool subprocess, so a
-        # newline or NUL must not get in.
-        if any(ord(char) < 32 for char in user_email):
-            raise ProtocolError("call.user_email must not contain control characters")
-
-    # The agent token is opaque to this module: it is verified by the relay and the
-    # edge, never parsed here. Only its shape is checked, because it crosses the
-    # tunnel verbatim.
+    # The agent token is opaque to this module and to the edge: the relay verifies it
+    # (the only verifier in this path) and forwards it for the runner. Only its shape
+    # is checked, because it crosses the tunnel verbatim.
     agent_token = frame.get("agent_token")
     if agent_token is not None:
         if not isinstance(agent_token, str):

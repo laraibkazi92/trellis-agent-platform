@@ -5,12 +5,15 @@
 
 Traffic that reaches ``hub.run_tool`` without going through ``use_tool`` or a bound-tool
 wrapper now carries a principal: the hub verifies the ``__agent_token`` on the request
-(the one the framework already forwards), falls back to ``__user_id``, and asks the
-shared evaluator under ``hub_call_mode`` / ``surface="hub_direct"`` before executing.
+(the one the framework already forwards), takes the caller's identity from its claims,
+and asks the shared evaluator under ``hub_call_mode`` / ``surface="hub_direct"`` before
+executing. ``__user_id`` is only the no-token (``ENFORCE_AGENT_TOKENS=off``) dev
+fallback: it is never consulted once a token verifies.
 
 Every test is hermetic: the authz registry is faked (``tests/_hub_authz_registry.py``),
 the local/remote dispatch seams are recorded instead of executed, and the agent-token
-gate is pinned ``off`` -- this file is about the second gate, not the first.
+gate is pinned ``off`` except where a test pins another mode -- the default here is the
+second gate, not the first.
 """
 
 import asyncio
@@ -98,8 +101,14 @@ def executions(monkeypatch):
         ran.append({"tool": config.name, "arguments": dict(arguments), "user_id": user_id})
         return {"ok": True}
 
-    async def fake_remote(config, arguments, user_id, *, agent_token=None, claims=None):
-        ran.append({"tool": config.name, "arguments": dict(arguments), "user_id": user_id})
+    async def fake_remote(config, arguments, *, agent_token=None, claims=None):
+        ran.append(
+            {
+                "tool": config.name,
+                "arguments": dict(arguments),
+                "user_id": claims.user_id if claims is not None else None,
+            }
+        )
         return {"ok": True}
 
     monkeypatch.setattr(hub, "_run_tool_attempt", fake_local)
@@ -329,8 +338,68 @@ def test_gateway_token_without_a_user_is_an_agent_principal(executions, registry
     assert entry["principal"] == "agent:gateway"
 
 
-def test_malformed_token_is_not_a_call_failure(executions, registry, caplog):
-    """A bad token must cost the call its claims, never crash the call."""
+# --- caller groups: the token claim, else the stored record ------------------
+
+
+def group_rule(**kwargs):
+    """A policy that allows ``opsctl`` only to ``group:ops``."""
+    return {
+        "default_action": "deny",
+        "rules": [
+            {
+                "tools": ["opsctl"],
+                "allow_principals": ["group:ops"],
+                "scopes": ["tools:call"],
+            }
+        ],
+        **kwargs,
+    }
+
+
+def test_token_groups_win_over_the_stored_record(monkeypatch, executions, registry):
+    """Mint-time groups are the authority: no record read, and the claim wins.
+
+    The record below disagrees on purpose (a stale/demoted profile). A token-bearing
+    call must not re-read it at the last mile, and the fresh claim must decide.
+    """
+    fake = registry(
+        policy=group_rule(), hub_mode="enforcing", users={"alice": {"groups": ["other"]}}
+    )
+    reads = []
+    monkeypatch.setattr(
+        fake, "get_user", lambda user_id: reads.append(user_id) or {"groups": ["other"]}
+    )
+    token = agent_token.mint("supervisor", user_id="alice", groups=("ops",))
+
+    assert call({"__agent_token": token}) == {"ok": True}
+
+    assert len(executions) == 1
+    assert fake.denies == []
+    assert reads == []
+
+
+def test_a_token_without_groups_falls_back_to_the_stored_record(executions, registry):
+    """A pre-groups token (or a group-less identity) still matches on the record."""
+    fake = registry(
+        policy=group_rule(), hub_mode="enforcing", users={"alice": {"groups": ["ops"]}}
+    )
+
+    assert call({"__agent_token": mint("supervisor", "alice")}) == {"ok": True}
+
+    assert len(executions) == 1
+    assert fake.denies == []
+
+
+def test_malformed_token_is_not_a_call_failure(monkeypatch, executions, registry, caplog):
+    """A bad token must cost the call its claims, never crash the call.
+
+    It also costs it the identity the body asserted: a forged or broken token cannot
+    borrow the `__user_id` that came with it, so the principal is `anonymous`.
+    """
+    # `log` rather than the file's usual `off`: with the gate off nothing is verified
+    # and the body value is legitimately the caller; this test is about a token that
+    # was presented and did not verify.
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "log")
     fake = registry(policy=DENY_ALL, hub_mode="enforcing")
 
     with caplog.at_level(logging.DEBUG, logger="core.hub"):
@@ -338,15 +407,31 @@ def test_malformed_token_is_not_a_call_failure(executions, registry, caplog):
 
     assert result == {"error": DENIED.format(name="opsctl")}
     [entry] = fake.denies
-    assert entry["principal"] == "user:alice"
+    assert entry["principal"] == "anonymous"
     assert "did not verify" in caplog.text
 
 
-def test_expired_token_falls_back_to_the_user_id(executions, registry):
+def test_expired_token_does_not_fall_back_to_the_user_id(monkeypatch, executions, registry):
+    """An expired token carries no identity, and the body's claim to one is ignored."""
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "log")
     fake = registry(policy=DENY_ALL, hub_mode="enforcing")
     expired = mint("supervisor", "alice", now=time.time() - 100_000)
 
     call({"__agent_token": expired, "__user_id": "alice"})
+
+    [entry] = fake.denies
+    assert entry["principal"] == "anonymous"
+
+
+def test_off_mode_keeps_the_user_id_as_the_dev_fallback(executions, registry):
+    """With the agent-token gate off nothing is verified, so `__user_id` stands.
+
+    It is the documented dev/rollout fallback; it is never consulted once a token
+    verifies (see the malformed/expired cases above).
+    """
+    fake = registry(policy=DENY_ALL, hub_mode="enforcing")
+
+    call({"__user_id": "alice"})
 
     [entry] = fake.denies
     assert entry["principal"] == "user:alice"

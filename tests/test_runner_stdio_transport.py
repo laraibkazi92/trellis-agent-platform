@@ -14,6 +14,7 @@ import json
 import struct
 
 import mcp_types as types
+import pytest
 from fastmcp.client.transports.base import TransportOptions
 from mcp.shared.message import SessionMessage
 
@@ -97,7 +98,6 @@ def _transport(client: FakeRunnerClient, **overrides) -> RunnerStdioTransport:
         session_key=SESSION_KEY,
         env={"MCP_TOKEN": "s3cret"},
         manifest_digest=DIGEST,
-        agent="demo-assistant",
         client_factory=lambda: client,
     )
     kwargs.update(overrides)
@@ -137,8 +137,18 @@ def test_initialize_round_trip_with_a_split_frame_header():
     assert request.session_key == SESSION_KEY
     assert request.manifest_digest == DIGEST
     assert request.env == {"MCP_TOKEN": "s3cret"}
-    assert request.agent == "demo-assistant"
     assert request.deadline_ms == 3_600_000
+    # No identity in the body (v0.7.1 Phase 2): the runner derives the agent, user,
+    # email and groups from the token's claims.
+    assert set(request.model_dump()) == {
+        "kind",
+        "target",
+        "manifest_digest",
+        "session_key",
+        "env",
+        "deadline_ms",
+        "agent_token",
+    }
 
     # Newline-delimited JSON-RPC, exactly as a local stdio server would see it.
     assert len(client.stdin) == 1
@@ -248,6 +258,17 @@ def test_stderr_frames_never_reach_the_session():
 
     assert isinstance(message, SessionMessage)
     assert message.message.id == 3
+
+
+def test_identity_keywords_are_gone_not_merely_ignored():
+    """v0.7.1 Phase 2 took them out of the signature: identity is token-only."""
+    with pytest.raises(TypeError):
+        RunnerStdioTransport(
+            target="stateful",
+            session_key=SESSION_KEY,
+            env={},
+            user_id="user-1",
+        )
 
 
 def test_parse_frames_tolerates_partial_headers_and_payloads():

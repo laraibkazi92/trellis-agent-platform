@@ -589,7 +589,9 @@ async def run_background_script(
     token = user_id_var.set(user_id)
     task_id = context.message.task_id if (context and context.message) else "unknown"
     # Background runs act as `svc_agent_<name>`; the token carries the agent name so
-    # every enforcement point maps it back to the agent record.
+    # every enforcement point maps it back to the agent record. Service identity: NO
+    # email and NO groups, deliberately -- a background run must not inherit the
+    # groups of the user who triggered it (the fail-closed contract for workflows).
     mint_for_run(agent_name, user_id, run_id=task_id)
     try:
         identity_mgr = get_identity_manager()
@@ -786,7 +788,8 @@ async def run_background_agent(
     t0 = time.monotonic()
     config_data: Optional[Dict] = None
     # Background runs act as `svc_agent_<name>`; the token carries the agent name so
-    # every enforcement point maps it back to the agent record.
+    # every enforcement point maps it back to the agent record. Service identity: NO
+    # email and NO groups, deliberately (see run_background_script).
     mint_for_run(agent_name, user_id, run_id=task_id)
     try:
         identity_mgr = get_identity_manager()

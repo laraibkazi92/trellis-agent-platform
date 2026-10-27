@@ -159,10 +159,45 @@
                         {% if edge.edge_key_id %}
                         <span class="font-mono text-[10px] font-bold border border-neutral-200 dark:border-neutral-700 text-neutral-500 dark:text-neutral-400 px-1.5 py-0.5 uppercase tracking-widest">id {{ edge.edge_key_id }}</span>
                         {% endif %}
+                        {% if edge.edge_key_approved %}
+                        <span class="font-mono text-[10px] font-bold border border-emerald-300 text-emerald-600 dark:border-emerald-800/30 dark:text-emerald-400 px-1.5 py-0.5 uppercase tracking-widest bg-emerald-50 dark:bg-emerald-900/10">Approved</span>
+                        {% elif edge.edge_key_pending_fp %}
+                        <span class="font-mono text-[10px] font-bold border border-amber-500/50 text-amber-700 dark:text-amber-300 px-1.5 py-0.5 uppercase tracking-widest">Pending approval</span>
+                        {% endif %}
                     </div>
                     <p class="font-mono text-[10px] text-neutral-500 dark:text-neutral-400">
                         Last rotation: {{ edge.edge_key_rotated_at or '—' }}
                     </p>
+                    {% if edge.edge_key_approved %}
+                    <p class="font-mono text-[10px] text-neutral-500 dark:text-neutral-400">
+                        Approved by {{ edge.edge_key_approved_by or '—' }}{% if edge.edge_key_approved_at %} at {{ edge.edge_key_approved_at }}{% endif %}.
+                        Users can seal credentials to this key.
+                    </p>
+                    {% elif edge.edge_key_pending_fp %}
+                    <div class="border border-amber-500/40 bg-amber-50 dark:bg-amber-950/20 px-2.5 py-2 space-y-2">
+                        <p class="font-mono text-[10px] text-amber-700 dark:text-amber-300">
+                            Sealing is disabled: fingerprint
+                            <code class="break-all">{{ edge.edge_key_pending_fp }}</code>
+                            is waiting for approval.
+                            {% if edge.edge_key_approved_fp %}
+                            Still trusted: the previously approved key
+                            <code class="break-all">{{ edge.edge_key_approved_fp }}</code>
+                            &mdash; blobs sealed to it keep working during the rotation overlap.
+                            {% endif %}
+                        </p>
+                        <form action="/admin/edges/{{ edge.name }}/approve-key" method="POST"
+                              onsubmit="return confirm('Approve credential key {{ edge.edge_key_pending_fp }}? Sealing is enabled for this edge once approved.');">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                            <button type="submit" class="border border-amber-400 text-amber-700 dark:border-amber-700 dark:text-amber-400 hover:bg-amber-500 hover:text-white dark:hover:bg-amber-600/20 font-mono font-bold text-xs uppercase tracking-widest px-4 py-2 transition-colors">
+                                Approve key
+                            </button>
+                        </form>
+                    </div>
+                    {% elif edge.edge_key_approved_fp %}
+                    <p class="font-mono text-[10px] text-neutral-500 dark:text-neutral-400">
+                        Previously approved key: <code class="break-all">{{ edge.edge_key_approved_fp }}</code>
+                    </p>
+                    {% endif %}
                     {% if edge.retired_credentials %}
                     <div class="flex items-start gap-2 border border-amber-500/40 bg-amber-50 dark:bg-amber-950/20 px-2.5 py-1.5">
                         <span class="text-amber-600 dark:text-amber-400 shrink-0"><i data-lucide="triangle-alert" class="w-3.5 h-3.5"></i></span>

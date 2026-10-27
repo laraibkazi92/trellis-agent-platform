@@ -110,27 +110,6 @@ def strip_framework_names(
     return env
 
 
-def scoped_env_for(
-    config: Any,
-    *,
-    passthrough: bool = False,
-    token_env: Optional[str] = None,
-) -> Dict[str, str]:
-    """The scoped environment for one ``tool.yaml``/``mcp.yaml`` manifest.
-
-    Single home for the rule ``core.proxy.build_env`` (tools) and the MCP session
-    builder both need: the manifest's declared keys only, with **both** token names
-    stripped -- a mid-migration host can carry a valid token under the default
-    variable while ``token_env`` already points at another, so removing just the
-    configured one would leak the other to every child process.
-    """
-    return scoped_env(
-        declared_keys_for(config),
-        passthrough=passthrough,
-        secret_env_names={DEFAULT_TOKEN_ENV, token_env or DEFAULT_TOKEN_ENV},
-    )
-
-
 def declared_keys_for(config: Any) -> set[str]:
     """Every env name a ``tool.yaml``/``mcp.yaml`` declares it needs.
 

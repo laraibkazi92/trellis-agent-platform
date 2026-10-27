@@ -117,10 +117,7 @@ def test_container_call_sends_declared_env_digest_deadline_and_target(tmp_path, 
             "NOT_DECLARED": "smuggled",
             "PATH": "/usr/bin",
         },
-        agent="demo-assistant",
-        user_id="user-1",
-        user_email="u@example.com",
-        run_id="run-1",
+        agent_token="t1.the.run.token",
     )
 
     assert result == {"count": 3}
@@ -133,10 +130,12 @@ def test_container_call_sends_declared_env_digest_deadline_and_target(tmp_path, 
     assert request.manifest_digest == manifest_digest(config)
     assert request.deadline_ms == 5000
     assert request.input == json.dumps({"q": "x"})
-    assert request.agent == "demo-assistant"
-    assert request.user_id == "user-1"
-    assert request.user_email == "u@example.com"
-    assert request.run_id == "run-1"
+    # The body carries no identity (v0.7.1 Phase 2): the runner derives it from
+    # the token's claims. TRELLIS_USER_* still reach the tool through the declared
+    # env above.
+    for field in ("agent", "user_id", "user_email", "run_id"):
+        assert field not in request.model_dump(), field
+    assert request.agent_token == "t1.the.run.token"
     # Declared keys only; the runner re-sanitizes the base environment itself.
     assert request.env == {
         "API_KEY": "a",

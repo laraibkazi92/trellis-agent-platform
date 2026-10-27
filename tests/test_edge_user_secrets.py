@@ -225,7 +225,8 @@ def test_shared_mode_prefers_the_file_over_the_process_env(tmp_path, monkeypatch
     assert resolved == {"DEVOPS_PASSWORD": SECRET_VALUE}
 
 
-def test_shared_mode_falls_back_to_the_process_env_per_key(tmp_path, monkeypatch):
+def test_a_declared_secret_never_comes_from_the_process_env(tmp_path, monkeypatch):
+    """v0.7.1: the shared file is the only non-sealed secret source."""
     monkeypatch.setenv("DEVOPS_PASSWORD", PROCESS_VALUE)
     store = make_store(tmp_path)
     write_shared(store, CORALOGIX_DOMAIN="corp.example")
@@ -237,7 +238,23 @@ def test_shared_mode_falls_back_to_the_process_env_per_key(tmp_path, monkeypatch
         site="dc1",
     )
 
-    assert resolved == {"DEVOPS_PASSWORD": PROCESS_VALUE, "CORALOGIX_DOMAIN": "corp.example"}
+    # The secret is absent (not the process value); the variable still resolves.
+    assert resolved == {"CORALOGIX_DOMAIN": "corp.example"}
+
+
+def test_a_declared_variable_still_comes_from_the_process_env(tmp_path, monkeypatch):
+    """Endpoints are edge configuration, not per-user material: the env layer stays."""
+    monkeypatch.setenv("CORALOGIX_DOMAIN", "from-the-container")
+    store = make_store(tmp_path)
+
+    resolved = store.resolve(
+        tool_config(variables=["CORALOGIX_DOMAIN"]),
+        name="devops",
+        email="ops@example.com",
+        site="dc1",
+    )
+
+    assert resolved == {"CORALOGIX_DOMAIN": "from-the-container"}
 
 
 def test_shared_mode_with_no_file_and_no_env_returns_nothing(tmp_path):
@@ -248,7 +265,8 @@ def test_shared_mode_with_no_file_and_no_env_returns_nothing(tmp_path):
     ) == {}
 
 
-def test_an_empty_shared_file_value_does_not_mask_the_process_env(tmp_path, monkeypatch):
+def test_an_empty_shared_file_value_leaves_the_secret_unset(tmp_path, monkeypatch):
+    """A blank file value is "unset" -- and there is no process-env layer behind it."""
     monkeypatch.setenv("DEVOPS_PASSWORD", PROCESS_VALUE)
     store = make_store(tmp_path)
     shared = store.shared_file("devops")
@@ -262,7 +280,26 @@ def test_an_empty_shared_file_value_does_not_mask_the_process_env(tmp_path, monk
         site="dc1",
     )
 
-    assert resolved == {"DEVOPS_PASSWORD": PROCESS_VALUE}
+    assert resolved == {}
+
+
+def test_an_empty_shared_file_value_does_not_mask_a_variables_process_env(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CORALOGIX_DOMAIN", "from-the-container")
+    store = make_store(tmp_path)
+    shared = store.shared_file("devops")
+    shared.parent.mkdir(parents=True, exist_ok=True)
+    shared.write_text("CORALOGIX_DOMAIN=   \n", encoding="utf-8")
+
+    resolved = store.resolve(
+        tool_config(variables=["CORALOGIX_DOMAIN"]),
+        name="devops",
+        email="ops@example.com",
+        site="dc1",
+    )
+
+    assert resolved == {"CORALOGIX_DOMAIN": "from-the-container"}
 
 
 # ---------------------------------------------------------------- sealed sets
@@ -464,19 +501,35 @@ def test_an_unsafe_manifest_name_cannot_escape_the_secrets_dir(tmp_path, caplog)
     assert "invalid credential file name" in caplog.text
 
 
-def test_a_legacy_user_secrets_directory_warns_once(tmp_path, monkeypatch, caplog):
-    legacy = tmp_path / "edge-user-secrets"
-    legacy.mkdir()
-    monkeypatch.setenv("TRELLIS_EDGE_USER_SECRETS_DIR", str(legacy))
-    monkeypatch.setattr(secrets, "_LEGACY_WARNED", False)
+def test_the_v05_per_user_store_is_gone():
+    """Sealed credentials replaced it: no helper, no env var, no directory constant."""
+    assert not hasattr(secrets, "warn_about_legacy_user_secrets")
+    assert not hasattr(secrets, "LEGACY_USER_SECRETS_DIR")
+    assert not hasattr(secrets, "LEGACY_USER_SECRETS_ENV")
+
+
+def test_a_dropped_credential_key_is_logged(tmp_path, caplog):
+    """A silently ignored `my-key=` looks like a missing credential at call time."""
+    store = make_store(tmp_path)
+    shared = store.shared_file("devops")
+    shared.parent.mkdir(parents=True, exist_ok=True)
+    shared.write_text(
+        "DEVOPS_PASSWORD=kept\nmy-key=dropped\n1NVALID=also-dropped\n",
+        encoding="utf-8",
+    )
 
     with caplog.at_level(logging.WARNING, logger="core.edge_user_secrets"):
-        secrets.warn_about_legacy_user_secrets()
-        secrets.warn_about_legacy_user_secrets()
+        resolved = store.resolve(
+            tool_config(secrets=["DEVOPS_PASSWORD"]), name="devops", site="dc1"
+        )
 
-    warnings = [record for record in caplog.records if "no longer read" in record.getMessage()]
-    assert len(warnings) == 1
-    assert str(legacy) in caplog.text
+    assert resolved == {"DEVOPS_PASSWORD": "kept"}
+    drops = [r.getMessage() for r in caplog.records if "dropping credential key" in r.getMessage()]
+    assert len(drops) == 2
+    assert "my-key" in " ".join(drops)
+    assert str(shared) in " ".join(drops)
+    # Never the value.
+    assert "also-dropped" not in " ".join(drops)
 
 
 # ---------------------------------------------------------------- build_env

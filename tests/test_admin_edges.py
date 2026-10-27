@@ -754,6 +754,167 @@ def test_save_tool_refuses_the_remote_runtime(monkeypatch):
     assert "assigned by the edge relay" in session["flash_msg"]
 
 
+# --- credential-key approval ---------------------------------------------------
+
+KEY_FP = "SHA256:" + "A" * 43
+ROTATED_KEY_FP = "SHA256:" + "B" * 43
+
+
+def _keyed_edge(**overrides):
+    config = _edge_config(
+        edge_pubkey="c3Braw==", edge_key_fp=KEY_FP, edge_key_id="KEYID0000000000"
+    )
+    config.update(overrides)
+    return config
+
+
+def _render_page(monkeypatch):
+    return asyncio.run(admin.admin_edges_page(FakeRequest(session=_admin_session()))).body.decode()
+
+
+def test_pending_key_renders_the_approve_action(monkeypatch):
+    fake = FakeEdgeIdentityManager(edges={"plant-floor": _keyed_edge()})
+    monkeypatch.setattr(admin, "identity_mgr", fake)
+
+    html = _render_page(monkeypatch)
+
+    assert "Pending approval" in html
+    assert KEY_FP in html
+    assert 'action="/admin/edges/plant-floor/approve-key"' in html
+    # CSRF-protected like every other admin POST.
+    assert 'name="csrf_token"' in html
+
+
+def test_approved_key_renders_its_approver_and_no_approve_action(monkeypatch):
+    fake = FakeEdgeIdentityManager(edges={"plant-floor": _keyed_edge(
+        edge_key_approved=True,
+        edge_key_approved_fp=KEY_FP,
+        edge_key_approved_by=ADMIN_EMAIL,
+        edge_key_approved_at="2026-10-26T12:00:00+00:00",
+    )})
+    monkeypatch.setattr(admin, "identity_mgr", fake)
+
+    html = _render_page(monkeypatch)
+
+    assert "Approved" in html
+    assert ADMIN_EMAIL in html
+    assert "2026-10-26T12:00:00+00:00" in html
+    assert "approve-key" not in html
+
+
+def test_a_rotated_key_is_pending_next_to_the_still_approved_one(monkeypatch):
+    fake = FakeEdgeIdentityManager(edges={"plant-floor": _keyed_edge(
+        edge_key_fp=ROTATED_KEY_FP,
+        edge_key_id="ROTATED000000000",
+        edge_key_approved=False,
+        edge_key_approved_fp=KEY_FP,
+        prev_edge_key_fp=KEY_FP,
+        edge_key_fps=[KEY_FP],
+    )})
+    monkeypatch.setattr(admin, "identity_mgr", fake)
+
+    html = _render_page(monkeypatch)
+
+    assert f'action="/admin/edges/plant-floor/approve-key"' in html
+    assert ROTATED_KEY_FP in html
+    # The old approved key is named so the operator knows what still seals today.
+    assert KEY_FP in html
+    assert "rotation overlap" in html
+
+
+def test_approve_key_records_the_approver_and_the_timestamp(monkeypatch):
+    fake = FakeEdgeIdentityManager(edges={"plant-floor": _keyed_edge()})
+    monkeypatch.setattr(admin, "identity_mgr", fake)
+
+    session = _admin_session()
+    response = asyncio.run(
+        admin.approve_edge_key(FakeRequest(session=session), "plant-floor")
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin/edges"
+    saved = fake.saved_edge_configs["plant-floor"]
+    assert saved["edge_key_approved"] is True
+    assert saved["edge_key_approved_fp"] == KEY_FP
+    assert saved["edge_key_approved_by"] == ADMIN_EMAIL
+    assert saved["edge_key_approved_at"]
+    assert KEY_FP in session["flash_msg"]
+    assert "sealing is enabled" in session["flash_msg"]
+    # Nothing but the approval fields changes.
+    assert saved["token_hash"] == "hash-abc"
+    assert saved["display_name"] == "Plant floor"
+
+
+def test_approve_key_requires_an_admin_session(monkeypatch):
+    fake = FakeEdgeIdentityManager(edges={"plant-floor": _keyed_edge()})
+    monkeypatch.setattr(admin, "identity_mgr", fake)
+
+    session = {"user": {"email": "someone@example.com"}}
+    response = asyncio.run(
+        admin.approve_edge_key(FakeRequest(session=session), "plant-floor")
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin"
+    assert fake.saved_edge_configs == {}
+
+
+def test_approve_key_requires_a_session(monkeypatch):
+    fake = FakeEdgeIdentityManager(edges={"plant-floor": _keyed_edge()})
+    monkeypatch.setattr(admin, "identity_mgr", fake)
+
+    response = asyncio.run(admin.approve_edge_key(FakeRequest(), "plant-floor"))
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "/login"
+    assert fake.saved_edge_configs == {}
+
+
+def test_approve_key_without_a_published_key_flashes(monkeypatch):
+    fake = FakeEdgeIdentityManager(edges={"plant-floor": _edge_config()})
+    monkeypatch.setattr(admin, "identity_mgr", fake)
+
+    session = _admin_session()
+    response = asyncio.run(
+        admin.approve_edge_key(FakeRequest(session=session), "plant-floor")
+    )
+
+    assert response.status_code == 303
+    assert fake.saved_edge_configs == {}
+    assert "has not published a credential key yet" in session["flash_msg"]
+
+
+def test_approve_key_for_an_unknown_site_flashes(monkeypatch):
+    fake = FakeEdgeIdentityManager()
+    monkeypatch.setattr(admin, "identity_mgr", fake)
+
+    session = _admin_session()
+    response = asyncio.run(admin.approve_edge_key(FakeRequest(session=session), "ghost"))
+
+    assert response.status_code == 303
+    assert fake.saved_edge_configs == {}
+    assert "not found" in session["flash_msg"]
+
+
+def test_approving_the_same_fingerprint_twice_keeps_the_original_audit(monkeypatch):
+    fake = FakeEdgeIdentityManager(edges={"plant-floor": _keyed_edge(
+        edge_key_approved=True,
+        edge_key_approved_fp=KEY_FP,
+        edge_key_approved_by="first-admin@example.com",
+        edge_key_approved_at="2026-10-20T08:00:00+00:00",
+    )})
+    monkeypatch.setattr(admin, "identity_mgr", fake)
+
+    session = _admin_session()
+    response = asyncio.run(
+        admin.approve_edge_key(FakeRequest(session=session), "plant-floor")
+    )
+
+    assert response.status_code == 303
+    assert fake.saved_edge_configs == {}
+    assert "already approved" in session["flash_msg"]
+
+
 # --- hardening: per-site rate limit + tunnel probe ---------------------------------
 
 

@@ -53,17 +53,15 @@ async def _execute_in_container(
     *,
     env: Dict[str, str],
     timeout: float,
-    agent: Optional[str],
-    user_id: Optional[str],
-    user_email: Optional[str],
-    run_id: Optional[str],
     agent_token: Optional[str] = None,
     record_health,
 ) -> Dict[str, Any]:
     """Run the tool as its own container via the runner.
 
     Only declared env keys cross the socket; the runner re-sanitizes the base
-    environment and rejects anything the manifest does not declare.
+    environment and rejects anything the manifest does not declare. Identity travels
+    in ``agent_token`` only: the runner derives the caller's user id, email, groups,
+    agent and run id from the verified claims, so the request body carries none.
     """
     from core.execution.client import RunnerCallError, RunnerClient, RunnerUnavailable
     from core.execution.contract import ExecRequest
@@ -76,10 +74,6 @@ async def _execute_in_container(
             kind="tool",
             target=config.name,
             manifest_digest=manifest_digest(config),
-            agent=agent,
-            user_id=user_id,
-            user_email=user_email,
-            run_id=run_id,
             env={k: v for k, v in env.items() if k in declared},
             agent_token=agent_token,
             input=input_json,
@@ -189,18 +183,15 @@ async def execute_tool(
     *,
     env: Dict[str, str],
     on_health: Optional[HealthCallback] = None,
-    agent: Optional[str] = None,
-    user_id: Optional[str] = None,
-    user_email: Optional[str] = None,
-    run_id: Optional[str] = None,
     agent_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run one tool invocation and normalize its outcome into a result dict.
 
     ``env`` is the complete environment for the child (the caller has already
-    applied secrets and PATH); only declared keys are forwarded. ``on_health``
-    replaces the hub's ``health_monitor.record_event`` calls; it is invoked in a
-    worker thread so a slow store cannot stall concurrent tool I/O.
+    applied secrets, PATH and the caller's ``TRELLIS_USER_*`` identity); only
+    declared keys are forwarded. ``on_health`` replaces the hub's
+    ``health_monitor.record_event`` calls; it is invoked in a worker thread so a
+    slow store cannot stall concurrent tool I/O.
 
     Execution always happens in the runner's container for this call; the
     in-process sandbox backends are gone. ``tool_dir`` is validated here so a
@@ -233,10 +224,6 @@ async def execute_tool(
             arguments,
             env=env,
             timeout=timeout,
-            agent=agent,
-            user_id=user_id,
-            user_email=user_email,
-            run_id=run_id,
             agent_token=agent_token,
             record_health=record_health,
         )

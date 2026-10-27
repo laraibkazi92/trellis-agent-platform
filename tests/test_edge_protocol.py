@@ -84,16 +84,41 @@ def test_hello_accepts_and_trims_catalog():
     assert caps == ["tools"]
 
 
-def test_duplicate_tool_names_are_rejected():
-    with pytest.raises(protocol.ProtocolError) as exc:
-        protocol.validate_tools([{"name": "dup"}, {"name": "dup"}])
-    assert "duplicate" in str(exc.value)
+def _skips(catalog) -> str:
+    """The reasons a per-entry validator dropped entries, joined for assertions."""
+    return " | ".join(skip.describe() for skip in catalog.errors)
+
+
+def test_duplicate_tool_names_are_skipped_not_fatal():
+    """Per-entry validation: the duplicate is dropped, the first one is published."""
+    catalog = protocol.validate_tools([{"name": "dup"}, {"name": "dup"}])
+
+    assert [tool.name for tool in catalog] == ["dup"]
+    assert "duplicate" in _skips(catalog)
+
+
+def test_a_malformed_entry_does_not_shadow_a_valid_one_with_the_same_name():
+    """``seen`` is reserved by the successful append, not by the name check.
+
+    Otherwise a bad first entry would consume "a", the second (valid) entry would be
+    dropped as a duplicate, and the template would publish nothing while reporting
+    only the schema error.
+    """
+    catalog = protocol.validate_tools(
+        [{"name": "a", "description": 123}, {"name": "a", "description": "ok"}]
+    )
+
+    assert [tool.name for tool in catalog] == ["a"]
+    assert len(catalog.errors) == 1
+    assert "description must be a string" in _skips(catalog)
 
 
 @pytest.mark.parametrize("name", ["", "has space", "starts.with.dot", "x" * 65])
-def test_invalid_tool_names_are_rejected(name):
-    with pytest.raises(protocol.ProtocolError):
-        protocol.validate_tools([{"name": name}])
+def test_invalid_tool_names_are_skipped(name):
+    catalog = protocol.validate_tools([{"name": "good"}, {"name": name}])
+
+    assert [tool.name for tool in catalog] == ["good"]
+    assert _skips(catalog)
 
 
 def test_catalog_cap_is_enforced(monkeypatch):
@@ -122,9 +147,13 @@ def test_input_specs_are_normalized():
     assert inputs["plain"] == {"type": "string", "required": False}
 
 
-def test_unsupported_input_type_is_rejected():
-    with pytest.raises(protocol.ProtocolError):
-        protocol.validate_tools([{"name": "t", "inputs": {"q": {"type": "decimal"}}}])
+def test_unsupported_input_type_skips_that_tool_only():
+    catalog = protocol.validate_tools(
+        [{"name": "t", "inputs": {"q": {"type": "decimal"}}}, {"name": "ok"}]
+    )
+
+    assert [tool.name for tool in catalog] == ["ok"]
+    assert "unsupported type" in _skips(catalog)
 
 
 def _tool():
@@ -206,9 +235,10 @@ def test_tool_name_roundtrip():
 
 
 def test_namespace_separator_is_reserved():
-    with pytest.raises(protocol.ProtocolError) as exc:
-        protocol.validate_tools([{"name": "a__b"}])
-    assert "'__'" in str(exc.value)
+    catalog = protocol.validate_tools([{"name": "a__b"}, {"name": "fine"}])
+
+    assert [tool.name for tool in catalog] == ["fine"]
+    assert "'__'" in _skips(catalog)
 
 
 def test_validate_site_name_rules():
@@ -445,6 +475,55 @@ def test_validate_mcps_accepts_empty_catalogs():
     assert protocol.validate_mcps([]) == []
 
 
+def test_a_bad_credential_key_target_is_skipped_not_fatal():
+    """A hyphenated key costs that target's seal form, not the tunnel (v0.7.1)."""
+    hello = protocol.validate_hello(
+        {
+            "proto": protocol.PROTO,
+            "tools": [{"name": "boiler_status"}],
+            "credential_keys": {
+                "boiler_status": {"secret_keys": ["DEVOPS_PASSWORD"]},
+                "node_ssh": {"secret_keys": ["my-api-key"]},
+            },
+        }
+    )
+
+    assert hello.credentials.credential_keys == {
+        "boiler_status": {"secret_keys": ["DEVOPS_PASSWORD"], "variable_keys": []}
+    }
+    (skip,) = hello.errors
+    assert skip.name == "node_ssh"
+    assert "my-api-key" in skip.reason
+
+
+def test_an_ambiguous_credential_key_target_is_skipped():
+    hello = protocol.validate_hello(
+        {
+            "proto": protocol.PROTO,
+            "credential_keys": {
+                "ok": {"secret_keys": ["A"]},
+                "both": {"secret_keys": ["X"], "variable_keys": ["X"]},
+                "odd": {"secret_keys": ["A"], "unknown_key": []},
+            },
+        }
+    )
+
+    assert list(hello.credentials.credential_keys) == ["ok"]
+    assert sorted(skip.name for skip in hello.errors) == ["both", "odd"]
+
+
+def test_bad_key_material_is_still_fatal():
+    """The crypto half stays all-or-nothing: it is pinned in the registry."""
+    with pytest.raises(protocol.ProtocolError):
+        protocol.validate_hello(
+            {
+                "proto": protocol.PROTO,
+                "edge_pubkey": "bm90LWEta2V5",
+                "edge_key_fp": "SHA256:whatever",
+            }
+        )
+
+
 @pytest.mark.parametrize("raw", ["srv", 7, True, {"name": "srv"}])
 def test_validate_mcps_requires_a_list(raw):
     with pytest.raises(protocol.ProtocolError) as exc:
@@ -504,21 +583,36 @@ def test_mcp_server_cap_is_enforced(monkeypatch):
 
 
 @pytest.mark.parametrize("name", ["", "has space", "x" * 65, 7, None])
-def test_invalid_mcp_names_are_rejected(name):
-    with pytest.raises(protocol.ProtocolError):
-        protocol.validate_mcps([{"name": name}])
+def test_invalid_mcp_names_are_skipped(name):
+    catalog = protocol.validate_mcps([{"name": name}, {"name": "good"}])
+
+    assert [mcp.name for mcp in catalog] == ["good"]
+    assert _skips(catalog)
 
 
 def test_mcp_names_cannot_contain_the_namespace_separator():
-    with pytest.raises(protocol.ProtocolError) as exc:
-        protocol.validate_mcps([{"name": "devops__cli"}])
-    assert "'__'" in str(exc.value)
+    catalog = protocol.validate_mcps([{"name": "devops__cli"}, {"name": "cli"}])
+
+    assert [mcp.name for mcp in catalog] == ["cli"]
+    assert "'__'" in _skips(catalog)
 
 
-def test_duplicate_mcp_names_are_rejected():
-    with pytest.raises(protocol.ProtocolError) as exc:
-        protocol.validate_mcps([{"name": "dup"}, {"name": "dup"}])
-    assert "duplicate" in str(exc.value)
+def test_duplicate_mcp_names_are_skipped_not_fatal():
+    catalog = protocol.validate_mcps([{"name": "dup"}, {"name": "dup"}])
+
+    assert [mcp.name for mcp in catalog] == ["dup"]
+    assert "duplicate" in _skips(catalog)
+
+
+def test_a_malformed_mcp_entry_does_not_shadow_a_valid_one_with_the_same_name():
+    """Same rule as ``validate_tools``: only a published server reserves its name."""
+    catalog = protocol.validate_mcps(
+        [{"name": "srv", "transport": "websocket"}, {"name": "srv"}]
+    )
+
+    assert [mcp.name for mcp in catalog] == ["srv"]
+    assert len(catalog.errors) == 1
+    assert "unsupported transport" in _skips(catalog)
 
 
 @pytest.mark.parametrize("transport", ["stdio", "http", "streamable-http", "sse"])
@@ -532,49 +626,76 @@ def test_mcp_transport_defaults_to_stdio():
 
 
 @pytest.mark.parametrize("transport", ["websocket", "", 7])
-def test_unknown_mcp_transport_is_rejected(transport):
-    with pytest.raises(protocol.ProtocolError) as exc:
-        protocol.validate_mcps([{"name": "srv", "transport": transport}])
-    assert "transport" in str(exc.value)
+def test_unknown_mcp_transport_skips_that_server(transport):
+    catalog = protocol.validate_mcps(
+        [{"name": "srv", "transport": transport}, {"name": "good"}]
+    )
+
+    assert [mcp.name for mcp in catalog] == ["good"]
+    assert "transport" in _skips(catalog)
 
 
-def test_mcp_tool_cap_is_enforced(monkeypatch):
+def test_mcp_tool_cap_skips_that_server(monkeypatch):
     monkeypatch.setattr(protocol, "MAX_MCP_TOOLS_PER_SERVER", 2)
-    with pytest.raises(protocol.ProtocolError) as exc:
-        protocol.validate_mcps(
-            [{"name": "srv", "tools": [{"name": name} for name in ("a", "b", "c")]}]
-        )
-    assert "exceeds" in str(exc.value)
+    catalog = protocol.validate_mcps(
+        [
+            {"name": "srv", "tools": [{"name": name} for name in ("a", "b", "c")]},
+            {"name": "good"},
+        ]
+    )
+
+    assert [mcp.name for mcp in catalog] == ["good"]
+    assert "exceeds" in _skips(catalog)
 
 
-def test_duplicate_mcp_tool_names_are_rejected():
-    with pytest.raises(protocol.ProtocolError) as exc:
-        protocol.validate_mcps(
-            [{"name": "srv", "tools": [{"name": "dup"}, {"name": "dup"}]}]
-        )
-    assert "duplicate" in str(exc.value)
+def test_duplicate_mcp_tool_names_skip_that_server():
+    catalog = protocol.validate_mcps(
+        [
+            {"name": "srv", "tools": [{"name": "dup"}, {"name": "dup"}]},
+            {"name": "good"},
+        ]
+    )
+
+    assert [mcp.name for mcp in catalog] == ["good"]
+    assert "duplicate" in _skips(catalog)
 
 
-def test_mcp_tool_names_reject_the_namespace_separator():
-    with pytest.raises(protocol.ProtocolError) as exc:
-        protocol.validate_mcps([{"name": "srv", "tools": [{"name": "a__b"}]}])
-    assert "'__'" in str(exc.value)
+def test_mcp_tool_names_skip_the_server_on_a_reserved_separator():
+    catalog = protocol.validate_mcps(
+        [
+            {"name": "srv", "tools": [{"name": "a__b"}]},
+            {"name": "good"},
+        ]
+    )
+
+    assert [mcp.name for mcp in catalog] == ["good"]
+    assert "'__'" in _skips(catalog)
 
 
 @pytest.mark.parametrize("schema", ["{}", 7, ["oneOf"], True])
-def test_non_object_input_schema_is_rejected(schema):
-    with pytest.raises(protocol.ProtocolError) as exc:
-        protocol.validate_mcps(
-            [{"name": "srv", "tools": [{"name": "t", "inputSchema": schema}]}]
-        )
-    assert "inputSchema must be an object" in str(exc.value)
+def test_non_object_input_schema_skips_that_server(schema):
+    catalog = protocol.validate_mcps(
+        [
+            {"name": "srv", "tools": [{"name": "t", "inputSchema": schema}]},
+            {"name": "good"},
+        ]
+    )
+
+    assert [mcp.name for mcp in catalog] == ["good"]
+    assert "inputSchema must be an object" in _skips(catalog)
 
 
-def test_oversize_input_schema_is_rejected():
+def test_oversize_input_schema_skips_that_server():
     schema = {"type": "object", "description": "x" * protocol.MAX_MCP_SCHEMA_BYTES}
-    with pytest.raises(protocol.ProtocolError) as exc:
-        protocol.validate_mcps([{"name": "srv", "tools": [{"name": "t", "inputSchema": schema}]}])
-    assert "exceeds" in str(exc.value)
+    catalog = protocol.validate_mcps(
+        [
+            {"name": "srv", "tools": [{"name": "t", "inputSchema": schema}]},
+            {"name": "good"},
+        ]
+    )
+
+    assert [mcp.name for mcp in catalog] == ["good"]
+    assert "exceeds" in _skips(catalog)
 
 
 def test_long_mcp_description_is_truncated_not_rejected():
@@ -838,21 +959,23 @@ def test_without_the_cap_a_summary_length_description_is_not_rejected():
     assert tool.description == description
 
 
-def test_a_lazy_hello_over_the_summary_cap_is_refused():
+def test_a_lazy_hello_over_the_summary_cap_skips_that_tool():
+    """One over-long summary costs that tool, not the tunnel (v0.7.1)."""
     description = "d" * (protocol.MAX_TOOL_SUMMARY_CHARS + 1)
 
-    with pytest.raises(protocol.ProtocolError) as exc:
-        protocol.validate_hello(
-            {
-                "proto": protocol.PROTO,
-                "caps": ["tools", "lazy_catalog"],
-                "tools": [_summary_entry(description)],
-            }
-        )
+    hello = protocol.validate_hello(
+        {
+            "proto": protocol.PROTO,
+            "caps": ["tools", "lazy_catalog"],
+            "tools": [_summary_entry(description), {"name": "boiler_ok"}],
+        }
+    )
 
-    assert "lazy_catalog" in str(exc.value)
-    assert str(protocol.MAX_TOOL_SUMMARY_CHARS) in str(exc.value)
-    assert exc.value.close_code == protocol.CLOSE_MALFORMED
+    assert [tool.name for tool in hello[2]] == ["boiler_ok"]
+    (skip,) = hello.errors
+    assert skip.name == "boiler_status"
+    assert "lazy_catalog" in skip.reason
+    assert str(protocol.MAX_TOOL_SUMMARY_CHARS) in skip.reason
 
 
 def test_validate_tool_detail_accepts_a_full_entry():

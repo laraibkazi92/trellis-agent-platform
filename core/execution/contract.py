@@ -40,7 +40,12 @@ RunnerErrorCode = Literal[
 
 
 class ExecRequest(BaseModel):
-    """One blocking execution: a tool call or an ``execute`` console command."""
+    """One blocking execution: a tool call or an ``execute`` console command.
+
+    Carries NO identity fields: the caller's user id, email, groups, agent name and
+    run id all come from the verified ``agent_token`` (v0.7.1 Phase 2). The runner
+    derives them itself, so a forged body cannot name another caller.
+    """
 
     kind: ExecKind = "tool"
     # Registry name for ``tool``; literal "console" for ``console``.
@@ -48,10 +53,6 @@ class ExecRequest(BaseModel):
     # sha256 of the canonical manifest; the runner re-derives it from disk and
     # refuses a mismatch so a stale registration cannot run new code silently.
     manifest_digest: str = ""
-    agent: Optional[str] = None
-    user_id: Optional[str] = None
-    user_email: Optional[str] = None
-    run_id: Optional[str] = None
     # Declared keys only; the runner intersects with the manifest and rejects
     # anything it does not declare.
     env: dict[str, str] = Field(default_factory=dict)
@@ -60,7 +61,8 @@ class ExecRequest(BaseModel):
     # console only: the shell command to run.
     command: Optional[str] = None
     deadline_ms: int = 300_000
-    # Phase 3: short-lived HMAC token minted by the agent runtime.
+    # Short-lived HMAC token minted by the agent runtime; the runner verifies it and
+    # takes every identity attribute from its claims.
     agent_token: Optional[str] = None
 
 
@@ -81,14 +83,15 @@ class RunnerError(BaseModel):
 
 
 class SessionCreateRequest(BaseModel):
-    """Open a long-lived MCP session (or a throwaway discovery run)."""
+    """Open a long-lived MCP session (or a throwaway discovery run).
+
+    Like :class:`ExecRequest`, identity comes only from the verified
+    ``agent_token``: there are no ``user_id``/``user_email``/``agent`` fields.
+    """
 
     kind: Literal["mcp_session", "discovery"] = "mcp_session"
     target: str
     manifest_digest: str = ""
-    agent: Optional[str] = None
-    user_id: Optional[str] = None
-    user_email: Optional[str] = None
     # 32 hex chars, chosen by the caller; stamped on the container label so a
     # leaked container can be traced back to a client-side session.
     session_key: str = Field(pattern=r"^[0-9a-f]{32}$")

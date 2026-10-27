@@ -20,7 +20,7 @@ from core import allowlist
 from core import edge_secrets_central
 from core.models import ToolConfig
 from core.auth import get_identity_manager
-from core.caller_identity import resolve_user_email
+from core.caller_identity import identity_incomplete_error, resolve_mint_identity
 from core.env_sanitize import sanitized_env
 from core.devmode import enforce_dev_mode_safety
 # The execution core lives in core.tool_runtime so the edge proxy
@@ -162,7 +162,7 @@ SYSTEM_PRINCIPALS = frozenset({"gateway"})
 
 
 async def _authorize_call(
-    config: ToolConfig, raw_token: Optional[str], user_id: Optional[str]
+    config: ToolConfig, raw_token: Optional[str]
 ) -> tuple[Optional[agent_token_module.Claims], Optional[Dict[str, Any]]]:
     """Verify the agent token and the agent's effective allowlist.
 
@@ -189,18 +189,6 @@ async def _authorize_call(
     if claims.principal == "system" or claims.agent in SYSTEM_PRINCIPALS:
         return claims, None
 
-    # The token is the authority for *who* the agent acts for: a caller may not
-    # borrow a valid token to read another user's injected secrets.
-    if claims.user_id and user_id and user_id not in (
-        claims.user_id,
-        f"svc_agent_{claims.agent}",
-    ):
-        message = "access_denied: token identity does not match the calling user"
-        if mode == "log":
-            logger.warning("hub: would deny %r: %s", config.name, message)
-            return claims, None
-        return claims, {"error": message}
-
     config_data = await asyncio.to_thread(identity_mgr.get_agent_config, claims.agent)
     if not config_data:
         message = f"access_denied: unknown agent '{claims.agent}'"
@@ -219,6 +207,24 @@ async def _authorize_call(
     return claims, None
 
 
+async def _caller_attributes(
+    claims: Optional[agent_token_module.Claims], user_id: Optional[str]
+) -> tuple[Optional[str], tuple[str, ...]]:
+    """The caller's ``(email, groups)``: claims when a token verified, else the record.
+
+    A verified token is the ONLY identity authority, so nothing is re-read from the
+    registry for a token-bearing call. The record read below exists for the no-token
+    dev/rollout path (``ENFORCE_AGENT_TOKENS=off``, or a DEV_MODE deployment with no
+    minting secret), where there are no claims to trust.
+    """
+    if claims is not None:
+        return claims.user_email, claims.groups
+    if not user_id:
+        return None, ()
+    resolved = await resolve_mint_identity(identity_mgr, user_id)
+    return resolved["user_email"], resolved["groups"]
+
+
 @stamina.retry(on=TransientToolError, attempts=3)
 async def _run_tool_attempt(
     config: ToolConfig,
@@ -235,32 +241,33 @@ async def _run_tool_attempt(
         return health_monitor.record_event("tool", config.name, ok, err)
 
     try:
-        env = await _build_tool_env(config, tool_dir, user_id)
+        env = await _build_tool_env(config, tool_dir, user_id, claims)
     except Exception as e:
         error_msg = f"Failed to execute tool: {str(e)}"
         await asyncio.to_thread(on_health, False, error_msg)
         return {"error": error_msg}
 
-    agent = claims.agent if claims is not None else (
-        user_id[len("svc_agent_"):] if user_id and user_id.startswith("svc_agent_") else None
-    )
     return await execute_tool(
         config,
         tool_dir,
         arguments,
         env=env,
         on_health=on_health,
-        agent=agent,
-        user_id=user_id,
-        user_email=(claims.user_email if claims is not None else None)
-        or env.get("TRELLIS_USER_EMAIL"),
-        run_id=claims.run_id if claims is not None else None,
         agent_token=agent_token,
     )
 
 
-async def _build_tool_env(config: ToolConfig, tool_dir: Path, user_id: Optional[str]) -> Dict[str, str]:
-    """Sanitized env, per-tool bin dir, and identity-scoped secrets/variables."""
+async def _build_tool_env(
+    config: ToolConfig,
+    tool_dir: Path,
+    user_id: Optional[str],
+    claims: Optional[agent_token_module.Claims] = None,
+) -> Dict[str, str]:
+    """Sanitized env, per-tool bin dir, and identity-scoped secrets/variables.
+
+    ``TRELLIS_USER_ID``/``TRELLIS_USER_EMAIL`` come from the verified claims (never
+    from the request body): the tool sees the caller the token proves.
+    """
     env = sanitized_env()
 
     # A CLI binary dropped into this tool's own bin/ on the host becomes
@@ -296,10 +303,11 @@ async def _build_tool_env(config: ToolConfig, tool_dir: Path, user_id: Optional[
             safe_vars = {str(k): str(v) for k, v in variables.items() if str(k).upper() not in RESTRICTED_ENV_VARS}
             env.update(safe_vars)
 
-        # Auto-inject user identity (email)
-        user_email = await resolve_user_email(identity_mgr, user_id)
-        if user_email:
-            env["TRELLIS_USER_EMAIL"] = user_email
+        # Auto-inject user identity: the caller the token proves, not the body's claim.
+        email, _groups = await _caller_attributes(claims, user_id)
+        env["TRELLIS_USER_ID"] = str(user_id)
+        if email:
+            env["TRELLIS_USER_EMAIL"] = email
 
     return env
 
@@ -374,7 +382,6 @@ def _cap_remote_result(name: str, result: Any) -> Any:
 async def _run_remote(
     config: ToolConfig,
     arguments: Dict[str, Any],
-    user_id: Optional[str],
     *,
     agent_token: Optional[str] = None,
     claims: Optional[agent_token_module.Claims] = None,
@@ -384,6 +391,11 @@ async def _run_remote(
     The relay owns the tunnel; this side only maps its HTTP contract onto the same
     result-dict shape a local tool returns. Arguments, results, and response bodies
     are never logged: they carry the customer's internal data.
+
+    Identity is the verified token's alone (``claims``): there is no user id argument,
+    because a caller-supplied or body-asserted one must never select the caller's
+    identity or another user's sealed credentials. Usage accounting stays in
+    ``run_tool``, which owns the invocation (not the retry attempt).
 
     Decorated like ``_run_tool_attempt`` so ``retry_on_transient`` keeps the same
     meaning it has for local tools. Remote tools default to False (an in-flight edge
@@ -411,25 +423,21 @@ async def _run_remote(
         except Exception as exc:
             logger.warning(f"Failed to record health for remote tool {config.name}: {exc}")
 
-    # Resolved before the request so a slow (or failing) registry read cannot eat
-    # into the call's timeout budget. Fail-open: an identity lookup hiccup costs
-    # this call its email, not the call itself. A verified token's claim wins.
+    # Identity is the verified token's: nothing is re-read from the registry here (no
+    # record lookup for the email, no body identity), and the caller cannot assert a
+    # different user through the call.
     user_email = claims.user_email if claims is not None else None
-    if user_email is None:
-        try:
-            user_email = await resolve_user_email(identity_mgr, user_id)
-        except Exception as exc:
-            logger.warning(f"Could not resolve the caller email for remote tool {config.name}: {exc}")
-            user_email = None
 
     # The caller's browser-sealed credential set for exactly this (site, tool, user).
     # It rides the relay body verbatim and is never logged here: central cannot open
-    # it, and the relay treats it as opaque bytes.
+    # it, and the relay treats it as opaque bytes. Only a verified token has an
+    # identity to seal to -- the relay builds the frame from that same token, so a
+    # no-token call has nothing to look up (and the edge's credential_mode decides).
     sealed: Optional[Dict[str, Any]] = None
-    if user_id:
+    if claims is not None and claims.user_id:
         try:
             sealed = await asyncio.to_thread(
-                edge_secrets_central.get, identity_mgr, site, user_id, "tool", tool
+                edge_secrets_central.get, identity_mgr, site, claims.user_id, "tool", tool
             )
         except Exception as exc:
             # A registry hiccup costs this call its per-user credentials, not the call;
@@ -441,6 +449,14 @@ async def _run_remote(
                 type(exc).__name__,
             )
 
+    if sealed is not None and (claims is None or not user_email):
+        # Per-user credentials are sealed to the caller's email. Refusing here names
+        # the real problem (identity, not credentials) instead of letting the edge
+        # report credential_rejected for a token that has no email to match.
+        error = identity_incomplete_error(f"tool '{config.name}'", site)["error"]
+        await record_health(False, error)
+        return {"error": error}
+
     try:
         async with _remote_client(timeout_seconds + 35) as client:
             response = await client.post(
@@ -449,10 +465,10 @@ async def _run_remote(
                     "tool": tool,
                     "args": arguments,
                     "deadline_ms": deadline_ms,
-                    "user": user_id,
-                    "user_email": user_email,
-                    # The relay verifies this and resolves the agent's allowlist
-                    # itself; the edge proxy verifies the signature again.
+                    # The relay verifies this token and builds the edge frame's
+                    # identity from its claims: it resolves the agent's allowlist
+                    # itself and forwards identity to the edge, which trusts the
+                    # authenticated tunnel rather than re-verifying the token.
                     "agent_token": agent_token,
                     "sealed": sealed,
                 },
@@ -601,12 +617,14 @@ async def _authorize_hub_call(
 
     ``off`` (the default) is a no-I/O fast path once the authz snapshot is warm: no
     token verification, no policy evaluation. A malformed or expired token is not an
-    error here -- the caller keeps its ``__user_id`` and the principal falls back to
-    that (or ``anonymous``), because rejecting tokens belongs to the agent-token gate
-    above, not to this one. The token's user id also supplies the caller's stored groups:
-    this process has no request for the middleware to publish them from, and without
-    them a ``group:`` rule would match on the host and deny here for the same call.
-    Everything else fails closed: an exception inside the check never runs the tool.
+    error here -- the principal falls back to the call's ``user_id`` (which is itself
+    claims-derived or the no-token dev fallback) or ``anonymous``, because rejecting
+    tokens belongs to the agent-token gate above, not to this one. The token's ``g``
+    claim also supplies the caller's groups (the stored record is read only when the
+    claim is empty): this process has no request for the middleware to publish them
+    from, and without them a ``group:`` rule would match on the host and deny here for
+    the same call. Everything else fails closed: an exception inside the check never
+    runs the tool.
 
     Note the same caveat as the other surfaces: if the authz state has never been
     readable, the cold snapshot says ``off`` and the gate fails open until a read
@@ -636,7 +654,11 @@ async def _authorize_hub_call(
             # synthetic one must not grant a workflow groups the host would not see.
             and not str(claims.user_id).startswith("svc_agent_")
         ):
-            tool_authz.set_request_groups(tool_authz.stored_user_groups(claims.user_id))
+            # The mint read the user record once: its claim is the caller's authority,
+            # so only a token WITHOUT groups falls back to the record here.
+            tool_authz.set_request_groups(
+                list(claims.groups) or tool_authz.stored_user_groups(claims.user_id)
+            )
         try:
             principal = tool_authz.principal_for(claims, user_id)
             if tool_authz.allowed(
@@ -657,15 +679,40 @@ async def _authorize_hub_call(
         return {"error": _HUB_CALL_CHECK_FAILED.format(name=config.name)}
 
 
+def _caller_user_id(
+    claims: Optional[agent_token_module.Claims],
+    presented_token: Optional[str],
+    body_user_id: Optional[str],
+) -> Optional[str]:
+    """Who this tool call acts for, from the token -- never from the request body.
+
+    * verified claims -> the token's user (the only authority);
+    * ``off`` mode -> the body's ``__user_id``, which is the documented dev/rollout
+      fallback (nothing is verified in that mode, so there is nothing to prefer);
+    * any other mode with a token that did NOT verify -> no identity at all; the
+      body's assertion is ignored, so a forged or expired token cannot borrow one;
+    * no token presented (``log`` mode, e.g. a deployment with no minting secret) ->
+      the body value, which is the pre-enforcement rollout posture.
+    """
+    if claims is not None:
+        return claims.user_id
+    if agent_token_module.mode() == "off":
+        return body_user_id
+    if presented_token:
+        return None
+    return body_user_id
+
+
 async def run_tool(config: ToolConfig, tool_dir: Optional[Path], arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Executes a tool locally (container) or remotely (edge relay)."""
     # stamina re-invokes with the same dict — never mutate the caller's arguments.
     arguments = dict(arguments)
-    user_id = arguments.pop("__user_id", None)
+    body_user_id = arguments.pop("__user_id", None)
     raw_token = agent_token_module.refresh(arguments.pop("__agent_token", None))
     # The former `__agent_name`-in-arguments path is gone: the token's claims are
     # the only source of agent identity (and they are verified, not asserted).
-    claims, denial = await _authorize_call(config, raw_token, user_id)
+    claims, denial = await _authorize_call(config, raw_token)
+    user_id = _caller_user_id(claims, raw_token, body_user_id)
     try:
         if denial is not None:
             return denial
@@ -675,9 +722,7 @@ async def run_tool(config: ToolConfig, tool_dir: Optional[Path], arguments: Dict
         if hub_denial is not None:
             return hub_denial
         if config.remote is not None:
-            return await _run_remote(
-                config, arguments, user_id, agent_token=raw_token, claims=claims
-            )
+            return await _run_remote(config, arguments, agent_token=raw_token, claims=claims)
         return await _run_tool_attempt(
             config, tool_dir, arguments, user_id, claims, raw_token
         )
@@ -748,7 +793,8 @@ def _create_tool_handler(c: ToolConfig, d: Optional[Path]) -> Any:
             )
             annotations[input_name] = py_type
 
-    # Add __user_id
+    # Add __user_id: a reserved handler arg that is NOT identity. It is the no-token
+    # dev/rollout fallback only -- once a token verifies, its claims are the identity.
     params.append(
         inspect.Parameter(
             "__user_id",

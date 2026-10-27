@@ -13,7 +13,7 @@ from fastapi import APIRouter, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from core.dependencies import templates, CSRFRoute
 from core.auth import get_identity_manager
-from core import edge_secrets_central
+from core import edge_key_approval, edge_secrets_central
 from core.edge_keypair import key_id as edge_key_id
 import logging
 
@@ -1336,10 +1336,31 @@ def _edge_key_view(name: str, config: dict) -> dict:
     frame. When no key has been published yet the card simply omits the block, and we
     do not touch the sealed-credential store at all (a pre-phase-4 fixture has no
     ``client`` surface either).
+
+    Approval state is reported next to the fingerprint: a key central has not approved
+    (a first hello, or the new half of a rotation) cannot be sealed to, so the card has
+    to say which fingerprint is waiting and offer the approve action.
     """
     fp = config.get("edge_key_fp") if isinstance(config.get("edge_key_fp"), str) else ""
+    approved_fp = edge_key_approval.approved_fingerprint(config)
+    approved = edge_key_approval.is_current_key_approved(config)
+    approval = {
+        "edge_key_approved": approved,
+        "edge_key_approved_fp": approved_fp,
+        "edge_key_approved_by": edge_key_approval.approved_by(config),
+        "edge_key_approved_at": edge_key_approval.approved_at(config),
+        # Only a *current* fingerprint can be pending: an approved_fp left behind by a
+        # rotation is the key blobs may still be sealed to, not a pending one.
+        "edge_key_pending_fp": "" if approved else fp,
+    }
     if not fp:
-        return {"edge_key_fp": "", "edge_key_id": "", "edge_key_rotated_at": "", "retired_credentials": 0}
+        return {
+            "edge_key_fp": "",
+            "edge_key_id": "",
+            "edge_key_rotated_at": "",
+            "retired_credentials": 0,
+            **approval,
+        }
 
     key_id = config.get("edge_key_id")
     if not isinstance(key_id, str) or not key_id:
@@ -1360,6 +1381,7 @@ def _edge_key_view(name: str, config: dict) -> dict:
         "edge_key_id": key_id,
         "edge_key_rotated_at": edge_secrets_central.last_rotated_at(config),
         "retired_credentials": retired,
+        **approval,
     }
 
 
@@ -1414,6 +1436,42 @@ async def admin_edges_page(request: Request):
             "rate_limit_default": os.getenv("EDGE_RATE_LIMIT_PER_MIN", "120"),
         },
     )
+
+
+@router.post("/admin/edges/{site}/approve-key")
+async def approve_edge_key(request: Request, site: str):
+    """Approve the fingerprint the edge currently publishes, enabling sealing.
+
+    Admin-session gated like every other route here, and CSRF-protected by
+    ``CSRFRoute`` (the form submits the session token in the body).
+    """
+    if redirect := require_admin(request, '/admin'):
+        return redirect
+
+    approver = (request.session.get("user") or {}).get("email") or "unknown"
+    config = await asyncio.to_thread(identity_mgr.get_edge_config, site)
+    if not config:
+        request.session["flash_msg"] = f"Edge '{site}' not found."
+        return RedirectResponse(url='/admin/edges', status_code=303)
+
+    try:
+        updated, changed = edge_key_approval.approve_current_key(config, approver)
+    except ValueError as exc:
+        request.session["flash_msg"] = f"Edge '{site}': {exc}"
+        return RedirectResponse(url='/admin/edges', status_code=303)
+
+    fingerprint = updated["edge_key_approved_fp"]
+    if changed:
+        await asyncio.to_thread(identity_mgr.save_edge_config, site, updated)
+        request.session["flash_msg"] = (
+            f"Credential key {fingerprint} for edge '{site}' approved by {approver}; "
+            f"sealing is enabled."
+        )
+    else:
+        request.session["flash_msg"] = (
+            f"Credential key {fingerprint} for edge '{site}' was already approved."
+        )
+    return RedirectResponse(url='/admin/edges', status_code=303)
 
 
 @router.post("/admin/edges/create")

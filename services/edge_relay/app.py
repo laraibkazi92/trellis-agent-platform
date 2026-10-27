@@ -18,13 +18,14 @@ import asyncio
 import contextlib
 import logging
 import os
+import threading
 import time
 import uuid
 from typing import Annotated, Any, Dict, List, Optional
 
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.websockets import WebSocketDisconnect
 
 from core import agent_token as agent_token_module
@@ -165,7 +166,11 @@ class EdgeConn:
         agent_token: Optional[str] = None,
         sealed: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Forward one tool call and await its validated result frame."""
+        """Forward one tool call and await its validated result frame.
+
+        ``user``/``user_email`` are the verified token's claims (``_claims_identity``),
+        never a request body; the routes are the only production callers.
+        """
         if self.closed:
             raise EdgeDisconnected(f"edge '{self.site}' is closed")
         if tool not in self.tools:
@@ -288,7 +293,12 @@ class EdgeConn:
         agent_token: Optional[str] = None,
         sealed: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Build one ``call`` frame with the deadline clamped to the wire cap."""
+        """Build one ``call`` frame with the deadline clamped to the wire cap.
+
+        ``user``/``user_email`` are the claims-derived identity: the edge uses them
+        unchanged (MCP session key, sealed AAD, ``TRELLIS_USER_*``) and does not
+        verify anything of its own.
+        """
         frame: Dict[str, Any] = {
             "t": "call",
             "id": uuid.uuid4().hex,
@@ -300,8 +310,8 @@ class EdgeConn:
         # Omitted when absent so a v0.4 edge sees the exact same bytes.
         if user_email is not None:
             frame["user_email"] = user_email
-        # Forwarded verbatim: the edge verifies signature/expiry even though the
-        # authorization decision was already made here.
+        # Forwarded verbatim for the edge's runner, which verifies signature/expiry
+        # when it opens a container; the authorization decision was already made here.
         if agent_token is not None:
             frame["agent_token"] = agent_token
         # Opaque ciphertext: the relay cannot open it, so it forwards the bytes and
@@ -588,20 +598,75 @@ def _identity_manager() -> Any:
 
 
 class CallBody(BaseModel):
+    """One tool or MCP call, as the hub/host posts it.
+
+    There is **no caller identity here**: ``user``/``user_email`` were removed in
+    v0.7.1 (identity comes from the agent token's claims, see ``_claims_identity``).
+    ``extra="allow"`` exists only so a pre-v0.7.1 caller is not 422'd mid-rollout --
+    the fields it still posts are logged once and otherwise ignored.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
     tool: str
     args: Dict[str, Any] = Field(default_factory=dict)
     # Strict: pydantic would otherwise accept ``true`` as ``1``.
     deadline_ms: Annotated[int, Field(strict=True)] = DEFAULT_DEADLINE_MS
-    user: Optional[str] = None
-    # Length/control-char rules live in protocol.validate_call: one code path, so a
-    # bad value is a 400 invalid_arguments rather than FastAPI's 422 echo.
-    user_email: Optional[str] = None
-    # Minted by the agent runtime; verified here and forwarded verbatim to the edge.
+    # Minted by the agent runtime; verified here -- the relay is the only verifier on
+    # this path -- and forwarded verbatim to the edge for the runner.
     agent_token: Optional[str] = None
     # Browser-sealed per-user credentials: opaque to the relay, forwarded verbatim and
     # never logged or audited (only ``has_sealed`` reaches the audit line). Typed as
     # ``Any`` so a non-object body is a 400 from ``validate_call``, not pydantic's 422.
     sealed: Optional[Any] = None
+
+
+# Fields a pre-v0.7.1 caller may still post. Ignored (never read) and reported once so
+# an operator can find the stale caller; a body can never assert an identity.
+_BODY_IDENTITY_FIELDS = ("user", "user_email")
+_BODY_IDENTITY_WARNED = False
+# Two calls can arrive on two threads: check-and-set under a lock so one rollout window
+# logs one line, not one per concurrent request.
+_BODY_IDENTITY_LOCK = threading.Lock()
+
+
+def _warn_body_identity(body: CallBody) -> None:
+    """Log once if a request still carries body identity, then ignore it."""
+    global _BODY_IDENTITY_WARNED
+    extra = body.model_extra or {}
+    present = [name for name in _BODY_IDENTITY_FIELDS if name in extra]
+    if not present:
+        return
+    with _BODY_IDENTITY_LOCK:
+        if _BODY_IDENTITY_WARNED:
+            return
+        _BODY_IDENTITY_WARNED = True
+    logger.warning(
+        "relay: ignoring %s in a call body; the caller identity comes from the agent "
+        "token claims only (update the caller)",
+        ", ".join(present),
+    )
+
+
+def _claims_identity(
+    claims: Optional[agent_token_module.Claims],
+) -> tuple[Optional[str], Optional[str]]:
+    """The frame identity: ``(user, user_email)`` from the verified token's claims.
+
+    ``(None, None)`` when there is no verified caller (mode ``off``, or a token the
+    relay let through in ``log`` mode) -- the frame then carries no identity at all
+    and the edge must not invent one. The edge uses these values unchanged for the
+    MCP session key, the sealed-credential AAD identity and ``TRELLIS_USER_*``.
+    """
+    if claims is None:
+        return None, None
+    user = claims.user_id if isinstance(claims.user_id, str) and claims.user_id else None
+    email = (
+        claims.user_email
+        if isinstance(claims.user_email, str) and claims.user_email
+        else None
+    )
+    return user, email
 
 
 # Principals that are not agents: the gateway is an authenticated front door with its
@@ -616,8 +681,11 @@ async def _authorize_agent(
 
     Returns ``(claims, denial)``. ``denial`` is ``(code, message)`` for a 403, or
     ``None`` when the call may proceed. The allowlist is resolved from the registry
-    here, at call time, so a caller cannot assert permissions it does not hold; the
-    edge re-checks signature and expiry as defense in depth (it has no registry).
+    here, at call time, so a caller cannot assert permissions it does not hold.
+
+    This is the **only** token verification on the edge path: the identity in the
+    forwarded frame is built from these claims (``_claims_identity``) and the edge
+    trusts it over the authenticated tunnel.
 
     In ``log`` mode a refusal is logged and the call still runs (one rollout window);
     ``off`` skips the check entirely.
@@ -846,6 +914,13 @@ async def edge_connect(ws: WebSocket) -> None:
     except (WebSocketDisconnect, RuntimeError):
         return
 
+    # Entries the validator had to drop: log each (name + reason) and serve the rest.
+    # One unusable manifest costs that export, never the tunnel.
+    for skipped in hello.errors:
+        logger.warning(
+            "edge hello site=%s: not publishing %s", site, skipped.describe()
+        )
+
     conn = EdgeConn(
         ws,
         site,
@@ -974,6 +1049,9 @@ async def call_site_tool(site: str, body: CallBody) -> JSONResponse:
     started = time.monotonic()
     args_bytes = len(protocol.encode(body.args))
     call_id = uuid.uuid4().hex
+    # Filled in after the token is verified; the frame identity (and the audit line)
+    # come from the claims, never from the body.
+    identity: Dict[str, Optional[str]] = {"user": None, "user_email": None}
 
     def audit_call(outcome: str, **extra: Any) -> None:
         audit.record(
@@ -981,7 +1059,7 @@ async def call_site_tool(site: str, body: CallBody) -> JSONResponse:
             site=site,
             tool=body.tool,
             call_id=call_id,
-            user=body.user,
+            user=identity["user"],
             outcome=outcome,
             ms=int((time.monotonic() - started) * 1000),
             args_bytes=args_bytes,
@@ -989,6 +1067,8 @@ async def call_site_tool(site: str, body: CallBody) -> JSONResponse:
             has_sealed=body.sealed is not None,
             **extra,
         )
+
+    _warn_body_identity(body)
 
     try:
         conn = relay.require(site)
@@ -1013,8 +1093,18 @@ async def call_site_tool(site: str, body: CallBody) -> JSONResponse:
     )
     if denial is not None:
         code, message = denial
+        # The token verified even though the allowlist refused: keep the caller on the
+        # audit line. No claims means no identity, and none is invented.
+        identity["user"] = _claims_identity(claims)[0]
         audit_call("access_denied", agent=claims.agent if claims else None)
         return _error(403, code, message)
+    try:
+        identity["user"], identity["user_email"] = protocol.validate_identity(
+            *_claims_identity(claims)
+        )
+    except ProtocolError as exc:
+        audit_call("invalid_arguments")
+        return _error(400, "invalid_arguments", str(exc))
 
     tool = conn.tools.get(body.tool)
     if tool is None:
@@ -1028,10 +1118,6 @@ async def call_site_tool(site: str, body: CallBody) -> JSONResponse:
                 "tool": body.tool,
                 "args": body.args,
                 "deadline_ms": body.deadline_ms,
-                # Re-checked here, not only on the edge: the edge reports a bad
-                # email as a tool_error, so filtering here keeps the 400
-                # invalid_arguments contract and skips a wasted edge round trip.
-                "user_email": body.user_email,
                 "agent_token": body.agent_token,
                 "sealed": body.sealed,
             }
@@ -1056,8 +1142,8 @@ async def call_site_tool(site: str, body: CallBody) -> JSONResponse:
             body.tool,
             args,
             body.deadline_ms,
-            body.user,
-            body.user_email,
+            identity["user"],
+            identity["user_email"],
             agent_token=body.agent_token,
             sealed=body.sealed,
         )
@@ -1102,6 +1188,7 @@ async def call_site_mcp(site: str, mcp: str, body: McpCallBody) -> JSONResponse:
     started = time.monotonic()
     args_bytes = len(protocol.encode(body.args))
     call_id = uuid.uuid4().hex
+    identity: Dict[str, Optional[str]] = {"user": None, "user_email": None}
 
     def audit_call(outcome: str, **extra: Any) -> None:
         audit.record(
@@ -1110,7 +1197,7 @@ async def call_site_mcp(site: str, mcp: str, body: McpCallBody) -> JSONResponse:
             mcp=mcp,
             tool=body.tool,
             call_id=call_id,
-            user=body.user,
+            user=identity["user"],
             outcome=outcome,
             ms=int((time.monotonic() - started) * 1000),
             args_bytes=args_bytes,
@@ -1118,6 +1205,8 @@ async def call_site_mcp(site: str, mcp: str, body: McpCallBody) -> JSONResponse:
             has_sealed=body.sealed is not None,
             **extra,
         )
+
+    _warn_body_identity(body)
 
     try:
         conn = relay.require(site)
@@ -1156,9 +1245,6 @@ async def call_site_mcp(site: str, mcp: str, body: McpCallBody) -> JSONResponse:
                 "tool": body.tool,
                 "args": body.args,
                 "deadline_ms": body.deadline_ms,
-                # Re-checked here for the same reason as on the tool endpoint: keep
-                # the 400 invalid_arguments contract and skip a wasted round trip.
-                "user_email": body.user_email,
                 "agent_token": body.agent_token,
                 "sealed": body.sealed,
             }
@@ -1172,8 +1258,18 @@ async def call_site_mcp(site: str, mcp: str, body: McpCallBody) -> JSONResponse:
     )
     if denial is not None:
         code, message = denial
+        # As on the tool route: a verified caller stays on the audit line even when
+        # the allowlist refuses the call.
+        identity["user"] = _claims_identity(claims)[0]
         audit_call("access_denied", agent=claims.agent if claims else None)
         return _error(403, code, message)
+    try:
+        identity["user"], identity["user_email"] = protocol.validate_identity(
+            *_claims_identity(claims)
+        )
+    except ProtocolError as exc:
+        audit_call("invalid_arguments")
+        return _error(400, "invalid_arguments", str(exc))
 
     try:
         payload = await conn.request_mcp(
@@ -1181,8 +1277,8 @@ async def call_site_mcp(site: str, mcp: str, body: McpCallBody) -> JSONResponse:
             body.tool,
             body.args,
             body.deadline_ms,
-            body.user,
-            body.user_email,
+            identity["user"],
+            identity["user_email"],
             agent_token=body.agent_token,
             sealed=body.sealed,
         )

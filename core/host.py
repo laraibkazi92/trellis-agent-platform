@@ -20,6 +20,7 @@ from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart, Te
 
 from core.auth import AuthMiddleware, agent_token_var, user_id_var
 from core.agent_token import mint_for_run
+from core.caller_identity import resolve_mint_identity
 from core.devmode import configure_cors, enforce_dev_mode_safety
 from core.models import is_agent_external, is_routable_agent_type
 from core.health import compute_agent_operational_status
@@ -302,11 +303,17 @@ async def chat_completions(request: ChatRequest):
         return await agent.run(request.messages[-1].content, message_history=history, deps=run_deps)
 
     captured_user_id = user_id_var.get()
-    # One token per run proves (agent, user, run) to the hub/relay/runner. Minting
-    # here (not in a wrapper) means every tool call in this run inherits it.
+    # One token per run proves (agent, user, email, groups, run) to the hub/relay/runner.
+    # Minting here (not in a wrapper) means every tool call in this run inherits it.
+    # The user's attributes are read ONCE, here: nothing downstream re-reads the
+    # registry for identity. An unresolvable record costs the token its email and
+    # groups, never the run.
+    mint_identity = await resolve_mint_identity(identity_mgr, captured_user_id)
     run_token = mint_for_run(
         request.model,
         captured_user_id,
+        user_email=mint_identity["user_email"],
+        groups=mint_identity["groups"],
         run_id=uuid.uuid4().hex,
         principal="system" if request.model == "supervisor" else None,
     )

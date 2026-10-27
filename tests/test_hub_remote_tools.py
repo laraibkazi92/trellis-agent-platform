@@ -32,7 +32,7 @@ import json
 import httpx
 import pytest
 
-from core import discovery, hub
+from core import agent_token, discovery, hub
 from core.models import ToolConfig
 
 
@@ -177,8 +177,21 @@ def relay_error(status, code, message="boom"):
     return json_response(status, {"error": {"code": code, "message": message}})
 
 
-def run_remote(config, arguments, user_id=None):
-    return asyncio.run(hub._run_remote(config, arguments, user_id))
+def run_remote(config, arguments, claims=None):
+    return asyncio.run(hub._run_remote(config, arguments, claims=claims))
+
+
+def claims_for(user_id="user-1", email="user-1@corp.example", agent="supervisor"):
+    """Verified claims, as the hub would hold them after checking the token."""
+    return agent_token.Claims(
+        agent=agent,
+        user_id=user_id,
+        user_email=email,
+        run_id="run-1",
+        iat=0,
+        exp=2**31,
+        jti="j" * 32,
+    )
 
 
 async def _run_tool_and_drain(config, arguments):
@@ -226,7 +239,7 @@ def test_remote_dispatch_success_returns_result_and_records_health(monkeypatch):
         monkeypatch, json_response(200, {"tool": TOOL, "result": {"temp": 42}})
     )
 
-    result = run_remote(config, {"unit": "1"}, user_id="user-1")
+    result = run_remote(config, {"unit": "1"})
 
     assert result == {"temp": 42}
     assert health == [
@@ -241,9 +254,8 @@ def test_remote_dispatch_success_returns_result_and_records_health(monkeypatch):
         "tool": TOOL,
         "args": {"unit": "1"},
         "deadline_ms": 330_000,  # (300 s tunable + 30 s slack) * 1000
-        "user": "user-1",
-        # No profile in the registry stub, so nothing is forwarded.
-        "user_email": None,
+        # No body identity: the relay builds the frame identity from the verified
+        # token, so this call asserts nothing about the caller.
         # v0.6: the run's agent token rides the body (None outside a run).
         "agent_token": None,
         # No sealed per-user credential is registered for this caller.
@@ -270,27 +282,63 @@ def test_remote_dispatch_forwards_the_callers_sealed_blob(monkeypatch):
         monkeypatch, json_response(200, {"tool": TOOL, "result": {"temp": 1}})
     )
 
-    assert run_remote(config, {"unit": "1"}, user_id="user-1") == {"temp": 1}
+    # Per-user credentials are sealed to the caller's email, which is a token claim.
+    claims = claims_for()
+    assert run_remote(config, {"unit": "1"}, claims=claims) == {"temp": 1}
     assert asked == [(SITE, "user-1", "tool", TOOL)]
     assert json.loads(requests[0].content)["sealed"] == blob
 
 
-def test_remote_dispatch_without_a_user_never_reads_sealed_credentials(monkeypatch):
+def test_remote_dispatch_refuses_a_sealed_call_without_an_email_claim(monkeypatch):
+    """``identity_incomplete``, never ``credential_rejected``: re-sealing cannot fix it."""
+    install_fake_health(monkeypatch)
+    blob = {"v": 1, "ciphertext": "opaque", "keys": ["NODE_SSH_USER"]}
+    monkeypatch.setattr(hub.edge_secrets_central, "get", lambda *args, **kwargs: dict(blob))
+    requests = install_transport(
+        monkeypatch, json_response(200, {"tool": TOOL, "result": {"temp": 1}})
+    )
+
+    # A verified token whose claims carry no email: the set is opened with that
+    # email, so forwarding it could only end in the edge's ``credential_rejected``.
+    result = run_remote(
+        make_remote_config(),
+        {"unit": "1"},
+        claims=claims_for(email=None),
+    )
+
+    assert "identity_incomplete" in result["error"]
+    assert "no email" in result["error"]
+    # Nothing was dispatched to the edge.
+    assert requests == []
+
+
+def test_a_call_without_claims_never_reads_sealed_credentials(monkeypatch):
+    """No token, no identity to seal to: central does not even look a set up.
+
+    The old fallback resolved the body's ``__user_id`` to a record email and sent the
+    blob anyway -- the edge then had no claims-derived identity to open it with and
+    reported ``credential_rejected`` for what is really a missing identity.
+    """
+    monkeypatch.setenv("DEV_MODE", "true")
+    monkeypatch.setattr(
+        hub.identity_mgr, "get_user", lambda user_id: {"email": "user-1@corp.example"}
+    )
     monkeypatch.setattr(
         hub.edge_secrets_central,
         "get",
-        lambda *args, **kwargs: pytest.fail("no user id, no blob lookup"),
+        lambda *args, **kwargs: pytest.fail("no claims, no sealed lookup"),
     )
     install_fake_health(monkeypatch)
     requests = install_transport(
         monkeypatch, json_response(200, {"tool": TOOL, "result": {"temp": 1}})
     )
 
-    assert run_remote(make_remote_config(), {"unit": "1"}, user_id=None) == {"temp": 1}
+    assert run_remote(make_remote_config(), {"unit": "1"}) == {"temp": 1}
     assert json.loads(requests[0].content)["sealed"] is None
 
 
-def test_remote_call_forwards_the_resolved_user_email(monkeypatch):
+def test_remote_call_posts_no_body_identity(monkeypatch):
+    """The email is not forwarded on the body: the relay reads the token's claims."""
     monkeypatch.setattr(
         hub.identity_mgr, "get_user", lambda user_id: {"email": "user-1@corp.example"}
     )
@@ -300,18 +348,57 @@ def test_remote_call_forwards_the_resolved_user_email(monkeypatch):
         monkeypatch, json_response(200, {"tool": TOOL, "result": {"ok": True}})
     )
 
-    run_remote(config, {}, user_id="user-1")
+    run_remote(config, {})
 
     body = json.loads(requests[0].content)
-    assert body["user"] == "user-1"
-    assert body["user_email"] == "user-1@corp.example"
+    assert "user" not in body
+    assert "user_email" not in body
 
 
-def test_remote_call_in_dev_mode_sends_the_dev_user_email(monkeypatch):
+def test_remote_call_takes_the_sealed_identity_from_the_claims(monkeypatch):
+    """The claims identity drives the sealed-credential lookup, with no registry read,
+    and no identity is asserted on the body."""
+    called = []
+    monkeypatch.setattr(
+        hub.identity_mgr, "get_user", lambda user_id: called.append(user_id) or None
+    )
+    asked = []
+    monkeypatch.setattr(
+        hub.edge_secrets_central,
+        "get",
+        lambda identity_mgr, site, user_id, kind, name: asked.append(user_id),
+    )
+    install_fake_health(monkeypatch)
+    requests = install_transport(
+        monkeypatch, json_response(200, {"tool": TOOL, "result": {"ok": True}})
+    )
+
+    run_remote(
+        make_remote_config(),
+        {},
+        claims=claims_for(user_id="alice", email="alice@corp.example"),
+    )
+
+    body = json.loads(requests[0].content)
+    assert "user" not in body
+    assert "user_email" not in body
+    # The token's identity drove the sealed-credential lookup, and there was no
+    # per-call registry read.
+    assert asked == ["alice"]
+    assert called == []
+
+
+def test_remote_call_in_dev_mode_posts_no_identity(monkeypatch):
+    """The no-token path (dev/rollout): no registry read, no sealed store, no identity."""
     monkeypatch.setenv("DEV_MODE", "true")
     called = []
     monkeypatch.setattr(
         hub.identity_mgr, "get_user", lambda user_id: called.append(user_id)
+    )
+    monkeypatch.setattr(
+        hub.edge_secrets_central,
+        "get",
+        lambda *args, **kwargs: pytest.fail("no claims, no sealed lookup"),
     )
     config = make_remote_config()
     install_fake_health(monkeypatch)
@@ -319,16 +406,19 @@ def test_remote_call_in_dev_mode_sends_the_dev_user_email(monkeypatch):
         monkeypatch, json_response(200, {"tool": TOOL, "result": {"ok": True}})
     )
 
-    run_remote(config, {}, user_id="user-1")
+    run_remote(config, {})
 
     body = json.loads(requests[0].content)
-    assert body["user_email"] == "dev-user@local.host"
-    # DEV_MODE short-circuits the registry read entirely.
+    assert "user" not in body
+    assert "user_email" not in body
+    # Identity is the token's alone: without claims nothing is resolved from the
+    # registry (not even the DEV_MODE dev email) and no sealed set is looked up.
     assert called == []
+    assert body["sealed"] is None
 
 
-def test_remote_call_for_a_service_agent_forwards_no_email(monkeypatch):
-    """A service identity has no user profile, so no email is forwarded at all."""
+def test_remote_call_for_a_service_agent_posts_no_identity(monkeypatch):
+    """A service-identity token has no email: nothing identity-shaped is forwarded."""
     called = []
     monkeypatch.setattr(
         hub.identity_mgr,
@@ -341,31 +431,14 @@ def test_remote_call_for_a_service_agent_forwards_no_email(monkeypatch):
         monkeypatch, json_response(200, {"tool": TOOL, "result": {"ok": True}})
     )
 
-    run_remote(config, {}, user_id="svc_agent_triage")
+    run_remote(config, {}, claims=claims_for(user_id="svc_agent_triage", email=None))
 
     body = json.loads(requests[0].content)
-    assert body["user"] == "svc_agent_triage"
-    assert body["user_email"] is None
-    # The lookup was attempted (and found nothing) rather than skipped by DEV_MODE.
-    assert called == ["svc_agent_triage"]
-
-
-def test_remote_call_survives_an_identity_lookup_failure(monkeypatch):
-    """An etcd hiccup costs the call its email, never the call itself."""
-    def boom(user_id):
-        raise RuntimeError("etcd unavailable")
-
-    monkeypatch.setattr(hub.identity_mgr, "get_user", boom)
-    config = make_remote_config()
-    install_fake_health(monkeypatch)
-    requests = install_transport(
-        monkeypatch, json_response(200, {"tool": TOOL, "result": {"ok": True}})
-    )
-
-    result = run_remote(config, {}, user_id="user-1")
-
-    assert result == {"ok": True}
-    assert json.loads(requests[0].content)["user_email"] is None
+    assert "user" not in body
+    assert "user_email" not in body
+    # A service identity is resolved to nothing WITHOUT a registry read: no profile
+    # lookup, no groups (fail closed for background runs).
+    assert called == []
 
 
 def test_build_tool_env_exports_the_caller_email_for_local_tools(monkeypatch, tmp_path):
@@ -579,9 +652,9 @@ def test_run_tool_records_usage_once_for_remote_call(monkeypatch):
     assert usage == [("user-1", REGISTRY_NAME)]
 
 
-def test_run_tool_remote_background_agent_sends_user_id_only(monkeypatch):
-    """Edge tools have no agent-identity semantics: `user` carries the identity and
-    `__agent_name` is never invented as an argument (a local tool would receive it)."""
+def test_run_tool_remote_background_agent_posts_no_identity(monkeypatch):
+    """Edge tools have no agent-identity semantics: the token claims carry the caller
+    and `__agent_name` is never invented as an argument (a local tool would receive it)."""
     config = make_remote_config()
     install_fake_health(monkeypatch)
     install_fake_usage(monkeypatch)
@@ -592,7 +665,7 @@ def test_run_tool_remote_background_agent_sends_user_id_only(monkeypatch):
     asyncio.run(_run_tool_and_drain(config, {"__user_id": "svc_agent_triage", "unit": "1"}))
 
     body = json.loads(requests[0].content)
-    assert body["user"] == "svc_agent_triage"
+    assert "user" not in body
     assert "__agent_name" not in body["args"]
     assert body["args"] == {"unit": "1"}
 
@@ -853,7 +926,7 @@ def test_an_oversized_remote_result_is_truncated_like_a_local_tool(monkeypatch):
         json_response(200, {"tool": TOOL, "result": {"blob": "x" * 100_000}}),
     )
 
-    result = run_remote(config, {}, user_id="user-1")
+    result = run_remote(config, {})
 
     assert "Global Safety Net" in result["error"]
     assert result["partial_data_preview"].endswith("[TRUNCATED DUE TO SAFETY LIMITS]")

@@ -25,6 +25,7 @@ from core.auth import (
 )
 from core import agent_token
 from core.agent_token import mint_for_run
+from core.caller_identity import resolve_mint_identity
 from core.devmode import configure_cors, enforce_dev_mode_safety
 from core.discovery import discover_agents, is_agent_configured, is_tool_configured
 from core.agent_search import search_agents as _search_agents_ranked
@@ -598,7 +599,17 @@ async def use_tool(ctx: Context, tool_name: str, arguments: Dict[str, Any]) -> A
     if agent_token.verify_or_none(agent_token_var.get()) is None:
         # Direct tool use is a gateway capability, not an agent's: mint a token for
         # the `gateway` system principal so the hub/relay can still verify origin.
-        mint_for_run("gateway", user_id, run_id=uuid.uuid4().hex, principal="system")
+        # It carries the caller's identity (read once here), so the last mile can
+        # attribute the call without trusting a request body.
+        mint_identity = await resolve_mint_identity(identity_mgr, user_id)
+        mint_for_run(
+            "gateway",
+            user_id,
+            user_email=mint_identity["user_email"],
+            groups=mint_identity["groups"],
+            run_id=uuid.uuid4().hex,
+            principal="system",
+        )
 
     await ctx.report_progress(0, 3, message=f"Checking access for: {tool_name}")
     await ctx.report_progress(1, 3, message=f"Checking configuration for: {tool_name}")

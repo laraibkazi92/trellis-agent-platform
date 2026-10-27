@@ -123,6 +123,11 @@ def manager(keys):
                 "edge_pubkey": current.spki_b64,
                 "edge_key_fp": current.fingerprint,
                 "edge_key_fps": [],
+                # An admin approved this key (Admin -> Edges): sealing is enabled.
+                "edge_key_approved": True,
+                "edge_key_approved_fp": current.fingerprint,
+                "edge_key_approved_by": "admin@example.com",
+                "edge_key_approved_at": "2026-10-26T10:00:00+00:00",
             }
         },
         tool_configs={f"{SITE}__{TOOL}": TOOL_CONFIG, TOOL: TOOL_CONFIG},
@@ -219,6 +224,75 @@ def test_pubkey_requires_a_session(_patched):
     )
 
     assert response.status_code == 401
+
+
+def test_pubkey_is_refused_until_the_fingerprint_is_approved(_patched, manager, keys):
+    """A published key nobody approved is not sealing material: no SPKI, no encryption."""
+    import asyncio
+
+    current, _ = keys
+    for field in ("edge_key_approved", "edge_key_approved_fp"):
+        manager._edges[SITE].pop(field)
+
+    response = asyncio.run(
+        edge_secrets.edge_secret_pubkey(FakeRequest(session=_session()), SITE, "tool", TOOL)
+    )
+    body = json.loads(response.body)
+
+    assert response.status_code == 409
+    assert body["error"] == "key_pending_approval"
+    assert current.fingerprint in body["detail"]
+    # The page needs the fingerprint; it must never get the key itself.
+    assert "spki" not in body
+
+
+def test_pubkey_refuses_the_new_key_during_a_rotation_overlap(_patched, manager, keys):
+    """Rotation: the approved fingerprint stays the trusted one until the new one is approved."""
+    import asyncio
+
+    current, rotated = keys
+    manager._edges[SITE].update({
+        "edge_pubkey": rotated.spki_b64,
+        "edge_key_fp": rotated.fingerprint,
+        "edge_key_id": rotated.key_id,
+        "prev_edge_key_fp": current.fingerprint,
+        "edge_key_fps": [current.fingerprint],
+        "edge_key_approved": False,
+    })
+
+    response = asyncio.run(
+        edge_secrets.edge_secret_pubkey(FakeRequest(session=_session()), SITE, "tool", TOOL)
+    )
+    body = json.loads(response.body)
+
+    assert response.status_code == 409
+    assert body["error"] == "key_pending_approval"
+    assert body["key_fp"] == rotated.fingerprint
+    assert body["approved_fp"] == current.fingerprint
+    assert rotated.fingerprint in body["detail"]
+    assert "spki" not in body
+
+
+def test_pubkey_serves_the_rotated_key_once_it_is_approved(_patched, manager, keys):
+    import asyncio
+
+    _current, rotated = keys
+    manager._edges[SITE].update({
+        "edge_pubkey": rotated.spki_b64,
+        "edge_key_fp": rotated.fingerprint,
+        "edge_key_id": rotated.key_id,
+        "edge_key_approved": True,
+        "edge_key_approved_fp": rotated.fingerprint,
+    })
+
+    response = asyncio.run(
+        edge_secrets.edge_secret_pubkey(FakeRequest(session=_session()), SITE, "tool", TOOL)
+    )
+    body = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert body["key_fp"] == rotated.fingerprint
+    assert body["spki"] == rotated.spki_b64
 
 
 # --- POST ---------------------------------------------------------------------
@@ -322,6 +396,46 @@ def test_post_accepts_the_previous_key_during_the_rotation_overlap(_patched, man
 
     assert response.status_code == 200, body
     assert body["key_fp"] == previous.fingerprint
+
+
+def test_post_still_stores_a_blob_sealed_to_the_old_approved_key(_patched, manager, keys):
+    """Rotation overlap: the previous key keeps working while the new one awaits approval."""
+    import asyncio
+
+    current, rotated = keys
+    manager._edges[SITE].update({
+        "edge_pubkey": rotated.spki_b64,
+        "edge_key_fp": rotated.fingerprint,
+        "edge_key_id": rotated.key_id,
+        "prev_edge_key_fp": current.fingerprint,
+        "edge_key_fps": [current.fingerprint],
+        "edge_key_approved": False,
+    })
+
+    response, body = asyncio.run(_post(_seal(current)))
+
+    assert response.status_code == 200, body
+    assert body["key_fp"] == current.fingerprint
+
+
+def test_post_refuses_a_blob_sealed_to_a_pending_key(_patched, manager, keys):
+    """While the current key is pending, only the approved (previous) one may be sealed."""
+    import asyncio
+
+    _current, rotated = keys
+    manager._edges[SITE].update({
+        "edge_pubkey": rotated.spki_b64,
+        "edge_key_fp": rotated.fingerprint,
+        "edge_key_id": rotated.key_id,
+        "edge_key_approved": False,
+    })
+
+    response, body = asyncio.run(_post(_seal(rotated)))
+
+    assert response.status_code == 409
+    assert body["error"] == "key_pending_approval"
+    assert rotated.fingerprint in body["detail"]
+    assert edge_secrets_central.list_for_site(manager, SITE) == []
 
 
 def test_post_rejects_a_key_id_that_does_not_match_the_fingerprint(_patched, keys):

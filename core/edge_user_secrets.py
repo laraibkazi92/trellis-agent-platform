@@ -3,26 +3,30 @@
 
 """Edge-local credential rules: the shared store plus the sealed per-user set.
 
-Three sources exist, and only one of them is central:
+Two sources hold a **secret**, and only one of them is central:
 
 * ``secrets_dir`` (default ``edge-secrets``) -- one ``<tool-or-mcp>.env`` per exported
-  item, for a service account every caller shares. Dotenv, mode 0600.
+  item, for a service account every caller shares. Dotenv, mode 0600. This is the only
+  non-sealed source for a declared secret: the process environment is **not** a
+  fallback for one (v0.7.1), because a value in the edge container's env reaches every
+  tool and every operator container inspection.
 * a **sealed blob** -- per-user credentials the browser encrypted to this edge's
   public key (``core.edge_crypto``). Central stores ciphertext; only this process
   can open it, and only for the ``(site, kind, name, identity)`` the AAD binds.
-* the process environment -- the last fallback in ``shared`` mode only.
+
+``variables`` (endpoints) are the edge's own configuration, not a credential: they
+come from the shared file and then the process environment, in every mode.
 
 ``credential_mode`` decides what happens when a sealed set exists:
 
-* ``shared`` (default): the shared file -> process env.
-* ``per_user``: the sealed set if the caller has one, else shared -> process env.
+* ``shared`` (default): the shared file for secrets, shared file -> process env for
+  variables.
+* ``per_user``: the sealed set if the caller has one, else the same as ``shared``.
 * ``per_user_required``: the sealed set **only**; nothing sealed for this caller is
   a hard refusal (``missing_credentials``) -- the call must not run at all.
 
 The per-user set is all-or-nothing (plan §5 Phase 4 R8): once a blob is present, a
-declared secret it omits stays missing and is never filled from the shared file or
-the process env. ``variables`` (endpoints) are never per-user material: they come
-from the shared file and the process env in every mode.
+declared secret it omits stays missing and is never filled from the shared file.
 
 Only names the manifest declares are ever read or returned; anything else in a file
 or a blob is ignored. Values are never logged -- only paths and key names.
@@ -58,11 +62,10 @@ DIR_MODE = 0o700
 # top of a mounted directory; the hash suffix keeps it unique after the cap.
 MAX_SANITIZED_EMAIL = 48
 
+# A dropped key name reaches a log line; cap it so a pathological line cannot flood it.
+MAX_LOGGED_KEY_CHARS = 64
+
 DEFAULT_SECRETS_DIR = Path("edge-secrets")
-# The v0.5 plaintext per-user store. Nothing reads it any more; the path is kept only
-# so the proxy can log one startup warning when a stale directory is still mounted.
-LEGACY_USER_SECRETS_DIR = Path("edge-user-secrets")
-LEGACY_USER_SECRETS_ENV = "TRELLIS_EDGE_USER_SECRETS_DIR"
 
 _EMAIL_SLUG_RE = re.compile(r"[^a-z0-9]+")
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -75,7 +78,6 @@ _GROUP_OTHER_READABLE = 0o044
 # One warning per file per process: a permissive shared file is worth saying once, not
 # on every call. Tests clear this to re-assert the warning.
 _WARNED_PERMISSIVE: set[str] = set()
-_LEGACY_WARNED = False
 
 
 class MissingCredentials(Exception):
@@ -105,7 +107,7 @@ def normalize_email(email: str) -> str:
     return f"{slug}_{digest}"
 
 
-def parse_env_text(text: str) -> Dict[str, str]:
+def parse_env_text(text: str, *, source: str = "") -> Dict[str, str]:
     """Parse ``KEY=VALUE`` lines defensively: never interpolate, never evaluate.
 
     Blank lines and ``#`` comments are skipped, an optional leading ``export `` (the
@@ -114,9 +116,13 @@ def parse_env_text(text: str) -> Dict[str, str]:
     the file), ``KEY=`` parses as an empty value (the resolver treats that as unset),
     and one layer of matching quotes is stripped. Later duplicates win, which is what
     "re-set the key" means.
+
+    A dropped name is logged (key name only, never the value): a silently ignored
+    ``my-key=...`` looks exactly like a missing credential at call time. ``source``
+    names the file in that line; without it the message still names the key.
     """
     values: Dict[str, str] = {}
-    for line in text.splitlines():
+    for number, line in enumerate(text.splitlines(), start=1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
@@ -129,6 +135,13 @@ def parse_env_text(text: str) -> Dict[str, str]:
             continue
         key = key.strip()
         if not _ENV_KEY_RE.match(key):
+            logger.warning(
+                "%sline %d: dropping credential key %r -- not a valid environment "
+                "variable name (expected ^[A-Za-z_][A-Za-z0-9_]*$)",
+                f"{source}: " if source else "",
+                number,
+                key[:MAX_LOGGED_KEY_CHARS],
+            )
             continue
         values[key] = _unquote(value.strip())
     return values
@@ -153,35 +166,7 @@ def parse_env_file(path: Path) -> Dict[str, str]:
     except UnicodeDecodeError:
         logger.warning("credential file %s is not valid UTF-8; ignoring it", path)
         return {}
-    return parse_env_text(text)
-
-
-def warn_about_legacy_user_secrets() -> None:
-    """Log once when a v0.5 ``edge-user-secrets/`` directory is still mounted.
-
-    Nothing reads it: per-user credentials are browser-sealed now. The operator must
-    re-enter them in the UI (compact JSON), and the directory can be deleted together
-    with its compose mount (docs/upgrading.md).
-    """
-    global _LEGACY_WARNED
-    if _LEGACY_WARNED:
-        return
-    _LEGACY_WARNED = True
-    candidates = [Path(os.getenv(LEGACY_USER_SECRETS_ENV) or LEGACY_USER_SECRETS_DIR)]
-    for directory in candidates:
-        try:
-            if not directory.is_dir():
-                continue
-        except OSError:
-            continue
-        logger.warning(
-            "%s still exists but per-user plaintext credentials are no longer read "
-            "(v0.6 seals them in the browser and decrypts on this edge). Re-enter "
-            "those credentials in central under Configuration -> Edge credentials, "
-            "then delete the directory and its compose mount.",
-            directory,
-        )
-        return
+    return parse_env_text(text, source=str(path))
 
 
 def _warn_if_permissive(path: Path) -> None:
@@ -300,16 +285,21 @@ class CredentialStore:
         means the caller has no blob). Its presence switches the per-user branch on:
 
         * only declared **secret** names are taken, all-or-nothing -- a missing one is
-          not filled from the shared file or the process env;
+          not filled from the shared file;
         * declared **variable** names still come from the shared file / process env,
           because an endpoint is edge configuration (plan §6 invariant 10).
 
         Without a blob, ``per_user_required`` fails closed and every other mode reads
-        the shared file then the process env. Side-effect free and synchronous: no
-        directory is created, and the only log lines name files and keys.
+        the shared file for **secrets** and the shared file then the process env for
+        **variables**. The process environment is deliberately not a secret source
+        (v0.7.1): it is visible to every tool in the container and to any operator
+        inspecting it, so a declared secret comes from ``secrets_dir`` or is absent.
+        Side-effect free and synchronous: no directory is created, and the only log
+        lines name files and keys.
         """
         declared = edge_env.declared_keys_for(config)
         resolved_mode = _mode(mode)
+        variables = declared_variable_keys(config)
 
         if sealed is not None:
             secrets = declared_secret_keys(config)
@@ -324,7 +314,6 @@ class CredentialStore:
             if resolved_mode == "per_user_required" and not resolved:
                 # A blob with no declared secret is as good as no blob: fail closed.
                 raise _missing(email, site)
-            variables = declared_variable_keys(config)
             for layer in (
                 self._read_shared(name),
                 {key: os.environ[key] for key in variables if key in os.environ},
@@ -337,10 +326,12 @@ class CredentialStore:
         if resolved_mode == "per_user_required":
             raise _missing(email, site)
 
-        layers = [
+        # Shared file first for both halves; the process env is a source for the
+        # declared *variables* only.
+        layers = (
             self._read_shared(name),
-            {key: os.environ[key] for key in declared if key in os.environ},
-        ]
+            {key: os.environ[key] for key in variables if key in os.environ},
+        )
         resolved: Dict[str, str] = {}
         for layer in layers:
             for key, value in _nonempty(layer).items():

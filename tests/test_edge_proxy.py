@@ -315,6 +315,81 @@ def test_load_tools_skips_an_invalid_catalog_entry(tmp_path, caplog):
     assert "unsupported type" in caplog.text
 
 
+def test_load_tools_skips_a_manifest_with_an_invalid_secret_name(tmp_path, caplog):
+    """A hyphenated key would close the relay's tunnel for EVERY export (v0.7.1)."""
+    tools_dir = tmp_path / "tools"
+    write_tool_yaml(
+        tools_dir,
+        "bad",
+        {
+            "name": "bad",
+            "description": "a",
+            "runtime": "python",
+            "entrypoint": "main.py",
+            "secrets": ["my-api-key"],
+        },
+    )
+    write_tool_yaml(
+        tools_dir,
+        "healthy",
+        {
+            "name": "healthy",
+            "description": "b",
+            "runtime": "python",
+            "entrypoint": "main.py",
+            "secrets": ["API_KEY"],
+        },
+    )
+
+    with caplog.at_level(logging.WARNING, logger="core.proxy"):
+        configs = proxy.load_tools(tools_dir, ["bad", "healthy"])
+
+    assert set(configs) == {"healthy"}
+    assert "my-api-key" in caplog.text
+    assert "^[A-Za-z_][A-Za-z0-9_]*$" in caplog.text
+
+
+def test_credential_keys_omits_a_target_with_an_invalid_declared_name(tmp_path, caplog):
+    """Last gate before the hello: never publish a name the relay would refuse."""
+    config = make_config(secrets=["my-api-key"])
+    tools_dir = tmp_path / "tools"
+    write_tool_yaml(
+        tools_dir,
+        "bad",
+        {
+            "name": "bad",
+            "description": "a",
+            "runtime": "python",
+            "entrypoint": "main.py",
+            "secrets": ["my-api-key"],
+        },
+    )
+    good = make_config(name="good", secrets=["API_KEY"])
+    write_tool_yaml(
+        tools_dir,
+        "good",
+        {
+            "name": "good",
+            "description": "b",
+            "runtime": "python",
+            "entrypoint": "main.py",
+            "secrets": ["API_KEY"],
+        },
+    )
+    good_config, good_dir = proxy.load_tools(tools_dir, ["good"])["good"]
+
+    with caplog.at_level(logging.WARNING, logger="core.proxy"):
+        keys = proxy.credential_keys(
+            {
+                "bad": (config, tmp_path),
+                "good": (good_config, good_dir),
+            }
+        )
+
+    assert keys == {"good": {"secret_keys": ["API_KEY"], "variable_keys": []}}
+    assert "my-api-key" in caplog.text
+
+
 # ---------------------------------------------------------------- handle_call
 
 
@@ -1095,10 +1170,10 @@ def _install_fake_connect(monkeypatch, close_code):
 
 # ---------------------------------------------------------------- agent tokens
 #
-# The edge verifies signature and expiry only: it has no agent registry, so the
-# allowlist decision belongs to the relay (staffed with etcd). The token must still
-# ride through to the tool call and to the MCP session container, where the runner
-# verifies it again -- that is the part these tests pin.
+# v0.7.1: the edge verifies **nothing**. The relay authenticated the caller, verified
+# the token and built the frame identity from its claims; the edge trusts that identity
+# over the authenticated tunnel. A bad, missing or expired token is therefore not the
+# edge's refusal to make -- it is forwarded unchanged so the runner can act on it.
 
 TOKEN_SECRET = "test-agent-token-secret-0123456789abcdef"
 
@@ -1109,39 +1184,37 @@ def enforcing_tokens(monkeypatch):
     monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
 
 
-def test_handle_call_refuses_an_invalid_token_when_enforcing(
-    tmp_path, monkeypatch, enforcing_tokens
-):
-    monkeypatch.setattr(proxy.tool_runtime, "execute_tool", pytest.fail)
+@pytest.mark.parametrize(
+    "token",
+    [None, "t1.forged.signature", ""],
+    ids=["missing", "bad_sig", "empty"],
+)
+def test_handle_call_never_verifies_a_token(tmp_path, monkeypatch, enforcing_tokens, token):
+    """Even in enforce mode the edge runs the call: verification is the relay's job."""
+    ran = {}
+
+    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None, agent_token=None):
+        ran["agent_token"] = agent_token
+        return {"ok": True}
+
+    monkeypatch.setattr(proxy.tool_runtime, "execute_tool", fake_execute)
 
     frame = asyncio.run(
         proxy.handle_call(
-            {"demo": (make_config(), tmp_path)},
-            call_frame(agent_token="t1.forged.signature"),
+            {"demo": (make_config(), tmp_path)}, call_frame(agent_token=token)
         )
     )
 
-    assert frame["ok"] is False
-    assert frame["error"]["code"] == "access_denied"
-    assert "bad_sig" in frame["error"]["message"]
+    assert frame["ok"] is True
+    # An empty token is not forwarded (the frame keeps its pre-v0.6 shape).
+    assert ran.get("agent_token") == (token or None)
 
 
-def test_handle_call_refuses_a_missing_token_when_enforcing(
-    tmp_path, monkeypatch, enforcing_tokens
-):
-    monkeypatch.setattr(proxy.tool_runtime, "execute_tool", pytest.fail)
+def test_handle_call_never_verifies_an_expired_token(tmp_path, monkeypatch, enforcing_tokens):
+    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None, agent_token=None):
+        return {"ok": True}
 
-    frame = asyncio.run(proxy.handle_call({"demo": (make_config(), tmp_path)}, call_frame()))
-
-    assert frame["ok"] is False
-    assert frame["error"]["code"] == "access_denied"
-    assert "missing" in frame["error"]["message"]
-
-
-def test_handle_call_refuses_an_expired_token_when_enforcing(
-    tmp_path, monkeypatch, enforcing_tokens
-):
-    monkeypatch.setattr(proxy.tool_runtime, "execute_tool", pytest.fail)
+    monkeypatch.setattr(proxy.tool_runtime, "execute_tool", fake_execute)
     token = agent_token.mint("demo", now=time.time() - 10_000, ttl_s=60)
 
     frame = asyncio.run(
@@ -1150,8 +1223,24 @@ def test_handle_call_refuses_an_expired_token_when_enforcing(
         )
     )
 
-    assert frame["ok"] is False
-    assert "expired" in frame["error"]["message"]
+    assert frame["ok"] is True
+
+
+def test_the_edge_starts_without_an_agent_token_secret(tmp_path, monkeypatch):
+    """AGENT_TOKEN_SECRET is not an edge requirement any more (v0.7.1)."""
+    monkeypatch.delenv("AGENT_TOKEN_SECRET", raising=False)
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+    monkeypatch.setenv("TRELLIS_EDGE_TOKEN", "edge_plant-floor_secret")
+    _install_fake_connect(monkeypatch, close_code=None)
+
+    async def _accepting_serve(session, ws):
+        session.accepted = True
+
+    monkeypatch.setattr(proxy, "_serve", _accepting_serve)
+
+    # `run` reaches the connect loop and completes instead of dying at the old
+    # require_secret gate (enforce mode with no secret used to be a SystemExit).
+    asyncio.run(proxy.run(_once_config(), once=True))
 
 
 def test_handle_call_passes_the_agent_token_to_the_tool(
@@ -1176,33 +1265,18 @@ def test_handle_call_passes_the_agent_token_to_the_tool(
     assert seen["agent_token"] == token
 
 
-def test_a_bad_token_only_warns_in_log_mode(tmp_path, monkeypatch, caplog):
-    monkeypatch.setenv("AGENT_TOKEN_SECRET", TOKEN_SECRET)
-    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "log")
+def test_handle_mcp_call_never_verifies_a_token(monkeypatch, enforcing_tokens):
+    """Same rule on the MCP path: the manager is reached with the frame as-is."""
+    seen = {}
 
-    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None, agent_token=None):
-        return {"ok": True}
-
-    monkeypatch.setattr(proxy.tool_runtime, "execute_tool", fake_execute)
-
-    with caplog.at_level(logging.WARNING, logger="core.proxy"):
-        frame = asyncio.run(
-            proxy.handle_call(
-                {"demo": (make_config(), tmp_path)},
-                call_frame(agent_token="t1.forged.signature"),
-            )
-        )
-
-    assert frame["ok"] is True
-    assert "access_denied" in caplog.text
-
-
-def test_handle_mcp_call_refuses_an_invalid_token_when_enforcing(
-    monkeypatch, enforcing_tokens
-):
     class Manager:
-        async def call(self, *args, **kwargs):
-            pytest.fail("an unauthenticated MCP call must not reach the manager")
+        site = "plant-floor"
+
+        async def call(
+            self, mcp, tool, args, identity, deadline_ms, *, agent_token=None, sealed=None
+        ):
+            seen["agent_token"] = agent_token
+            return {"content": [], "isError": False}
 
     frame = asyncio.run(
         proxy.handle_mcp_call(
@@ -1219,8 +1293,8 @@ def test_handle_mcp_call_refuses_an_invalid_token_when_enforcing(
         )
     )
 
-    assert frame["ok"] is False
-    assert frame["error"]["code"] == "access_denied"
+    assert frame["ok"] is True
+    assert seen["agent_token"] == "t1.forged.signature"
 
 
 def test_handle_mcp_call_passes_the_agent_token_to_the_manager(

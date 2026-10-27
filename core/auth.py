@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Tuple, Union
 from functools import wraps
 
+from core import edge_key_approval
 from core.models import Identity, IdentityType
 
 import pyetcd
@@ -1124,7 +1125,14 @@ class IdentityManager:
 
     @retry_etcd()
     def save_edge_config(self, name: str, config: Dict) -> None:
-        """Persist an edge (site) record. Operator-editable fields are the admin UI's."""
+        """Persist an edge (site) record. Operator-editable fields are the admin UI's.
+
+        Key-approval state is normalised on the way in rather than in each writer: a
+        fingerprint the relay publishes on a hello (a first connect, a rotation) is not
+        sealing material until an admin approves it, so new key material lands pending
+        whichever process writes the record.
+        """
+        config = edge_key_approval.with_pending_state(config)
         self.client.put(f"{EDGES_PREFIX}{name}/config", json.dumps(config))
 
     @retry_etcd()

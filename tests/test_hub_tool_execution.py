@@ -24,11 +24,13 @@ import json
 
 import pytest
 
-from core import hub
+from core import agent_token, hub
 from core.execution import client as client_module
 from core.execution.client import RunnerCallError, RunnerUnavailable
 from core.execution.contract import ExecResult
 from core.models import ToolConfig
+
+SECRET = "hub-tool-execution-unit-secret-0123456789ab"
 
 
 @pytest.fixture(autouse=True)
@@ -116,6 +118,7 @@ class FakeIdentityManager:
         self.execution_token_calls = []
         self.get_config_calls = []
         self.get_user_calls = []
+        self.get_agent_config_calls = []
         self.record_tool_usage_calls = []
         self._resolved_config = {"API_KEY": "v"} if resolved_config is None else resolved_config
 
@@ -134,6 +137,11 @@ class FakeIdentityManager:
     def get_user(self, identity):
         self.get_user_calls.append(identity)
         return {"email": "u@example.com"}
+
+    def get_agent_config(self, name):
+        # Hermetic: the agent-token gate resolves the agent's allowlist off-loop.
+        self.get_agent_config_calls.append(name)
+        return {"name": name, "allowed_tools": ["tmpltool"]}
 
     def record_tool_usage(self, user_id, tool_name):
         self.record_tool_usage_calls.append((user_id, tool_name))
@@ -171,7 +179,14 @@ def install_fake_runner(monkeypatch, *outcomes):
 
 def install_fake_identity(monkeypatch, resolved_config=None):
     fake = FakeIdentityManager(resolved_config=resolved_config)
-    for method in ("get_resolved_config", "generate_execution_token", "get_config", "get_user", "record_tool_usage"):
+    for method in (
+        "get_resolved_config",
+        "generate_execution_token",
+        "get_config",
+        "get_user",
+        "get_agent_config",
+        "record_tool_usage",
+    ):
         monkeypatch.setattr(hub.identity_mgr, method, getattr(fake, method))
     return fake
 
@@ -256,6 +271,78 @@ def test_run_tool_does_not_mutate_caller_arguments(monkeypatch, tmp_path):
     assert json.loads(runner.requests[0].input) == {"q": "x"}
 
 
+def test_tool_env_identity_comes_from_the_verified_token(monkeypatch, tmp_path):
+    """A verified token is the only identity authority: the body cannot override it."""
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", SECRET)
+    monkeypatch.delenv("ENFORCE_AGENT_TOKENS", raising=False)
+    fake_identity = install_fake_identity(monkeypatch)
+    install_fake_health(monkeypatch)
+    runner = install_fake_runner(monkeypatch, ok_result())
+    token = agent_token.mint(
+        "agent-a", user_id="alice", user_email="alice@corp.example", groups=["ops"]
+    )
+
+    result = asyncio.run(
+        _run_tool_scenario(
+            make_config(secrets=["API_KEY"]),
+            make_tool_dir(tmp_path),
+            {"__user_id": "mallory", "__agent_token": token},
+        )
+    )
+
+    assert result == {"ok": True}
+    env = runner.requests[0].env
+    assert env["TRELLIS_USER_ID"] == "alice"
+    assert env["TRELLIS_USER_EMAIL"] == "alice@corp.example"
+    # ... and the forged body user never reaches secret resolution, usage or a
+    # per-call record read (the claims already carry the identity).
+    assert {call["identity"] for call in fake_identity.resolved_config_calls} == {"alice"}
+    assert fake_identity.get_user_calls == []
+    assert fake_identity.record_tool_usage_calls == [("alice", "tmpltool")]
+
+
+def test_tool_env_ignores_the_body_user_when_a_token_does_not_verify(monkeypatch, tmp_path):
+    """A presented-but-invalid token drops the caller's identity entirely."""
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", SECRET)
+    monkeypatch.delenv("ENFORCE_AGENT_TOKENS", raising=False)
+    fake_identity = install_fake_identity(monkeypatch)
+    install_fake_health(monkeypatch)
+    runner = install_fake_runner(monkeypatch, ok_result())
+
+    result = asyncio.run(
+        _run_tool_scenario(
+            make_config(secrets=["API_KEY"]),
+            make_tool_dir(tmp_path),
+            {"__user_id": "mallory", "__agent_token": "t1.forged.signature"},
+        )
+    )
+
+    assert result == {"ok": True}
+    # No identity -> no secret injection scoped to a user, no TRELLIS_USER_* env.
+    assert fake_identity.resolved_config_calls == []
+    assert "TRELLIS_USER_ID" not in runner.requests[0].env
+    assert "TRELLIS_USER_EMAIL" not in runner.requests[0].env
+    assert fake_identity.record_tool_usage_calls == []
+
+
+def test_off_mode_falls_back_to_the_body_user_id(monkeypatch, tmp_path):
+    """The documented dev/rollout fallback: nothing is verified in ``off``."""
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "off")
+    fake_identity = install_fake_identity(monkeypatch)
+    install_fake_health(monkeypatch)
+    runner = install_fake_runner(monkeypatch, ok_result())
+
+    asyncio.run(
+        _run_tool_scenario(
+            make_config(secrets=["API_KEY"]), make_tool_dir(tmp_path), {"__user_id": "user-1"}
+        )
+    )
+
+    env = runner.requests[0].env
+    assert env["TRELLIS_USER_ID"] == "user-1"
+    assert env["TRELLIS_USER_EMAIL"] == "u@example.com"
+
+
 def test_run_tool_args_carry_no_identity_fields_across_retries(monkeypatch, tmp_path):
     install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
@@ -272,9 +359,13 @@ def test_run_tool_args_carry_no_identity_fields_across_retries(monkeypatch, tmp_
         # v0.6: agent identity travels in the verified token, never as a stdin field.
         assert "__agent_name" not in payload
         assert "__user_id" not in payload
-        assert request.user_id == "svc_agent_triage"
-    # A background run's tool call still names the agent it belongs to.
-    assert runner.requests[0].agent == "triage"
+        # v0.7.1: the runner request body carries no identity at all. The runner
+        # derives user/email/groups/agent/run from the token's claims.
+        dumped = request.model_dump()
+        for field in ("agent", "user_id", "user_email", "run_id"):
+            assert field not in dumped, field
+    # A background run's own identity still reaches the tool's environment.
+    assert runner.requests[0].env["TRELLIS_USER_ID"] == "svc_agent_triage"
 
 
 def test_run_tool_skips_retry_when_retry_on_transient_false(monkeypatch, tmp_path):

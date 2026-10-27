@@ -609,6 +609,22 @@ def _agent_manifest(agent: str) -> Optional[dict]:
     return None
 
 
+def _verified_claims(payload: Any) -> Optional[agent_token_module.Claims]:
+    """The caller's verified claims, or ``None`` when the request carries no verified token.
+
+    Identity in the runner comes from here and nowhere else -- the wire bodies have no
+    identity fields. ``None`` is the rollout/dev posture (``ENFORCE_AGENT_TOKENS=off``,
+    or ``log`` without a minting secret): the container then runs with no identity
+    attribution rather than an asserted one.
+    """
+    if agent_token_module.mode() == "off":
+        return None
+    try:
+        return agent_token_module.verify(getattr(payload, "agent_token", None))
+    except agent_token_module.AgentTokenError:
+        return None
+
+
 def _authorize(payload: Any) -> Optional[JSONResponse]:
     """Verify the agent token and, where it owns the resource, the allowlist.
 
@@ -642,12 +658,6 @@ def _authorize(payload: Any) -> Optional[JSONResponse]:
         return None
 
     claimed_agent = claims.agent
-    if getattr(payload, "agent", None) and payload.agent != claimed_agent:
-        message = (
-            f"access_denied: token is for agent '{claimed_agent}', request claims "
-            f"'{payload.agent}'"
-        )
-        return _error(403, "access_denied", message)
 
     if claims.principal == "system" or claimed_agent in {"gateway", "supervisor"}:
         return None
@@ -1070,6 +1080,10 @@ async def exec_tool(request: Request, payload: ExecRequest):
     if denial is not None:
         return denial
 
+    # Identity for the container: the verified claims, and nothing else. A request
+    # with no verified token (off/log rollout) runs unattributed.
+    claims = _verified_claims(payload)
+
     if payload.kind == "console":
         return await _execute_one_shot(
             "console",
@@ -1077,9 +1091,9 @@ async def exec_tool(request: Request, payload: ExecRequest):
             lambda: spec.build_console_spec(
                 payload.command or "",
                 env=payload.env,
-                user_id=payload.user_id,
-                user_email=payload.user_email,
-                run_id=payload.run_id,
+                user_id=claims.user_id if claims else None,
+                user_email=claims.user_email if claims else None,
+                run_id=claims.run_id if claims else None,
             ),
         )
 
@@ -1120,8 +1134,10 @@ async def exec_tool(request: Request, payload: ExecRequest):
             env=payload.env,
             host_workspace=_host_workspace(),
             workspace_root=_workspace_root(),
-            agent=payload.agent,
-            run_id=payload.run_id,
+            # Output-directory ownership follows the token's agent, so a tool can
+            # only be handed `output|reports|data/<its own agent>`.
+            agent=claims.agent if claims else None,
+            run_id=claims.run_id if claims else None,
         ),
     )
 
@@ -1254,7 +1270,9 @@ async def open_session(request: Request, payload: SessionCreateRequest):
                 env=payload.env,
                 host_workspace=_host_workspace(),
                 workspace_root=_workspace_root(),
-                agent=payload.agent,
+                # A session mounts no agent-owned output directory, so there is no
+                # agent name to pass into the spec.
+                agent=None,
                 session_key=payload.session_key,
                 run_id=None,
             )

@@ -15,6 +15,7 @@ import httpx
 import pytest
 import yaml
 
+from core import agent_token
 from core.execution import backend as backend_module
 from core.execution import canary as canary_module
 from core.execution import runner as runner_module
@@ -24,6 +25,14 @@ from core.models import ToolConfig
 from fixtures.fake_backend import FakeBackend, RawExec
 
 AUTH = {"authorization": "Bearer test-token"}
+SECRET = "runner-api-unit-secret-0123456789abcdef"
+
+
+def _token(agent="demo-assistant", run_id="run-1", user_id="u-1"):
+    """The run's token: the runner's ONLY identity source."""
+    return agent_token.mint(
+        agent, user_id=user_id, user_email="u@example.test", run_id=run_id
+    )
 
 TOOL_YAML = """\
 - name: echo
@@ -65,6 +74,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTAINER_DEFAULT_RUNTIME", "runsc")
     monkeypatch.setenv("RUNNER_MAX_CONTAINERS_PER_TOOL", "8")
     monkeypatch.delenv("DEV_MODE", raising=False)
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", SECRET)
+    monkeypatch.delenv("ENFORCE_AGENT_TOKENS", raising=False)
     monkeypatch.setenv("TRELLIS_UID", "1000")
     monkeypatch.setenv("TRELLIS_GID", "1000")
 
@@ -86,12 +97,12 @@ def _digest(root) -> str:
 
 
 def _body(root, **overrides) -> dict:
+    # No identity in the body: agent/run/user/email come from the token's claims.
     body = {
         "kind": "tool",
         "target": "echo",
         "manifest_digest": _digest(root),
-        "agent": "demo-assistant",
-        "run_id": "run-1",
+        "agent_token": _token(),
         "env": {"ECHO_TOKEN": "s3cret"},
         "input": '{"text":"hi"}',
         "deadline_ms": 5000,

@@ -121,6 +121,32 @@ def test_rotation_state_is_offered():
     assert "storedFp !== payload.key_fp" not in source
 
 
+# --- approval state -----------------------------------------------------------
+
+
+def test_the_fingerprint_the_page_encrypts_to_is_displayed():
+    source = _source()
+
+    assert 'id="edge-secret-fingerprint"' in source
+    assert 'id="edge-secret-fingerprint-value"' in source
+    assert "fingerprintValueEl.textContent = payload.key_fp;" in source
+
+
+def test_a_pending_key_blocks_sealing_and_names_the_fingerprint():
+    source = _source()
+    open_modal = _block(source, "async function openModal(button)")
+
+    assert 'id="edge-secret-pending"' in source
+    assert 'id="edge-secret-pending-message"' in source
+    # 409 key_pending_approval is its own state: it shows the server's message (which
+    # names the fingerprint) instead of a generic error.
+    assert 'payload.error === "key_pending_approval"' in open_modal
+    assert "showPending(payload.detail" in open_modal
+    # Nothing on the pending path can enable the submit button: it is set once at the
+    # start, and only the success path may re-evaluate it.
+    assert "submitBtn.disabled = false" not in open_modal
+
+
 # --- the page wiring ----------------------------------------------------------
 
 

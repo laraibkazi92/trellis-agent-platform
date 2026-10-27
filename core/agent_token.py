@@ -27,7 +27,7 @@ import secrets
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,11 @@ class Claims:
     # "system" for the framework's own entry points (gateway, supervisor). A
     # user-created agent cannot obtain this: only the runtime mints tokens.
     principal: Optional[str] = None
+    # The caller's OIDC groups at mint time (claim "g"): the only group source the
+    # policy evaluator may trust. Empty for service identities.
+    groups: tuple[str, ...] = ()
+    # The run that delegated this one (claim "p"), for child tokens.
+    parent_run_id: Optional[str] = None
 
     def identity(self) -> str:
         """The identity the agent acts for: `svc_agent_<agent>` for background runs."""
@@ -68,6 +73,26 @@ class Claims:
 
     def expired(self, now: Optional[float] = None) -> bool:
         return (now or time.time()) > self.exp + CLOCK_SKEW_S
+
+
+def normalize_groups(value: Optional[Iterable[str]]) -> tuple[str, ...]:
+    """Sorted, deduplicated, non-empty group names; ``None``/garbage reads as empty.
+
+    A bare string is garbage here, not a comma-separated list: the claim (and the
+    record field it mirrors) is a list, and iterating a string would yield characters.
+    """
+    if not value or isinstance(value, str):
+        return ()
+    try:
+        items = list(value)
+    except TypeError:
+        return ()
+    names = {
+        item.strip()
+        for item in items
+        if isinstance(item, str) and item.strip()
+    }
+    return tuple(sorted(names))
 
 
 def _dev_mode() -> bool:
@@ -149,6 +174,8 @@ def mint(
     ttl_s: Optional[int] = None,
     now: Optional[float] = None,
     principal: Optional[str] = None,
+    groups: Optional[Iterable[str]] = None,
+    parent_run_id: Optional[str] = None,
 ) -> str:
     """Mint one token; the first key signs."""
     if not agent or not str(agent).strip():
@@ -167,6 +194,13 @@ def mint(
     }
     if principal:
         payload["k"] = str(principal)
+    # Omitted when empty so a service identity's token is byte-identical to a
+    # pre-groups token (and reads back as "no groups", never as "all groups").
+    normalized = normalize_groups(groups)
+    if normalized:
+        payload["g"] = list(normalized)
+    if parent_run_id:
+        payload["p"] = str(parent_run_id)
     encoded = _b64url(
         json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     )
@@ -220,6 +254,9 @@ def verify(token: Optional[str], *, now: Optional[float] = None) -> Claims:
     if issued > reference + CLOCK_SKEW_S:
         raise AgentTokenError("malformed", "token was issued in the future")
 
+    groups = _claim_groups(payload.get("g"))
+    parent_run_id = _claim_parent_run_id(payload.get("p"))
+
     return Claims(
         agent=agent,
         user_id=payload.get("u"),
@@ -229,7 +266,45 @@ def verify(token: Optional[str], *, now: Optional[float] = None) -> Claims:
         exp=expires,
         jti=jti,
         principal=payload.get("k"),
+        groups=groups,
+        parent_run_id=parent_run_id,
     )
+
+
+def _claim_groups(value: object) -> tuple[str, ...]:
+    """The ``g`` claim: trimmed, sorted, de-duplicated, capped group names.
+
+    Normalised on read exactly as ``mint`` normalises on write, so a hand-built or
+    foreign token cannot smuggle padding or duplicates past a rule that matches an
+    exact group name -- and cannot make every call carry an unbounded set.
+    """
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise AgentTokenError("malformed", "claim 'g' must be a list of non-empty strings")
+    groups = normalize_groups(value)
+    # Imported here, not at module scope: ``core.auth`` carries the whole identity stack
+    # (FastAPI, etcd) and verification must stay cheap in every process that holds a key.
+    from core.auth import MAX_CLAIM_GROUPS
+
+    if len(groups) > MAX_CLAIM_GROUPS:
+        logger.warning(
+            "Agent token 'g' claim carries %d groups; keeping the first %d",
+            len(groups),
+            MAX_CLAIM_GROUPS,
+        )
+    return groups[:MAX_CLAIM_GROUPS]
+
+
+def _claim_parent_run_id(value: object) -> Optional[str]:
+    """The ``p`` claim: a run id string, or absent."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise AgentTokenError("malformed", "claim 'p' must be a non-empty string")
+    return value
 
 
 def verify_or_none(token: Optional[str]) -> Optional[Claims]:
@@ -248,6 +323,8 @@ def mint_for_run(
     run_id: Optional[str] = None,
     ttl_s: Optional[int] = None,
     principal: Optional[str] = None,
+    groups: Optional[Iterable[str]] = None,
+    parent_run_id: Optional[str] = None,
 ) -> str:
     """Mint a token and publish it (plus the run id) to the current context."""
     try:
@@ -258,6 +335,8 @@ def mint_for_run(
             run_id=run_id,
             ttl_s=ttl_s,
             principal=principal,
+            groups=groups,
+            parent_run_id=parent_run_id,
         )
     except AgentTokenError as exc:
         # Rollout (off/log) without a key must not break calls; enforce does.
@@ -309,6 +388,8 @@ def refresh(token: Optional[str], *, min_validity_s: int = 60) -> Optional[str]:
             user_email=claims.user_email,
             run_id=claims.run_id,
             principal=claims.principal,
+            groups=claims.groups,
+            parent_run_id=claims.parent_run_id,
         )
     except AgentTokenError:
         return token

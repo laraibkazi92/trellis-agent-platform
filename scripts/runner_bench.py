@@ -36,7 +36,6 @@ import os
 import statistics
 import sys
 import time
-import uuid
 from typing import Any, Optional
 
 from core import agent_token
@@ -282,9 +281,9 @@ async def _run(
         kind="tool",
         target=target.config.name,
         manifest_digest=manifest_digest(target.config),
-        agent=args.agent,
+        # No identity (no agent/user/run) on the wire: the runner derives it from the
+        # token's claims, which is what --agent mints below.
         agent_token=args.agent_token or None,
-        run_id=f"bench-{uuid.uuid4().hex[:12]}",
         env={},
         input=input_json,
         deadline_ms=_deadline_ms(target.config),

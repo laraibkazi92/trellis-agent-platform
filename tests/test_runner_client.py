@@ -41,6 +41,25 @@ def exec_with(handler, *, request=None, token=None):
     return asyncio.run(scenario())
 
 
+def test_exec_body_carries_no_identity_fields():
+    """The runner request has no identity: claims are the only authority."""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"exit_code": 0, "stdout": "", "stderr": "", "duration_ms": 1},
+        )
+
+    exec_with(handler)
+
+    for field in ("agent", "user_id", "user_email", "run_id"):
+        assert field not in seen, field
+    # None is dropped from the wire (exclude_none), so a token-less call sends none.
+    assert "agent_token" not in seen
+
+
 def test_exec_parses_a_200_result():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"

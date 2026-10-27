@@ -575,14 +575,21 @@ def test_the_session_env_is_scoped_and_carries_the_caller_identity(
     """Only declared keys + identity reach the runner; the host env never does."""
     monkeypatch.setenv("TRELLIS_EDGE_TOKEN", "edge_plant-floor_supersecret")
     monkeypatch.setenv("UNDECLARED_PROCESS_VAR", "should-not-leak")
-    monkeypatch.setenv("DEVOPS_PASSWORD", "hunter2")
+    # A declared secret is no longer read from the process env (v0.7.1): it must come
+    # from the edge's shared file.
+    monkeypatch.setenv("DEVOPS_PASSWORD", "process-env-must-not-win")
     write_mcp(
         tmp_path / "mcps",
         secrets=["DEVOPS_PASSWORD"],
         tools=SERVER_TOOLS + [ENV_DUMP_TOOL],
     )
+    store = credentials_at(tmp_path)
+    store.secrets_dir.mkdir(parents=True, exist_ok=True)
+    (store.secrets_dir / "stateful.env").write_text(
+        "DEVOPS_PASSWORD=hunter2\n", encoding="utf-8"
+    )
     entries = load_one(tmp_path / "mcps")
-    manager = proxy_mcp.McpSessionManager()
+    manager = proxy_mcp.McpSessionManager(credentials=store)
 
     async def scenario():
         try:
@@ -1455,6 +1462,42 @@ def test_small_results_are_untouched():
     assert proxy_mcp._truncate(payload) is payload
 
 
+def test_the_session_identity_and_key_come_from_the_frame_never_the_token(
+    tmp_path, fake_sessions
+):
+    """v0.7.1: no token-derived identity on the edge. The frame is the only source."""
+    write_mcp(tmp_path / "mcps", tools=SERVER_TOOLS + [ENV_DUMP_TOOL])
+    entries = load_one(tmp_path / "mcps")
+    manager = proxy_mcp.McpSessionManager()
+    identity = {"user": "frame-user", "user_email": "frame@example.com"}
+
+    async def scenario():
+        try:
+            manager.set_entries(entries, await catalogs_for(entries))
+            result = await manager.call(
+                "stateful",
+                "env_dump",
+                {},
+                identity,
+                DEADLINE_MS,
+                # A token for somebody else changes nothing: the edge never reads it.
+                agent_token="t1.forged.signature",
+            )
+            return result, list(manager._sessions)
+        finally:
+            await manager.kill_all()
+
+    result, sessions = asyncio.run(scenario())
+    seen = structured(result)
+
+    assert seen["TRELLIS_USER_ID"] == "frame-user"
+    assert seen["TRELLIS_USER_EMAIL"] == "frame@example.com"
+    # One session, keyed by the frame identity (normalized email), not by the token.
+    assert sessions == [
+        ("stateful", edge_user_secrets.normalize_email("frame@example.com"))
+    ]
+
+
 def test_identity_key_prefers_the_email():
     assert proxy_mcp._identity_key({"user_email": "a@x", "user": "u1"}) == SESSION_KEY
     # Two spellings of one address are one person: one session, one server process.
@@ -1601,16 +1644,16 @@ def test_a_stdio_session_is_a_runner_transport_with_declared_env_and_digest(
     proxy_mcp._transport(
         entry,
         {"DEVOPS_PASSWORD": "s3cret", "TRELLIS_USER_ID": "u1"},
-        identity={"user": "u1", "user_email": "u1@corp.example"},
     )
 
     assert captured["target"] == "devops-cli"
     assert len(captured["session_key"]) == 32
     assert captured["env"] == {"DEVOPS_PASSWORD": "s3cret", "TRELLIS_USER_ID": "u1"}
     assert captured["manifest_digest"] == manifest_digest(entry.config)
-    assert captured["agent"] is None
-    assert captured["user_id"] == "u1"
-    assert captured["user_email"] == "u1@corp.example"
+    # No identity on the transport (v0.7.1 Phase 2): the runner reads it from the token.
+    assert "agent" not in captured
+    assert "user_id" not in captured
+    assert "user_email" not in captured
     assert captured["kind"] == "mcp_session"
     assert captured["deadline_ms"] == proxy_mcp.DEFAULT_SESSION_DEADLINE_MS
 

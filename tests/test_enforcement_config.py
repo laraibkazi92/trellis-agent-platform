@@ -54,13 +54,26 @@ def test_central_compose_configures_every_enforcement_point():
     assert services["runner"]["environment"]["RUNNER_AUTHORIZATION"] == "allowlist"
 
 
-def test_edge_compose_runner_is_signature_only_but_proxy_verifies():
+def test_the_edge_proxy_never_verifies_an_agent_token():
+    """v0.7.1: the edge trusts the relay's frame identity; the proxy has no key.
+
+    The **runner** keeps the key (temporary Phase 2 posture): it verifies nothing
+    today, and Phase 4 turns enforcement on and derives the agent / output dir from
+    the token's claims.
+    """
     services = _services(ROOT / "deploy" / "proxy" / "docker-compose.yml")
-    runner_env = services["runner"]["environment"]
+
     proxy_env = services["trellis-proxy"]["environment"]
-    assert runner_env["RUNNER_AUTHORIZATION"] == "signature"
+    assert "AGENT_TOKEN_SECRET" not in proxy_env
+    assert "ENFORCE_AGENT_TOKENS" not in proxy_env
+
+    runner_env = services["runner"]["environment"]
     assert "AGENT_TOKEN_SECRET" in runner_env
-    assert "AGENT_TOKEN_SECRET" in proxy_env
+    assert "set AGENT_TOKEN_SECRET" in runner_env["AGENT_TOKEN_SECRET"]
+    # The edge runner is pinned out of verification even if a stale .env sets it.
+    assert runner_env["ENFORCE_AGENT_TOKENS"] == "off"
+    # Deleted in the next phase, kept here on purpose.
+    assert runner_env["RUNNER_AUTHORIZATION"] == "signature"
 
 
 def _config(**overrides) -> ToolConfig:

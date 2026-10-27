@@ -130,9 +130,8 @@ class Live:
             kind="tool",
             target=name,
             manifest_digest=manifest_digest(target.config),
-            agent=self.agent,
+            # Identity is the token's claims (v0.7.1 Phase 2): no body fields.
             agent_token=self.token,
-            run_id=f"live-{uuid.uuid4().hex[:12]}",
             env=env or {},
             input=json.dumps(payload),
             deadline_ms=deadline_ms,

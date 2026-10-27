@@ -16,7 +16,7 @@ import os
 import pytest
 import yaml
 
-from core import edge_env, proxy, proxy_mcp
+from core import edge_env, edge_user_secrets, proxy, proxy_mcp
 from core.models import MCPConfig, ToolConfig
 
 TOKEN = "edge_site_supersecret"
@@ -89,6 +89,20 @@ def tool_config(name="devops", **kwargs):
         entrypoint="main.py",
         **kwargs,
     )
+
+
+def shared_store(tmp_path, name, **values):
+    """The edge's shared credential store with one ``<name>.env`` file.
+
+    Since v0.7.1 a declared *secret* is read from here only -- the process
+    environment is not a fallback for one.
+    """
+    store = edge_user_secrets.CredentialStore(secrets_dir=tmp_path / "edge-secrets")
+    store.secrets_dir.mkdir(parents=True, exist_ok=True)
+    (store.secrets_dir / f"{name}.env").write_text(
+        "".join(f"{key}={value}\n" for key, value in values.items()), encoding="utf-8"
+    )
+    return store
 
 
 # --- default (allowlist) mode -------------------------------------------------------
@@ -282,9 +296,13 @@ def test_declared_keys_for_nothing_declared():
 
 def test_build_env_scopes_the_env_and_keeps_the_tool_bin_first(tmp_path, process_env):
     config = tool_config(secrets=["DEVOPS_PASSWORD"])
+    store = shared_store(tmp_path, "devops", DEVOPS_PASSWORD="hunter2")
 
     env = proxy.build_env(
-        tmp_path, config, {"user": "u1", "user_email": "u1@corp.example"}
+        tmp_path,
+        config,
+        {"user": "u1", "user_email": "u1@corp.example"},
+        credentials=store,
     )
 
     assert env["DEVOPS_PASSWORD"] == "hunter2"
@@ -295,6 +313,21 @@ def test_build_env_scopes_the_env_and_keeps_the_tool_bin_first(tmp_path, process
     assert "TRELLIS_EDGE_TOKEN" not in env
 
 
+def test_build_env_never_takes_a_declared_secret_from_the_process_env(
+    tmp_path, process_env, monkeypatch
+):
+    """v0.7.1: the container env is not a credential source for a declared secret."""
+    config = tool_config(secrets=["DEVOPS_PASSWORD"])
+    monkeypatch.setenv("DEVOPS_URL", "https://corp.example")
+
+    env = proxy.build_env(tmp_path, config)
+
+    assert "DEVOPS_PASSWORD" not in env
+    # A declared *variable* (edge configuration) still resolves from the env.
+    variable_env = proxy.build_env(tmp_path, tool_config(variables=["DEVOPS_URL"]))
+    assert variable_env["DEVOPS_URL"] == "https://corp.example"
+
+
 def test_build_env_honors_passthrough_and_still_drops_the_token(tmp_path, process_env):
     config = tool_config()
 
@@ -302,6 +335,56 @@ def test_build_env_honors_passthrough_and_still_drops_the_token(tmp_path, proces
 
     assert env["SUSPICIOUS"] == "1"
     assert "TRELLIS_EDGE_TOKEN" not in env
+
+
+def test_passthrough_never_hands_over_a_declared_secret_from_the_process_env(
+    tmp_path, process_env, monkeypatch
+):
+    """``env_passthrough`` restores the denylist for *undeclared* keys only.
+
+    A declared secret is a credential: it comes from the shared file or the caller's
+    sealed set, never from the container's own environment. Without this the
+    passthrough layer would silently re-supply a key the store does not hold.
+    """
+    monkeypatch.setenv("DEVOPS_URL", "https://corp.example")
+    config = tool_config(secrets=["DEVOPS_PASSWORD"], variables=["DEVOPS_URL"])
+
+    env = proxy.build_env(tmp_path, config, passthrough=True)
+
+    # Present in the process env, declared as a SECRET: absent from the tool env.
+    assert "DEVOPS_PASSWORD" not in env
+    # A declared VARIABLE is edge configuration and still passes through.
+    assert env["DEVOPS_URL"] == "https://corp.example"
+
+
+def test_an_mcp_session_passthrough_never_hands_over_a_declared_secret(
+    tmp_path, process_env, monkeypatch
+):
+    """The same rule on the MCP session env builder (``_server_env``)."""
+    monkeypatch.setenv("DEVOPS_URL", "https://corp.example")
+    entry = proxy_mcp.McpExport(
+        name="devops-cli",
+        config=MCPConfig(
+            name="devops-cli",
+            transport="stdio",
+            command="devops-mcp",
+            secrets=["DEVOPS_PASSWORD"],
+            variables=["DEVOPS_URL"],
+        ),
+        directory=tmp_path,
+    )
+
+    env = proxy_mcp._server_env(
+        entry,
+        {},
+        passthrough=True,
+        token_env=None,
+        credentials=edge_user_secrets.CredentialStore(secrets_dir=tmp_path / "edge-secrets"),
+        site="plant-floor",
+    )
+
+    assert "DEVOPS_PASSWORD" not in env
+    assert env["DEVOPS_URL"] == "https://corp.example"
 
 
 def test_build_env_never_inherits_a_stale_identity(tmp_path, process_env, monkeypatch):
@@ -331,13 +414,18 @@ def test_handle_call_applies_the_proxy_config_policy(tmp_path, process_env, monk
 
     monkeypatch.setattr(proxy.tool_runtime, "execute_tool", fake_execute)
     config_map = {"devops": (tool_config(secrets=["DEVOPS_PASSWORD"]), tmp_path)}
+    store = shared_store(tmp_path, "devops", DEVOPS_PASSWORD="hunter2")
     frame = {"t": "call", "id": "c1", "tool": "devops", "args": {}, "deadline_ms": 1000}
 
     result = asyncio.run(
         proxy.handle_call(
             config_map,
             frame,
-            proxy_config=proxy.ProxyConfig(site="plant-floor", server_url="ws://relay/x"),
+            proxy_config=proxy.ProxyConfig(
+                site="plant-floor",
+                server_url="ws://relay/x",
+                secrets_dir=store.secrets_dir,
+            ),
         )
     )
 
@@ -467,9 +555,10 @@ def test_http_headers_carry_only_the_declared_credentials(tmp_path, process_env,
     monkeypatch.setenv("TRELLIS_USER_ID", "user-1")
     monkeypatch.setenv("TRELLIS_USER_EMAIL", "user-1@corp.example")
     monkeypatch.setenv("CORALOGIX_DOMAIN", "corp.example")
+    store = shared_store(tmp_path, "devops-cli", DEVOPS_PASSWORD="hunter2")
     env = proxy_mcp._server_env(
         entry, {"user": "user-1", "user_email": "user-1@corp.example"},
-        passthrough=False, token_env=None,
+        passthrough=False, token_env=None, credentials=store,
     )
 
     proxy_mcp._transport(entry, env)
@@ -491,7 +580,10 @@ def test_http_headers_carry_only_the_declared_credentials(tmp_path, process_env,
 def test_sse_headers_never_include_the_scoped_environment(tmp_path, process_env, monkeypatch):
     recorded = _RecordingTransports().install(monkeypatch)
     entry = mcp_export(tmp_path, transport="sse", secrets=["DEVOPS_PASSWORD"])
-    env = proxy_mcp._server_env(entry, {}, passthrough=False, token_env=None)
+    store = shared_store(tmp_path, "devops-cli", DEVOPS_PASSWORD="hunter2")
+    env = proxy_mcp._server_env(
+        entry, {}, passthrough=False, token_env=None, credentials=store
+    )
 
     proxy_mcp._transport(entry, env)
 
@@ -512,7 +604,10 @@ def test_passthrough_does_not_widen_http_headers(tmp_path, process_env, monkeypa
     """env_passthrough is a legacy subprocess policy; the runner request stays narrow."""
     recorded = _RecordingTransports().install(monkeypatch)
     entry = mcp_export(tmp_path, transport="http", secrets=["DEVOPS_PASSWORD"])
-    env = proxy_mcp._server_env(entry, {}, passthrough=True, token_env=None)
+    store = shared_store(tmp_path, "devops-cli", DEVOPS_PASSWORD="hunter2")
+    env = proxy_mcp._server_env(
+        entry, {}, passthrough=True, token_env=None, credentials=store
+    )
 
     proxy_mcp._transport(entry, env)
 
@@ -524,8 +619,13 @@ def test_passthrough_does_not_widen_http_headers(tmp_path, process_env, monkeypa
 def test_stdio_receives_the_declared_session_env(tmp_path, process_env, monkeypatch):
     recorded = _RecordingTransports().install(monkeypatch)
     entry = mcp_export(tmp_path, transport="stdio", secrets=["DEVOPS_PASSWORD"])
+    store = shared_store(tmp_path, "devops-cli", DEVOPS_PASSWORD="hunter2")
     env = proxy_mcp._server_env(
-        entry, {"user_email": "user-1@corp.example"}, passthrough=False, token_env=None
+        entry,
+        {"user_email": "user-1@corp.example"},
+        passthrough=False,
+        token_env=None,
+        credentials=store,
     )
 
     proxy_mcp._transport(entry, env)

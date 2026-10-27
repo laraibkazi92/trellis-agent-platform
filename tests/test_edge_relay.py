@@ -167,6 +167,14 @@ def _agent_token_env(monkeypatch):
     monkeypatch.delenv("ENFORCE_AGENT_TOKENS", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _body_identity_warning_armed():
+    """The one-shot body-identity warning is process-global: re-arm it per test."""
+    app_module._BODY_IDENTITY_WARNED = False
+    yield
+    app_module._BODY_IDENTITY_WARNED = False
+
+
 def _install_conn(site="site-a", tools=None, mcps=None, caps=None):
     if caps is None and mcps:
         caps = ["tools", "mcp"]
@@ -431,7 +439,21 @@ def test_invalid_arguments_return_400():
     assert "bogus" in payload["message"]
 
 
-def test_call_body_email_reaches_the_edge_connection():
+def test_call_body_has_no_identity_fields():
+    """v0.7.1 removed them: identity comes from the token claims, not the body."""
+    assert "user" not in app_module.CallBody.model_fields
+    assert "user_email" not in app_module.CallBody.model_fields
+    assert set(app_module.CallBody.model_fields) == {
+        "tool",
+        "args",
+        "deadline_ms",
+        "agent_token",
+        "sealed",
+    }
+
+
+def test_the_frame_identity_comes_from_the_claims_only(enforcing):
+    """A body identity is inert: only the verified token's claims reach the edge."""
     conn = _install_conn()
     seen = {}
 
@@ -444,6 +466,7 @@ def test_call_body_email_reaches_the_edge_connection():
         return {"id": "x", "ok": True, "result": {"echoed": args}}
 
     conn.request = _record
+    token = _mint(user_id="claim-user", user_email="claims@example.com")
     client = TestClient(app_module.app)
 
     response = client.post(
@@ -451,29 +474,79 @@ def test_call_body_email_reaches_the_edge_connection():
         json={
             "tool": "echo",
             "args": {"q": "x"},
-            "user": "u1",
-            "user_email": "ann@example.com",
+            # Both are ignored: they are not fields of the body any more.
+            "user": "body-user",
+            "user_email": "body@example.com",
+            "agent_token": token,
         },
     )
 
     assert response.status_code == 200
     assert seen == {
         "tool": "echo",
-        "user": "u1",
-        "user_email": "ann@example.com",
-        "agent_token": None,
+        "user": "claim-user",
+        "user_email": "claims@example.com",
+        "agent_token": token,
         "sealed": None,
     }
 
 
-def test_a_malformed_email_is_rejected_before_forwarding():
+def test_a_body_identity_is_logged_once_and_ignored(caplog):
+    """The stale-caller aid: one warning naming the fields, then silence."""
+    conn = _install_conn()
+    client = TestClient(app_module.app)
+
+    # The warning is emitted before dispatch; answer the call so the test does not
+    # wait out the real deadline.
+    async def _answer(
+        tool, args, deadline_ms, user=None, user_email=None, agent_token=None, sealed=None
+    ):
+        return {"id": "x", "ok": True, "result": {}}
+
+    conn.request = _answer
+
+    body = {"tool": "echo", "args": {"q": "x"}, "user": "body-user"}
+    assert client.post("/v1/sites/site-a/call", json=body).status_code == 200
+    assert client.post("/v1/sites/site-a/call", json=body).status_code == 200
+
+    lines = [r for r in caplog.records if "ignoring" in r.getMessage()]
+    assert len(lines) == 1
+    assert "user" in lines[0].getMessage()
+
+
+def test_a_call_without_a_token_has_no_identity(in_log_mode):
+    """No verified token: the frame carries no identity, and none is invented."""
+    conn = _install_conn()
+    seen = {}
+
+    async def _record(
+        tool, args, deadline_ms, user=None, user_email=None, agent_token=None, sealed=None
+    ):
+        seen.update(user=user, user_email=user_email)
+        return {"id": "x", "ok": True, "result": {}}
+
+    conn.request = _record
+
+    response = TestClient(app_module.app).post(
+        "/v1/sites/site-a/call", json={"tool": "echo", "args": {"q": "x"}}
+    )
+
+    assert response.status_code == 200
+    assert seen == {"user": None, "user_email": None}
+
+
+def test_a_malformed_claims_email_is_rejected_before_forwarding(enforcing):
     """The edge closes the tunnel on a bad call frame, so the relay must pre-filter."""
     conn = _install_conn()
     client = TestClient(app_module.app)
 
     response = client.post(
         "/v1/sites/site-a/call",
-        json={"tool": "echo", "args": {"q": "x"}, "user_email": "ann@example.com\n"},
+        json={
+            "tool": "echo",
+            "args": {"q": "x"},
+            "agent_token": _mint(user_email="ann@example.com\n"),
+        },
     )
 
     assert response.status_code == 400
@@ -624,7 +697,8 @@ def test_mcp_calls_share_the_inflight_cap():
     asyncio.run(_scenario())
 
 
-def test_mcp_endpoint_routes_to_the_edge_connection():
+def test_mcp_endpoint_routes_to_the_edge_connection(enforcing):
+    enforcing.agents["agent-a"] = _agent(mcps=["site-a__devops-cli"])
     conn = _install_conn(mcps={"devops-cli": _mcp()})
     seen = {}
     result = {"content": [{"type": "text", "text": "ok"}], "isError": False}
@@ -639,6 +713,7 @@ def test_mcp_endpoint_routes_to_the_edge_connection():
         return {"id": "x", "ok": True, "result": result}
 
     conn.request_mcp = _record
+    token = _mint(user_id="claim-user", user_email="claims@example.com")
     client = TestClient(app_module.app)
 
     response = client.post(
@@ -646,8 +721,10 @@ def test_mcp_endpoint_routes_to_the_edge_connection():
         json={
             "tool": "tenant_account_tools",
             "args": {"action": "list_actions"},
-            "user": "u1",
-            "user_email": "ann@example.com",
+            # Body identity is inert; the claims are what the edge sees.
+            "user": "body-user",
+            "user_email": "body@example.com",
+            "agent_token": token,
         },
     )
 
@@ -659,9 +736,9 @@ def test_mcp_endpoint_routes_to_the_edge_connection():
         # Forwarded un-coerced: the MCP server owns argument validation.
         "args": {"action": "list_actions"},
         "deadline_ms": protocol.DEFAULT_DEADLINE_MS,
-        "user": "u1",
-        "user_email": "ann@example.com",
-        "agent_token": None,
+        "user": "claim-user",
+        "user_email": "claims@example.com",
+        "agent_token": token,
         "sealed": None,
     }
 
@@ -802,7 +879,7 @@ def test_mcp_calls_are_audited_without_payloads(monkeypatch):
     )
     response = client.post(
         "/v1/sites/site-a/mcps/devops-cli/call",
-        json={"tool": "tenant_account_tools", "args": {"secret": "secret-value"}, "user": "u1"},
+        json={"tool": "tenant_account_tools", "args": {"secret": "secret-value"}},
     )
 
     assert response.status_code == 200
@@ -813,7 +890,9 @@ def test_mcp_calls_are_audited_without_payloads(monkeypatch):
     assert last["mcp"] == "devops-cli"
     assert last["tool"] == "tenant_account_tools"
     assert last["call_id"]
-    assert last["user"] == "u1"
+    # No verified caller here, so no identity on the line -- and never one from a body.
+    # (The real audit.record drops a None field; this interception sees it.)
+    assert last["user"] is None
     assert last["args_bytes"] > 0
     # The audit trail records shape, never payload.
     assert "secret-value" not in str(events)
@@ -1156,16 +1235,77 @@ def test_version_mismatch_closes_with_4001(monkeypatch):
     assert exc.value.code == protocol.CLOSE_VERSION
 
 
-def test_duplicate_tool_names_close_with_4000(monkeypatch):
+def test_duplicate_tool_names_skip_one_entry_not_the_hello(monkeypatch, caplog):
+    """One unusable entry costs that export; the tunnel and the rest stay up."""
     monkeypatch.setattr(app_module, "resolve_token", lambda token: {"name": "site-a"})
     client = TestClient(app_module.app)
 
-    with pytest.raises(WebSocketDisconnect) as exc:
-        with _connect(client) as ws:
-            ws.send_json(_hello(tools=[{"name": "dup"}, {"name": "dup"}]))
-            ws.receive_text()
+    with _connect(client) as ws:
+        ws.send_json(
+            _hello(tools=[{"name": "dup"}, {"name": "dup"}, {"name": "healthy"}])
+        )
+        assert ws.receive_json()["t"] == "welcome"
+        # The welcome is answered before the site is registered for dispatch.
+        _wait_until(
+            lambda: app_module.relay.get("site-a") is not None,
+            "the site was never registered",
+        )
+        conn = app_module.relay.get("site-a")
+        assert sorted(conn.tools) == ["dup", "healthy"]
 
-    assert exc.value.code == protocol.CLOSE_MALFORMED
+    assert any("duplicate" in record.getMessage() for record in caplog.records)
+
+
+def test_an_invalid_credential_key_target_keeps_the_tunnel_up(monkeypatch, caplog):
+    """A hyphenated declared key costs that seal form, not every export (v0.7.1)."""
+    monkeypatch.setattr(app_module, "resolve_token", lambda token: {"name": "site-a"})
+    client = TestClient(app_module.app)
+
+    with _connect(client) as ws:
+        ws.send_json(
+            _hello(
+                tools=[{"name": "echo"}],
+                credential_keys={
+                    "echo": {"secret_keys": ["ECHO_TOKEN"]},
+                    "node_ssh": {"secret_keys": ["my-api-key"]},
+                },
+            )
+        )
+        assert ws.receive_json()["t"] == "welcome"
+        _wait_until(
+            lambda: app_module.relay.get("site-a") is not None,
+            "the site was never registered",
+        )
+        conn = app_module.relay.get("site-a")
+        assert sorted(conn.tools) == ["echo"]
+
+    assert any("my-api-key" in record.getMessage() for record in caplog.records)
+
+
+def test_an_invalid_mcp_entry_keeps_the_other_servers_online(monkeypatch, caplog):
+    monkeypatch.setattr(app_module, "resolve_token", lambda token: {"name": "site-a"})
+    client = TestClient(app_module.app)
+
+    with _connect(client) as ws:
+        ws.send_json(
+            _hello(
+                tools=[{"name": "echo"}],
+                caps=["tools", "mcp"],
+                mcps=[
+                    {"name": "devops-cli", "tools": [{"name": "list_actions"}]},
+                    {"name": "broken", "transport": "carrier-pigeon"},
+                ],
+            )
+        )
+        assert ws.receive_json()["t"] == "welcome"
+        _wait_until(
+            lambda: app_module.relay.get("site-a") is not None,
+            "the site was never registered",
+        )
+        conn = app_module.relay.get("site-a")
+        assert sorted(conn.mcps) == ["devops-cli"]
+
+    assert any("carrier-pigeon" in record.getMessage() for record in caplog.records)
 
 
 def _mcp_catalog():
@@ -1486,8 +1626,8 @@ def test_end_to_end_tunnel_call(monkeypatch):
         asyncio.run(_scenario())
 
 
-def test_end_to_end_wire_frame_carries_the_caller_email(monkeypatch):
-    """The email crosses the real tunnel; without one the frame has no such key."""
+def test_end_to_end_wire_frame_carries_the_claims_email(monkeypatch):
+    """The claims email crosses the real tunnel; without one the frame has no key."""
     import httpx
     from websockets.asyncio.client import connect
 
@@ -1531,14 +1671,24 @@ def test_end_to_end_wire_frame_carries_the_caller_email(monkeypatch):
                             json={
                                 "tool": "echo",
                                 "args": {"q": "hi"},
-                                "user_email": "ann@example.com",
+                                "agent_token": _mint(
+                                    user_id="claim-user",
+                                    user_email="ann@example.com",
+                                ),
                             },
                         )
-                        assert with_email.json()["result"]["user_email"] == "ann@example.com"
+                        echoed = with_email.json()["result"]
+                        assert echoed["user_email"] == "ann@example.com"
+                        assert echoed["user"] == "claim-user"
 
+                        # A token with no email claim carries no such key at all.
                         without_email = await client.post(
                             "/v1/sites/site-a/call",
-                            json={"tool": "echo", "args": {"q": "hi"}},
+                            json={
+                                "tool": "echo",
+                                "args": {"q": "hi"},
+                                "agent_token": _mint(user_id="claim-user"),
+                            },
                         )
                         assert "user_email" not in without_email.json()["result"]
                 finally:
@@ -2035,6 +2185,13 @@ def _agent(tools=None, mcps=None):
 
 
 @pytest.fixture
+def in_log_mode(monkeypatch):
+    """Explicit log mode: a missing token is tolerated (and no identity is invented)."""
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "log")
+    return None
+
+
+@pytest.fixture
 def enforcing(monkeypatch, edge_registry):
     monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
     edge_registry.agents["agent-a"] = _agent(tools=["site-a__echo"])
@@ -2229,7 +2386,11 @@ def test_an_access_denial_is_audited_with_the_agent_and_no_args(monkeypatch, enf
 
     response = TestClient(app_module.app).post(
         "/v1/sites/site-a/call",
-        json={"tool": "echo", "args": {"q": "do-not-log-me"}, "agent_token": _mint()},
+        json={
+            "tool": "echo",
+            "args": {"q": "do-not-log-me"},
+            "agent_token": _mint(user_id="u-alice"),
+        },
     )
 
     assert response.status_code == 403
@@ -2238,8 +2399,35 @@ def test_an_access_denial_is_audited_with_the_agent_and_no_args(monkeypatch, enf
     assert entry["site"] == "site-a"
     assert entry["tool"] == "echo"
     assert entry["agent"] == "agent-a"
+    # The token verified; only the allowlist refused. The caller stays on the line.
+    assert entry["user"] == "u-alice"
     assert "args" not in entry
     assert "do-not-log-me" not in str(events)
+
+
+def test_an_mcp_access_denial_keeps_the_caller_on_the_audit_line(monkeypatch, enforcing):
+    """Same rule on the MCP route: a verified caller is never dropped from the line."""
+    events = []
+    monkeypatch.setattr(
+        app_module.audit, "record", lambda event, **kw: events.append({"event": event, **kw})
+    )
+    conn = _install_conn(mcps={"devops-cli": _mcp()})
+    conn.request_mcp = pytest.fail
+    enforcing.agents["agent-a"] = _agent(tools=[], mcps=[])
+
+    response = TestClient(app_module.app).post(
+        "/v1/sites/site-a/mcps/devops-cli/call",
+        json={
+            "tool": "tenant_account_tools",
+            "args": {"action": "list_actions"},
+            "agent_token": _mint(user_id="u-alice"),
+        },
+    )
+
+    assert response.status_code == 403
+    [entry] = events
+    assert entry["outcome"] == "access_denied"
+    assert entry["user"] == "u-alice"
 
 
 def test_a_malformed_token_shape_is_a_400_in_log_mode():

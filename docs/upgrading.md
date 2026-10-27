@@ -90,6 +90,109 @@ release. `deny`/`off` still mean `none`, and any unrecognized value still falls 
   on any manifest that must stay offline. The interactive `execute` path is unaffected —
   it is always `none`.
 
+#### Caller identity comes only from the agent token — body fields are gone
+
+The verified agent token is the single source of caller identity. `user` and `user_email`
+were removed from every request body (relay `CallBody`, hub `ExecRequest`, the runner exec
+payload); the relay now derives the edge frame's identity from the token's claims (`u`
+user id, `e` email) and the rest of the stack reads the claims instead of a body.
+
+**What to do instead**
+
+- Nothing, for the shipped components — they all ship in one image and were changed
+  together. A custom caller that posts to the relay's `/v1/sites/{site}/call` must send
+  `agent_token` and stop sending `user`/`user_email`; the relay logs one warning if it
+  still sees them and ignores them (a body can never assert an identity).
+- A token minted without an email claim has no `TRELLIS_USER_EMAIL` at the edge, and a
+  per-user-credential call from it fails with `identity_incomplete` (not
+  `credential_rejected`) instead of guessing an address from the user id.
+- Per-user sealed edge credentials need a **mintable** token. A deployment with no
+  `AGENT_TOKEN_SECRET` mints nothing, so such a call carries no claims at all: there is
+  no verified identity to seal a credential set to, central does not look one up, and the
+  edge's `credential_mode` refuses the call instead of opening a set it cannot attribute.
+  A token that carries a user id but no email fails with `identity_incomplete`. Configure
+  the signing key, or use the shared edge credential file instead of sealing.
+
+#### The edge proxy no longer verifies agent tokens
+
+`trellis-proxy` verifies nothing: the relay authenticated the caller, verified the token
+and built the frame identity from its claims, and the edge trusts that identity over the
+authenticated tunnel (the same trust it already placed in the relay's authorization
+decision). The signing key is still part of an edge install, but only for the **runner**
+— and only for Phase 4's benefit: the runner verifies nothing yet (`ENFORCE_AGENT_TOKENS`
+is fixed at `off` there), while Phase 4 turns enforcement on and derives the agent and the
+output dir from the token's claims. `RUNNER_AUTHORIZATION` stays until the next phase
+deletes it.
+
+**What to do instead**
+
+- Keep `AGENT_TOKEN_SECRET` in the edge's `.env`: the sample
+  `deploy/proxy/docker-compose.yml` requires it on the runner service (`:?` — compose
+  refuses to start without it) and does not set it on `trellis-proxy`. Do not set
+  `ENFORCE_AGENT_TOKENS` yourself; the sample pins it to `off` on the edge runner so a
+  leftover value cannot re-enable verification early.
+- The **central** install still needs it on host/hub/gateway/relay/taskiq/runner — that is
+  where verification happens today.
+- Upgrade the edge to the same image tag as central in the same change. The frame carries
+  the same `user`/`user_email` field names, now sourced from the token's claims, so the
+  wire stays compatible — but the trust model does not: an edge on the new build verifies
+  nothing, and an edge on the old build still expects the proxy to verify.
+
+#### Declared secrets come from the shared file only
+
+The process-environment fallback for a declared **secret** is removed. `edge-secrets/
+<tool-or-mcp>.env` is the only non-sealed source for a secret; a caller's sealed set still
+wins whole. Declared **variables** (endpoints, non-secret configuration) keep their
+`shared file -> process env` order.
+
+**What to do instead**
+
+- Move any credential that today lives only in the edge container's `.env` into
+  `edge-secrets/<tool-or-mcp>.env` (mode 0600) or seal it per user in the central UI. A
+  key left only in the environment now resolves to unset.
+- `env_passthrough: true` still hands a tool the whole sanitized environment (that is its
+  documented cost), so do not rely on it as a credential path either.
+
+#### One bad manifest no longer takes an edge offline
+
+Both sides validate a catalog entry by entry before publishing it:
+
+- The edge checks every exported tool/MCP's declared credential names against
+  `^[A-Za-z_][A-Za-z0-9_]*$` (and re-checks catalog entries the relay would refuse) and
+  **skips** the offending export with a warning; the rest stay online.
+- The relay's `hello` validation drops a single unusable tool/MCP/credential target and
+  logs it (`edge hello site=…: not publishing '<name>': <reason>`) instead of closing the
+  tunnel. Only frame-level violations (wrong `proto`, unknown caps, mismatched key
+  fingerprint, oversized frame) still refuse the handshake.
+- A credential-file line whose key is not a valid environment identifier is now logged
+  with its line number and path instead of being silently ignored.
+
+**What to do instead**
+
+- Rename a declared key that contains `-` or starts with a digit (for example
+  `my-api-key` -> `MY_API_KEY`) in `tool.yaml`/`mcp.yaml` and in the matching dotenv file.
+  Until then that export is simply absent from central's catalog, with a warning in the
+  edge log explaining why.
+
+#### Edge credential keys need admin approval before sealing
+
+Sealing a per-user edge credential set is now gated on an admin approving the edge's key
+fingerprint. A newly published key — a site's first hello, or the new half of
+`edge-keygen --rotate` — stays **pending** in `/registry/edges/<site>/config`
+(`edge_key_approved: false`), and the seal endpoint refuses to serve its public key
+(`409 key_pending_approval`). Configuration → Edge credentials shows the waiting
+fingerprint and keeps the form disabled.
+
+**What to do instead**
+
+- After upgrading **and after every key rotation**, open **Admin → Edges**, check the
+  fingerprint, and click **Approve key**. Existing edges need this once: their current
+  key is pending until approved, and until then users cannot seal new credential sets
+  (sets already stored keep working).
+- During a rotation overlap the previously approved fingerprint stays approved, so blobs
+  sealed to the old key keep opening. Approving the new fingerprint is what re-enables
+  sealing; `--drop-old-key` still ends the overlap.
+
 <!-- v0.7.1: further removals are appended below this marker before the tag. -->
 
 ---

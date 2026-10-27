@@ -22,13 +22,13 @@ services:
     # Same non-root posture as the central services: tools run as this uid.
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     command: python core/proxy.py --config /etc/trellis/proxy.yaml
-    # Non-secret runtime settings only (HTTPS_PROXY, ...). Credentials do NOT belong
-    # here: the shared store is `edge-secrets/<tool-or-mcp>.env` and per-user
-    # credentials are sealed in the central UI and opened with the edge key mounted
-    # below (never plaintext files). The process env is only the last fallback for a
-    # shared install that still carries a value here. The tunnel token is deliberately
-    # NOT here either -- Docker injects secrets as a mounted file, which keeps the
-    # token out of the process environment (and out of /proc/<pid>/environ).
+    # Non-secret runtime settings only (HTTPS_PROXY, endpoints for tools that declare
+    # them as `variables`, ...). Credentials do NOT belong here: a declared secret is
+    # read from the shared store `edge-secrets/<tool-or-mcp>.env` (or sealed per user
+    # in the central UI and opened with the edge key mounted below) and the process
+    # environment is no longer a fallback for one (v0.7.1). The tunnel token is
+    # deliberately NOT here either -- Docker injects it as a mounted file, which keeps
+    # it out of the process environment (and out of /proc/<pid>/environ).
     env_file: .env
     secrets:
       - edge_token
@@ -44,12 +44,10 @@ services:
       # "Per-user credentials and the edge key"); `trellis-proxy edge-keygen --show`
       # prints the public fingerprint.
       EDGE_PRIVATE_KEY_PATH: ${EDGE_PRIVATE_KEY_PATH:-/etc/trellis/keys/edge-key}
-      # Phase 3: the edge verifies the agent token's signature and expiry on every
-      # call (it has no agent registry, so the allowlist decision stays central).
-      # Must be the same value (rotation list) as the central host's.
-      AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET in this edge's .env to the central value}
-      # off | log | enforce: enforce refuses a missing/invalid/expired token.
-      ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
+      # The edge PROXY never verifies an agent token (v0.7.1): the relay
+      # authenticated the caller and derived the call's identity from the token's
+      # claims, and the edge trusts that identity over the authenticated tunnel. The
+      # signing key therefore lives on the RUNNER only (see below).
     volumes:
       # Tool suites and write targets live under the workspace. Tool containers get
       # their own read-only suite/shared mounts and, when asked for, one rw output
@@ -137,10 +135,16 @@ services:
       # manifest says `network: none`.
       TRELLIS_UID: ${TRELLIS_UID:-1000}
       TRELLIS_GID: ${TRELLIS_GID:-1000}
-      # The edge has no agent registry or agent manifests: the relay already made
-      # the allowlist decision. The edge runner verifies signature and expiry only.
-      AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET in this edge's .env to the central value}
-      ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
+      # TEMPORARY Phase 2 posture. The runner verifies nothing today (`off`), and the
+      # proxy is the only caller of this socket, so `off` also stops a stale value in
+      # an existing .env from re-enabling verification before Phase 4 is ready.
+      ENFORCE_AGENT_TOKENS: "off"
+      # Kept (and required) on the RUNNER ONLY: Phase 4 turns enforcement on here and
+      # derives the agent and the output dir from the token's claims. The proxy service
+      # above never sets it -- the proxy verifies no agent token at all.
+      AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET}
+      # Kept until Phase 4 deletes the runner's own allowlist check; an edge has no
+      # agent manifests, so the check would only ever deny.
       RUNNER_AUTHORIZATION: signature
       PYTHONDONTWRITEBYTECODE: "1"
     healthcheck:

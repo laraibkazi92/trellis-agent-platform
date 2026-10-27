@@ -338,10 +338,13 @@ def load_mcps(mcps_dir: Path, export_mcps: List[Any]) -> Dict[str, McpExport]:
             # Static catalogs are checked now so the relay can never be the first to
             # refuse one. Discovery-based servers are checked in ``build_catalog``.
             if config.tools:
-                try:
-                    protocol.validate_mcps([_catalog_payload(name, config.transport, config.tools)])
-                except protocol.ProtocolError as exc:
-                    logger.warning("Skipping mcp %r: %s", name, exc)
+                catalog = protocol.validate_mcps(
+                    [_catalog_payload(name, config.transport, config.tools)]
+                )
+                if not catalog:
+                    logger.warning(
+                        "Skipping mcp %r: %s", name, catalog.errors[0].describe()
+                    )
                     continue
 
             options = requested[name]
@@ -483,7 +486,6 @@ def _runner_transport(
     *,
     kind: str = "mcp_session",
     deadline_ms: int = DEFAULT_SESSION_DEADLINE_MS,
-    identity: Optional[Mapping[str, Any]] = None,
     agent_token: Optional[str] = None,
 ) -> Any:
     """The stdio transport seam: one runner session container per session.
@@ -491,7 +493,8 @@ def _runner_transport(
     Module-level so tests can substitute an in-memory transport without a runner
     or Docker. ``session_key`` is random per transport: it indexes the runner's
     session registry and is never derived from the caller (two identities must
-    never collide, and a respawn must not reuse a dead container's key).
+    never collide, and a respawn must not reuse a dead container's key). Identity is
+    not a transport input: the runner reads it from the verified token.
     """
     from core.execution.stdio_transport import RunnerStdioTransport
 
@@ -500,11 +503,9 @@ def _runner_transport(
         session_key=secrets.token_hex(16),
         env=dict(env),
         manifest_digest=manifest_digest(entry.config),
-        agent=None,
-        user_id=(identity or {}).get("user"),
-        user_email=(identity or {}).get("user_email"),
         # Verified by the runner when the session opens; a warm session keeps the
-        # token it was created with (no re-mint, plan §3.4(c)).
+        # token it was created with (no re-mint, plan §3.4(c)). The session's
+        # identity (agent/user/email/groups) is derived from it, never from the frame.
         agent_token=agent_token,
         deadline_ms=deadline_ms,
         kind=kind,
@@ -586,7 +587,6 @@ def _transport(
     *,
     kind: str = "mcp_session",
     deadline_ms: int = DEFAULT_SESSION_DEADLINE_MS,
-    identity: Optional[Mapping[str, Any]] = None,
     agent_token: Optional[str] = None,
 ):
     """A client for one server. Only stdio runs code, and it runs in a container.
@@ -603,7 +603,6 @@ def _transport(
                 env,
                 kind=kind,
                 deadline_ms=deadline_ms,
-                identity=identity,
                 agent_token=agent_token,
             )
         )
@@ -664,10 +663,11 @@ def _server_env(
     a credential (which would defeat ``per_user_required`` whenever the caller's
     sealed set happens to define the key).
 
-    When ``sealed`` is set the per-user branch is all-or-nothing: a declared secret
-    the caller's set omits is removed outright, even with ``passthrough`` and even if
-    a literal ``env:`` carries it -- the shared file and the container never fill the
-    gap. Declared ``variables`` are still the edge's own configuration.
+    A declared **secret** is never read from the edge process env (``passthrough``
+    included). When ``sealed`` is set the per-user branch is all-or-nothing: a
+    declared secret the caller's set omits is removed outright, even if a literal
+    ``env:`` carries it -- the shared file and the container never fill the gap.
+    Declared ``variables`` are still the edge's own configuration.
 
     The result is intersected with the manifest's declared keys: the runner rejects
     anything else (``400``), and a caller cannot smuggle a control-plane name in.
@@ -685,6 +685,12 @@ def _server_env(
         passthrough=passthrough,
         secret_env_names={edge_env.DEFAULT_TOKEN_ENV, token_env or edge_env.DEFAULT_TOKEN_ENV},
     )
+    declared_secrets = edge_user_secrets.declared_secret_keys(entry.config)
+    # A declared secret is never read from the edge process env -- not even under
+    # ``passthrough``: only the credential layers below may supply one, so an inherited
+    # value is dropped before they run.
+    for key in declared_secrets:
+        env.pop(key, None)
     env.update(
         {
             key: str(value)
@@ -696,7 +702,9 @@ def _server_env(
     # mode's point, and the only source under ``per_user_required``).
     env.update(resolved)
     if sealed is not None:
-        for key in edge_user_secrets.declared_secret_keys(entry.config):
+        # All-or-nothing: a declared secret the caller's set omits must not survive
+        # from a literal ``env:`` either.
+        for key in declared_secrets:
             if key not in resolved:
                 env.pop(key, None)
     # Neither a credential nor a literal env: may reintroduce a control-plane name.
@@ -802,13 +810,22 @@ async def build_catalog(
     catalog_tools = [_tool_dict(tool) for tool in tools]
     published = [tool for tool in catalog_tools if is_published(entry, tool["name"])]
     try:
-        return protocol.validate_mcps(
+        catalog = protocol.validate_mcps(
             [_catalog_payload(entry.name, entry.config.transport, published)]
-        )[0]
+        )
     except protocol.ProtocolError as exc:
         raise McpCallError(
             "mcp_unavailable", f"mcp {entry.name!r} catalog is not publishable: {exc}"
         ) from exc
+    if not catalog:
+        # Per-entry validation drops the server instead of raising: it is skipped
+        # (logged by the caller) while the other exports stay online.
+        raise McpCallError(
+            "mcp_unavailable",
+            f"mcp {entry.name!r} catalog is not publishable: "
+            f"{catalog.errors[0].describe()}",
+        )
+    return catalog[0]
 
 
 # ---------------------------------------------------------------- results
@@ -1148,7 +1165,6 @@ class McpSessionManager:
                 env,
                 self.token_env,
                 deadline_ms=_session_deadline_ms(entry),
-                identity=identity,
                 agent_token=agent_token,
             )
             await client.__aenter__()

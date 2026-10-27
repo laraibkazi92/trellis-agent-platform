@@ -66,6 +66,24 @@ def test_execute_sends_a_console_request():
     assert request.deadline_ms == 5_000
 
 
+def test_console_request_carries_no_identity(monkeypatch):
+    """Identity is the token's, not the body's (v0.7.1 Phase 2).
+
+    The user id, email and run id that used to ride the request now come from the
+    verified claims, so the console container is attributed from the token alone.
+    """
+    client = FakeRunnerClient(ExecResult(exit_code=0, stdout="", stderr=""))
+    backend = _backend(client)
+
+    backend.execute("echo hi", timeout=5)
+
+    request = client.requests[0]
+    for field in ("agent", "user_id", "user_email", "run_id"):
+        assert field not in request.model_dump(), field
+    # The run's token is the only identity carrier, and it is refreshed per call.
+    assert "agent_token" in request.model_dump()
+
+
 def test_execute_defaults_the_deadline_to_the_library_timeout():
     client = FakeRunnerClient()
     backend = _backend(client)

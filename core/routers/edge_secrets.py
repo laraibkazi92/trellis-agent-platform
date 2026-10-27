@@ -14,7 +14,10 @@ is the server's rather than the browser's:
   compared, so a caller cannot store a blob for somebody else even with a valid
   envelope;
 * **which edge key** -- the fingerprint must be the site's current key or one still in
-  the rotation overlap.
+  the rotation overlap; the pubkey endpoint serves an SPKI only when an admin has approved
+  the *current* fingerprint (``core/edge_key_approval``), and while a newly published or
+  rotated key is pending the write endpoint accepts blobs only for the previously
+  approved one.
 
 No response, log line or error message here contains ``wrapped_key`` or ``ciphertext``;
 the store's summaries are names and a fingerprint only.
@@ -29,7 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from core import edge_crypto, edge_keypair, edge_secrets_central
+from core import edge_crypto, edge_key_approval, edge_keypair, edge_secrets_central
 from core.auth import is_admin
 from core.dependencies import CSRFRoute, identity_mgr
 # The flattening rules are shared with the edge (core/edge_env.py) so central can
@@ -170,6 +173,20 @@ async def edge_secret_pubkey(request: Request, site: str, kind: str, name: str):
     spki = record.get("edge_pubkey")
     if not fp or not isinstance(spki, str) or not spki:
         return _error(404, "no_edge_key", "this edge has not published a credential key yet")
+    if not edge_key_approval.is_current_key_approved(record):
+        # Sealing is the one place where a key central has not verified by an admin would
+        # leak plaintext to whoever published it: refuse the SPKI, keep the fingerprint so
+        # the page can name what is waiting.
+        return _json(
+            409,
+            {
+                "error": edge_key_approval.PENDING_CODE,
+                "detail": edge_key_approval.pending_message(record),
+                "key_fp": fp,
+                "key_id": key_id,
+                "approved_fp": edge_key_approval.approved_fingerprint(record),
+            },
+        )
 
     secret_keys, variable_keys = _declared_for(site, kind, name, config)
     return _json(
@@ -242,6 +259,14 @@ async def store_edge_secret(request: Request, site: str, kind: str, name: str):
             "retired_key",
             "the edge key this blob was sealed to is retired; reload the page and retry",
         )
+    if (
+        not edge_key_approval.is_current_key_approved(record)
+        and key_fp != edge_key_approval.approved_fingerprint(record)
+    ):
+        # While the current key is pending, only the previously approved one may receive
+        # blobs (the rotation overlap). Nothing may be sealed to a fingerprint central has
+        # not approved -- the endpoint already refuses to serve its SPKI.
+        return _error(409, edge_key_approval.PENDING_CODE, edge_key_approval.pending_message(record))
 
     created_by = str(user.get("email") or user_id)
     stored = await asyncio.to_thread(

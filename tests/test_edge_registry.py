@@ -17,14 +17,17 @@ the etcd key layout in these tests is the layout production uses.
 """
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
 
 import pytest
 
+from core import edge_key_approval, edge_secrets_central
 from core.auth import EDGE_TOKENS_PREFIX, IdentityManager
 from services.edge_relay import registry
-from services.edge_relay.protocol import EdgeMcp, EdgeMcpTool, EdgeTool
+from services.edge_relay.protocol import EdgeCredentials, EdgeMcp, EdgeMcpTool, EdgeTool
 
 SITE = "plant-floor"
 TOOL = "boiler_status"
@@ -636,6 +639,117 @@ def test_an_admin_driven_empty_catalog_still_prunes(mgr):
 
     assert published == []
     assert _config(mgr, REGISTRY_NAME) is None
+
+
+# --- published key material and admin approval -------------------------------------
+#
+# The relay merges the hello's key material into the site record; approval is a central
+# decision (`core.edge_key_approval`), normalised on every write, so a key that appears
+# or changes lands pending until an admin approves the fingerprint.
+
+
+def _fp(tag: str) -> str:
+    """A well-formed SHA256: fingerprint, distinct per tag."""
+    return "SHA256:" + base64.b64encode(hashlib.sha256(tag.encode()).digest()).decode("ascii")
+
+
+def _credentials(fp=None, prev=None, pubkey="spki-b64"):
+    return EdgeCredentials(
+        edge_pubkey=pubkey if fp else None,
+        edge_key_fp=fp,
+        prev_edge_key_fp=prev,
+    )
+
+
+def _approve(mgr, approver="admin@example.com"):
+    approved, _changed = edge_key_approval.approve_current_key(
+        mgr.get_edge_config(SITE), approver
+    )
+    mgr.save_edge_config(SITE, approved)
+
+
+def test_a_first_published_key_is_pending_until_an_admin_approves_it(mgr):
+    mgr.create_edge(SITE, "Plant floor", "admin@example.com")
+    fp = _fp("one")
+
+    assert registry.publish_edge_credentials(mgr, SITE, _credentials(fp)) is True
+
+    record = mgr.get_edge_config(SITE)
+    assert record["edge_key_fp"] == fp
+    assert record["edge_key_approved"] is False
+    assert record.get("edge_key_approved_fp", "") == ""
+    assert edge_key_approval.is_current_key_approved(record) is False
+    assert edge_key_approval.pending_fingerprint(record) == fp
+
+
+def test_an_approved_fingerprint_survives_the_next_hello(mgr):
+    mgr.create_edge(SITE, "Plant floor", "admin@example.com")
+    fp = _fp("one")
+    registry.publish_edge_credentials(mgr, SITE, _credentials(fp))
+    _approve(mgr)
+
+    # Reconnect with the same key: nothing reverts the approval.
+    registry.publish_edge_credentials(mgr, SITE, _credentials(fp))
+
+    record = mgr.get_edge_config(SITE)
+    assert record["edge_key_approved"] is True
+    assert record["edge_key_approved_fp"] == fp
+    assert record["edge_key_approved_by"] == "admin@example.com"
+    assert record["edge_key_approved_at"]
+    assert edge_key_approval.is_current_key_approved(record) is True
+
+
+def test_a_rotated_key_is_pending_while_the_approved_fingerprint_is_kept(mgr):
+    mgr.create_edge(SITE, "Plant floor", "admin@example.com")
+    old_fp, new_fp = _fp("one"), _fp("two")
+    registry.publish_edge_credentials(mgr, SITE, _credentials(old_fp))
+    _approve(mgr)
+
+    registry.publish_edge_credentials(mgr, SITE, _credentials(new_fp, prev=old_fp))
+
+    record = mgr.get_edge_config(SITE)
+    assert record["edge_key_fp"] == new_fp
+    # The overlap keeps the old key usable for blobs already sealed to it.
+    assert record["edge_key_fps"] == [old_fp]
+    # The new key is pending; the approved fingerprint is untouched, so central still
+    # knows which key blobs may be sealed to.
+    assert record["edge_key_approved"] is False
+    assert record["edge_key_approved_fp"] == old_fp
+    assert edge_key_approval.pending_fingerprint(record) == new_fp
+
+
+def test_approving_the_rotated_key_moves_the_approved_fingerprint(mgr):
+    mgr.create_edge(SITE, "Plant floor", "admin@example.com")
+    old_fp, new_fp = _fp("one"), _fp("two")
+    registry.publish_edge_credentials(mgr, SITE, _credentials(old_fp))
+    _approve(mgr)
+    registry.publish_edge_credentials(mgr, SITE, _credentials(new_fp, prev=old_fp))
+
+    _approve(mgr, "second-admin@example.com")
+
+    record = mgr.get_edge_config(SITE)
+    assert record["edge_key_approved"] is True
+    assert record["edge_key_approved_fp"] == new_fp
+    assert record["edge_key_approved_by"] == "second-admin@example.com"
+    assert edge_key_approval.is_current_key_approved(record) is True
+    # Approving does not retire the overlap: an in-flight re-seal still resolves.
+    assert edge_secrets_central.active_fingerprints(record) >= {old_fp, new_fp}
+
+
+def test_a_record_written_with_new_key_material_lands_pending(mgr):
+    """The chokepoint: whoever saves the record, an unapproved fingerprint is pending."""
+    mgr.create_edge(SITE, "Plant floor", "admin@example.com")
+
+    record = mgr.get_edge_config(SITE)
+    record.update({"edge_key_fp": _fp("direct"), "edge_key_approved_fp": _fp("other")})
+    mgr.save_edge_config(SITE, record)
+    assert mgr.get_edge_config(SITE)["edge_key_approved"] is False
+
+    # Dropping the key also drops the approval: the same key returning must be re-approved.
+    record = mgr.get_edge_config(SITE)
+    record.pop("edge_key_fp")
+    mgr.save_edge_config(SITE, record)
+    assert mgr.get_edge_config(SITE)["edge_key_approved"] is False
 
 
 # --- publish_mcp_catalog -----------------------------------------------------------
