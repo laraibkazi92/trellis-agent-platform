@@ -445,11 +445,10 @@ def test_per_user_required_refuses_a_sealed_set_without_a_declared_name(tmp_path
 
 
 def test_per_user_required_refuses_a_missing_identity_before_missing_credentials(tmp_path):
-    """No email write the set could ever be sealed to: identity, not a credential (R7.1).
+    """No set and no email: identity, not a credential (R7.1).
 
     The old order answered ``missing_credentials`` ("no credentials for anonymous"),
-    which sends the operator to a seal form that cannot help: sealing needs the very
-    email the identity does not carry.
+    which reads as "your stored set is incomplete" when the caller has no set at all.
     """
     store = make_store(tmp_path)
     write_shared(store, DEVOPS_PASSWORD=SECRET_VALUE)
@@ -748,11 +747,11 @@ def test_handle_call_refuses_per_user_required_without_a_sealed_set(tmp_path, mo
 def test_handle_call_reports_identity_incomplete_for_a_frame_without_an_email(
     tmp_path, monkeypatch
 ):
-    """The reserved code travels to central, so the UI can send the user to the IdP.
+    """The reserved code travels to central, so the UI can offer the seal form.
 
-    A frame whose identity has no email is what the relay builds from an email-less
-    token: the edge must not answer ``missing_credentials`` here, because sealing a set
-    needs an address the caller does not have.
+    A frame whose identity has no email and no sealed set is what the relay builds from
+    an email-less token: the edge must not answer ``missing_credentials`` here, because
+    that reads as "your stored set is incomplete" when there is no set at all.
     """
     monkeypatch.setattr(proxy.tool_runtime, "execute_tool", _never_called)
     frame = {

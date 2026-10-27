@@ -22,14 +22,15 @@ from core.agent_token import normalize_groups
 logger = logging.getLogger(__name__)
 
 # Stable refusal code for a per-user-credential call the edge cannot serve: its
-# ``credential_mode`` is ``per_user_required``, which is satisfied only by a set sealed
-# for the caller, and the caller's identity has no email to seal to.
+# ``credential_mode`` is ``per_user_required``, which only a set sealed for the caller
+# satisfies, and this caller holds none and has no email claim to seal one under.
 IDENTITY_INCOMPLETE = "identity_incomplete"
 
 # Background runs act as a service identity (``svc_agent_<agent>``) and are email-less
-# by design: they have no profile record, so there is no address to seal to. Callers
-# that decide "this identity cannot serve a per-user credential" must not treat that
-# deliberate emptiness as a broken identity.
+# by design: they have no profile record, so there is no address in their claims. The
+# id is still a valid seal subject (``edge_secrets_central.sealed_identity`` falls back
+# to it), so this is not by itself a reason to refuse a per-user credential call: it
+# only decides which scoped secrets a manifest's ``secrets:`` / ``variables:`` resolve.
 SERVICE_IDENTITY_PREFIX = "svc_agent_"
 
 
@@ -90,19 +91,20 @@ async def resolve_mint_identity(identity_mgr: Any, user_id: Optional[str]) -> di
 
 
 def identity_incomplete_error(subject: str, site: str) -> dict:
-    """The refusal for a ``per_user_required`` call whose caller has no email.
+    """The refusal for a ``per_user_required`` call whose caller has no set and no email.
 
     Raised by the edge, which is the only side that knows the export's
-    ``credential_mode``. Never ``credential_rejected``: that code tells an operator to
-    re-seal credentials, which cannot fix a caller whose identity is missing. The
-    message names what is missing, so the operator looks at the identity provider, not
-    the seal.
+    ``credential_mode``. Never ``credential_rejected``: that code tells an operator a
+    stored set went stale, which is not what happened. The message names both ways out,
+    because an email-less caller *can* still seal one -- the seal falls back to their
+    user id -- and the operator should not be sent to the IdP for a fix the UI offers.
     """
     return {
         "error": (
             f"{IDENTITY_INCOMPLETE}: {subject} on edge '{site}' uses per-user "
-            "credentials, which are sealed to the caller's email, and the calling "
-            "identity has no email claim. Sign in with an identity provider that "
-            "asserts one (or use a token minted for a user with an email)."
+            "credentials, which are sealed per caller, and this caller has no sealed "
+            "set and the calling identity has no email claim. Seal the declared keys in "
+            "Configuration -> Edge credentials (such a set is bound to your user id), "
+            "or sign in with an identity provider that asserts an email."
         )
     }

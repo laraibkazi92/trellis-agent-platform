@@ -329,11 +329,16 @@ def test_a_runner_without_runsc_binary_skips_the_version_check(env, monkeypatch)
 
 
 def test_runsc_version_reads_stderr_and_ignores_a_blank_stream(monkeypatch):
-    """Some builds print the version to stderr; a whitespace-only line is not a line.
+    """Some builds print the version to stderr; an empty stream is not an empty line.
 
     ``_runsc_version`` indexed ``stderr.splitlines()[0]`` and raised ``IndexError`` out
-    of a check documented as never failing.
+    of a check documented as never failing -- both the empty stream (crash) and the
+    whitespace-only one (a blank "version") are pinned here.
     """
+    class _Empty:
+        stdout = ""
+        stderr = ""
+
     class _Blank:
         stdout = ""
         stderr = "  \n"
@@ -341,6 +346,9 @@ def test_runsc_version_reads_stderr_and_ignores_a_blank_stream(monkeypatch):
     class _OnStderr:
         stdout = ""
         stderr = "runsc version release-20261019.0\nspec: 1.2.1\n"
+
+    monkeypatch.setattr(runner_module.subprocess, "run", lambda *a, **k: _Empty())
+    assert runner_module._runsc_version() == ""
 
     monkeypatch.setattr(runner_module.subprocess, "run", lambda *a, **k: _Blank())
     assert runner_module._runsc_version() == ""
@@ -364,9 +372,8 @@ def test_runsc_bin_overrides_the_probed_binary(monkeypatch):
     monkeypatch.setenv("RUNSC_BIN", "/opt/gvisor/runsc")
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
 
-    runner_module._runsc_version()
-
-    assert seen["argv"][0] == "/opt/gvisor/runsc"
+    assert runner_module._runsc_version() == "runsc version release-20261019.0"
+    assert seen["argv"] == ["/opt/gvisor/runsc", "--version"]
 
 
 @pytest.mark.parametrize(

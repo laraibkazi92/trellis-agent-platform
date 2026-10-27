@@ -1264,6 +1264,9 @@ def test_the_slot_wait_never_outlives_the_run_timeout(monkeypatch):
     """The run's own deadline can be the earlier ceiling: waiting cannot extend a run."""
     from fixtures.fake_runner import FakeRunnerClient
 
+    # Jitter off: the retry steps are then deterministic, and this test is about the
+    # deadline ceiling, not the shape of the backoff.
+    monkeypatch.setattr(tasks, "SLOT_WAIT_JITTER", 0.0)
     mgr = FakeScriptIdentityManager(_script_workflow())
     runner = FakeRunnerClient(capacity_until_call=1000)
     waits = _record_slot_waits(monkeypatch)
@@ -1273,8 +1276,10 @@ def test_the_slot_wait_never_outlives_the_run_timeout(monkeypatch):
         _run_script_workflow(mgr)
 
     assert "runner_capacity" in str(excinfo.value)
-    # It waited the whole run timeout and not a second of the larger slot window.
-    assert sum(waits) == pytest.approx(100.0)
+    # It waited the whole run timeout and not a second of the larger slot window. (The
+    # loop stops once less than SLOT_WAIT_MIN_DEADLINE_S would be left, so the ceiling
+    # is a band, never a value above the deadline.)
+    assert 100.0 - tasks.SLOT_WAIT_MIN_DEADLINE_S <= sum(waits) <= 100.0
     # The message names the budget that ran out, not just the window.
     assert "of the run's 100s deadline" in str(excinfo.value)
 

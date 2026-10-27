@@ -103,6 +103,10 @@ services:
       # isolation boundary in production; dev machines without gVisor set this to
       # runc. A per-tool `container_runtime` overrides it.
       CONTAINER_DEFAULT_RUNTIME: ${CONTAINER_DEFAULT_RUNTIME:-runsc}
+      # gVisor is a HOST runtime: this compose file mounts no `runsc` into the runner, so
+      # the version probe reports itself skipped. Forwarded for a deployment that does
+      # mount the binary and wants the probe to check it.
+      RUNSC_BIN: ${RUNSC_BIN:-}
       RUNNER_IMAGE: ${RUNNER_IMAGE:-${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.1}}
       RUNNER_MAX_CONTAINERS: ${RUNNER_MAX_CONTAINERS:-32}
       RUNNER_MAX_CONTAINERS_PER_TOOL: ${RUNNER_MAX_CONTAINERS_PER_TOOL:-8}

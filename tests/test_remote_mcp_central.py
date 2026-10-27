@@ -346,8 +346,7 @@ def test_call_edge_mcp_leaves_the_per_user_decision_to_the_edge(monkeypatch):
     A blob is sealed to the email *or the user id*, so an email-less identity that
     holds one is a legitimate caller (a webhook run mints the literal id ``webhook``).
     ``per_user_required`` without a set is the edge's refusal -- it is the only side
-    that knows its ``credential_mode`` -- and its ``identity_incomplete`` comes back as
-    the call's error, never as a central short-circuit.
+    that knows its ``credential_mode``.
     """
     requests, _ = install_transport(monkeypatch, json_response(200, {"result": {"content": []}}))
     monkeypatch.setattr(

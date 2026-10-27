@@ -287,15 +287,16 @@ one, at sync time and at parse time:
 Three ordering fixes, all fail-closed:
 
 - **`identity_incomplete` is reported before `missing_credentials`.** A
-  `per_user_required` edge export called by an identity with no email **and no sealed
-  set** is refused with `identity_incomplete` instead of `missing_credentials`, which
-  would tell an operator to re-seal a set nobody could have sealed. The edge owns that
-  decision because it is the only side that knows the export's `credential_mode`; central
-  makes no identity decision of its own. A sealed set that *did* arrive is still served:
-  it is sealed to the caller's email, or to their user id when the identity has no email,
-  so an email-less identity can legitimately hold one (`webhook` runs are the shipped
-  example). A set sealed to an address the caller no longer carries is
-  `credential_rejected` — re-seal it as that identity.
+  `per_user_required` edge export called by a caller with **no sealed set and no email
+  claim** is refused with `identity_incomplete` instead of `missing_credentials`. The edge
+  owns that decision because it is the only side that knows the export's
+  `credential_mode`; central makes no identity decision of its own. Two ways out: seal the
+  declared keys in Configuration → Edge credentials (a set is bound to the email *or*, when
+  there is none, to the user id, so an email-less caller can seal one — `webhook` runs are
+  the shipped example), or fix the email claim at the IdP. A set sealed to an address the
+  caller no longer carries is `credential_rejected`: re-seal it as that identity. Note the
+  direction — once an IdP starts asserting an email, the AAD identity becomes the email, so
+  a set sealed under the bare user id stops opening and has to be re-sealed too.
 - **The body `__user_id` fallback is gone in every mode**, `off` and `log` included. Caller
   identity comes only from a verified token; a call with no token has no user identity, so
   it has no user-scoped secrets, no `TRELLIS_USER_*` and no usage row. A custom caller that
@@ -312,8 +313,8 @@ Three ordering fixes, all fail-closed:
 - Send an agent token from any custom caller into the relay, the hub or `/mcp`; a body is
   never an identity.
 - If a per-user tool now answers `identity_incomplete`, the caller has no email claim and
-  no sealed set: look at the identity provider's email claim and at the user record, not at
-  the credential set.
+  no sealed set. Have them seal the declared keys in Configuration → Edge credentials
+  (bound to their user id when they have no address) or fix the claim at the IdP.
 - Check any user record or IdP that stores a mixed-case address (`User@Example.com`). It now
   normalizes to `user@example.com` everywhere, which is also what a sealed set is keyed
   under.

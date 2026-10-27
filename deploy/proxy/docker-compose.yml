@@ -132,6 +132,10 @@ services:
       # every mount resolve to the wrong files and the startup canary refuses to serve.
       TRELLIS_HOST_WORKSPACE: ${TRELLIS_HOST_WORKSPACE:?set TRELLIS_HOST_WORKSPACE to this host's absolute ./workspace path}
       CONTAINER_DEFAULT_RUNTIME: ${CONTAINER_DEFAULT_RUNTIME:-runsc}
+      # gVisor is a HOST runtime, so no binary is mounted into this service by default
+      # and the runner's version probe reports itself skipped. Forwarded for a
+      # deployment that does mount `runsc` and wants the probe to check it.
+      RUNSC_BIN: ${RUNSC_BIN:-}
       RUNNER_IMAGE: ${RUNNER_IMAGE:-${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:latest}}
       TRELLIS_INSTALL_ID: ${TRELLIS_INSTALL_ID:-default}
       # Tool containers get no network override (Docker's default bridge) unless the

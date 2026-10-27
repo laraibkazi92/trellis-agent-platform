@@ -374,11 +374,10 @@ one, and the edge ignores it anyway because it is not in the declared secret set
 Only keys the manifest declares are read out of any source, so an extra key in a file
 cannot reach a child process. An anonymous caller (no `user_email`) with no sealed set
 falls back to the shared file under `per_user`, and is refused under `per_user_required`
-with `identity_incomplete` — there is no address to seal a new set to, and nothing an
-operator seals fixes that. A set is keyed by the caller's email *or*, when they have none,
-their user id, so an email-less identity that already sealed one is served normally. For
-MCP sessions, credentials are resolved once at session creation (see
-[MCP sessions](#mcp-sessions)).
+with `identity_incomplete` — sealing the declared keys fixes it, since a set is keyed by
+the caller's email *or*, when they have none, their user id. An email-less identity that
+already sealed one is served normally. For MCP sessions, credentials are resolved once at
+session creation (see [MCP sessions](#mcp-sessions)).
 
 ### Shared file format
 

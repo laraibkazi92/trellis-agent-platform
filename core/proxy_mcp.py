@@ -1126,13 +1126,14 @@ class McpSessionManager:
         identity: Mapping[str, Any],
         sealed: Optional[Mapping[str, str]] = None,
     ) -> Dict[str, str]:
-        """This session's credentials, or a ``missing_credentials`` refusal.
+        """This session's credentials, or a fail-closed refusal from ``resolve``.
 
         Resolved once here, at creation: a live session keeps the credentials it
         started with until its TTL, a SIGHUP that retires it, or a restart
         (documented in ``proxy._Session.reload``). A ``sealed`` blob that cannot be
         resolved -- e.g. ``per_user_required`` with no blob -- fails here, before any
-        container is created.
+        container is created; the refusal keeps its own code (``missing_credentials``,
+        or ``identity_incomplete`` for an email-less caller with no set).
         """
         try:
             return resolve_credentials(
