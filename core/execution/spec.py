@@ -467,12 +467,28 @@ def _uid_gid() -> tuple[Optional[int], Optional[int]]:
 
 
 def _require_user() -> str:
-    """Fail closed: a container never runs without an explicit non-root uid."""
+    """Fail closed: a container never runs without an explicit non-root uid/gid.
+
+    ``0`` is refused here as well as at the runner's startup gate
+    (``runner._check_tool_identity``), because that gate reads the environment
+    once: a ``TRELLIS_UID=0`` added after startup, or a spec built by a process
+    that never ran the preflight, would otherwise reach Docker as ``0:0``. This
+    is the last gate before a container is created. Root is not a cosmetic
+    detail: the workspace and the per-agent output dirs are host bind mounts, so
+    a root tool owns every file it writes and can write into another agent's
+    output directory.
+    """
     uid, gid = _uid_gid()
     if uid is None or gid is None:
         raise InvalidRequest(
             "TRELLIS_UID and TRELLIS_GID must be set; refusing to start a container "
             "with the image's default user (which may be root)"
+        )
+    if uid <= 0 or gid <= 0:
+        raise InvalidRequest(
+            "TRELLIS_UID and TRELLIS_GID must be a non-root uid/gid (0 is root); "
+            "refusing to start a container that would own the workspace and could "
+            "write into another agent's output directory"
         )
     return f"{uid}:{gid}"
 

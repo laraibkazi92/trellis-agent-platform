@@ -279,6 +279,52 @@ def test_preflight_checks_exactly_the_startup_gates(env):
     assert runner_module.startup_ready(checks) is True
 
 
+@pytest.mark.parametrize(
+    ("variable", "value", "root"),
+    [
+        # 0 is root, and "00" is 0: ``isdigit()`` alone accepted both (v0.7.2 R5).
+        ("TRELLIS_UID", "0", True),
+        ("TRELLIS_GID", "0", True),
+        ("TRELLIS_UID", "00", True),
+        ("TRELLIS_GID", "00", True),
+        ("TRELLIS_UID", "", False),
+        ("TRELLIS_GID", "abc", False),
+    ],
+)
+def test_preflight_refuses_a_root_or_unusable_tool_identity(
+    env, monkeypatch, variable, value, root
+):
+    """A root (or unparseable) identity stops the runner at startup."""
+    monkeypatch.setenv(variable, value)
+
+    checks = asyncio.run(runner_module.run_preflight(env.backend))
+    identity = next(check for check in checks if check.name == "tool_identity")
+
+    assert identity.ok is False
+    assert "TRELLIS_UID and TRELLIS_GID" in identity.message
+    if root:
+        # The message has to say WHY: the mounts make root a workspace-wide grant.
+        assert "root" in identity.message
+        assert "another agent's output directory" in identity.message
+    else:
+        assert "must be set" in identity.message
+    assert runner_module.startup_ready(checks) is False
+
+    with pytest.raises(SystemExit):
+        asyncio.run(runner_module.startup(env.backend))
+
+
+def test_a_non_root_identity_passes_the_gate(env, monkeypatch):
+    monkeypatch.setenv("TRELLIS_UID", "1000")
+    monkeypatch.setenv("TRELLIS_GID", "1001")
+
+    checks = asyncio.run(runner_module.run_preflight(env.backend))
+    identity = next(check for check in checks if check.name == "tool_identity")
+
+    assert identity.ok is True
+    assert "1000:1001" in identity.message
+
+
 def test_preflight_fails_closed_on_an_unregistered_manifest_runtime(env):
     """A tool pinning ``container_runtime: runc`` cannot start on a runsc-only host."""
     (env.root / "tools" / "echo" / "tool.yaml").write_text(
@@ -324,9 +370,38 @@ def test_canary_round_trip_cleans_up(env, monkeypatch):
     canary_spec = env.backend.specs[0]
     assert canary_spec.kind == "canary"
     assert canary_spec.network_mode == "none"
+    # R5: the canary runs as the tool user, not as the image's default user.
+    assert canary_spec.user == "1000:1000"
     assert canary_spec.mounts[0].target == "/canary"
     assert canary_spec.mounts[0].source == f"/host{env.root}"
     assert not list(env.root.glob(".runner-canary-*"))
+
+
+def test_recheck_canary_without_a_tool_identity_is_a_failed_check(env, monkeypatch):
+    """The periodic/SIGHUP re-check reports a verdict; it must never raise.
+
+    The startup gate refuses this environment first, but the re-check runs on a
+    live process (an edited env, a restarted container with a broken override),
+    so an escaping ``InvalidRequest`` would be an unhandled task exception.
+    """
+    monkeypatch.delenv("TRELLIS_UID", raising=False)
+
+    result = asyncio.run(runner_module.recheck_canary(env.backend))
+
+    assert result.ok is False
+    assert "TRELLIS_UID and TRELLIS_GID" in result.detail
+    assert env.backend.specs == []
+    assert canary_module.last_result() == result
+
+
+def test_recheck_canary_with_a_root_identity_is_a_failed_check(env, monkeypatch):
+    monkeypatch.setenv("TRELLIS_GID", "0")
+
+    result = asyncio.run(runner_module.recheck_canary(env.backend))
+
+    assert result.ok is False
+    assert "0 is root" in result.detail
+    assert env.backend.specs == []
 
 
 def test_backend_timeout_maps_to_504(env):

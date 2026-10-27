@@ -807,3 +807,29 @@ def test_missing_tool_identity_refuses_to_build(workspace, monkeypatch):
     monkeypatch.delenv("TRELLIS_GID", raising=False)
     with pytest.raises(InvalidRequest):
         build(workspace, make_config())
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [("TRELLIS_UID", "0"), ("TRELLIS_GID", "0"), ("TRELLIS_UID", "00"), ("TRELLIS_GID", "00")],
+)
+def test_a_root_tool_identity_refuses_to_build(workspace, monkeypatch, variable, value):
+    """The last gate before a container exists: 0 must not reach Docker as ``0:0``.
+
+    The runner's startup preflight reads the environment once, so a ``TRELLIS_UID``
+    changed after startup would otherwise slip through to the spec builder.
+    """
+    monkeypatch.setenv(variable, value)
+
+    with pytest.raises(InvalidRequest) as excinfo:
+        build(workspace, make_config())
+
+    assert "non-root" in str(excinfo.value)
+
+
+def test_a_root_tool_identity_refuses_a_console_spec(monkeypatch):
+    monkeypatch.setenv("TRELLIS_UID", "0")
+    monkeypatch.setenv("TRELLIS_GID", "1000")
+
+    with pytest.raises(InvalidRequest):
+        build_console_spec("echo hi", env={})

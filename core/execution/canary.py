@@ -21,7 +21,7 @@ from typing import Optional
 
 from core.execution import env
 from core.execution.backend import ContainerBackend
-from core.execution.spec import ContainerSpec, Mount
+from core.execution.spec import ContainerSpec, InvalidRequest, Mount, _require_user
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +92,13 @@ def _looks_like_missing_shim(exit_code: Optional[int], text: str) -> bool:
 
 def _spec(name: str, *, image: str, runtime: str, host_workspace: str,
           container_workspace: str) -> ContainerSpec:
+    # The canary runs as the SAME non-root identity every tool container runs as
+    # (``spec._require_user()``, the one place that identity is resolved). Leaving
+    # ``user`` unset made it the only container in the system started as the image
+    # default -- root in the engine image -- so it proved the mount works while
+    # proving nothing about the boundary the mounts exist to enforce. It also means
+    # a passing canary now covers "the tool user can traverse and read the
+    # workspace", which is what every real tool needs anyway.
     return ContainerSpec(
         image=image,
         runtime=runtime,
@@ -108,6 +115,7 @@ def _spec(name: str, *, image: str, runtime: str, host_workspace: str,
             "trellis.install": os.getenv("TRELLIS_INSTALL_ID", "default"),
             "trellis.kind": "canary",
         },
+        user=_require_user(),
         kind="canary",
     )
 
@@ -136,13 +144,26 @@ async def _probe(
             ),
         )
 
-    container_spec = _spec(
-        name,
-        image=image,
-        runtime=runtime,
-        host_workspace=host_workspace,
-        container_workspace=container_workspace,
-    )
+    try:
+        container_spec = _spec(
+            name,
+            image=image,
+            runtime=runtime,
+            host_workspace=host_workspace,
+            container_workspace=container_workspace,
+        )
+    except InvalidRequest as exc:
+        # A canary that cannot resolve the tool identity is a FAILED CHECK, not a
+        # traceback: it runs from the startup preflight, from the SIGHUP handler and
+        # from the periodic re-check, and none of those may die on a misconfigured
+        # environment. The identity gate's own wording is passed through, so the
+        # operator sees the same instruction here as from
+        # ``runner._check_tool_identity``. (``run`` still unlinks the marker in its
+        # ``finally``, so this early return leaves nothing behind.)
+        logger.error("host-path canary cannot resolve the tool identity: %s", exc)
+        return CanaryResult(
+            False, f"the canary container cannot run as the tool user: {exc}"
+        )
     try:
         raw = await backend.run(
             container_spec,

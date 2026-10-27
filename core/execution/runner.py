@@ -474,19 +474,38 @@ async def _check_image(backend: ContainerBackend) -> Check:
 
 
 async def _check_tool_identity() -> Check:
-    """A container must never inherit the image's default (possibly root) user."""
+    """A container must never inherit the image's default (possibly root) user.
+
+    ``isdigit()`` accepted ``"0"`` and ``"00"``: both are root. Root is not a
+    cosmetic difference here -- the workspace and the per-agent output dirs are
+    bind-mounted from the host, so a root tool owns every file it writes and can
+    write into another agent's output directory, which is exactly the boundary the
+    mounts exist to hold. ``spec._require_user()`` refuses the same values when a
+    spec is built (the last gate before a container exists); this gate is the one
+    that fails the *startup* loudly, before the runner serves anything.
+    """
     uid = (os.getenv("TRELLIS_UID") or "").strip()
     gid = (os.getenv("TRELLIS_GID") or "").strip()
-    if uid.isdigit() and gid.isdigit():
+    if not (uid.isdigit() and gid.isdigit()):
         return Check(
-            "tool_identity", True, f"tool containers run as {uid}:{gid} (non-root)"
+            "tool_identity",
+            False,
+            "TRELLIS_UID and TRELLIS_GID must be set to the workspace owner's numeric "
+            "uid/gid. Without them a tool container would run as the image default, "
+            "which is root.",
+        )
+    if int(uid) == 0 or int(gid) == 0:
+        return Check(
+            "tool_identity",
+            False,
+            "TRELLIS_UID and TRELLIS_GID are 0, which is root. A tool container runs "
+            "with the workspace and per-agent output dirs bind-mounted from the host, "
+            "so a root tool owns every file it writes and could write into another "
+            "agent's output directory. Set them to the workspace owner's non-root "
+            "uid/gid.",
         )
     return Check(
-        "tool_identity",
-        False,
-        "TRELLIS_UID and TRELLIS_GID must be set to the workspace owner's numeric "
-        "uid/gid. Without them a tool container would run as the image default, "
-        "which is root.",
+        "tool_identity", True, f"tool containers run as {uid}:{gid} (non-root)"
     )
 
 

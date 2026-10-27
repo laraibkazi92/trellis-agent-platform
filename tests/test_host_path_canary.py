@@ -38,7 +38,12 @@ def _run(coro):
 
 
 @pytest.fixture(autouse=True)
-def _reset():
+def _reset(monkeypatch):
+    # The canary starts as the tool user (v0.7.2 R5), so the pair every real
+    # deployment sets must exist here too, or the failure under test is the
+    # identity gate rather than the workspace path.
+    monkeypatch.setenv("TRELLIS_UID", "1000")
+    monkeypatch.setenv("TRELLIS_GID", "1000")
     canary.reset_for_tests()
     yield
     canary.reset_for_tests()
@@ -60,6 +65,76 @@ def test_canary_passes_when_the_two_roots_agree(tmp_path):
     assert list(tmp_path.glob(".runner-canary-*")) == []
     assert backend.specs[0].mounts[0].target == "/canary"
     assert backend.specs[0].network_mode == "none"
+
+
+def test_the_canary_container_runs_as_the_tool_user(tmp_path, monkeypatch):
+    """R5: the canary is a tool-class container, not a root one-off.
+
+    ``user`` unset meant the image default -- root in the engine image -- so the
+    probe proved the bind mount while saying nothing about the identity every real
+    tool runs as (and could not catch a workspace the tool user cannot read).
+    """
+    backend = _Binder()
+    _run(
+        canary.run(
+            backend,
+            host_workspace=str(tmp_path),
+            workspace_root=str(tmp_path),
+            image="img:test",
+            runtime="runsc",
+        )
+    )
+    assert backend.specs[0].user == "1000:1000"
+
+    monkeypatch.setenv("TRELLIS_UID", "4242")
+    monkeypatch.setenv("TRELLIS_GID", "4343")
+    backend = _Binder()
+    _run(
+        canary.run(
+            backend,
+            host_workspace=str(tmp_path),
+            workspace_root=str(tmp_path),
+            image="img:test",
+            runtime="runsc",
+        )
+    )
+    assert backend.specs[0].user == "4242:4343"
+
+
+@pytest.mark.parametrize("kind", ["unset", "root"])
+def test_without_a_usable_tool_identity_the_canary_is_a_failed_check(
+    tmp_path, monkeypatch, kind
+):
+    """No uid is a failed check with an instruction, never a traceback.
+
+    The canary runs from the startup preflight, the SIGHUP handler and the
+    periodic re-check: an exception escaping any of them is a crash, not a
+    diagnosis. The message is the identity gate's own.
+    """
+    if kind == "unset":
+        monkeypatch.delenv("TRELLIS_UID", raising=False)
+    else:
+        monkeypatch.setenv("TRELLIS_UID", "0")
+
+    backend = _Binder()
+    result = _run(
+        canary.run(
+            backend,
+            host_workspace=str(tmp_path),
+            workspace_root=str(tmp_path),
+            image="img:test",
+            runtime="runsc",
+        )
+    )
+
+    assert result.ok is False
+    assert "TRELLIS_UID and TRELLIS_GID" in result.detail
+    assert kind == "root" or "must be set" in result.detail
+    if kind == "root":
+        assert "root" in result.detail
+    # It failed before a container was asked for, and left no marker behind.
+    assert backend.specs == []
+    assert list(tmp_path.glob(".runner-canary-*")) == []
 
 
 def test_canary_fails_closed_when_runner_view_and_host_path_disagree(tmp_path):
