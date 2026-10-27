@@ -39,6 +39,7 @@ from core.execution.env import (
     invalid_env_names,
     split_env,
 )
+from core.manifest_keys import _group_keys
 from core.models import (
     MCPConfig,
     ContainerLimits,
@@ -173,15 +174,9 @@ def declared_env_keys(config: Any) -> set[str]:
         # MCPConfig has a literal `env:` block: those names are part of the
         # manifest's declared environment (not caller-supplied credentials).
         keys |= {str(name) for name in declared_names(getattr(config, attr, None))}
-    for group in getattr(config, "secret_groups", None) or []:
-        if not isinstance(group, Mapping):
-            continue
-        for option in group.get("options") or []:
-            if not isinstance(option, Mapping):
-                continue
-            for field_def in option.get("fields") or []:
-                if isinstance(field_def, Mapping) and field_def.get("key"):
-                    keys.add(str(field_def["key"]))
+    # `secret_groups` field keys are declared credentials too. Same flattening as the
+    # edge's manifest check, sync and the model validator (one helper, no copies).
+    keys |= set(_group_keys(config))
     keys |= {"TRELLIS_USER_ID", "TRELLIS_USER_EMAIL"}
     return keys
 

@@ -16,9 +16,9 @@ from core.execution.env import (
     declared_names,
     invalid_env_names,
 )
-# The one flattening of the ``secret_groups`` shape, shared with the edge's
-# manifest check and with sync: a second copy here could disagree about which
-# names a manifest declares.
+# The one flattening of the ``secret_groups`` shape: sync, the edge's manifest
+# check and this validator all read it, so they cannot disagree about which names
+# a manifest declares.
 from core.manifest_keys import _group_keys
 
 logger = logging.getLogger(__name__)

@@ -211,6 +211,7 @@ def test_a_declared_name_that_is_not_an_env_name_fails_the_sync(
 
     monkeypatch.setattr(sync_to_db, "TOOLS_DIR", workspace / "tools")
     monkeypatch.setattr(sync_to_db, "MCPS_DIR", mcps)
+    monkeypatch.setattr(sync_to_db, "AGENTS_DIR", workspace / "agents")
     manager = FakeManager()
     monkeypatch.setattr(sync_to_db, "IdentityManager", lambda **_kwargs: manager)
 
@@ -237,6 +238,8 @@ def test_a_clean_workspace_passes_the_env_name_check(tmp_path, monkeypatch):
 
     monkeypatch.setattr(sync_to_db, "TOOLS_DIR", workspace / "tools")
     monkeypatch.setattr(sync_to_db, "MCPS_DIR", workspace / "mcps")
+    # The real workspace/agents is a tracked tree: never let it decide this test.
+    monkeypatch.setattr(sync_to_db, "AGENTS_DIR", workspace / "agents")
 
     assert sync_to_db.validate_declared_env_names() == []
 
@@ -575,10 +578,16 @@ def test_a_clean_workspace_passes_every_env_name_surface(tmp_path, monkeypatch):
         + "variables: [SERVICE_URL]\n"
     )
 
+    agents = workspace / "agents" / "ops-bot"
+    agents.mkdir(parents=True)
+    (agents / "config.yaml").write_text(
+        "name: ops-bot\nsecrets: [AGENT_TOKEN]\nvariables:\n  user: [AGENT_BASE_URL]\n"
+    )
+
     monkeypatch.setattr(sync_to_db, "TOOLS_DIR", workspace / "tools")
     monkeypatch.setattr(sync_to_db, "MCPS_DIR", workspace / "mcps")
+    monkeypatch.setattr(sync_to_db, "AGENTS_DIR", workspace / "agents")
     monkeypatch.setattr(sync_to_db, "WORKFLOWS_DIR", workspace / "workflows")
 
     assert sync_to_db.validate_declared_env_names() == []
     assert sync_to_db.validate_workflow_manifests() == []
-

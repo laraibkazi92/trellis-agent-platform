@@ -134,6 +134,13 @@ async def _probe(
     try:
         with open(path, "wb") as handle:
             handle.write(payload)
+        # The canary container runs as TRELLIS_UID, which is usually NOT this
+        # process's user (the runner is root for the Docker socket). ``open`` uses
+        # ``0666 & ~umask``, so a hardened host (``UMask=0077``, or a daemon started
+        # from a shell with ``umask 077``) would leave the marker unreadable for the
+        # tool user and fail a healthy deployment with a message about the workspace
+        # path. The runner holds DAC_OVERRIDE, so the chmod always succeeds here.
+        os.chmod(path, 0o644)
     except OSError as exc:
         return CanaryResult(
             False,
@@ -157,13 +164,11 @@ async def _probe(
         # traceback: it runs from the startup preflight, from the SIGHUP handler and
         # from the periodic re-check, and none of those may die on a misconfigured
         # environment. The identity gate's own wording is passed through, so the
-        # operator sees the same instruction here as from
+        # operator reads the same guidance here as from
         # ``runner._check_tool_identity``. (``run`` still unlinks the marker in its
         # ``finally``, so this early return leaves nothing behind.)
-        logger.error("host-path canary cannot resolve the tool identity: %s", exc)
-        return CanaryResult(
-            False, f"the canary container cannot run as the tool user: {exc}"
-        )
+        logger.error("host-path canary cannot build its container: %s", exc)
+        return CanaryResult(False, f"cannot build the canary container: {exc}")
     try:
         raw = await backend.run(
             container_spec,

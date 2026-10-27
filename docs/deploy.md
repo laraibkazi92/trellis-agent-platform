@@ -196,7 +196,7 @@ The variables below are the ones you must touch for a first deployment. Everythi
 | `ADMIN_USERS` | Yes | Comma-separated admin identities (e.g. `ops@example.com`). |
 | `TRELLIS_WORKSPACE_DIR` | Recommended | Workspace bind-mount source. Defaults to `./workspace` inside the clone. Point it at your content repo to keep the engine pristine. |
 | `TRELLIS_IMAGE` | Optional | Pins the engine image tag or digest, e.g. `ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.1`. |
-| `TRELLIS_UID` / `TRELLIS_GID` | Optional | Container uid:gid for workspace file ownership. Defaults to `1000:1000`. |
+| `TRELLIS_UID` / `TRELLIS_GID` | Optional | Container uid:gid for workspace file ownership. Defaults to `1000:1000`; both must be non-zero — the runner refuses to start otherwise, because `0` is root and a root tool owns every file it writes (v0.7.2). |
 | `DEV_MODE` | No | Keep `false` for anything shared. `true` disables **all** authentication. |
 | `OIDC_GROUPS_CLAIM` | Optional | Identity-provider claim holding group membership for the tool-access group rules (default `groups`). Accepted as a list or a comma-separated string. |
 | `HOST_BIND` | Optional | Host address published ports bind to. Default `0.0.0.0`. |
