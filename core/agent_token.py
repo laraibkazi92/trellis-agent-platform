@@ -58,8 +58,9 @@ class Claims:
     iat: int
     exp: int
     jti: str
-    # "system" for the framework's own entry points (gateway, supervisor). A
-    # user-created agent cannot obtain this: only the runtime mints tokens.
+    # Informational only (v0.7.1): no enforcement point honours it. It is kept so a
+    # token signed before the exemptions were removed still verifies; it grants
+    # nothing to anyone.
     principal: Optional[str] = None
     # The caller's OIDC groups at mint time (claim "g"): the only group source the
     # policy evaluator may trust. Empty for service identities.

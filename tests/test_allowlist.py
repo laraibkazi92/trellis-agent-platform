@@ -7,11 +7,22 @@ Table-driven against the matrix in ``core/allowlist.py`` (and the plan's Phase 3
 item 4), which is the server-side access-control decision the hub, the relay and the
 runner all make. The last block pins that an ``AgentConfig.model_dump()`` (the way
 the registry hands an agent to the hub) resolves identically to the raw dict.
+
+The ``bare name`` section is the v0.7.1 rule: an entry with no ``mcp__`` prefix grants
+exactly one tool -- the registered framework/hub (or console) tool that owns the name.
+It is never a name-collision grant for an MCP tool, and it never opens an MCP session.
 """
 
 import pytest
 
-from core.allowlist import CONSOLE_TOOLS, EMPTY, permits_mcp, permits_tool, resolve
+from core.allowlist import (
+    CONSOLE_TOOLS,
+    EMPTY,
+    permits_mcp,
+    permits_mcp_session,
+    permits_tool,
+    resolve,
+)
 from core.models import AgentConfig
 
 EDGE_TOOL = "dc1__node_ssh"
@@ -59,7 +70,9 @@ def test_edge_tool_is_never_implied_by_allowed_mcps():
     "config,permitted",
     [
         ({"allowed_tools": [CENTRAL_MCP_TOOL]}, True),
-        ({"allowed_tools": ["t"]}, True),
+        # A bare name is a grant for the framework/hub tool of that name only: it is
+        # not a name-collision grant for an MCP tool (v0.7.1 Phase 3).
+        ({"allowed_tools": ["t"]}, False),
         ({"allowed_mcps": ["coralogix"]}, True),
         ({"allowed_mcps": ["coralogix2"]}, False),
         ({"allowed_tools": ["mcp__coralogix2__t"]}, False),
@@ -79,7 +92,8 @@ def test_central_mcp_tool_grants(config, permitted):
     "config,permitted",
     [
         ({"allowed_tools": [EDGE_MCP_TOOL]}, True),
-        ({"allowed_tools": ["t"]}, True),
+        # Same rule on the 4-part edge form: `t` alone is not an MCP grant.
+        ({"allowed_tools": ["t"]}, False),
         ({"allowed_mcps": ["dc1__devops-cli"]}, True),
         ({"allowed_mcps": ["dc1__*"]}, True),
         ({"allowed_mcps": ["dc10__*"]}, False),  # prefix is not a prefix-match
@@ -99,6 +113,101 @@ def test_wildcard_does_not_grant_another_tool_name_shape():
     # A wildcard is not a tool-name wildcard: it only travels through the 4-part form.
     assert permits_tool(allowlist, EDGE_TOOL) is False
     assert permits_tool(allowlist, CENTRAL_MCP_TOOL) is False
+
+
+# --------------------------------------------------------------------------- #
+# v0.7.1 Phase 3: a bare name is not a name-collision grant for an MCP tool
+# --------------------------------------------------------------------------- #
+#
+# The same rule holds at all three sites that resolve a grant: `permits_tool` (the
+# hub / relay / runner verdict), `permits_mcp_session` (the runner's session gate) and
+# the build-time registration in `core.agent_factory._register_mcp_server_tools`
+# (pinned in tests/test_agent_factory_wrappers.py). A hub tool named `deploy` and an
+# MCP tool named `deploy` are two different tools; the bare entry grants the hub one.
+
+BARE = "deploy"
+
+
+def test_a_bare_name_grants_only_the_tool_that_owns_it():
+    allowlist = resolve({"allowed_tools": [BARE]})
+
+    # The framework/hub tool of that name: granted.
+    assert permits_tool(allowlist, BARE) is True
+    # A same-named MCP tool, central or edge: not granted, in any form.
+    assert permits_tool(allowlist, "mcp__devops__deploy") is False
+    assert permits_tool(allowlist, "mcp__dc1__devops__deploy") is False
+    # The bare name implies no server either.
+    assert permits_mcp(allowlist, "devops") is False
+    assert permits_mcp(allowlist, "devops", site="dc1") is False
+    # And it opens no MCP session, central or edge.
+    assert permits_mcp_session(allowlist, "devops") is False
+    assert permits_mcp_session(allowlist, "devops", site="dc1") is False
+
+
+def test_a_server_grant_is_the_only_route_to_the_whole_server():
+    allowlist = resolve({"allowed_mcps": ["devops"]})
+
+    assert permits_tool(allowlist, "mcp__devops__deploy") is True
+    assert permits_tool(allowlist, "mcp__devops__sibling") is True
+    assert permits_mcp_session(allowlist, "devops") is True
+    # The server grant never leaks back as a bare tool grant for the hub tool.
+    assert permits_tool(allowlist, BARE) is False
+
+
+def test_a_full_reference_grants_exactly_one_mcp_tool_and_its_session():
+    allowlist = resolve({"allowed_tools": ["mcp__devops__deploy"]})
+
+    assert permits_tool(allowlist, "mcp__devops__deploy") is True
+    assert permits_tool(allowlist, "mcp__devops__sibling") is False
+    # The documented narrowing: one tool-level grant still opens the session it needs.
+    assert permits_mcp_session(allowlist, "devops") is True
+    # But it is not a grant for the bare name's own tool.
+    assert permits_tool(allowlist, BARE) is False
+
+
+def test_the_edge_forms_follow_the_same_rule():
+    bare = resolve({"allowed_tools": [BARE]})
+    assert permits_tool(bare, "mcp__dc1__devops__deploy") is False
+    assert permits_mcp_session(bare, "devops", site="dc1") is False
+
+    narrowed = resolve({"allowed_tools": ["mcp__dc1__devops__deploy"]})
+    assert permits_tool(narrowed, "mcp__dc1__devops__deploy") is True
+    assert permits_tool(narrowed, "mcp__dc1__devops__sibling") is False
+    assert permits_mcp_session(narrowed, "devops", site="dc1") is True
+    assert permits_mcp_session(narrowed, "devops", site="dc2") is False
+
+    wildcard = resolve({"allowed_mcps": ["dc1__*"]})
+    assert permits_tool(wildcard, "mcp__dc1__devops__deploy") is True
+    assert permits_mcp_session(wildcard, "devops", site="dc1") is True
+    assert permits_mcp_session(wildcard, "devops", site="dc2") is False
+    # A wildcard is not a bare tool grant either.
+    assert permits_tool(wildcard, BARE) is False
+
+
+@pytest.mark.parametrize(
+    "config,mcp,site,permitted",
+    [
+        # The server grant, its edge form and the site wildcard: a session opens.
+        ({"allowed_mcps": ["devops"]}, "devops", None, True),
+        ({"allowed_mcps": ["devops"]}, "devops2", None, False),
+        ({"allowed_mcps": ["dc1__devops"]}, "devops", "dc1", True),
+        ({"allowed_mcps": ["dc1__*"]}, "devops", "dc1", True),
+        # Tool-level narrowing: only the full `mcp__...` reference opens a session.
+        ({"allowed_tools": ["mcp__devops__deploy"]}, "devops", None, True),
+        ({"allowed_tools": ["mcp__dc1__devops__deploy"]}, "devops", "dc1", True),
+        ({"allowed_tools": ["mcp__dc1__devops__deploy"]}, "devops", None, False),
+        # v0.7.1: a bare hub-tool name (and a bare tool name generally) opens nothing.
+        ({"allowed_tools": [BARE]}, "devops", None, False),
+        ({"allowed_tools": ["devops"]}, "devops", None, False),
+        ({"allowed_tools": ["devops"]}, "devops", "dc1", False),
+        ({"allowed_tools": ["devops__deploy"]}, "devops", None, False),
+        # An `mcp__` entry with no tool segment names no tool.
+        ({"allowed_tools": ["mcp__devops__"]}, "devops", None, False),
+        ({}, "devops", None, False),
+    ],
+)
+def test_permits_mcp_session(config, mcp, site, permitted):
+    assert permits_mcp_session(resolve(config), mcp, site=site) is permitted
 
 
 # --------------------------------------------------------------------------- #

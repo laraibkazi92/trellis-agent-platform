@@ -741,6 +741,92 @@ def test_chat_completions_exempts_supervisor(monkeypatch):
     assert result["choices"][0]["message"]["content"] == "supervisor reply"
 
 
+def test_a_supervisor_run_mints_an_ordinary_token_and_uses_its_group_claim(monkeypatch):
+    """v0.7.1 Phase 3: the supervisor gets no elevated principal, and the run's
+    `group:` rules come from the token claim the mint wrote.
+
+    The identity read happens ONCE, at mint. Inside the run the gates (bound tools,
+    use_tool) must resolve groups from that claim -- not from a second user-record
+    read -- so the host and the hub cannot reach different verdicts for one call.
+    """
+    import _hub_authz_registry as hub_authz
+    from core import agent_token, tool_authz
+
+    group_rule = {
+        "default_action": "deny",
+        "rules": [
+            {
+                "tools": ["text_stats"],
+                "allow_principals": ["group:ops"],
+                "scopes": ["tools:call"],
+            }
+        ],
+    }
+    # The stored record disagrees with the claim on purpose: the claim is the authority.
+    hub_authz.install(
+        monkeypatch,
+        policy=group_rule,
+        mode="enforcing",
+        users={"user-1": {"groups": ["stale"]}},
+    )
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", "host-run-claim-groups-secret-01234567")
+    monkeypatch.delenv("DEV_MODE", raising=False)
+    monkeypatch.setattr(host.identity_mgr, "get_disabled_standard_agents", lambda: [])
+    monkeypatch.setattr(
+        host.identity_mgr,
+        "get_agent_config",
+        lambda name: {"name": name, "type": "user_agent", "external": False},
+    )
+    monkeypatch.setattr(host.health_monitor, "get_status", lambda kind, name: {"status": "Online"})
+    monkeypatch.setattr(host.health_monitor, "record_event", lambda *a, **k: None)
+    monkeypatch.setattr(
+        host, "get_memory_manager", lambda: SimpleNamespace(active_for=lambda cfg: False)
+    )
+    record_reads = []
+
+    def fake_get_user(user_id):
+        record_reads.append(user_id)
+        return {"email": "ops@example.test", "groups": ["ops", "sre"]}
+
+    monkeypatch.setattr(host.identity_mgr, "get_user", fake_get_user)
+
+    seen = {}
+
+    class FakeResult:
+        output = "ok"
+        usage = None
+
+    async def fake_get_agent(name):
+        class FakeAgent:
+            async def run(self, *a, **k):
+                seen["claims"] = agent_token.verify(host.agent_token_var.get())
+                seen["principal"] = tool_authz.resolve_current_principal()
+                seen["permitted"] = tool_authz.allowed(
+                    seen["principal"], "text_stats", "tools:call"
+                )
+                return FakeResult()
+        return FakeAgent()
+
+    monkeypatch.setattr(host, "get_agent", fake_get_agent)
+    user_id_var.set("user-1")
+
+    try:
+        asyncio.run(host.chat_completions(_make_request("supervisor")))
+    finally:
+        # The authz snapshot is process-global: leave the fake policy behind and the
+        # next test in this session would evaluate against it.
+        tool_authz.reset_cache()
+
+    claims = seen["claims"]
+    assert claims.agent == "supervisor"
+    assert claims.principal is None
+    assert claims.groups == ("ops", "sre")
+    assert seen["principal"] == "agent:supervisor"
+    # Allowed by the claim's `ops` group, not the record's `stale` one.
+    assert seen["permitted"] is True
+    assert record_reads == ["user-1"]  # the mint's single identity read
+
+
 def test_chat_completions_allows_external_true(monkeypatch):
     monkeypatch.setattr(host.identity_mgr, "get_disabled_standard_agents", lambda: [])
     monkeypatch.setattr(host.identity_mgr, "get_agent_config", lambda name: {"name": name, "type": "user_agent", "external": True})

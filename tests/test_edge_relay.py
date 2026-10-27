@@ -82,6 +82,12 @@ class FakeEdgeRegistry:
     def get_agent_config(self, name):
         return self.agents.get(name)
 
+    def get_tool_config(self, name):
+        return self.tools.get(name)
+
+    def get_mcp_config(self, name):
+        return self.mcps.get(name)
+
     def save_tool_config(self, name, config):
         self.tools[name] = dict(config)
 
@@ -2308,11 +2314,66 @@ def test_an_unknown_agent_is_refused(enforcing):
     assert "unknown agent" in response.json()["error"]["message"]
 
 
-def test_the_gateway_principal_needs_no_agent_record(enforcing):
-    """The gateway is authenticated by its own key; it has no allowlist to resolve."""
+def test_the_front_door_gets_no_exemption(enforcing):
+    """The gateway has no agent record, so it has no allowlist either.
+
+    v0.7.1 Phase 3: `principal="system"` and the `gateway` agent name grant nothing.
+    Its only possible grant on the edge is the export's own public exposure.
+    """
+    conn = _install_conn()
+    conn.request = pytest.fail
+
+    response = TestClient(app_module.app).post(
+        "/v1/sites/site-a/call",
+        json={
+            "tool": "echo",
+            "args": {"q": "x"},
+            "agent_token": _mint("gateway", principal="system"),
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "access_denied"
+    assert "unknown agent" in response.json()["error"]["message"]
+    assert conn.ws.sent == []
+
+
+def test_the_forwarded_frame_carries_the_token_identity_not_a_record_read(enforcing):
+    """The relay takes user id, email and groups from the claims only.
+
+    Nothing on this path may go back to the registry for the caller's identity: a
+    second read could disagree with the claim the hub already trusted.
+    """
     conn = _install_conn()
     seen = {}
     conn.request = _capture(seen)
+    reads = []
+
+    def fake_get_user(user_id):
+        reads.append(user_id)
+        return {"groups": ["other"], "email": "stale@example.test"}
+
+    enforcing.get_user = fake_get_user
+    token = _mint(user_id="u-1", user_email="u@example.test", groups=("ops",))
+
+    response = TestClient(app_module.app).post(
+        "/v1/sites/site-a/call",
+        json={"tool": "echo", "args": {"q": "x"}, "agent_token": token},
+    )
+
+    assert response.status_code == 200
+    assert reads == []
+    # The frame's positional identity arguments came from the verified claims.
+    assert seen["call"][3] == "u-1"
+    assert seen["call"][4] == "u@example.test"
+
+
+def test_a_public_export_is_the_front_doors_grant(enforcing):
+    """A public export needs no agent record: that is the grant the front door uses."""
+    conn = _install_conn()
+    seen = {}
+    conn.request = _capture(seen)
+    enforcing.tools["site-a__echo"] = {"name": "site-a__echo", "public": True}
 
     response = TestClient(app_module.app).post(
         "/v1/sites/site-a/call",
@@ -2321,6 +2382,49 @@ def test_the_gateway_principal_needs_no_agent_record(enforcing):
 
     assert response.status_code == 200
     assert seen["call"][0] == "echo"
+
+
+def test_a_public_export_does_not_widen_an_agents_allowlist(enforcing):
+    """`public` substitutes for a MISSING allowlist, never for a non-matching one."""
+    conn = _install_conn()
+    conn.request = pytest.fail
+    enforcing.agents["agent-a"] = _agent(tools=[])
+    enforcing.tools["site-a__echo"] = {"name": "site-a__echo", "public": True}
+
+    response = TestClient(app_module.app).post(
+        "/v1/sites/site-a/call",
+        json={"tool": "echo", "args": {"q": "x"}, "agent_token": _mint()},
+    )
+
+    assert response.status_code == 403
+    assert "site-a__echo" in response.json()["error"]["message"]
+    assert conn.ws.sent == []
+
+
+def test_a_public_mcp_tool_list_is_the_front_doors_grant(enforcing):
+    """The MCP route applies the same rule: the server's public/public_tools decides."""
+    conn = _install_conn(mcps={"devops-cli": _mcp()})
+    seen = {}
+    conn.request_mcp = _capture(seen)
+    client = TestClient(app_module.app)
+    body = {
+        "tool": "tenant_account_tools",
+        "args": {"action": "list_actions"},
+        "agent_token": _mint("gateway"),
+    }
+
+    denied = client.post("/v1/sites/site-a/mcps/devops-cli/call", json=body)
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "access_denied"
+
+    enforcing.mcps["site-a__devops-cli"] = {
+        "name": "site-a__devops-cli",
+        "public": False,
+        "public_tools": ["tenant_account_tools"],
+    }
+    allowed = client.post("/v1/sites/site-a/mcps/devops-cli/call", json=body)
+    assert allowed.status_code == 200
+    assert seen["call"][0] == "devops-cli"
 
 
 def test_an_mcp_call_accepts_a_server_grant_or_a_per_tool_grant(enforcing):
@@ -2340,14 +2444,24 @@ def test_an_mcp_call_accepts_a_server_grant_or_a_per_tool_grant(enforcing):
     assert permitted.status_code == 200
     assert seen["agent_token"] == token
 
-    # Documented narrowing: a bare tool name grants just that tool, which is
-    # enough to open the session it needs (permits_tool folds in the server).
-    enforcing.agents["agent-a"] = _agent(tools=["tenant_account_tools"])
+    # Documented narrowing: the tool's full `mcp__...` reference grants just that tool,
+    # which is enough to open the session it needs.
+    enforcing.agents["agent-a"] = _agent(tools=["mcp__site-a__devops-cli__tenant_account_tools"])
     narrowed = client.post(
         "/v1/sites/site-a/mcps/devops-cli/call",
         json={**body, "agent_token": _mint()},
     )
     assert narrowed.status_code == 200
+
+    # v0.7.1: the bare tool name is NOT that grant -- it belongs to the framework tool
+    # of that name (permits_tool / permits_mcp_session / build-time registration).
+    enforcing.agents["agent-a"] = _agent(tools=["tenant_account_tools"])
+    collision = client.post(
+        "/v1/sites/site-a/mcps/devops-cli/call",
+        json={**body, "agent_token": _mint()},
+    )
+    assert collision.status_code == 403
+    assert collision.json()["error"]["code"] == "access_denied"
 
     # Nothing granted: denied.
     enforcing.agents["agent-a"] = _agent(tools=[], mcps=[])
@@ -2459,20 +2573,10 @@ def test_a_token_with_control_characters_is_a_400():
 # --- lazy catalog detail cache (P6) -----------------------------------------
 
 
-class _DetailRegistry(FakeEdgeRegistry):
-    """FakeEdgeRegistry plus the per-record reads the detail cache performs."""
-
-    def get_tool_config(self, name):
-        return self.tools.get(name)
-
-    def get_mcp_config(self, name):
-        return self.mcps.get(name)
-
-
 @pytest.fixture()
 def detail_registry(monkeypatch):
-    """Point the relay's registry at the detail-aware fake (no etcd, no embedder)."""
-    fake = _DetailRegistry()
+    """Point the relay's registry at a fake that serves stored records (no etcd)."""
+    fake = FakeEdgeRegistry()
     monkeypatch.setattr(app_module, "_identity_manager", lambda: fake)
     return fake
 
@@ -2522,7 +2626,7 @@ def _lazy_mcp_record(mgr):
 
 
 def test_a_lazy_publish_writes_a_summary_record():
-    mgr = _DetailRegistry()
+    mgr = FakeEdgeRegistry()
 
     published = app_module.registry.publish_catalog(
         mgr,
@@ -2542,7 +2646,7 @@ def test_a_lazy_publish_writes_a_summary_record():
 
 def test_a_full_publish_keeps_the_pre_lazy_record_shape():
     """No cap: the record has no ``detail`` key at all (absent reads as "full")."""
-    mgr = _DetailRegistry()
+    mgr = FakeEdgeRegistry()
 
     app_module.registry.publish_catalog(
         mgr,
@@ -2556,7 +2660,7 @@ def test_a_full_publish_keeps_the_pre_lazy_record_shape():
 
 
 def test_a_lazy_publish_that_still_carries_inputs_is_a_full_record():
-    mgr = _DetailRegistry()
+    mgr = FakeEdgeRegistry()
 
     app_module.registry.publish_catalog(
         mgr,
@@ -2572,7 +2676,7 @@ def test_a_lazy_publish_that_still_carries_inputs_is_a_full_record():
 
 
 def test_a_lazy_mcp_publish_marks_the_server_when_a_schema_is_missing():
-    mgr = _DetailRegistry()
+    mgr = FakeEdgeRegistry()
     mcp = protocol.EdgeMcp(
         name="devops-cli",
         tools=[
@@ -2591,7 +2695,7 @@ def test_a_lazy_mcp_publish_marks_the_server_when_a_schema_is_missing():
 
 
 def test_fetch_tool_detail_serves_a_cached_full_record_without_the_edge():
-    mgr = _DetailRegistry()
+    mgr = FakeEdgeRegistry()
     _stored_tool(mgr)
     calls = []
 
@@ -2612,7 +2716,7 @@ def test_fetch_tool_detail_serves_a_cached_full_record_without_the_edge():
 
 
 def test_fetch_tool_detail_fetches_validates_and_caches_a_lazy_record():
-    mgr = _DetailRegistry()
+    mgr = FakeEdgeRegistry()
     _stored_tool(mgr, detail="lazy", inputs={})
     calls = []
 
@@ -2648,7 +2752,7 @@ def test_fetch_tool_detail_fetches_validates_and_caches_a_lazy_record():
 
 
 def test_fetch_tool_detail_rejects_an_invalid_detail_and_degrades():
-    mgr = _DetailRegistry()
+    mgr = FakeEdgeRegistry()
     _stored_tool(mgr, detail="lazy", inputs={})
 
     async def requester(mcp, tool):
@@ -2664,7 +2768,7 @@ def test_fetch_tool_detail_rejects_an_invalid_detail_and_degrades():
     assert mgr.tools["site-a__echo"]["detail"] == "lazy"
 
 
-class _RacyDetailRegistry(_DetailRegistry):
+class _RacyDetailRegistry(FakeEdgeRegistry):
     """First read misses, later reads see a full record (a concurrent publish)."""
 
     def __init__(self):
@@ -2697,7 +2801,7 @@ def test_fetch_tool_detail_falls_back_to_a_stale_copy_when_the_edge_fails():
 
 
 def test_fetch_tool_detail_degrades_to_unavailable_without_a_cache():
-    mgr = _DetailRegistry()
+    mgr = FakeEdgeRegistry()
 
     async def requester(mcp, tool):
         raise RuntimeError("tunnel dropped")
@@ -2715,7 +2819,7 @@ def test_fetch_tool_detail_degrades_to_unavailable_without_a_cache():
 
 def test_fetch_mcp_tool_detail_round_trips_the_schema():
     """The MCP payload's ``detail`` is the ``inputSchema`` itself, not the entry."""
-    mgr = _DetailRegistry()
+    mgr = FakeEdgeRegistry()
     _lazy_mcp_record(mgr)
     schema = {"type": "object", "properties": {"action": {"type": "string"}}}
     calls = []
@@ -2751,7 +2855,7 @@ def test_fetch_mcp_tool_detail_round_trips_the_schema():
 
 
 def test_storing_one_mcp_detail_completes_only_that_entry():
-    mgr = _DetailRegistry()
+    mgr = FakeEdgeRegistry()
     _lazy_mcp_record(mgr)
     schema = {"type": "object", "properties": {"action": {"type": "string"}}}
 

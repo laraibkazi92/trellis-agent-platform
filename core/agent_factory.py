@@ -3,6 +3,7 @@
 
 import os
 import secrets
+import uuid
 import yaml
 import asyncio
 import copy
@@ -10,9 +11,11 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import replace
 from urllib.parse import urlparse
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Union
+from typing import AsyncIterator, Awaitable, Callable, Dict, List, Any, Optional, Union
 
 from collections import OrderedDict
 
@@ -23,17 +26,22 @@ from fastmcp.client import SSETransport, StreamableHttpTransport
 
 from subagents_pydantic_ai import SubAgentCapability, SubAgentConfig
 from subagents_pydantic_ai.registry import DynamicAgentRegistry
-from subagents_pydantic_ai.toolset import create_subagent_toolset
+# `_compile_subagent` is the library's own agent compiler, not exported at package root:
+# importing it by name is the supported path for a consumer that supplies an
+# `agent_factory` (pydantic-deep does the same), and rebuilding it here would duplicate it.
+from subagents_pydantic_ai.toolset import _compile_subagent, create_subagent_toolset
 from subagents_pydantic_ai.types import CompiledSubAgent
 from pydantic_ai_backends import ConsoleCapability
 from pydantic_ai_shields import CostTracking, ToolGuard
 from pydantic_ai_rlm import create_rlm_toolset
 
+from core import agent_token
 from core.auth import (
     EtcdContentionError,
     IdentityManager,
     agent_token_var,
     get_identity_manager,
+    run_id_var,
     user_id_var,
 )
 from core import llm_defaults, llm_factory
@@ -225,6 +233,322 @@ class _RegistryEligibilitySnapshot:
         self._stop.set()
 
 
+def _parent_claims() -> Optional[agent_token.Claims]:
+    """The delegating run's claims, or ``None`` when there is no usable parent token.
+
+    ``None`` covers every "nothing to inherit" case -- no token minted yet, a rollout
+    posture with no signing key, a token that does not verify -- and delegation then
+    behaves exactly as it did before child tokens existed rather than inventing an
+    identity the caller never had.
+    """
+    token = agent_token_var.get()
+    if not token:
+        return None
+    return agent_token.verify_or_none(token)
+
+
+@asynccontextmanager
+async def _delegated_run(target_agent_name: str):
+    """Scope one delegated sub-agent run to a token minted for *that* agent.
+
+    Every tool call the child makes -- local hub tools, edge tools, MCP sessions --
+    reads ``agent_token_var`` at call time, so carrying the child token there is what
+    makes the hub, the relay and the runner authorize the sub-agent against its OWN
+    manifest allowlist instead of the caller's. Nothing is passed through tool
+    arguments: the contextvar is the only channel, and a new asyncio task (async-mode
+    delegation) copies its context on creation, so background children inherit it too.
+
+    Identity is inherited from the parent claims (``u``/``e``/``g``), the child gets a
+    fresh ``r``, and the parent's run id becomes its ``p``. The parent's token and run
+    id are restored on the way out, so nesting (A -> B -> C) and exceptions or
+    cancellation in the child leave the caller's context untouched.
+
+    Yields the child run id, or ``None`` when nothing was minted.
+
+    Raises ``AgentTokenError`` when the child token cannot be minted in ``enforce``
+    mode: the delegation tool surfaces that error to the model instead of letting the
+    child run under the caller's token (see :func:`_mint_child_token`).
+    """
+    parent = _parent_claims()
+    if parent is None:
+        yield None
+        return
+
+    previous_token = agent_token_var.get()
+    previous_run_id = run_id_var.get()
+    child_run_id = uuid.uuid4().hex
+    child_token = _mint_child_token(target_agent_name, parent, child_run_id)
+
+    if not child_token:
+        # Rollout with no signing key: `mint_for_run` minted nothing, so there is
+        # nothing to scope or restore.
+        yield None
+        return
+
+    logger.debug(
+        "Delegated run: agent='%s' run='%s' parent_agent='%s' parent_run='%s'",
+        target_agent_name,
+        child_run_id,
+        parent.agent,
+        parent.run_id,
+    )
+    try:
+        yield child_run_id
+    finally:
+        agent_token_var.set(previous_token)
+        run_id_var.set(previous_run_id)
+
+
+@contextmanager
+def _delegated_run_sync(target_agent_name: str):
+    """``_delegated_run`` for the blocking entry points (``run_sync`` & friends).
+
+    A sync method cannot await an async context manager, so the token is installed
+    and restored directly. The contextvar still scopes to the enclosing context, so
+    the caller's token is back in place however the run ends.
+    """
+    parent = _parent_claims()
+    if parent is None:
+        yield None
+        return
+
+    previous_token = agent_token_var.get()
+    previous_run_id = run_id_var.get()
+    child_run_id = uuid.uuid4().hex
+    child_token = _mint_child_token(target_agent_name, parent, child_run_id)
+
+    if not child_token:
+        yield None
+        return
+
+    try:
+        yield child_run_id
+    finally:
+        agent_token_var.set(previous_token)
+        run_id_var.set(previous_run_id)
+
+
+def _mint_child_token(
+    target_agent_name: str, parent: agent_token.Claims, child_run_id: str
+) -> str:
+    """Mint the child's token, or fail closed.
+
+    ``enforce`` mode propagates the failure: falling back to the caller's token would
+    silently grant the child the caller's allowlist, which is exactly what this seam
+    exists to prevent. In ``log``/``off`` mode the documented fallback stands -- the
+    child runs under the parent token, as it did before this seam existed -- because
+    those modes do not authorize anything anyway, and delegation must not be the one
+    thing a rollout posture breaks.
+    """
+    try:
+        return agent_token.mint_for_run(
+            target_agent_name,
+            parent.user_id,
+            user_email=parent.user_email,
+            groups=parent.groups,
+            run_id=child_run_id,
+            parent_run_id=parent.run_id,
+        )
+    except agent_token.AgentTokenError as exc:
+        if agent_token.mode() == "enforce":
+            logger.error(
+                "Refusing to delegate agent '%s' to '%s': no token could be minted "
+                "(%s). The child would otherwise run with the parent's allowlist.",
+                parent.agent,
+                target_agent_name,
+                exc.code,
+            )
+            raise
+        logger.warning(
+            "Could not mint a delegation token for agent '%s'; it runs under the "
+            "parent's token (parent agent '%s', run '%s')",
+            target_agent_name,
+            parent.agent,
+            parent.run_id,
+            exc_info=True,
+        )
+        return ""
+
+
+async def _run_as_delegate(
+    target_agent_name: str, coro_factory: Callable[[], Awaitable[Any]]
+) -> Any:
+    """Await ``coro_factory()`` with the child token installed for its whole run."""
+    async with _delegated_run(target_agent_name):
+        return await coro_factory()
+
+
+class _DelegatedAgent:
+    """A sub-agent agent object whose runs carry a token minted for that agent.
+
+    Everything except the run entry points is the wrapped agent's own, because
+    callers read attributes off it (``model``, ``event_stream_handler``, ...). The
+    library drives ``run``/``iter`` on a compiled sub-agent's ``agent``; every other
+    run entry point is wrapped too, so a future caller cannot silently run the child
+    under the parent's token.
+
+    Dynamic specialists created at run time by the library's ``create_agent`` tool
+    have no agent record of their own: they are registered into
+    ``FrameworkAgentRegistry`` and are only reachable through ``task`` ->
+    ``get_compiled()``, which is why they pass through this wrapper as well. A path
+    that handed such an agent out directly would run it under the supervisor's token.
+    """
+
+    def __init__(self, agent_name: str, agent: Any) -> None:
+        self._delegation_agent_name = agent_name
+        self._delegation_agent = agent
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._delegation_agent, item)
+
+    def __repr__(self) -> str:
+        return f"<delegated agent {self._delegation_agent_name!r}>"
+
+    async def run(self, *args: Any, **kwargs: Any) -> Any:
+        return await _run_as_delegate(
+            self._delegation_agent_name,
+            lambda: self._delegation_agent.run(*args, **kwargs),
+        )
+
+    def run_sync(self, *args: Any, **kwargs: Any) -> Any:
+        # getattr, not a direct call: a library version without the method must raise
+        # AttributeError rather than run the child unscoped.
+        run_sync = getattr(self._delegation_agent, "run_sync")
+        with _delegated_run_sync(self._delegation_agent_name):
+            return run_sync(*args, **kwargs)
+
+    def run_stream(self, *args: Any, **kwargs: Any) -> "_DelegatedRunScope":
+        return _DelegatedRunScope(
+            self._delegation_agent_name,
+            self._delegation_agent.run_stream(*args, **kwargs),
+        )
+
+    def run_stream_sync(self, *args: Any, **kwargs: Any) -> "_DelegatedSyncScope":
+        run_stream_sync = getattr(self._delegation_agent, "run_stream_sync")
+        return _DelegatedSyncScope(
+            self._delegation_agent_name, run_stream_sync(*args, **kwargs)
+        )
+
+    def run_stream_events(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        run_stream_events = getattr(self._delegation_agent, "run_stream_events")
+        return _stream_events_as_delegate(
+            self._delegation_agent_name, run_stream_events(*args, **kwargs)
+        )
+
+    def iter(self, *args: Any, **kwargs: Any) -> "_DelegatedRunScope":
+        return _DelegatedRunScope(
+            self._delegation_agent_name,
+            self._delegation_agent.iter(*args, **kwargs),
+        )
+
+
+async def _stream_events_as_delegate(
+    agent_name: str, events: AsyncIterator[Any]
+) -> AsyncIterator[Any]:
+    """Re-yield ``events`` with the child token installed for the whole iteration."""
+    async with _delegated_run(agent_name):
+        async for event in events:
+            yield event
+
+
+class _DelegatedRunScope:
+    """Keeps the child token installed for as long as a run context manager is open.
+
+    ``agent.iter()`` and ``agent.run_stream()`` are async context managers, and the
+    subagent retry path drives every attempt through ``iter()``, so the token has to
+    stay installed across the whole ``async with`` rather than around a single await.
+    """
+
+    def __init__(self, agent_name: str, inner: Any) -> None:
+        self._delegation_agent_name = agent_name
+        self._inner = inner
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._inner, item)
+
+    async def __aenter__(self) -> Any:
+        self._tokens = _delegated_run(self._delegation_agent_name)
+        await self._tokens.__aenter__()
+        try:
+            return await self._inner.__aenter__()
+        except BaseException as exc:
+            await self._tokens.__aexit__(type(exc), exc, exc.__traceback__)
+            raise
+
+    async def __aexit__(self, *exc_info: Any) -> Any:
+        try:
+            return await self._inner.__aexit__(*exc_info)
+        finally:
+            await self._tokens.__aexit__(None, None, None)
+
+
+class _DelegatedSyncScope:
+    """Sync twin of :class:`_DelegatedRunScope` for ``run_stream_sync()``."""
+
+    def __init__(self, agent_name: str, inner: Any) -> None:
+        self._delegation_agent_name = agent_name
+        self._inner = inner
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._inner, item)
+
+    def __enter__(self) -> Any:
+        self._tokens = _delegated_run_sync(self._delegation_agent_name)
+        self._tokens.__enter__()
+        try:
+            return self._inner.__enter__()
+        except BaseException as exc:
+            self._tokens.__exit__(type(exc), exc, exc.__traceback__)
+            raise
+
+    def __exit__(self, *exc_info: Any) -> Any:
+        try:
+            return self._inner.__exit__(*exc_info)
+        finally:
+            self._tokens.__exit__(None, None, None)
+
+
+def _as_delegate(agent_name: str, agent: Any) -> Any:
+    """``agent`` wrapped for delegation under ``agent_name`` (idempotent)."""
+    if agent is None or isinstance(agent, _DelegatedAgent):
+        return agent
+    return _DelegatedAgent(agent_name, agent)
+
+
+def _compiled_as_delegate(
+    agent_name: str, compiled: Any
+) -> Optional[CompiledSubAgent]:
+    """``compiled`` with its agent wrapped for delegation.
+
+    The stored entry is copied, never mutated: one registry entry serves every
+    dispatch, so wrapping it in place would nest a proxy per delegation.
+    """
+    if not isinstance(compiled, CompiledSubAgent) or compiled.agent is None:
+        return compiled
+    return replace(compiled, agent=_as_delegate(agent_name, compiled.agent))
+
+
+def _delegating_subagent_factory(
+    agent_name: str, default_model: Any
+) -> Callable[[SubAgentConfig], Any]:
+    """``agent_factory`` for one A2A subagent: the library's own agent, token-scoped.
+
+    ``SubAgentConfig`` entries are compiled once, when the capability is built, so the
+    only place to reach an A2A child's run is the agent its config hands over. The
+    library compiles the same agent as before -- ``can_ask_questions`` is dropped from
+    the compile input so no ``ask_parent`` tool is baked in, which the toolset injects
+    at run time for any caller-supplied agent instead.
+    """
+
+    def factory(subagent_config: SubAgentConfig) -> Any:
+        base = {k: v for k, v in dict(subagent_config).items() if k != "agent_factory"}
+        base["can_ask_questions"] = False
+        compiled = _compile_subagent(base, default_model)
+        return _as_delegate(agent_name, compiled.agent)
+
+    return factory
+
+
 class FrameworkAgentRegistry(DynamicAgentRegistry):
     """DynamicAgentRegistry backed by the framework's agent cache.
 
@@ -243,7 +567,9 @@ class FrameworkAgentRegistry(DynamicAgentRegistry):
         entry = self._snapshot.get(name)
         if entry is not None and (entry.get("disabled") or entry.get("offline") or not entry.get("external", True)):
             return None
-        return super().get_compiled(name)
+        # Supervisor dispatch: the child runs under a token minted for `name`, so its
+        # tool calls are checked against its allowlist, not the supervisor's.
+        return _compiled_as_delegate(name, super().get_compiled(name))
 
     def _set_snapshot_for_testing(self, entries):
         self._snapshot.set_for_testing(entries)
@@ -714,24 +1040,30 @@ def _register_mcp_server_tools(agent: Agent, mcp_name: str, tools: List[Any], al
 
     ``provider`` is the agent's effective provider; it only reaches the schema handed to
     ``Tool.from_schema`` (root-union normalization), never the catalogs.
+
+    An MCP tool is granted only by its server (``allowed_mcps``, including the
+    ``<site>__*`` form) or by its own full ``mcp__...`` reference in ``allowed_tools``.
+    A bare ``allowed_tools`` name is a grant for the framework/hub tool that owns it and
+    must never register a same-named MCP tool -- the hub, relay and runner resolve the
+    allowlist by that same rule (``core.allowlist``).
     """
     edge_parts = _external_remote_mcps.get(mcp_name)
     wildcard = f"{edge_parts[0]}__*" if edge_parts else None
     for tool in tools:
         prefixed_name = f"mcp__{mcp_name}__{tool.name}"
-        # Register if the entire MCP is allowed (by name or site wildcard), OR if the
-        # specific tool (by prefixed or base name) is allowed.
-        if not (
+        server_granted = bool(
             mcp_name in allowed_mcps
             or (wildcard is not None and wildcard in allowed_mcps)
-            or prefixed_name in allowed_tools
-            or tool.name in allowed_tools
-        ):
+        )
+        # Register if the entire MCP is allowed (by name or site wildcard), OR if this
+        # specific tool is allowed by its full prefixed reference. A bare tool name is
+        # deliberately NOT a grant here: it belongs to the framework tool of that name.
+        if not (server_granted or prefixed_name in allowed_tools):
             continue
         if edge_parts:
             _register_remote_mcp_tool(agent, edge_parts[0], edge_parts[1], tool, prefixed_name=prefixed_name, provider=provider)
             continue
-        name_to_use = prefixed_name if (mcp_name not in allowed_mcps and prefixed_name in allowed_tools) else tool.name
+        name_to_use = prefixed_name if not server_granted else tool.name
         _register_external_mcp_tool(agent, mcp_name, tool, prefixed_name=name_to_use, provider=provider)
 
 
@@ -868,7 +1200,10 @@ async def build_agent(agent_name: str) -> Agent:
             subagent_configs.append(SubAgentConfig(
                 name=target,
                 description=target_cfg.get("description", f"Call the {target} agent"),
-                instructions=target_instructions or ""
+                instructions=target_instructions or "",
+                # A2A delegation: the same child-token seam as supervisor dispatch,
+                # applied to the agent this config compiles.
+                agent_factory=_delegating_subagent_factory(target, model),
             ))
 
     if subagent_configs:

@@ -16,10 +16,13 @@ Two groups:
 """
 import asyncio
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
-from core import agent_factory
+import yaml
+
+from core import agent_factory, allowlist
 from core.auth import user_id_var
 
 from _llm_key_seam import install_provider_keys
@@ -487,3 +490,22 @@ def test_build_agent_supervisor_registers_two_tier_toolset(monkeypatch):
     for toolset in agent._user_toolsets:
         subagent_tool_names.update(getattr(toolset, "tools", {}).keys())
     assert "task" in subagent_tool_names
+
+
+# --- the shipped manifest's own allowlist (v0.7.1 Phase 3) -------------------
+#
+# Supervisor turns are no longer exempt from the hub's allowlist gate, so the
+# bundled manifest has to bind the deterministic tools its prompt is told to run.
+# A missing binding is not a crash: `use_tool` returns a recoverable denial string
+# and the turn silently degrades, which is why this is asserted rather than assumed.
+
+
+def test_the_shipped_supervisor_manifest_binds_its_direct_tools():
+    asset = Path(agent_factory.__file__).parent / "assets" / "supervisor" / "config.yaml"
+    config = yaml.safe_load(asset.read_text(encoding="utf-8")) or {}
+    resolved = allowlist.resolve(config)
+
+    # The framework's own demo tool is the bundled Tier 1 target ("analyze this text").
+    assert allowlist.permits_tool(resolved, "text_stats")
+    # The list is a real allowlist, not a wildcard for everything.
+    assert not allowlist.permits_tool(resolved, "netctl_api_probe")

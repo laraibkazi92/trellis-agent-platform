@@ -282,7 +282,7 @@ def test_denied_call_still_records_usage_once(monkeypatch, executions, registry)
     "token_call,arguments,agent_configs,expected",
     [
         pytest.param(
-            {"agent": "gateway", "user_id": "alice", "principal": "system"},
+            {"agent": "gateway", "user_id": "alice"},
             {"__user_id": "alice"},
             {},
             "user:alice",
@@ -332,7 +332,7 @@ def test_principal_derivation(
 def test_gateway_token_without_a_user_is_an_agent_principal(executions, registry):
     fake = registry(policy=DENY_ALL, hub_mode="enforcing")
 
-    call({"__agent_token": mint("gateway", None, principal="system")})
+    call({"__agent_token": mint("gateway", None)})
 
     [entry] = fake.denies
     assert entry["principal"] == "agent:gateway"

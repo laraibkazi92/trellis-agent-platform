@@ -13,10 +13,16 @@ Reference forms (same grammar as ``core.models``):
 
 | Reference | Granted by |
 |---|---|
+| ``echo`` (framework/hub tool) | exactly that name in ``tools`` |
 | ``dc1__node_ssh`` (edge tool) | exact ``tools`` entry only |
-| ``mcp__coralogix__t`` (central MCP tool) | the 3-part name or ``t`` in ``tools``, or ``coralogix`` in ``mcps`` |
-| ``mcp__dc1__devops-cli__t`` (edge MCP tool) | the 4-part name or ``t`` in ``tools``, or ``dc1__devops-cli`` in ``mcps``, or ``dc1__*`` in ``wildcards`` |
+| ``mcp__coralogix__t`` (central MCP tool) | the 3-part name in ``tools``, or ``coralogix`` in ``mcps`` |
+| ``mcp__dc1__devops-cli__t`` (edge MCP tool) | the 4-part name in ``tools``, or ``dc1__devops-cli`` in ``mcps``, or ``dc1__*`` in ``wildcards`` |
 | ``execute`` / console names | name in ``console`` |
+
+A bare name is a grant for exactly one tool: the registered framework/hub (or console)
+tool that carries that name. It is **not** a name-collision grant -- an MCP tool that
+happens to be called the same thing is reachable only through its server
+(``allowed_mcps``) or its full ``mcp__...`` reference.
 
 Wildcards expand against the *live* registry, never a build-time snapshot: a
 wildcard is stored unexpanded and checked per call.
@@ -81,33 +87,35 @@ def _segments(reference: str) -> list[str]:
 
 
 def permits_tool(allowlist: EffectiveAllowlist, reference: str) -> bool:
-    """Does the agent's allowlist grant this tool reference?"""
+    """Does the agent's allowlist grant this tool reference?
+
+    A full ``mcp__...`` reference is matched verbatim against ``tools`` first, then
+    through its server grant; anything else (a bare framework/hub name, an edge
+    ``<site>__<tool>`` pair, a console name) matches only itself.
+    """
     if not reference:
         return False
-    if reference in allowlist.tools:
-        return True
-    if reference in allowlist.console:
-        return True
-
     parts = _segments(reference)
-    if parts[0] == "mcp" and len(parts) == 3:
-        # mcp__<central-server>__<tool>
-        server, tool = parts[1], parts[2]
-        return server in allowlist.mcps or tool in allowlist.tools
-    if parts[0] == "mcp" and len(parts) == 4:
-        # mcp__<site>__<mcp>__<tool>
-        site, mcp, tool = parts[1], parts[2], parts[3]
-        edge_mcp = f"{site}__{mcp}"
-        return (
-            edge_mcp in allowlist.mcps
-            or f"{site}__*" in allowlist.wildcards
-            or tool in allowlist.tools
-        )
-    # A bare tool name in `allowed_tools` grants that tool everywhere it appears
-    # (this is how a workspace tool name has always been written).
-    if reference in allowlist.tools:
-        return True
-    return False
+    if parts[0] == "mcp":
+        if reference in allowlist.tools:
+            return True
+        if len(parts) == 3:
+            # mcp__<central-server>__<tool>
+            server, tool = parts[1], parts[2]
+            return bool(server) and bool(tool) and server in allowlist.mcps
+        if len(parts) == 4:
+            # mcp__<site>__<mcp>__<tool>
+            site, mcp, tool = parts[1], parts[2], parts[3]
+            if not (site and mcp and tool):
+                return False
+            return (
+                f"{site}__{mcp}" in allowlist.mcps
+                or f"{site}__*" in allowlist.wildcards
+            )
+        return False
+    # A bare entry grants the one tool that owns that name -- never an MCP tool that
+    # happens to share it: only `mcp__...` references and `allowed_mcps` reach MCPs.
+    return reference in allowlist.tools or reference in allowlist.console
 
 
 def permits_mcp_session(
@@ -116,14 +124,22 @@ def permits_mcp_session(
     """May the agent open a session for this MCP server?
 
     A session is the transport for every tool of that server, so either the server
-    grant or *any* per-tool grant for it is enough. Requiring the server grant would
-    silently break the documented ``allowed_tools: [mcp__server__tool]`` narrowing.
+    grant (``allowed_mcps``, or its ``<site>__*`` wildcard) or a per-tool grant for
+    that same server is enough. Requiring the server grant would silently break the
+    documented ``allowed_tools: [mcp__server__tool]`` narrowing.
+
+    The per-tool path reads full ``mcp__...`` references only. A bare hub-tool name
+    that happens to equal the server's name opens nothing -- the same rule
+    :func:`permits_tool` applies.
     """
     if permits_mcp(allowlist, mcp, site=site):
         return True
     name = f"{site}__{mcp}" if site else mcp
     prefix = f"mcp__{name}__"
-    return any(entry.startswith(prefix) for entry in allowlist.tools)
+    return any(
+        entry.startswith(prefix) and bool(entry[len(prefix):])
+        for entry in allowlist.tools
+    )
 
 
 def permits_mcp(

@@ -625,12 +625,29 @@ def _verified_claims(payload: Any) -> Optional[agent_token_module.Claims]:
         return None
 
 
+# The resource kinds the runner itself owns: a session container and a console
+# container are created and kept alive here, so the runner is the party that has to
+# check the allowlist. Everything else is somebody else's decision (see _authorize).
+_RUNNER_OWNED_KINDS = {"console", "mcp_session"}
+
+
 def _authorize(payload: Any) -> Optional[JSONResponse]:
     """Verify the agent token and, where it owns the resource, the allowlist.
 
-    ``tool`` callers are authorized by the hub (same registry the hub just read);
-    the runner only proves the token is valid. A session/console container is
-    owned by the runner, so the agent's on-disk manifest is checked here.
+    ``tool`` callers are authorized by the hub, which read the same registry the tool
+    was registered from and dispatched the call; the runner only proves the token is
+    valid. Requiring an on-disk manifest here would refuse every front-door/gateway
+    call -- neither has an agent record -- and the supervisor, whose manifest ships
+    inside the image (``core/assets/supervisor``) and is never materialised under
+    ``workspace/``.
+
+    A session/console container *is* owned by the runner, so the agent's on-disk
+    manifest is checked here, and an unrecognized kind is refused rather than trusted.
+
+    No caller is exempt: whoever minted the token, a resource the runner owns is
+    checked against that token agent's own allowlist. The one non-agent path is a
+    ``kind: "discovery"`` catalog read, which carries no agent run at all and is
+    gated by the runner bearer token on the control socket.
     """
     mode = agent_token_module.mode()
     if mode == "off":
@@ -659,13 +676,24 @@ def _authorize(payload: Any) -> Optional[JSONResponse]:
 
     claimed_agent = claims.agent
 
-    if claims.principal == "system" or claimed_agent in {"gateway", "supervisor"}:
-        return None
-
     # The edge runner has no agent manifests and no registry: the relay already
     # made the allowlist decision on the same call. Signature/expiry only there.
     if (os.getenv("RUNNER_AUTHORIZATION") or "allowlist").strip().lower() == "signature":
         return None
+
+    if payload.kind == "tool":
+        # The hub authorized this call before dispatch (local and edge tools alike),
+        # against the same registry the target was resolved from. Re-deriving an
+        # allowlist from a workspace manifest here cannot work: the gateway has no
+        # agent record at all and the supervisor's manifest is an image asset.
+        return None
+
+    if payload.kind not in _RUNNER_OWNED_KINDS:
+        message = f"access_denied: unrecognized exec kind '{payload.kind}'"
+        if mode == "log":
+            logger.warning("runner: would deny %r: %s", payload.kind, message)
+            return None
+        return _error(403, "access_denied", message)
 
     manifest = _agent_manifest(claimed_agent)
     if manifest is None:
@@ -678,10 +706,8 @@ def _authorize(payload: Any) -> Optional[JSONResponse]:
     allowed = allowlist.resolve(manifest)
     if payload.kind == "mcp_session":
         permitted = allowlist.permits_mcp_session(allowed, payload.target)
-    elif payload.kind == "console":
+    else:  # console: the runtime's own console tools
         permitted = "execute" in allowed.console
-    else:
-        permitted = True
     if not permitted:
         message = agent_token_module.deny_message(claimed_agent, payload.target)
         if mode == "log":

@@ -10,13 +10,20 @@ Covers:
   - get_agent() not registering external: False agents into the shared _supervisor_registry.
   - build_agent()'s A2A loop skipping a2a_access targets with internal: False, while still
     injecting targets with internal: True.
+  - v0.7.1: delegation child tokens — a sub-agent runs under a token minted for it (both
+    delegation paths), so the hub checks ITS allowlist, not the caller's.
 """
 import asyncio
 import logging
 from types import SimpleNamespace
 from typing import Dict, Optional
 
-from core import agent_factory
+import pytest
+
+import _hub_authz_registry as hub_authz
+from core import agent_factory, agent_token, auth, hub
+from core.models import ToolConfig
+from core import tool_authz
 from subagents_pydantic_ai import SubAgentConfig
 from subagents_pydantic_ai.types import CompiledSubAgent
 
@@ -395,3 +402,525 @@ def test_evict_agent_is_defensive_when_config_fetch_fails(monkeypatch):
     assert "B" not in cache
     assert "A" in cache  # cascade couldn't run, but the direct eviction still succeeded
     assert registry.exists("B") is False
+
+
+# --- v0.7.1 Phase 3: delegation child tokens ---------------------------------
+#
+# A delegated sub-agent used to inherit the caller's token, so every tool call it made
+# was authorized against the CALLER's allowlist. `_delegated_run` mints a token for the
+# child agent, installs it in `agent_token_var` (the only channel — no tool argument
+# carries it) and restores the parent's when the child run ends, however it ends.
+
+SECRET = "delegation-token-unit-secret-0123456789abcdef"
+
+
+@pytest.fixture
+def delegation_tokens(monkeypatch):
+    """Real minting/verification, enforced, with a clean run context per test."""
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", SECRET)
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+    monkeypatch.delenv("DEV_MODE", raising=False)
+    for var in (auth.agent_token_var, auth.user_id_var, auth.run_id_var):
+        var.set(None)
+    yield
+    for var in (auth.agent_token_var, auth.user_id_var, auth.run_id_var):
+        var.set(None)
+
+
+@pytest.fixture
+def hub_authz_off(monkeypatch):
+    """Every authz mode off, and no real registry read from the bound-tool gate."""
+    fake = hub_authz.install(monkeypatch, mode="off", bound_mode="off", hub_mode="off")
+    tool_authz.reset_cache()
+    yield fake
+    tool_authz.reset_cache()
+
+
+def _parent_token(agent="supervisor", run_id="run-parent", email="dev@example.com"):
+    return agent_token.mint_for_run(
+        agent,
+        "user-1",
+        user_email=email,
+        groups=["ops", "dev"],
+        run_id=run_id,
+    )
+
+
+def test_delegated_run_mints_a_token_for_the_target_agent(delegation_tokens):
+    """The child's token names the TARGET agent, carries a fresh run id with the
+    parent's run id as `p`, and inherits `u`/`e`/`g` from the parent."""
+    _parent_token()
+    seen: Dict[str, object] = {}
+
+    async def child_run():
+        seen["claims"] = agent_token.verify(auth.agent_token_var.get())
+        seen["run_id_var"] = auth.run_id_var.get()
+
+    async def scenario():
+        async with agent_factory._delegated_run("data-parser") as child_run_id:
+            await child_run()
+            return child_run_id
+
+    child_run_id = asyncio.run(scenario())
+
+    claims = seen["claims"]
+    assert claims.agent == "data-parser"
+    assert claims.parent_run_id == "run-parent"
+    assert claims.run_id == child_run_id != "run-parent"
+    assert claims.user_id == "user-1"
+    assert claims.user_email == "dev@example.com"
+    assert claims.groups == ("dev", "ops")
+    assert seen["run_id_var"] == child_run_id
+
+
+async def _claims_probe():
+    return agent_token.verify(auth.agent_token_var.get())
+
+
+def test_delegated_run_restores_the_parent_token(delegation_tokens):
+    parent = _parent_token()
+
+    async def scenario():
+        inside = await agent_factory._run_as_delegate("data-parser", _claims_probe)
+        return inside, auth.agent_token_var.get(), auth.run_id_var.get()
+
+    inside, token, run_id = asyncio.run(scenario())
+
+    assert inside.agent == "data-parser"
+    assert token == parent
+    assert run_id == "run-parent"
+
+
+def test_delegated_run_restores_the_parent_token_when_the_child_raises(delegation_tokens):
+    parent = _parent_token()
+
+    async def scenario():
+        with pytest.raises(RuntimeError):
+            async with agent_factory._delegated_run("data-parser"):
+                raise RuntimeError("child exploded")
+        return auth.agent_token_var.get(), auth.run_id_var.get()
+
+    token, run_id = asyncio.run(scenario())
+
+    assert token == parent
+    assert run_id == "run-parent"
+
+
+def test_delegated_run_restores_the_parent_token_when_the_child_is_cancelled(delegation_tokens):
+    """Cancellation unwinds through the seam's `finally`, so the caller keeps its token."""
+    parent = _parent_token()
+    entered = asyncio.Event()
+    restored: Dict[str, object] = {}
+
+    async def scenario():
+        async def delegation():
+            try:
+                async with agent_factory._delegated_run("data-parser"):
+                    entered.set()
+                    await asyncio.Event().wait()  # parked until cancelled
+            except asyncio.CancelledError:
+                restored["token"] = auth.agent_token_var.get()
+                restored["run_id"] = auth.run_id_var.get()
+                raise
+
+        task = asyncio.create_task(delegation())
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    assert restored == {"token": parent, "run_id": "run-parent"}
+
+
+def test_nested_delegation_chains_each_parent_run_id(delegation_tokens):
+    """A -> B -> C: C's `p` is B's run id, and each level restores its own parent."""
+    _parent_token(agent="agent-a", run_id="run-a")
+    seen: Dict[str, object] = {}
+
+    async def scenario():
+        async with agent_factory._delegated_run("agent-b") as run_b:
+            seen["b"] = agent_token.verify(auth.agent_token_var.get())
+            async with agent_factory._delegated_run("agent-c") as run_c:
+                seen["c"] = agent_token.verify(auth.agent_token_var.get())
+            seen["after_c"] = agent_token.verify(auth.agent_token_var.get())
+            seen["run_c"] = run_c
+        seen["after_b"] = agent_token.verify(auth.agent_token_var.get())
+        seen["run_b"] = run_b
+
+    asyncio.run(scenario())
+
+    assert seen["b"].agent == "agent-b"
+    assert seen["b"].parent_run_id == "run-a"
+    assert seen["c"].agent == "agent-c"
+    assert seen["c"].parent_run_id == seen["run_b"]
+    assert seen["c"].run_id == seen["run_c"]
+    assert seen["after_c"].agent == "agent-b"  # inner scope closed, middle one intact
+    assert seen["after_b"].agent == "agent-a"
+
+
+def test_delegation_without_a_parent_token_mints_nothing(delegation_tokens):
+    """No parent token means no child token: the child runs as it always did."""
+    minted = []
+
+    async def scenario():
+        async with agent_factory._delegated_run("data-parser") as child_run_id:
+            minted.append(child_run_id)
+            minted.append(auth.agent_token_var.get())
+        minted.append(auth.agent_token_var.get())
+
+    asyncio.run(scenario())
+
+    assert minted == [None, None, None]
+
+
+def test_child_token_reaches_the_hub_tool_call(delegation_tokens, hub_authz_off, monkeypatch):
+    """The bound-tool wrapper forwards whatever token is installed, so a delegated
+    child's call arrives at the hub as ITS token, not the caller's."""
+    captured = []
+    auth.user_id_var.set("user-1")
+
+    class RecordingHubClient:
+        async def call_tool(self, name, arguments):
+            captured.append(arguments)
+            return SimpleNamespace(content=["ok"])
+
+    class RecordingToolAgent:
+        def __init__(self):
+            self.tools = {}
+
+        def tool(self, name=None, description=None):
+            def deco(fn):
+                self.tools[name or fn.__name__] = fn
+                return fn
+
+            return deco
+
+    async def fake_get_hub_client():
+        return RecordingHubClient()
+
+    async def scenario():
+        _parent_token()
+        async with agent_factory._delegated_run("data-parser"):
+            await recording_agent.tools["text_stats"](None)
+
+    monkeypatch.setattr(agent_factory, "get_hub_client", fake_get_hub_client)
+    monkeypatch.setattr(
+        agent_factory,
+        "get_health_monitor",
+        lambda: SimpleNamespace(get_status=lambda *a: {"status": "Online"}),
+    )
+    recording_agent = RecordingToolAgent()
+    agent_factory._register_mcp_tool(
+        recording_agent, SimpleNamespace(name="text_stats", description="Stats.")
+    )
+
+    asyncio.run(scenario())
+
+    [arguments] = captured
+    claims = agent_token.verify(arguments["__agent_token"])
+    assert claims.agent == "data-parser"
+    assert claims.parent_run_id == "run-parent"
+
+
+class FakeHubRegistry:
+    """Only the read `hub._authorize_call` makes: the caller agent's record."""
+
+    def __init__(self, configs: Dict[str, Dict]):
+        self._configs = configs
+
+    def get_agent_config(self, name):
+        return self._configs.get(name)
+
+
+def test_hub_authorizes_the_child_against_its_own_allowlist(delegation_tokens, monkeypatch):
+    """The real hub decision: the parent's manifest grants `text_stats`, the child's
+    does not, and the child's token is what reaches the hub mid-delegation."""
+    monkeypatch.setattr(
+        hub,
+        "identity_mgr",
+        FakeHubRegistry({
+            "supervisor": {"name": "supervisor", "allowed_tools": ["text_stats"]},
+            "data-parser": {"name": "data-parser", "allowed_tools": []},
+        }),
+    )
+    tool = ToolConfig(
+        name="text_stats", description="Stats.", runtime="python", entrypoint="main.py"
+    )
+    outcome: Dict[str, object] = {}
+
+    async def scenario():
+        parent = _parent_token()
+        assert (await hub._authorize_call(tool, parent))[1] is None
+        async with agent_factory._delegated_run("data-parser"):
+            outcome["child_token"] = auth.agent_token_var.get()
+            claims, outcome["denial"] = await hub._authorize_call(
+                tool, auth.agent_token_var.get()
+            )
+            outcome["child_agent"] = claims.agent
+        # ... and the parent's own grant is intact again once the child is done.
+        return (await hub._authorize_call(tool, auth.agent_token_var.get()))[1]
+
+    parent_after = asyncio.run(scenario())
+
+    assert outcome["child_agent"] == "data-parser"
+    assert outcome["denial"] == {
+        "error": agent_token.deny_message("data-parser", "text_stats")
+    }
+    assert parent_after is None
+
+
+# --- seam installation on both delegation paths ------------------------------
+
+class FakeChildAgent:
+    """Records the delegation claims visible when a run entry point is called."""
+
+    def __init__(self):
+        self.runs = []
+        self.iterations = []
+        self.streams = []
+        self.sync_runs = []
+        self.sync_streams = []
+        self.events = []
+
+    async def run(self, prompt):
+        self.runs.append(agent_token.verify(auth.agent_token_var.get()))
+        return f"ran: {prompt}"
+
+    def run_sync(self, prompt):
+        self.sync_runs.append(agent_token.verify(auth.agent_token_var.get()))
+        return f"ran: {prompt}"
+
+    def iter(self, prompt):
+        return self._scope(self.iterations)
+
+    def run_stream(self, prompt):
+        return self._scope(self.streams)
+
+    def run_stream_sync(self, prompt):
+        return self._sync_scope(self.sync_streams)
+
+    async def run_stream_events(self, prompt):
+        self.events.append(agent_token.verify(auth.agent_token_var.get()))
+        yield "event"
+
+    def _scope(self, sink):
+        class FakeRun:
+            async def __aenter__(self):
+                sink.append(agent_token.verify(auth.agent_token_var.get()))
+                return self
+
+            async def __aexit__(self, *exc_info):
+                return None
+
+        return FakeRun()
+
+    def _sync_scope(self, sink):
+        class FakeRun:
+            def __enter__(self):
+                sink.append(agent_token.verify(auth.agent_token_var.get()))
+                return self
+
+            def __exit__(self, *exc_info):
+                return None
+
+        return FakeRun()
+
+
+def test_supervisor_dispatch_runs_the_child_under_its_own_token(delegation_tokens, monkeypatch):
+    """`FrameworkAgentRegistry.get_compiled()` hands the supervisor's task() tool an
+    agent whose runs carry the child's token (`run`, plus the library's `iter` retry
+    path and the streaming context manager)."""
+    fake_identity = FakeIdentityManagerRegistry({})
+    registry = agent_factory.FrameworkAgentRegistry(fake_identity, FakeHealthMonitor())
+    child = FakeChildAgent()
+    registry.register(SubAgentConfig(name="data-parser", description="d", instructions=""), child)
+
+    compiled_once = registry.get_compiled("data-parser")
+    compiled_twice = registry.get_compiled("data-parser")
+
+    async def scenario():
+        _parent_token()
+        await compiled_once.agent.run("parse it")
+        async with compiled_once.agent.iter("parse it"):
+            pass
+        async with compiled_once.agent.run_stream("parse it"):
+            pass
+        return auth.agent_token_var.get()
+
+    parent_after = asyncio.run(scenario())
+
+    assert compiled_once.agent is not child  # wrapped, never mutated in place
+    assert registry.agents["data-parser"] is child  # the stored entry is untouched
+    assert compiled_once.agent is not compiled_twice.agent  # one proxy per dispatch
+    claims, iter_claims, stream_claims = child.runs[0], child.iterations[0], child.streams[0]
+    assert claims.agent == "data-parser"
+    assert claims.parent_run_id == "run-parent"
+    assert iter_claims.agent == "data-parser"
+    assert stream_claims.agent == "data-parser"
+    assert parent_after is not None
+    assert agent_token.verify(parent_after).agent == "supervisor"
+
+
+def test_every_remaining_run_entry_point_is_scoped_too(delegation_tokens, monkeypatch):
+    """`run_sync` / `run_stream_sync` / `run_stream_events` must not be a way around
+    the seam: a caller that reaches one of them still calls as the child."""
+    fake_identity = FakeIdentityManagerRegistry({})
+    registry = agent_factory.FrameworkAgentRegistry(fake_identity, FakeHealthMonitor())
+    child = FakeChildAgent()
+    registry.register(SubAgentConfig(name="data-parser", description="d", instructions=""), child)
+    wrapped = registry.get_compiled("data-parser").agent
+
+    async def scenario():
+        _parent_token()
+        wrapped.run_sync("parse it")
+        with wrapped.run_stream_sync("parse it"):
+            pass
+        events = [event async for event in wrapped.run_stream_events("parse it")]
+        return events, auth.agent_token_var.get(), auth.run_id_var.get()
+
+    events, parent_after, parent_run_id = asyncio.run(scenario())
+
+    claims = child.sync_runs[0]
+    assert claims.agent == "data-parser"
+    assert claims.parent_run_id == "run-parent"
+    assert child.sync_streams[0].agent == "data-parser"
+    # The async generator installs the token for the whole iteration, not per event.
+    assert child.events[0].agent == "data-parser"
+    assert events == ["event"]
+    assert agent_token.verify(parent_after).agent == "supervisor"
+    assert parent_run_id == "run-parent"
+
+
+def test_a_missing_entry_point_is_not_silently_unwrapped():
+    """A wrapped agent without `run_sync` raises rather than running unscoped."""
+
+    class MinimalChild:
+        async def run(self, prompt):
+            return prompt
+
+    wrapped = agent_factory._DelegatedAgent("data-parser", MinimalChild())
+
+    with pytest.raises(AttributeError):
+        wrapped.run_sync("parse it")
+
+
+def _mint_failure(monkeypatch):
+    """Make `mint_for_run` fail the way a missing or rotated key does."""
+    def boom(*_args, **_kwargs):
+        raise agent_token.AgentTokenError(
+            "missing_secret", "AGENT_TOKEN_SECRET is not set"
+        )
+
+    monkeypatch.setattr(agent_token, "mint_for_run", boom)
+
+
+def test_enforce_refuses_to_delegate_when_no_child_token_can_be_minted(
+    delegation_tokens, monkeypatch
+):
+    """Fail closed: the child must never inherit the parent's allowlist.
+
+    Before this, a mint failure fell back to the parent's token, which silently gave
+    the sub-agent every tool the caller had. In enforce mode the delegation tool now
+    gets the error and the child never runs.
+    """
+    parent = _parent_token()
+    _mint_failure(monkeypatch)
+    ran = []
+
+    async def child():
+        ran.append(True)
+
+    async def scenario():
+        with pytest.raises(agent_token.AgentTokenError):
+            await agent_factory._run_as_delegate("data-parser", child)
+        with pytest.raises(agent_token.AgentTokenError):
+            async with agent_factory._delegated_run("data-parser"):
+                ran.append(True)
+        return auth.agent_token_var.get(), auth.run_id_var.get()
+
+    token, run_id = asyncio.run(scenario())
+
+    assert ran == []  # the child never ran at all
+    assert token == parent  # and the caller's context is untouched
+    assert run_id == "run-parent"
+
+
+def test_log_mode_keeps_the_documented_parent_token_fallback(
+    delegation_tokens, monkeypatch, caplog
+):
+    """In `log` mode a mint failure still falls back to the parent's token.
+
+    Nothing is authorized in that posture, and a rollout must not be the one thing
+    that breaks delegation -- but it has to be loud about it.
+    """
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "log")
+    parent = _parent_token()
+    _mint_failure(monkeypatch)
+    seen = {}
+
+    async def child():
+        seen["claims"] = agent_token.verify(auth.agent_token_var.get())
+
+    async def scenario():
+        async with agent_factory._delegated_run("data-parser") as child_run_id:
+            await child()
+            return child_run_id
+
+    with caplog.at_level(logging.WARNING, logger="core.agent_factory"):
+        child_run_id = asyncio.run(scenario())
+
+    assert child_run_id is None
+    assert seen["claims"].agent == "supervisor"  # the documented fallback
+    assert "parent's token" in caplog.text
+    assert auth.agent_token_var.get() == parent
+
+
+def test_a2a_subagent_agent_factory_wraps_the_compiled_agent(monkeypatch):
+    """build_agent's A2A path compiles its subagents through a factory that returns the
+    library's own agent, wrapped — `agent_factory` is dropped so the compile cannot
+    recurse, and `ask_parent` is left to the toolset's run-time injection."""
+    compiled_agent = FakeChildAgent()
+    seen: Dict[str, object] = {}
+
+    def fake_compile(config, default_model):
+        seen["config"] = config
+        seen["default_model"] = default_model
+        return CompiledSubAgent(
+            name=config["name"],
+            description=config["description"],
+            agent=compiled_agent,
+            config=config,
+        )
+
+    monkeypatch.setattr(agent_factory, "_compile_subagent", fake_compile)
+    factory = agent_factory._delegating_subagent_factory("data-parser", "sentinel-model")
+    wrapped = factory(
+        SubAgentConfig(
+            name="data-parser",
+            description="Parses input.",
+            instructions="You parse.",
+            can_ask_questions=True,
+            agent_factory=lambda config: compiled_agent,
+        )
+    )
+
+    assert isinstance(wrapped, agent_factory._DelegatedAgent)
+    assert wrapped._delegation_agent is compiled_agent
+    assert "agent_factory" not in seen["config"]
+    assert seen["config"]["can_ask_questions"] is False
+    assert seen["default_model"] == "sentinel-model"
+
+
+def test_build_agent_wires_the_seam_into_every_a2a_subagent(monkeypatch):
+    _setup_build_agent_common(monkeypatch)
+    monkeypatch.setattr(agent_factory, "get_identity_manager", lambda: FakeIdentityManagerA2A())
+
+    agent = asyncio.run(agent_factory.build_agent("triage-lead"))
+
+    [capability] = [
+        c for c in agent.kwargs["capabilities"] if isinstance(c, FakeSubAgentCapability)
+    ]
+    [subagent] = [sa for sa in capability.subagents if sa["name"] == "data-parser"]
+    assert callable(subagent["agent_factory"])

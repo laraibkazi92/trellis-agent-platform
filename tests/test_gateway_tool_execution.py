@@ -660,7 +660,9 @@ def test_use_tool_mints_a_gateway_token_with_the_callers_email_and_groups(monkey
 
     claims = agent_token.verify(minted["token"])
     assert claims.agent == "gateway"
-    assert claims.principal == "system"
+    # An ordinary agent token: no elevated principal, so the hub/relay treat the front
+    # door like any other caller (its grant is the tool's own public exposure).
+    assert claims.principal is None
     assert claims.user_id == "user-1"
     assert claims.user_email == "ops@example.com"
     # Sorted and de-duplicated, exactly as the token claim requires.

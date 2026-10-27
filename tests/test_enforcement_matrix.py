@@ -5,12 +5,12 @@
 
 Both enforcement points are driven directly, without a container backend or a live
 relay: ``core.hub._authorize_call`` (local tools) and
-``core.execution.runner._authorize`` (sessions, console, discovery). The two relay
-routes are covered in ``tests/test_edge_relay.py``.
+``core.execution.runner._authorize`` (tool calls, sessions, console, discovery). The
+two relay routes are covered in ``tests/test_edge_relay.py``.
 
 The property under test is the one in the plan's invariant 9: no call executes
-without a valid, unexpired token and without the agent's effective allowlist being
-re-resolved by the party that owns the resource.
+without a valid, unexpired token, and every party re-resolves the allowlist for the
+resources it owns (the hub for tools, the runner for sessions and console).
 """
 
 import asyncio
@@ -34,6 +34,8 @@ ECHO = ToolConfig(
 HUB_AGENTS = {
     "agent-a": {"allowed_tools": ["echo", "execute"]},
     "agent-b": {"allowed_tools": []},
+    # The supervisor is an agent like any other: its own manifest decides.
+    "supervisor": {"allowed_tools": ["echo"]},
 }
 
 RUNNER_AGENTS = {
@@ -50,6 +52,23 @@ RUNNER_AGENTS = {
         "allowed_mcps": [],
     },
 }
+# Deliberately NOT here: `supervisor`. Its manifest is an image asset
+# (`core/assets/supervisor/config.yaml`, read by scripts/sync_to_db.py) and is never
+# materialised under `workspace/`, so fabricating one here would test a layout that
+# does not exist -- and hide the runner bug that layout causes.
+
+# A second, non-public tool: no agent's allowlist grants it here, so it is the
+# denial probe for callers that used to be exempt.
+NETCTL = ToolConfig(
+    name="netctl", description="Inspect cluster nodes.", runtime="python", entrypoint="netctl.py"
+)
+PUBLIC_ECHO = ToolConfig(
+    name="echo",
+    description="Echo a block of text back.",
+    runtime="python",
+    entrypoint="echo.py",
+    public=True,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -91,9 +110,9 @@ def hub_env(monkeypatch):
     return HUB_AGENTS
 
 
-def _hub_call(token):
+def _hub_call(token, config=ECHO):
     """``_authorize_call`` is async because it reads the registry off-loop."""
-    return asyncio.run(hub._authorize_call(ECHO, token))
+    return asyncio.run(hub._authorize_call(config, token))
 
 
 def _assert_hub_denied(denial, *, contains: str = "access_denied") -> None:
@@ -138,6 +157,62 @@ def test_hub_enforce_allows_the_granted_tool(hub_env, monkeypatch):
     assert claims is not None
     assert claims.agent == "agent-a"
     assert claims.user_id == "user-1"
+
+
+# --- no exempt principals ----------------------------------------------------
+#
+# v0.7.1 Phase 3 removed every "this caller is special" branch. These pin the three
+# names that used to be exempt (a `system` principal, `gateway`, `supervisor`) against
+# the allowlist they actually have -- not against a bypass.
+
+
+def test_hub_enforce_checks_the_supervisor_against_its_own_allowlist(hub_env, monkeypatch):
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+
+    allowed_claims, denial = _hub_call(agent_token.mint("supervisor", user_id="user-1"))
+    assert denial is None, denial
+    assert allowed_claims.agent == "supervisor"
+
+    _, denied = _hub_call(agent_token.mint("supervisor", user_id="user-1"), NETCTL)
+    _assert_hub_denied(denied, contains="not in agent 'supervisor' allowlist")
+
+
+def test_hub_enforce_a_system_principal_is_not_exempt(hub_env, monkeypatch):
+    """A token claiming `principal="system"` gets no bypass: no agent record, no grant."""
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+
+    _, denial = _hub_call(agent_token.mint("gateway", principal="system"), NETCTL)
+
+    _assert_hub_denied(denial, contains="unknown agent 'gateway'")
+
+
+def test_hub_enforce_the_front_door_is_limited_to_public_tools(hub_env, monkeypatch):
+    """The gateway mints for the caller it serves and has no manifest of its own.
+
+    Its only possible grant is the tool's own `public` exposure -- the same rule the
+    gateway applied before dispatching; everything else is denied.
+    """
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+    gateway_token = agent_token.mint("gateway", user_id="user-1")
+
+    _, denial = _hub_call(gateway_token, NETCTL)
+    _assert_hub_denied(denial, contains="unknown agent 'gateway'")
+
+    claims, allowed = _hub_call(gateway_token, PUBLIC_ECHO)
+    assert allowed is None
+    assert claims.user_id == "user-1"
+
+
+def test_hub_enforce_public_exposure_does_not_widen_an_agents_allowlist(
+    hub_env, monkeypatch
+):
+    """`public` is the grant for a caller with no manifest -- never a shortcut for an
+    agent whose own allowlist does not name the tool."""
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+
+    _, denial = _hub_call(agent_token.mint("agent-b"), PUBLIC_ECHO)
+
+    _assert_hub_denied(denial, contains="not in agent 'agent-b' allowlist")
 
 
 @pytest.mark.parametrize("case", BAD_TOKEN_CASES)
@@ -273,17 +348,109 @@ def test_runner_refuses_an_unknown_agent(runner_env):
     )
 
 
-def test_runner_gateway_bypasses_the_allowlist(runner_env):
-    # The gateway is a system principal: it has no manifest on disk, by design.
-    assert runner_module._authorize(_console(agent_token.mint("gateway"))) is None
+def test_runner_enforce_a_system_principal_is_not_exempt(runner_env):
+    """A `system` principal gets no session/console bypass: it is not on disk at all."""
+    _assert_runner_denied(
+        runner_module._authorize(
+            _console(agent_token.mint("gateway", principal="system"))
+        )
+    )
+    # And neither does the front door's ordinary token.
+    _assert_runner_denied(runner_module._authorize(_console(agent_token.mint("gateway"))))
 
 
-def test_runner_tool_calls_are_the_hubs_decision(runner_env):
-    """For ``kind=tool`` the runner proves the token only; the hub owns the allowlist.
+# --- the runner authorizes only what it owns ---------------------------------
+#
+# v0.7.1 Phase 3: `kind="tool"` is the hub's decision. The runner used to re-derive
+# the allowlist from a workspace manifest, which denied EVERY front-door/gateway call
+# (no agent record exists) and every supervisor call (its manifest ships inside the
+# image). The regression tests below use the real shipping layout: no supervisor
+# directory under `workspace/agents`, per the fixture above.
 
-    `echo` is deliberately absent from agent-a's on-disk manifest here.
+
+@pytest.mark.parametrize("agent", ["supervisor", "gateway"])
+def test_runner_enforce_allows_a_tool_call_from_a_manifestless_caller(
+    runner_env, agent
+):
+    """A tool call is authorized by the hub; the runner must not demand a manifest.
+
+    Neither caller has an on-disk agent record here (the supervisor's is an image
+    asset, the gateway has none at all), which is exactly the shipping layout.
     """
-    assert runner_module._authorize(_tool(agent_token.mint("agent-a"))) is None
+    token = agent_token.mint(agent, user_id="user-1")
+
+    assert runner_module._authorize(_tool(token)) is None
+
+
+def test_runner_enforce_a_tool_call_from_an_unknown_agent_is_not_the_runners_call(
+    runner_env,
+):
+    """Even a name with no record anywhere passes the runner: the hub already denied
+    or admitted it before dispatch, and the runner cannot re-derive that verdict."""
+    assert runner_module._authorize(_tool(agent_token.mint("ghost"))) is None
+
+
+@pytest.mark.parametrize("agent", ["supervisor", "gateway"])
+def test_runner_owned_resources_stay_locked_without_a_manifest(runner_env, agent):
+    """Sessions and console containers ARE the runner's: no manifest, no call.
+
+    The same manifest-less tokens that may run a hub-authorized tool are refused a
+    container the runner would create and keep alive on its own authority.
+    """
+    token = agent_token.mint(agent, user_id="user-1")
+
+    _assert_runner_denied(runner_module._authorize(_session(token)))
+    _assert_runner_denied(runner_module._authorize(_console(token)))
+
+
+def test_runner_refuses_an_unrecognized_kind(runner_env):
+    """A kind the runner does not know is denied outright, never silently authorized.
+
+    ``ExecKind`` is validated by the contract today; this pins the behaviour for the
+    next kind added (workflows in v0.7.1 Phase 6) before it has an owner here.
+    """
+    payload = _tool(agent_token.mint("agent-a"))
+    payload.kind = "workflow"
+
+    _assert_runner_denied(runner_module._authorize(payload))
+
+
+def test_the_shipped_supervisor_manifest_is_an_image_asset():
+    """Layout guard: the supervisor is read from the package, not from the workspace.
+
+    ``scripts/sync_to_db.py`` syncs it from ``core/assets/supervisor`` into etcd, and
+    nothing materialises it under ``workspace/agents``. If this ever changes, the
+    runner's manifest-free tool path above would start being exercised against a
+    directory that exists -- so assert the layout the tests assume.
+    """
+    from scripts import sync_to_db
+
+    manifest = sync_to_db.SUPERVISOR_DIR / "config.yaml"
+    assert manifest.is_file(), f"the shipped supervisor manifest is missing: {manifest}"
+    assert sync_to_db.SUPERVISOR_DIR == (
+        sync_to_db.BASE_DIR / "core" / "assets" / "supervisor"
+    )
+    assert not (sync_to_db.AGENTS_DIR / "supervisor").exists()
+
+    config = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+    assert config["name"] == "supervisor"
+    # The hub checks the supervisor against this list, so it must be a real one.
+    assert config["allowed_tools"] == ["text_stats"]
+
+
+def test_runner_discovery_is_the_one_non_agent_path(runner_env):
+    """The legitimate remaining bypass by KIND: a catalog read no agent owns.
+
+    Its agent token (even a `system` one) is not an identity to authorize -- the
+    runner bearer token on the control socket is the gate. ``kind="tool"`` is not a
+    bypass of the same sort: the hub authorized it (see the tests above); every
+    resource the runner owns still needs a manifest.
+    """
+    payload = _session(
+        agent_token.mint("gateway", principal="system"), target="x", kind="discovery"
+    )
+
+    assert runner_module._authorize(payload) is None
 
 
 def test_runner_off_mode_short_circuits(runner_env, monkeypatch):

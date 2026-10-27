@@ -155,12 +155,6 @@ def load_tool_configs() -> Optional[Dict[str, tuple[ToolConfig, Optional[Path]]]
     return configs
 
 
-# Principals that are not agents: the gateway is an authenticated front door whose
-# tool visibility is enforced by its own whitelist search, so it is not subject to
-# an agent's `allowed_tools`.
-SYSTEM_PRINCIPALS = frozenset({"gateway"})
-
-
 async def _authorize_call(
     config: ToolConfig, raw_token: Optional[str]
 ) -> tuple[Optional[agent_token_module.Claims], Optional[Dict[str, Any]]]:
@@ -169,6 +163,13 @@ async def _authorize_call(
     Returns ``(claims, denial)``. ``denial`` is the result dict to send back, or
     ``None`` when the call may proceed. In ``log`` mode a refusal is recorded and
     the call still runs (one rollout window); ``off`` skips everything.
+
+    There are no exempt callers: the token's agent is resolved in the registry and
+    checked against its own ``allowed_tools``, whoever minted it. A caller with no
+    agent record (the gateway front door mints for the external client it serves)
+    has no allowlist to resolve, so the tool's own ``public`` exposure is the only
+    grant that can apply -- the same rule the gateway already applied before
+    dispatching.
     """
     mode = agent_token_module.mode()
     if mode == "off":
@@ -186,11 +187,10 @@ async def _authorize_call(
             return None, None
         return None, {"error": message}
 
-    if claims.principal == "system" or claims.agent in SYSTEM_PRINCIPALS:
-        return claims, None
-
     config_data = await asyncio.to_thread(identity_mgr.get_agent_config, claims.agent)
     if not config_data:
+        if config.public:
+            return claims, None
         message = f"access_denied: unknown agent '{claims.agent}'"
         if mode == "log":
             logger.warning("hub: would deny %r: %s", config.name, message)

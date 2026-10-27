@@ -669,9 +669,24 @@ def _claims_identity(
     return user, email
 
 
-# Principals that are not agents: the gateway is an authenticated front door with its
-# own tool whitelist, so an agent's `allowed_tools` does not apply to it.
-SYSTEM_PRINCIPALS = frozenset({"gateway"})
+async def _publicly_exposed(site: str, tool: str, mcp: Optional[str]) -> bool:
+    """Is this edge export exposed to external clients?
+
+    A caller with no agent record has no allowlist to resolve, so the export's own
+    published exposure -- the same ``public``/``public_tools`` decision
+    ``tool_search.is_tool_publicly_whitelisted`` applied before dispatching -- is the
+    only grant that can apply. Read from the ``<site>__…`` records the relay itself
+    published, so it reflects the site record an admin edited.
+    """
+    mgr = _identity_manager()
+    if mcp is not None:
+        record = await asyncio.to_thread(mgr.get_mcp_config, f"{site}__{mcp}") or {}
+        if record.get("public") is True:
+            return True
+        names = record.get("public_tools")
+        return isinstance(names, list) and tool in names
+    record = await asyncio.to_thread(mgr.get_tool_config, f"{site}__{tool}")
+    return bool(record) and record.get("public") is True
 
 
 async def _authorize_agent(
@@ -686,6 +701,10 @@ async def _authorize_agent(
     This is the **only** token verification on the edge path: the identity in the
     forwarded frame is built from these claims (``_claims_identity``) and the edge
     trusts it over the authenticated tunnel.
+
+    No caller is exempt. A token whose agent has no record (the gateway front door
+    mints for the external client it serves) is left with the export's own public
+    exposure as its only possible grant.
 
     In ``log`` mode a refusal is logged and the call still runs (one rollout window);
     ``off`` skips the check entirely.
@@ -705,17 +724,13 @@ async def _authorize_agent(
             return None, None
         return None, ("access_denied", message)
 
-    # Signature and expiry still applied above: a system principal is authenticated,
-    # it just has no agent record to resolve an allowlist from.
-    if claims.principal == "system" or claims.agent in SYSTEM_PRINCIPALS:
-        return claims, None
-
     config = await asyncio.to_thread(
         _identity_manager().get_agent_config, claims.agent
     )
     permitted = False
     reference = f"{site}__{tool}"
     if not config:
+        permitted = await _publicly_exposed(site, tool, mcp)
         message = f"access_denied: unknown agent '{claims.agent}'"
     else:
         allowed = allowlist.resolve(config)

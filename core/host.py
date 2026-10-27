@@ -23,6 +23,7 @@ from core.agent_token import mint_for_run
 from core.caller_identity import resolve_mint_identity
 from core.devmode import configure_cors, enforce_dev_mode_safety
 from core.models import is_agent_external, is_routable_agent_type
+from core import tool_authz
 from core.health import compute_agent_operational_status
 from core.background.tasks import (
     background_tasks as _background_tasks,
@@ -308,6 +309,9 @@ async def chat_completions(request: ChatRequest):
     # The user's attributes are read ONCE, here: nothing downstream re-reads the
     # registry for identity. An unresolvable record costs the token its email and
     # groups, never the run.
+    #
+    # The supervisor gets the same ordinary token as any other agent: no elevated
+    # principal, so the hub checks it against the supervisor manifest's own allowlist.
     mint_identity = await resolve_mint_identity(identity_mgr, captured_user_id)
     run_token = mint_for_run(
         request.model,
@@ -315,7 +319,14 @@ async def chat_completions(request: ChatRequest):
         user_email=mint_identity["user_email"],
         groups=mint_identity["groups"],
         run_id=uuid.uuid4().hex,
-        principal="system" if request.model == "supervisor" else None,
+    )
+    # Publish the run's groups so the in-process gates (bound tools, use_tool) resolve
+    # `group:` rules from the claim the mint wrote instead of re-reading the record --
+    # the rule the hub's last mile applies. Mirrored exactly: a token minted without a
+    # `g` claim falls back to the stored record, so both sides of the boundary reach
+    # one verdict. (Phase 4 drops the fallback and reads the claim only.)
+    tool_authz.set_request_groups(
+        mint_identity["groups"] or tool_authz.stored_user_groups(captured_user_id)
     )
 
     async def handle_success(result, user_id, ttft_ms=None):

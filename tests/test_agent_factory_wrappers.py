@@ -857,6 +857,110 @@ def test_central_mcp_non_union_schema_is_unchanged_for_google(monkeypatch):
     assert tool.inputSchema == schema
 
 
+# --- Phase 3 (v0.7.1): bare `allowed_tools` names register no MCP tools ------
+#
+# Build-time twin of `core.allowlist.permits_tool`: an MCP tool is granted by its
+# server (`allowed_mcps`, including `<site>__*`) or by its own full `mcp__...`
+# reference. A bare name belongs to the framework/hub tool of that name, so it must
+# not register a same-named MCP tool -- exposing it would only produce a call the
+# call-time allowlist then denies.
+
+DEV = "deploy"
+SIBLING = "sibling"
+CENTRAL = "devops"
+EDGE_KEY = "dc1__devops"
+
+
+def _mcp_tool(name: str) -> MCPToolDefinition:
+    return MCPToolDefinition(
+        name=name,
+        description=f"{name} tool.",
+        inputSchema={"type": "object", "properties": {}},
+    )
+
+
+def _registered_names(agent) -> set[str]:
+    return set(agent._function_toolset.tools)
+
+
+def test_a_bare_allowed_tools_name_registers_no_mcp_tool(monkeypatch):
+    """`allowed_tools: [deploy]` + an MCP server exporting `deploy`: not registered."""
+    _install_build_stubs(
+        monkeypatch,
+        {"name": "bare-name-agent", "allowed_tools": [DEV]},
+        discovered={CENTRAL: [_mcp_tool(DEV), _mcp_tool(SIBLING)]},
+    )
+
+    agent = asyncio.run(agent_factory.build_agent("bare-name-agent"))
+
+    # Neither the same-named tool nor its sibling: a bare entry grants no MCP tool.
+    assert _registered_names(agent) == set()
+
+
+def test_a_bare_allowed_tools_name_still_registers_the_hub_tool_of_that_name(monkeypatch):
+    """The same entry does register the framework/hub tool that owns the name."""
+    _install_build_stubs(
+        monkeypatch, {"name": "hub-tool-agent", "allowed_tools": [DEV]}, discovered={}
+    )
+    monkeypatch.setattr(agent_factory, "_hub_tools_cache", [_mcp_tool(DEV)])
+
+    agent = asyncio.run(agent_factory.build_agent("hub-tool-agent"))
+
+    assert _registered_names(agent) == {DEV}
+
+
+def test_allowed_mcps_registers_the_servers_tools_under_their_exposed_names(monkeypatch):
+    """The server grant keeps today's exposed names (`tool.name`, not the prefix)."""
+    _install_build_stubs(
+        monkeypatch,
+        {"name": "server-grant-agent", "allowed_mcps": [CENTRAL]},
+        discovered={CENTRAL: [_mcp_tool(DEV), _mcp_tool(SIBLING)]},
+    )
+
+    agent = asyncio.run(agent_factory.build_agent("server-grant-agent"))
+
+    assert _registered_names(agent) == {DEV, SIBLING}
+
+
+def test_a_full_mcp_reference_registers_only_that_tool_under_its_prefixed_name(monkeypatch):
+    _install_build_stubs(
+        monkeypatch,
+        {"name": "narrowed-agent", "allowed_tools": [f"mcp__{CENTRAL}__{DEV}"]},
+        discovered={CENTRAL: [_mcp_tool(DEV), _mcp_tool(SIBLING)]},
+    )
+
+    agent = asyncio.run(agent_factory.build_agent("narrowed-agent"))
+
+    assert _registered_names(agent) == {f"mcp__{CENTRAL}__{DEV}"}
+
+
+def test_an_edge_mcp_wildcard_registers_the_four_part_names(monkeypatch):
+    _install_build_stubs(
+        monkeypatch,
+        {"name": "wildcard-agent", "allowed_mcps": ["dc1__*"]},
+        discovered={EDGE_KEY: [_mcp_tool(DEV)]},
+        remote_mcps={EDGE_KEY: ("dc1", "devops")},
+    )
+
+    agent = asyncio.run(agent_factory.build_agent("wildcard-agent"))
+
+    # Legacy semantics, pinned: an edge export is always 4-part namespaced.
+    assert _registered_names(agent) == {f"mcp__dc1__devops__{DEV}"}
+
+
+def test_a_bare_allowed_tools_name_registers_no_edge_mcp_tool(monkeypatch):
+    _install_build_stubs(
+        monkeypatch,
+        {"name": "bare-name-edge-agent", "allowed_tools": [DEV]},
+        discovered={EDGE_KEY: [_mcp_tool(DEV)]},
+        remote_mcps={EDGE_KEY: ("dc1", "devops")},
+    )
+
+    agent = asyncio.run(agent_factory.build_agent("bare-name-edge-agent"))
+
+    assert _registered_names(agent) == set()
+
+
 # --- Phase 1 (v0.7.1): bound-tool gating -------------------------------------
 #
 # Bound tools never reach `use_tool`, so the wrappers themselves ask the policy

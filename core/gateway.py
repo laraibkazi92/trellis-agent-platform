@@ -597,10 +597,10 @@ async def use_tool(ctx: Context, tool_name: str, arguments: Dict[str, Any]) -> A
     """
     user_id = user_id_var.get()
     if agent_token.verify_or_none(agent_token_var.get()) is None:
-        # Direct tool use is a gateway capability, not an agent's: mint a token for
-        # the `gateway` system principal so the hub/relay can still verify origin.
-        # It carries the caller's identity (read once here), so the last mile can
-        # attribute the call without trusting a request body.
+        # Direct tool use acts for the external caller, so the token names the
+        # `gateway` agent and carries that caller's identity (read once here). It is
+        # an ordinary agent token: no elevated principal, so the hub/relay resolve the
+        # front door's exposure from the tool's own `public` flag like anyone else's.
         mint_identity = await resolve_mint_identity(identity_mgr, user_id)
         mint_for_run(
             "gateway",
@@ -608,7 +608,6 @@ async def use_tool(ctx: Context, tool_name: str, arguments: Dict[str, Any]) -> A
             user_email=mint_identity["user_email"],
             groups=mint_identity["groups"],
             run_id=uuid.uuid4().hex,
-            principal="system",
         )
 
     await ctx.report_progress(0, 3, message=f"Checking access for: {tool_name}")

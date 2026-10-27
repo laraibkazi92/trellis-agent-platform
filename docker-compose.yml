@@ -351,8 +351,9 @@ services:
       # v0.6: tool execution is runner-side; the gateway only forwards calls.
       RUNNER_SOCKET: ${RUNNER_SOCKET:-/run/trellis/runner.sock}
       RUNNER_TOKEN: ${RUNNER_TOKEN:-}
-      # Phase 3: the gateway mints tokens for its own authenticated identity and the
-      # hub/relay verify them. `gateway` is a system principal, not an agent.
+      # Phase 3: the gateway mints tokens for the external caller it serves and the
+      # hub/relay verify them. `gateway` is an ordinary agent name there: no agent
+      # record, so the tool's own `public` exposure is its only grant.
       AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET in .env (openssl rand -hex 32)}
       ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
     volumes:

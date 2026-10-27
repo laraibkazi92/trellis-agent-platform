@@ -409,11 +409,11 @@ def test_background_run_token_is_a_workflow_principal(run_context):
     assert tool_authz.resolve_current_principal() == "workflow:nightly"
 
 
-def test_gateway_system_token_attributes_to_the_user(run_context):
+def test_gateway_token_attributes_to_the_user(run_context):
+    # The gateway acts for the external caller it serves, so its token is classified
+    # as that user -- not as a privileged principal of its own.
     auth.user_id_var.set("alice")
-    assert (
-        agent_token.mint_for_run("gateway", "alice", run_id="run-1", principal="system")
-    )
+    assert agent_token.mint_for_run("gateway", "alice", run_id="run-1")
 
     assert tool_authz.resolve_current_principal() == "user:alice"
 

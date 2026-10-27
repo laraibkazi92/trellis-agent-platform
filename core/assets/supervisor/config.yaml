@@ -5,6 +5,11 @@ description: Central router agent for the framework. Resolves deterministic CLI/
 tags: ["routing", "orchestration", "direct-tool-execution", "two-tier-dispatch"]
 model: gemini-3-flash-preview
 thinking_level: medium
+# The supervisor is authorized like any other agent: the hub checks every tool it
+# executes against this list. Its Tier 1 path runs whatever `search_tools` returns,
+# so a supervisor whose deterministic tools are not bound here cannot execute them.
+allowed_tools:
+  - text_stats
 a2a_access:
   - ticket-summary-agent
   - probable-cause-agent

@@ -333,7 +333,133 @@ def test_backend_timeout_maps_to_504(env):
     assert detail["retryable"] is False
 
 
+# --- authorization: no principal bypass --------------------------------------
+#
+# v0.7.1 Phase 3: the runner authorizes the resources it owns (sessions, console)
+# against the token agent's on-disk manifest, whoever minted the token. A tool call
+# is the hub's decision -- the runner only proves the token -- which matters because
+# neither the gateway (no agent record) nor the supervisor (manifest inside the
+# image, never under workspace/) can be found on disk. The one agent-free kind is a
+# throwaway discovery read, gated by the control socket's bearer token.
+
+
+def _console_body(token):
+    return {
+        "kind": "console",
+        "target": "console",
+        "command": "echo hi",
+        "agent_token": token,
+    }
+
+
+def test_a_system_principal_gets_no_runner_bypass(env, monkeypatch):
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+
+    response = asyncio.run(
+        _call(
+            "POST",
+            "/v1/exec",
+            json_body=_console_body(agent_token.mint("gateway", principal="system")),
+        )
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "access_denied"
+    assert env.backend.specs == []
+
+
+@pytest.mark.parametrize("agent", ["supervisor", "gateway"])
+def test_a_manifestless_caller_can_still_run_a_tool(env, monkeypatch, agent):
+    """The supervisor's manifest is an image asset and the gateway has none at all.
+
+    Both reach the runner only after the hub authorized the call, so requiring a
+    workspace manifest here denied every supervisor and front-door tool call. There
+    is no ``workspace/agents/supervisor`` in this fixture (or in a deployment).
+    """
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+    env.backend.queue(RawExec(exit_code=0, stdout=b'{"ok": true}\n'))
+    token = agent_token.mint(agent, user_id="u-1")
+
+    response = asyncio.run(
+        _call("POST", "/v1/exec", json_body=_body(env.root, agent_token=token))
+    )
+
+    assert response.status_code == 200, response.json()
+    assert response.json()["exit_code"] == 0
+    assert len(env.backend.specs) == 1
+    assert env.backend.specs[0].kind == "tool"
+
+
+@pytest.mark.parametrize("agent", ["supervisor", "gateway"])
+def test_a_manifestless_caller_cannot_run_a_console_container(env, monkeypatch, agent):
+    """The console container is the runner's own: no manifest, no container."""
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+
+    response = asyncio.run(
+        _call(
+            "POST",
+            "/v1/exec",
+            json_body=_console_body(agent_token.mint(agent, user_id="u-1")),
+        )
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "access_denied"
+    assert "unknown agent" in response.json()["detail"]["message"]
+    assert env.backend.specs == []
+
+
+def test_a_manifestless_caller_cannot_open_an_mcp_session(env, monkeypatch):
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+    body = {
+        "kind": "mcp_session",
+        "target": "coralogix",
+        "session_key": "a" * 32,
+        "agent_token": agent_token.mint("supervisor", user_id="u-1"),
+    }
+
+    response = asyncio.run(_call("POST", "/v1/sessions", json_body=body))
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "access_denied"
+
+
+def test_the_wire_contract_refuses_an_unrecognized_exec_kind(env, monkeypatch):
+    """``ExecKind`` is a closed Literal, so an unknown kind cannot reach the runner at
+    all; if one ever does (a future kind added to the contract), ``_authorize`` denies
+    it -- see ``tests/test_enforcement_matrix.py``."""
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+
+    response = asyncio.run(
+        _call(
+            "POST",
+            "/v1/exec",
+            json_body=_body(env.root, kind="workflow", agent_token=_token("supervisor")),
+        )
+    )
+
+    assert response.status_code == 422
+    assert env.backend.specs == []
+
+
+def test_a_discovery_read_is_gated_by_the_socket_token_alone(env, monkeypatch):
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+    body = {"kind": "discovery", "target": "catalog", "session_key": "a" * 32}
+
+    # Past authorization (no agent record involved); the target does not exist here.
+    authorized = asyncio.run(_call("POST", "/v1/sessions", json_body=body))
+    assert authorized.status_code == 404
+    assert authorized.json()["detail"]["code"] == "unknown_target"
+
+    # The socket bearer token is the gate on that path.
+    unauthenticated = asyncio.run(
+        _call("POST", "/v1/sessions", json_body=body, headers={})
+    )
+    assert unauthenticated.status_code == 401
+
+
 def test_preflight_endpoint_reports_ok_health(env, monkeypatch):
+
     monkeypatch.setattr(canary_module.secrets, "token_bytes", lambda _n: b"canary-payload")
     env.backend.queue(RawExec(exit_code=0, stdout=b"canary-payload"))
 
