@@ -260,6 +260,50 @@ def test_a_bad_mcp_env_block_key_fails_the_sync(tmp_path, monkeypatch, capsys):
     assert "mcp 'demo'" in errors[0]
 
 
+def _secret_groups_yaml(key):
+    """A ``secret_groups`` UI hint (one group, one option, one field)."""
+    return (
+        "secret_groups:\n"
+        "  - label: Environment\n"
+        "    options:\n"
+        "      - value: prod\n"
+        "        fields:\n"
+        f"          - key: {key}\n"
+        "            label: API key\n"
+    )
+
+
+def test_a_bad_secret_group_key_fails_the_sync(tmp_path, monkeypatch, capsys):
+    """A group's field key is a credential name, so it is held to the same rule."""
+    workspace = tmp_path / "workspace"
+    suite = workspace / "tools" / "ops"
+    suite.mkdir(parents=True)
+    (suite / "tool.yaml").write_text(
+        "name: ops\n"
+        "description: d\n"
+        "runtime: python\n"
+        "entrypoint: run.py\n" + _secret_groups_yaml("my-api-key")
+    )
+    mcps = workspace / "mcps"
+    mcps.mkdir(parents=True)
+
+    monkeypatch.setattr(sync_to_db, "TOOLS_DIR", workspace / "tools")
+    monkeypatch.setattr(sync_to_db, "MCPS_DIR", mcps)
+    manager = FakeManager()
+    monkeypatch.setattr(sync_to_db, "IdentityManager", lambda **_kwargs: manager)
+
+    assert sync_to_db.main([]) == 2
+
+    out = capsys.readouterr().out
+    assert "REFUSING TO SYNC" in out
+    # file + field + offending key, so an operator can fix the manifest.
+    assert "tool 'ops'" in out
+    assert "tool.yaml" in out
+    assert "secret_groups" in out
+    assert "my-api-key" in out
+    assert not [key for key, _value in manager.client.puts if "/registry/tools/" in key]
+
+
 # --------------------------------------------------------------------------- #
 # Reserved agent identities (scripts/sync_to_db.py)
 # --------------------------------------------------------------------------- #
@@ -403,3 +447,138 @@ def test_an_allowed_tools_that_is_not_a_list_is_rejected(tmp_path, monkeypatch):
 
     assert len(errors) == 1
     assert "allowed_tools" in errors[0]
+
+
+# A workflow's own declared secrets/variables reach its container as env vars, so they
+# follow the same manifest rule as a tool's. `secrets`/`variables` take a flat list or
+# a {general, user, background} mapping; both forms declare leaves, not bucket names.
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "secrets: [my-api-key]\n",
+        "secrets:\n  general: [SHARED_TOKEN]\n  user: [my-api-key]\n",
+    ],
+    ids=["flat-list", "bucket-mapping"],
+)
+def test_a_bad_workflow_secret_name_is_rejected(
+    tmp_path, monkeypatch, declaration
+):
+    _workflow_workspace(tmp_path, monkeypatch, GOOD_WORKFLOW + declaration)
+
+    errors = sync_to_db.validate_workflow_manifests()
+
+    assert len(errors) == 1
+    assert errors[0].startswith("workflow 'demo'")
+    assert "secrets" in errors[0]
+    assert "my-api-key" in errors[0]
+
+
+@pytest.mark.parametrize(
+    "declaration,bad",
+    [
+        ("variables: [ok_URL, 9bad]\n", "9bad"),
+        ("variables:\n  general: [ok_URL]\n  user: ['my url']\n", "my url"),
+    ],
+    ids=["flat-list", "bucket-mapping"],
+)
+def test_a_bad_workflow_variable_name_is_rejected(
+    tmp_path, monkeypatch, declaration, bad
+):
+    _workflow_workspace(tmp_path, monkeypatch, GOOD_WORKFLOW + declaration)
+
+    errors = sync_to_db.validate_workflow_manifests()
+
+    assert len(errors) == 1
+    assert errors[0].startswith("workflow 'demo'")
+    assert "variables" in errors[0]
+    assert bad in errors[0]
+
+
+@pytest.mark.parametrize("field", ["secrets", "variables"])
+def test_a_bad_workflow_env_name_aborts_the_sync(tmp_path, monkeypatch, capsys, field):
+    """The workflow check joins the same exit-2 path as every other manifest error."""
+    workspace = _workflow_workspace(
+        tmp_path, monkeypatch, GOOD_WORKFLOW + f"{field}: [my-api-key]\n"
+    )
+    manager = FakeManager()
+    monkeypatch.setattr(sync_to_db, "IdentityManager", lambda **_kwargs: manager)
+    policy = workspace / "tool_access.yaml"
+    policy.write_text("rules: []\n")
+    monkeypatch.setattr(sync_to_db, "TOOL_ACCESS_POLICY_PATH", policy)
+
+    assert sync_to_db.main([]) == 2
+
+    out = capsys.readouterr().out
+    assert "REFUSING TO SYNC" in out
+    assert "workflow 'demo'" in out
+    assert "config.yaml" in out
+    assert field in out
+    assert "my-api-key" in out
+    assert not [key for key, _value in manager.client.puts if "/registry/agents/" in key]
+
+
+def test_a_bad_agent_level_variable_name_fails_the_sync(tmp_path, monkeypatch, capsys):
+    """An agent config's own secrets/variables are requirements too (R6).
+
+    No model parses an agent config, so this surface reaches the registry as a raw
+    dict; ``core.discovery`` still resolves these names into what the agent's tools
+    must be given, which is why the sync checks them like any other manifest.
+    """
+    workspace = tmp_path / "workspace"
+    (workspace / "tools").mkdir(parents=True)
+    (workspace / "mcps").mkdir()
+    agent = workspace / "agents" / "ops-bot"
+    agent.mkdir(parents=True)
+    (agent / "config.yaml").write_text(
+        "name: ops-bot\n"
+        "description: d\n"
+        "model: gpt-x\n"
+        "variables:\n  user: [my-base-url]\n"
+    )
+    monkeypatch.setattr(sync_to_db, "TOOLS_DIR", workspace / "tools")
+    monkeypatch.setattr(sync_to_db, "MCPS_DIR", workspace / "mcps")
+    monkeypatch.setattr(sync_to_db, "AGENTS_DIR", workspace / "agents")
+    monkeypatch.setattr(sync_to_db, "IdentityManager", lambda **_kwargs: FakeManager())
+
+    assert sync_to_db.main([]) == 2
+
+    out = capsys.readouterr().out
+    assert "REFUSING TO SYNC" in out
+    assert "agent 'ops-bot'" in out
+    assert "config.yaml" in out
+    assert "my-base-url" in out
+
+
+def test_a_clean_workspace_passes_every_env_name_surface(tmp_path, monkeypatch):
+    """A tool's secrets + secret_groups and a workflow's secrets + variables."""
+    workspace = tmp_path / "workspace"
+    suite = workspace / "tools" / "ops"
+    suite.mkdir(parents=True)
+    (suite / "tool.yaml").write_text(
+        "name: ops\n"
+        "description: d\n"
+        "runtime: python\n"
+        "entrypoint: run.py\n"
+        "secrets: [OPS_API_KEY]\n" + _secret_groups_yaml("PROD_API_KEY")
+    )
+    mcp_dir = workspace / "mcps" / "demo"
+    mcp_dir.mkdir(parents=True)
+    (mcp_dir / "mcp.yaml").write_text("name: demo\nsecrets: [DEMO_TOKEN]\n")
+    wf = workspace / "workflows" / "demo"
+    wf.mkdir(parents=True)
+    (wf / "pipeline.py").write_text("print('{}')\n")
+    (wf / "config.yaml").write_text(
+        GOOD_WORKFLOW
+        + "secrets:\n  general: [SHARED_TOKEN]\n  user: [USER_TOKEN]\n"
+        + "variables: [SERVICE_URL]\n"
+    )
+
+    monkeypatch.setattr(sync_to_db, "TOOLS_DIR", workspace / "tools")
+    monkeypatch.setattr(sync_to_db, "MCPS_DIR", workspace / "mcps")
+    monkeypatch.setattr(sync_to_db, "WORKFLOWS_DIR", workspace / "workflows")
+
+    assert sync_to_db.validate_declared_env_names() == []
+    assert sync_to_db.validate_workflow_manifests() == []
+

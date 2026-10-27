@@ -22,6 +22,7 @@ from core.execution.contract import (
 )
 from core.execution.env import INVALID_ENV_NAME_HELP, declared_names, invalid_env_names
 from core.execution.spec import is_plain_relative
+from core.manifest_keys import _group_keys
 from core.models import (
     BACKGROUND_AGENT_TYPES,
     EDGE_MCP_REF_RE,
@@ -146,6 +147,15 @@ def _warn_unresolved_edge_refs(refs, known_mcps, known_tools):
         )
 
 
+def _env_name_error(label: str, field: str, bad: list[str]) -> str:
+    """One printable line naming the manifest, the field and the offending names."""
+    return (
+        f"{label}: {field} {', '.join(bad)} cannot be environment "
+        f"variables ({INVALID_ENV_NAME_HELP}); rename them in the manifest "
+        "(e.g. my-api-key -> MY_API_KEY)"
+    )
+
+
 def _declared_env_name_errors(config: dict, label: str) -> list[str]:
     """Problems with the env names a manifest declares, as printable lines.
 
@@ -161,14 +171,20 @@ def _declared_env_name_errors(config: dict, label: str) -> list[str]:
     env_block = config.get("env")
     if isinstance(env_block, dict):
         names.extend(str(name) for name in env_block)
+
+    errors = []
     invalid = invalid_env_names(names)
-    if not invalid:
-        return []
-    return [
-        f"{label}: declared name(s) {', '.join(invalid)} cannot be environment "
-        f"variables ({INVALID_ENV_NAME_HELP}); rename them in the manifest "
-        "(e.g. my-api-key -> MY_API_KEY)"
-    ]
+    if invalid:
+        errors.append(_env_name_error(label, "declared name(s)", invalid))
+    # `secret_groups` field keys are credential names too: the user types them in
+    # /configuration and the tool receives them as env vars. Same flattening as the
+    # edge's manifest check (`core.manifest_keys`), so the two cannot drift.
+    invalid_group_keys = invalid_env_names(_group_keys(config))
+    if invalid_group_keys:
+        errors.append(
+            _env_name_error(label, "secret_groups field key(s)", invalid_group_keys)
+        )
+    return errors
 
 
 def validate_declared_env_names() -> list[str]:
@@ -176,11 +192,17 @@ def validate_declared_env_names() -> list[str]:
 
     Runs before any write so a bad manifest fails the sync loudly instead of
     leaving a half-synced registry behind.
+
+    An **agent** config is included even though no model parses it: ``secrets`` and
+    ``variables`` at agent level are still resolved into requirements
+    (``core.discovery``) and handed to the tools the agent may call, so a name no
+    process environment can carry is the same silent loss it is for a tool.
     """
     errors: list[str] = []
     for manifest_glob, label in (
         (TOOLS_DIR.glob("**/tool.yaml"), "tool"),
         (MCPS_DIR.glob("**/mcp.yaml"), "mcp"),
+        (AGENTS_DIR.glob("*/config.yaml"), "agent"),
     ):
         for manifest in sorted(manifest_glob):
             try:
@@ -222,6 +244,16 @@ def _workflow_manifest_errors(config: dict, directory, label: str) -> list[str]:
         errors.append(
             f"{label}: allowed_tools must be a list of tool names (got {tools!r})"
         )
+
+    # A workflow's own declared secrets/variables reach its container as env vars, so
+    # they follow the manifest env-name rule too (the same one tools/mcps get above).
+    # Both bucket forms are accepted -- a flat list, or {general, user, background} --
+    # and ``declared_names`` flattens either. Checked before the script gate because
+    # an LLM workflow declares them too.
+    for field in ("secrets", "variables"):
+        invalid = invalid_env_names(declared_names(config.get(field)))
+        if invalid:
+            errors.append(_env_name_error(label, f"{field} name(s)", invalid))
 
     # `runtime`/`entrypoint`/`limits`/`network` only mean something to a container,
     # i.e. to a background_script. A background_agent ignores them, so validating
