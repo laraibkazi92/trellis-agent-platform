@@ -68,6 +68,10 @@ def clear_globals(monkeypatch):
     monkeypatch.setattr(agent_factory, "RunnerStdioTransport", FakeRunnerStdioTransport)
     monkeypatch.setattr(agent_factory, "FastMCPClient", FakeClient)
     monkeypatch.delenv("DEV_MODE", raising=False)
+    # These tests pin the request the host builds, not who may open a session: the
+    # token rollout window keeps the pre-runner gate out of the way (it is covered in
+    # tests/test_enforcement_matrix.py).
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "log")
     FakeRunnerStdioTransport.created = []
     yield
     agent_factory.mcp_client_cache.clear()
@@ -183,4 +187,98 @@ def test_discovery_of_an_http_server_is_unchanged(monkeypatch):
 
     asyncio.run(agent_factory.discover_external_mcps(force=True))
 
+    assert FakeRunnerStdioTransport.created == []
+
+
+# --- the front door: who may open a stdio session ------------------------------ #
+
+
+def _enforcing_run(monkeypatch, *, record=None, token_for=None, mcp_public=False):
+    """Enforce mode + a minted run token, with the agent record faked in the registry."""
+    import types
+
+    from core import agent_token, auth, tool_access
+
+    secret = "mcp-session-gate-secret-0123456789abcdef"
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", secret)
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+    monkeypatch.delenv(tool_access.MODE_ENV, raising=False)
+
+    class _NoPolicy:
+        def put(self, key, value):
+            raise AssertionError(f"no write expected: {key}")
+
+        def get(self, key, **_kwargs):
+            return None, None
+
+    monkeypatch.setattr(tool_access, "_client", lambda: _NoPolicy())
+    tool_access.reset_snapshot()
+
+    manager = agent_factory.get_identity_manager()
+    manager.get_agent_config = lambda name: record if name == "agent-a" else None
+    manager.get_mcp_config = lambda name: {
+        "name": name, "transport": "stdio", "command": "node", "public": mcp_public
+    }
+
+    monkeypatch.setattr(
+        auth,
+        "get_identity_manager",
+        lambda: types.SimpleNamespace(
+            get_agent_config=manager.get_agent_config,
+            get_mcp_config=manager.get_mcp_config,
+        ),
+    )
+    auth.agent_token_var.set(agent_token.mint(token_for or "agent-a", user_id="user-1"))
+    return manager
+
+
+def test_a_public_stdio_server_opens_a_session_for_the_front_door(monkeypatch):
+    """No agent record + a server published `public: true` ⇒ the session opens."""
+    _enforcing_run(monkeypatch, record=None, token_for="gateway", mcp_public=True)
+
+    try:
+        asyncio.run(agent_factory.get_external_mcp_client("devops-cli", "user-1"))
+    finally:
+        from core import auth
+
+        auth.agent_token_var.set(None)
+
+    assert len(FakeRunnerStdioTransport.created) == 1
+
+
+def test_a_non_public_stdio_server_refuses_the_front_door_with_access_denied(monkeypatch):
+    """No record + a non-public server ⇒ a distinguishable access-denied refusal."""
+    from core import auth
+    from core.tool_gate import ToolAccessDenied
+
+    _enforcing_run(monkeypatch, record=None, token_for="gateway", mcp_public=False)
+
+    try:
+        with pytest.raises(PermissionError) as caught:
+            asyncio.run(agent_factory.get_external_mcp_client("devops-cli", "user-1"))
+    finally:
+        auth.agent_token_var.set(None)
+
+    assert isinstance(caught.value, ToolAccessDenied)
+    assert "access_denied" in str(caught.value)
+    assert "devops-cli" in str(caught.value)
+    # Never a session: no container was requested.
+    assert FakeRunnerStdioTransport.created == []
+
+
+def test_a_record_without_the_server_grant_is_denied(monkeypatch):
+    """An agent record that lacks the server is refused before the runner is asked."""
+    from core import auth
+
+    _enforcing_run(
+        monkeypatch, record={"allowed_tools": ["text_stats"]}, token_for="agent-a"
+    )
+
+    try:
+        with pytest.raises(PermissionError) as caught:
+            asyncio.run(agent_factory.get_external_mcp_client("devops-cli", "user-1"))
+    finally:
+        auth.agent_token_var.set(None)
+
+    assert "access_denied" in str(caught.value)
     assert FakeRunnerStdioTransport.created == []

@@ -71,6 +71,43 @@ class TestModelValidation:
 
 
 # =============================================================================
+# Shared fixtures
+# =============================================================================
+
+DIRECT_GATEWAY_SECRET = "direct-gateway-unit-secret-0123456789ab"
+
+
+@pytest.fixture(autouse=True)
+def _front_door(monkeypatch):
+    """A hermetic front door: a mintable token, no agent record, no group rules.
+
+    `use_tool` mints for the caller it serves and then asks core.tool_access; the
+    gateway has no agent record (that is what makes it the front door), and an
+    absent policy document means the target's public exposure alone decides.
+    """
+    from core import auth, tool_access
+
+    class _NoPolicy:
+        def put(self, key, value):
+            raise AssertionError(f"no write expected: {key}")
+
+        def get(self, key, **_kwargs):
+            return None, None
+
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", DIRECT_GATEWAY_SECRET)
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+    monkeypatch.delenv("DEV_MODE", raising=False)
+    monkeypatch.setattr(tool_access, "_client", lambda: _NoPolicy())
+    monkeypatch.delenv(tool_access.MODE_ENV, raising=False)
+    tool_access.reset_snapshot()
+    monkeypatch.setattr(gateway.identity_mgr, "get_agent_config", lambda name: None)
+    monkeypatch.setattr(gateway.identity_mgr, "get_user", lambda user_id: None)
+    auth.agent_token_var.set(None)
+    yield
+    auth.agent_token_var.set(None)
+
+
+# =============================================================================
 # Shared fakes (mirror the harnesses already established in
 # tests/test_gateway_tool_execution.py and tests/test_supervisor_two_tier.py)
 # =============================================================================

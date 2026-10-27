@@ -352,6 +352,10 @@ class _FakeHostAgent:
 
 
 def _run_sync_chat(monkeypatch, fake_mem, user_id):
+    # A host run mints its agent token: enforcing is the code default, so an unkeyed
+    # run is refused at mint instead of running unauthenticated.
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", "memory-isolation-unit-secret-0123456")
+    monkeypatch.delenv("DEV_MODE", raising=False)
     monkeypatch.setattr(host, "identity_mgr", _FakeHostIdentity())
 
     async def fake_get_agent(name):

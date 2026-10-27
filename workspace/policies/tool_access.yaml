@@ -1,0 +1,71 @@
+# Tool-access group rules -- synced to the registry on every rebuild
+# (scripts/sync_to_db.py) and watched by every enforcing process, so an edit lands
+# everywhere within a second or two without a restart.
+#
+# How it decides (see core/tool_access.py):
+#   * A target matched by >= 1 rule is usable ONLY by a caller whose token groups
+#     intersect one of those rules' group sets.
+#   * A target no rule matches is governed by the agent allowlist alone.
+#   * Rules are allow-lists of groups. There are no priorities and no deny-overrides;
+#     if several rules match one target, the caller needs a group from ANY of them.
+#   * The agent allowlist is always enforced, whatever this file says. A rule can
+#     only narrow a call, never widen one.
+#
+# This file ships with no rules on purpose: that is the pre-v0.7.1 behaviour, where
+# the agent's own allowlist is the only gate. Add rules to require group membership
+# for specific tools.
+#
+# `targets` (or a single `target`) entries are shell globs matched against the
+# reference the enforcement point uses:
+#
+#   exact tool name            text_stats
+#   glob                       text_*          /  dc1__*
+#   edge tool                  dc1__node_ssh
+#   central MCP tool           mcp__coralogix__list_alerts
+#   edge MCP tool              mcp__dc1__devops-cli__kubectl
+#   console tool               execute        (the ONLY console tool these rules cover)
+#
+# The other console tools -- read_file, write_file, edit_file, ls, glob, grep -- do NOT
+# go through tool-access rules: a rule naming one of them is accepted but decides
+# nothing (the load warns about it), and those tools stay constrained by the agent's
+# console allowlist alone.
+#
+# `*` is a plain glob, so it matches EVERY reference -- console names, hub tools, edge
+# tools, MCP tools and MCP server (session) names alike. One `*` rule therefore
+# constrains every call in the framework, and it also hides every `search_tools` card
+# from a caller whose token carries no groups (a group-less caller matches no rule).
+#
+# `name` is an optional label shown in denial messages and shadow-deny records; it
+# must be unique. `groups` must name at least one group -- there is no wildcard group
+# meaning "everyone", so a rule can never accidentally grant access to all users.
+# Unknown keys, an empty `groups` list, duplicate rules and duplicate names are all
+# validation errors: a malformed file is refused by the sync and denies every call
+# the group rules could have decided rather than falling back to "no rules".
+
+rules: []
+
+# Example (comment out `rules: []` above before uncommenting any of this):
+#
+# rules:
+#   # Exact tool name, one group.
+#   - name: platform-ops-only
+#     targets: [text_stats]
+#     groups: [platform-ops]
+#
+#   # Glob: every tool this edge exports.
+#   - name: edge-dc1-readonly
+#     targets: ["dc1__*"]
+#     groups: [edge-operators, platform-ops]
+#
+#   # Edge tool reference form (explicit, no glob).
+#   - name: node-shell
+#     targets: [dc1__node_ssh]
+#     groups: [sre]
+#
+#   # Central MCP tools of one server, and one edge MCP tool inside a site.
+#   - name: coralogix-tools
+#     targets: ["mcp__coralogix__*"]
+#     groups: [observability]
+#   - name: edge-devops-cli
+#     targets: [mcp__dc1__devops-cli__kubectl]
+#     groups: [sre, platform-ops]

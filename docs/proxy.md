@@ -94,10 +94,11 @@ still see only their read-only mounts.
 > **v0.7.1: the edge proxy never verifies an agent token.** `trellis-proxy` uses the
 > identity the relay derived over the authenticated tunnel — see
 > [Edge credentials](#edge-credentials) — and takes no `AGENT_TOKEN_SECRET`. The edge
-> **runner** keeps the key (the sample compose sets it there only): it verifies nothing
-> today (`ENFORCE_AGENT_TOKENS=off`), and Phase 4 turns enforcement on and derives the
-> agent and the output dir from the token's claims. Until then the edge `.env` must still
-> carry a valid `AGENT_TOKEN_SECRET` — the runner refuses to start without one.
+> **runner** keeps the key (the sample compose sets it there only): it verifies the
+> forwarded token's signature and expiry, then derives the agent and the output dir from
+> that token's claims. It makes no authorization decision — the relay already made it for
+> the call it forwarded. The edge `.env` must carry a valid `AGENT_TOKEN_SECRET` (the
+> same value as central); the runner refuses to start without one.
 
 Prerequisites on the edge host are the same as central: `runsc` registered with Docker
 (proved with `docker run --runtime=runsc hello-world`) and the network profiles created

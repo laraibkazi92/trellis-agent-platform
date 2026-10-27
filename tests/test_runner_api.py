@@ -333,14 +333,14 @@ def test_backend_timeout_maps_to_504(env):
     assert detail["retryable"] is False
 
 
-# --- authorization: no principal bypass --------------------------------------
+# --- authorization: the token, and nothing else ------------------------------
 #
-# v0.7.1 Phase 3: the runner authorizes the resources it owns (sessions, console)
-# against the token agent's on-disk manifest, whoever minted the token. A tool call
-# is the hub's decision -- the runner only proves the token -- which matters because
-# neither the gateway (no agent record) nor the supervisor (manifest inside the
-# image, never under workspace/) can be found on disk. The one agent-free kind is a
-# throwaway discovery read, gated by the control socket's bearer token.
+# v0.7.1 Phase 4: the runner verifies signature and expiry and then runs. It has no
+# registry and no agent manifests, so it cannot resolve an allowlist, and every
+# decision is made before the request arrives: the hub authorizes tool calls, and the
+# process that owns the agent runtime authorizes console/MCP sessions
+# (`core.tool_gate`, checked in tests/test_enforcement_matrix.py). The one agent-free
+# kind remains a throwaway discovery read, gated by the control socket's bearer token.
 
 
 def _console_body(token):
@@ -352,64 +352,45 @@ def _console_body(token):
     }
 
 
-def test_a_system_principal_gets_no_runner_bypass(env, monkeypatch):
-    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+@pytest.mark.parametrize("agent", ["gateway", "supervisor", "agent-a", "ghost"])
+@pytest.mark.parametrize("kind", ["console", "tool"])
+def test_the_runner_does_not_rederive_an_allowlist(env, monkeypatch, agent, kind):
+    """A valid token is the whole gate, whatever the agent and whatever the target.
 
-    response = asyncio.run(
-        _call(
-            "POST",
-            "/v1/exec",
-            json_body=_console_body(agent_token.mint("gateway", principal="system")),
-        )
-    )
-
-    assert response.status_code == 403
-    assert response.json()["detail"]["code"] == "access_denied"
-    assert env.backend.specs == []
-
-
-@pytest.mark.parametrize("agent", ["supervisor", "gateway"])
-def test_a_manifestless_caller_can_still_run_a_tool(env, monkeypatch, agent):
-    """The supervisor's manifest is an image asset and the gateway has none at all.
-
-    Both reach the runner only after the hub authorized the call, so requiring a
-    workspace manifest here denied every supervisor and front-door tool call. There
-    is no ``workspace/agents/supervisor`` in this fixture (or in a deployment).
+    The old runner check re-read a workspace manifest and denied every caller whose
+    manifest was not on disk (the gateway has none, the supervisor's ships in the
+    image). That decision now belongs to the caller (``core.tool_gate``), so the
+    runner must not refuse a call it cannot judge.
     """
     monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
     env.backend.queue(RawExec(exit_code=0, stdout=b'{"ok": true}\n'))
     token = agent_token.mint(agent, user_id="u-1")
-
-    response = asyncio.run(
-        _call("POST", "/v1/exec", json_body=_body(env.root, agent_token=token))
+    body = (
+        _console_body(token)
+        if kind == "console"
+        else _body(env.root, agent_token=token)
     )
+
+    response = asyncio.run(_call("POST", "/v1/exec", json_body=body))
 
     assert response.status_code == 200, response.json()
-    assert response.json()["exit_code"] == 0
     assert len(env.backend.specs) == 1
-    assert env.backend.specs[0].kind == "tool"
 
 
-@pytest.mark.parametrize("agent", ["supervisor", "gateway"])
-def test_a_manifestless_caller_cannot_run_a_console_container(env, monkeypatch, agent):
-    """The console container is the runner's own: no manifest, no container."""
-    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+def test_runner_authorization_no_longer_reads_a_knob(monkeypatch):
+    """`RUNNER_AUTHORIZATION` is gone: the runner has one behaviour."""
+    from core.execution import runner as runner_module
 
-    response = asyncio.run(
-        _call(
-            "POST",
-            "/v1/exec",
-            json_body=_console_body(agent_token.mint(agent, user_id="u-1")),
-        )
-    )
-
-    assert response.status_code == 403
-    assert response.json()["detail"]["code"] == "access_denied"
-    assert "unknown agent" in response.json()["detail"]["message"]
-    assert env.backend.specs == []
+    assert not hasattr(runner_module, "_agent_manifest")
+    assert not hasattr(runner_module, "_RUNNER_OWNED_KINDS")
 
 
-def test_a_manifestless_caller_cannot_open_an_mcp_session(env, monkeypatch):
+def test_a_session_with_a_valid_token_is_authorized(env, monkeypatch):
+    """The session's authorization happened in the caller; the runner only verifies.
+
+    The target does not exist in this fixture, so the request stops at the manifest
+    lookup -- past authorization, which is what this pins.
+    """
     monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
     body = {
         "kind": "mcp_session",
@@ -417,6 +398,16 @@ def test_a_manifestless_caller_cannot_open_an_mcp_session(env, monkeypatch):
         "session_key": "a" * 32,
         "agent_token": agent_token.mint("supervisor", user_id="u-1"),
     }
+
+    response = asyncio.run(_call("POST", "/v1/sessions", json_body=body))
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "unknown_target"
+
+
+def test_a_session_without_a_token_is_refused(env, monkeypatch):
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+    body = {"kind": "mcp_session", "target": "coralogix", "session_key": "a" * 32}
 
     response = asyncio.run(_call("POST", "/v1/sessions", json_body=body))
 

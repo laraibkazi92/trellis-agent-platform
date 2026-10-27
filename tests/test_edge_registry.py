@@ -1025,6 +1025,16 @@ def test_mark_disconnected_preserves_the_mcp_catalog(mgr):
 class _SyncClient:
     def __init__(self, deleted):
         self._deleted = deleted
+        # The tool-access policy is published to etcd before the prune pass; keep it
+        # out of the `deleted` list the assertions read.
+        self.documents = {}
+
+    def put(self, path, value):
+        self.documents[path] = value
+        return True
+
+    def get(self, path, **_kwargs):
+        return self.documents.get(path), None
 
     def delete(self, path):
         self._deleted.append(path)
@@ -1181,7 +1191,7 @@ def test_a_public_site_opts_its_mcps_into_search_and_use_tool(mgr, monkeypatch):
     tool_search = _patch_tool_search(monkeypatch, mgr)
     tool_name = f"mcp__{SITE}__{MCP}__{MCP_TOOL}"
     assert [r["name"] for r in _search(tool_search, "tenants")] == [tool_name]
-    assert asyncio.run(tool_search.is_tool_publicly_whitelisted(tool_name, mgr)) is True
+    assert asyncio.run(tool_search.published_exposure(tool_name, mgr)) is True
 
     calls = []
 
@@ -1216,7 +1226,7 @@ def test_a_private_mcp_is_neither_searchable_nor_callable(mgr, monkeypatch):
     tool_name = f"mcp__{SITE}__{MCP}__{MCP_TOOL}"
 
     assert _search(tool_search, "tenants") == []
-    assert asyncio.run(tool_search.is_tool_publicly_whitelisted(tool_name, mgr)) is False
+    assert asyncio.run(tool_search.published_exposure(tool_name, mgr)) is False
 
 
 @pytest.mark.parametrize(

@@ -16,6 +16,8 @@ with a ``reports/<agent>`` root.
 
 import asyncio
 import contextlib
+import contextvars
+import logging
 import subprocess
 import sys
 import threading
@@ -33,6 +35,9 @@ from pydantic_ai_backends.backends.local import (
 from pydantic_ai_backends.types import ExecuteResponse, GrepMatch
 
 from core.env_sanitize import sanitized_env
+
+logger = logging.getLogger(__name__)
+
 
 
 class SanitizedLocalBackend(LocalBackend):
@@ -188,6 +193,22 @@ class RunnerConsoleBackend(SanitizedLocalBackend):
         from core.agent_token import refresh
         from core.auth import agent_token_var
         from core.execution.contract import ExecRequest
+        from core.tool_gate import deny_reason
+
+        # Pre-runner authorization: the runner only verifies the token, so the process
+        # that owns the agent runtime decides whether this run may shell out at all.
+        # A registry failure here fails CLOSED and still returns an ExecuteResponse:
+        # an access-check outage must never raise out of the agent's shell tool.
+        try:
+            denial = await deny_reason("execute", surface="host")
+        except Exception as exc:
+            logger.exception("console: access check failed")
+            return ExecuteResponse(
+                output=f"Error: access check failed ({exc})", exit_code=1, truncated=False
+            )
+        if denial is not None:
+            return ExecuteResponse(output=f"Error: {denial}", exit_code=1, truncated=False)
+
 
         # No identity in the body: the token carries the caller's user id, email and
         # run id, and the runner builds TRELLIS_USER_* from its verified claims.
@@ -229,17 +250,26 @@ def _runner_message(exc: BaseException) -> str:
 
 
 class _OneShotThread(threading.Thread):
-    """Runs one coroutine to completion on a private event loop."""
+    """Runs one coroutine to completion on a private event loop.
 
-    def __init__(self, coro) -> None:
+    The caller's context is copied in: the run's agent token lives in a contextvar,
+    and a bare thread starts with an empty context -- which would send a tokenless
+    (and therefore refused) request to the runner.
+    """
+
+    def __init__(self, coro, context=None) -> None:
         super().__init__(daemon=True)
         self._coro = coro
+        self._context = context
         self._result = None
         self._error: BaseException | None = None
 
     def run(self) -> None:
         try:
-            self._result = asyncio.run(self._coro)
+            if self._context is not None:
+                self._result = self._context.run(asyncio.run, self._coro)
+            else:
+                self._result = asyncio.run(self._coro)
         except BaseException as exc:  # re-raised in the calling thread
             self._error = exc
 
@@ -255,12 +285,13 @@ def _run_sync(coro):
 
     ``execute`` is called by the library's sync tool path, which may be on the
     event-loop thread. Nesting ``asyncio.run`` there raises, so a running loop gets
-    a one-shot thread with its own loop instead.
+    a one-shot thread with its own loop instead -- carrying this context with it, so
+    the run's agent token reaches the request.
     """
     try:
         asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(coro)
-    thread = _OneShotThread(coro)
+    thread = _OneShotThread(coro, contextvars.copy_context())
     thread.start()
     return thread.result()

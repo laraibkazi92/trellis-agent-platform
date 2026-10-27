@@ -13,6 +13,7 @@ from pathlib import Path
 # Add the parent directory to sys.path to import core
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from core import tool_access
 from core.auth import IdentityManager
 from core.embeddings import embed_text
 from core.models import (
@@ -33,6 +34,8 @@ WORKSPACE_DIR = BASE_DIR / "workspace"
 AGENTS_DIR = WORKSPACE_DIR / "agents"
 WORKFLOWS_DIR = WORKSPACE_DIR / "workflows"
 TOOLS_DIR = WORKSPACE_DIR / "tools"
+POLICIES_DIR = WORKSPACE_DIR / "policies"
+TOOL_ACCESS_POLICY_PATH = POLICIES_DIR / "tool_access.yaml"
 
 
 def _warn_unknown_rule_keys(model_cls, raw_rules, context):
@@ -132,6 +135,73 @@ def _warn_unresolved_edge_refs(refs, known_mcps, known_tools):
             "registry entry yet — edge not connected / catalog not published yet. "
             "The reference starts working once that edge connects; the sync continues."
         )
+
+
+def read_tool_access_policy(path=None):
+    """``(document, errors)`` for the workspace group-rule file.
+
+    ``(None, [])`` means the file does not exist -- not an error, but also not an
+    instruction to clear the registry (see ``sync_tool_access_policy``).
+    """
+    path = path or TOOL_ACCESS_POLICY_PATH
+    if not path.exists():
+        return None, []
+    try:
+        with open(path, "r") as f:
+            document = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError) as e:
+        return None, [f"{path}: {e}"]
+    errors = tool_access.validate_policy(document)
+    return (None if errors else document), errors
+
+
+def sync_tool_access_policy(identity_mgr, path=None) -> int:
+    """Publish ``workspace/policies/tool_access.yaml`` into the registry.
+
+    Returns 0 on success (or when the file does not exist) and 2 when the file is
+    invalid: nothing is written, so a typo never replaces a good policy with a
+    permissive one, and the non-zero exit stops the sync loudly. A *missing* file
+    leaves the registry untouched and warns -- deleting the file must not silently
+    drop every group rule.
+
+    db-sync runs this on every rebuild; ``trellis sync`` re-runs it while the stack
+    is up. From etcd the document reaches every enforcing process through its watch,
+    so a policy edit needs no restart.
+    """
+    document, errors = read_tool_access_policy(path)
+    resolved = path or TOOL_ACCESS_POLICY_PATH
+    if errors:
+        print(f"\nINVALID tool-access policy: {resolved}")
+        for error in errors:
+            print(f"  ERROR: {error}")
+        print(
+            "  Refusing to sync it. Fix workspace/policies/tool_access.yaml and "
+            "re-run; the registry still holds the last valid policy."
+        )
+        return 2
+    if document is None:
+        print(
+            f"\nWARNING: no {resolved} found — the registry keeps whatever "
+            "tool-access policy it already has (workspace layout: create "
+            "workspace/policies/tool_access.yaml with `rules: []` for no group rules)."
+        )
+        return 0
+    for warning in tool_access.policy_warnings(document):
+        print(f"  WARNING: {warning}")
+    try:
+        tool_access.publish_policy(document, client=identity_mgr.client)
+    except tool_access.PolicyInvalid as e:  # pragma: no cover - validate_policy above
+        print(f"\nINVALID tool-access policy: {e}")
+        return 2
+    except Exception as e:
+        print(f"\nERROR: could not publish the tool-access policy: {e}")
+        return 1
+    rules = len(document.get("rules") or [])
+    print(
+        f"  Saved tool-access policy ({rules} group rule"
+        f"{'' if rules == 1 else 's'}) for {tool_access.POLICY_PATH}"
+    )
+    return 0
 
 
 def sync_agent(identity_mgr, agent_dir, name=None, default_type=None, edge_refs=None):
@@ -401,6 +471,14 @@ def main(argv=None):
         host=os.getenv("ETCD_HOST", "127.0.0.1"),
         port=int(os.getenv("ETCD_PORT", 2379))
     )
+
+    # 0. Tool-access group rules. Validated and published FIRST: an invalid file must
+    #    stop the sync before any other write, never leave a stale policy behind.
+    print("Syncing tool-access policy to etcd...")
+    policy_status = sync_tool_access_policy(identity_mgr)
+    if policy_status:
+        print("\nREFUSING TO SYNC: nothing else was written to the registry.")
+        return policy_status
     
     # 1. Fetch current items from etcd
     existing_agents = set(identity_mgr._get_all_configs_by_prefix("/registry/agents/").keys())

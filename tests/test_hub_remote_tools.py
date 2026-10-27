@@ -53,21 +53,31 @@ def _reset_registered_tools():
 
 
 @pytest.fixture(autouse=True)
-def _hermetic_authz_registry(monkeypatch):
-    """Every hub call now asks the direct-call gate (``hub_call_mode``, default off).
+def _hermetic_tool_access(monkeypatch):
+    """Every hub call asks :mod:`core.tool_access` once.
 
-    ``core.tool_authz`` imports ``get_identity_manager`` from ``core.auth`` lazily, so
-    patching the hub's own binding is not enough: without this stub the first tool call
-    in each cache window would attempt a real etcd read.
+    These tests are about the remote call path, so the policy registry is faked (an
+    empty document: no group rules) and ``ENFORCE_AGENT_TOKENS`` is ``log``: a call
+    that carries no token is logged and still runs.
     """
-    import _hub_authz_registry as authz_registry
+    from core import tool_access
 
-    authz_registry.install(monkeypatch)
+    class _NoPolicy:
+        def put(self, key, value):
+            raise AssertionError(f"no write expected: {key}")
+
+        def get(self, key, **_kwargs):
+            return None, None
+
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "log")
+    monkeypatch.setattr(tool_access, "_client", lambda: _NoPolicy())
+    tool_access.reset_snapshot()
+    with tool_access._shadow_lock:
+        tool_access._shadow_ring.clear()
     yield
-    from core import tool_authz
-
-    tool_authz.reset_cache()
-    tool_authz.clear_shadow_denies()
+    tool_access.reset_snapshot()
+    with tool_access._shadow_lock:
+        tool_access._shadow_ring.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -441,13 +451,29 @@ def test_remote_call_for_a_service_agent_posts_no_identity(monkeypatch):
     assert called == []
 
 
-def test_build_tool_env_exports_the_caller_email_for_local_tools(monkeypatch, tmp_path):
-    """The refactor onto resolve_user_email must not drop the local-tool variable."""
+def test_build_tool_env_exports_the_caller_email_from_the_token(monkeypatch, tmp_path):
+    """`TRELLIS_USER_EMAIL` comes from the verified claims, never from the record."""
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", "remote-tools-unit-secret-0123456789abcdef")
+    token = agent_token.mint(
+        "agent-a", user_id="user-1", user_email="local@corp.example"
+    )
+    claims = agent_token.verify(token)
+    monkeypatch.setattr(
+        hub.identity_mgr, "get_config", lambda key, default=None: default
+    )
+    config = ToolConfig(
+        name="echo", description="echo", runtime="python", entrypoint="main.py"
+    )
+
+    env = asyncio.run(hub._build_tool_env(config, tmp_path, "user-1", claims))
+
+    assert env["TRELLIS_USER_EMAIL"] == "local@corp.example"
+
+
+def test_build_tool_env_invents_no_email_without_claims(monkeypatch, tmp_path):
+    """A no-token (off/log) call gets an id and nothing else: no record lookup."""
     monkeypatch.setattr(
         hub.identity_mgr, "get_user", lambda user_id: {"email": "local@corp.example"}
-    )
-    monkeypatch.setattr(
-        hub.identity_mgr, "generate_execution_token", lambda user_id: "token"
     )
     monkeypatch.setattr(
         hub.identity_mgr, "get_config", lambda key, default=None: default
@@ -458,7 +484,8 @@ def test_build_tool_env_exports_the_caller_email_for_local_tools(monkeypatch, tm
 
     env = asyncio.run(hub._build_tool_env(config, tmp_path, "user-1"))
 
-    assert env["TRELLIS_USER_EMAIL"] == "local@corp.example"
+    assert env["TRELLIS_USER_ID"] == "user-1"
+    assert "TRELLIS_USER_EMAIL" not in env
 
 
 def test_remote_tool_level_error_is_returned_and_recorded_as_failure(monkeypatch):

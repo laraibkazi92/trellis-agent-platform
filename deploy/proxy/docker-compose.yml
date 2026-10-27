@@ -135,17 +135,13 @@ services:
       # manifest says `network: none`.
       TRELLIS_UID: ${TRELLIS_UID:-1000}
       TRELLIS_GID: ${TRELLIS_GID:-1000}
-      # TEMPORARY Phase 2 posture. The runner verifies nothing today (`off`), and the
-      # proxy is the only caller of this socket, so `off` also stops a stale value in
-      # an existing .env from re-enabling verification before Phase 4 is ready.
-      ENFORCE_AGENT_TOKENS: "off"
-      # Kept (and required) on the RUNNER ONLY: Phase 4 turns enforcement on here and
-      # derives the agent and the output dir from the token's claims. The proxy service
-      # above never sets it -- the proxy verifies no agent token at all.
+      # The edge runner verifies the token's signature and expiry; the authorization
+      # decision was already made centrally (the relay) before the call was forwarded.
+      ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
+      # Kept (and required) on the RUNNER ONLY: it derives the agent and the output dir
+      # from the token's claims. The proxy service above never sets it -- the proxy
+      # verifies no agent token at all.
       AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET}
-      # Kept until Phase 4 deletes the runner's own allowlist check; an edge has no
-      # agent manifests, so the check would only ever deny.
-      RUNNER_AUTHORIZATION: signature
       PYTHONDONTWRITEBYTECODE: "1"
     healthcheck:
       test: ["CMD-SHELL", "python -m core.execution.runner --healthcheck"]

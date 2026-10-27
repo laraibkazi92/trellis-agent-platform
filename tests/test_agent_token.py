@@ -26,6 +26,9 @@ ISSUED = 1_700_000_000
 def _secret(monkeypatch):
     monkeypatch.setenv("AGENT_TOKEN_SECRET", SECRET)
     monkeypatch.delenv("DEV_MODE", raising=False)
+    # The "warn once per process" markers are module globals: re-arm them per test.
+    monkeypatch.setattr(agent_token, "_WARNED_MODE", set())
+    monkeypatch.setattr(agent_token, "_WARNED_DEV", False)
 
 
 def _mint(**overrides) -> str:
@@ -363,6 +366,9 @@ def test_no_secret_refuses_mint_and_verify(monkeypatch):
 def test_dev_mode_uses_the_fixed_development_key(monkeypatch):
     monkeypatch.delenv("AGENT_TOKEN_SECRET")
     monkeypatch.setenv("DEV_MODE", "true")
+    # The dev key is a local-development affordance, and `off` is the only mode that
+    # permits it: enforcing refuses a key every container image knows.
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "off")
 
     # The constant, not a random per-process value: that is what lets two local
     # processes (host + hub + runner) verify each other's tokens.
@@ -396,11 +402,24 @@ def test_require_secret_only_warns_in_rollout_mode(monkeypatch, caplog):
     assert any("AGENT_TOKEN_SECRET" in r.getMessage() for r in caplog.records)
 
 
-def test_require_secret_allows_dev_mode(monkeypatch):
+def test_require_secret_allows_dev_mode_with_tokens_off(monkeypatch, caplog):
     monkeypatch.delenv("AGENT_TOKEN_SECRET")
     monkeypatch.setenv("DEV_MODE", "true")
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "off")
 
     agent_token.require_secret("hub")
+
+    assert any("AGENT_TOKEN_SECRET" in r.getMessage() for r in caplog.records)
+
+
+def test_require_secret_exits_in_dev_mode_when_enforcing(monkeypatch):
+    """DEV_MODE is not a bypass: enforce still needs a real key."""
+    monkeypatch.delenv("AGENT_TOKEN_SECRET")
+    monkeypatch.setenv("DEV_MODE", "true")
+    monkeypatch.delenv("ENFORCE_AGENT_TOKENS", raising=False)
+
+    with pytest.raises(SystemExit):
+        agent_token.require_secret("hub")
 
 
 # --------------------------------------------------------------------------- #
@@ -445,19 +464,48 @@ def test_mint_for_run_publishes_the_token_and_run_id():
 @pytest.mark.parametrize(
     "value,expected",
     [
-        (None, "log"),  # unset
-        ("off", "off"),
-        ("log", "log"),
+        (None, "enforce"),  # unset: enforcing is the code default
+        ("", "enforce"),
         ("enforce", "enforce"),
         (" ENFORCE ", "enforce"),
-        ("", "log"),
-        ("garbage", "log"),
+        ("log", "log"),
+        ("garbage", "enforce"),  # a typo must never widen access
+        ("off", "enforce"),  # `off` needs DEV_MODE=true
     ],
 )
 def test_mode_parses_the_rollout_knob(monkeypatch, value, expected):
+    monkeypatch.delenv("DEV_MODE", raising=False)
     if value is None:
         monkeypatch.delenv("ENFORCE_AGENT_TOKENS", raising=False)
     else:
         monkeypatch.setenv("ENFORCE_AGENT_TOKENS", value)
 
     assert agent_token.mode() == expected
+
+
+def test_off_is_allowed_in_dev_mode(monkeypatch):
+    monkeypatch.setenv("DEV_MODE", "true")
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "off")
+
+    assert agent_token.mode() == "off"
+
+
+def test_off_outside_dev_mode_logs_an_error_and_enforces(monkeypatch, caplog):
+    monkeypatch.delenv("DEV_MODE", raising=False)
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "off")
+
+    assert agent_token.mode() == "enforce"
+    assert any("only allowed with DEV_MODE" in r.getMessage() for r in caplog.records)
+
+
+def test_mint_for_run_raises_rather_than_minting_nothing(monkeypatch):
+    """The old rollout behaviour returned "" and left every call unauthenticated."""
+    monkeypatch.delenv("AGENT_TOKEN_SECRET")
+    monkeypatch.delenv("DEV_MODE", raising=False)
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "log")
+
+    with pytest.raises(AgentTokenError) as excinfo:
+        agent_token.mint_for_run("agent-a", "user-1")
+
+    assert excinfo.value.code == "missing_secret"
+    assert "AGENT_TOKEN_SECRET" in excinfo.value.message

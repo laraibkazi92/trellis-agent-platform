@@ -4,9 +4,16 @@
 """Short-lived HMAC tokens that prove *which agent* is calling, and for whom.
 
 The token is minted by the agent runtime (host, taskiq worker, gateway) once per
-run and carried on every hub / relay / runner call. Enforcement points verify it
-and resolve the agent's effective allowlist themselves: the caller does not get
-to assert its own permissions.
+run and carried on every hub / relay / runner call. Enforcement points verify it,
+resolve the agent's effective allowlist themselves and ask the ONE tool-access
+evaluator (:mod:`core.tool_access`): the caller does not get to assert its own
+permissions.
+
+Enforcement is on by default: ``ENFORCE_AGENT_TOKENS`` unset or unrecognized means
+``enforce``, so a stack that forgot the knob cannot silently run without tokens.
+``log`` is the one intentional rollout window (a rejected token or an out-of-allowlist
+call is logged and still runs). ``off`` exists for local development only: it is
+refused outside ``DEV_MODE=true`` and behaves as ``enforce`` there.
 
 Format::
 
@@ -38,6 +45,25 @@ CLOCK_SKEW_S = 30
 # can verify each other's tokens; never acceptable outside development.
 _DEV_SECRET = "trellis-dev-insecure-agent-token-secret"
 _WARNED_DEV = False
+_WARNED_MODE: set[str] = set()
+
+
+def _warn(key: str) -> None:
+    """Log one mode-resolution problem once per distinct value (per process)."""
+    if key in _WARNED_MODE:
+        return
+    _WARNED_MODE.add(key)
+    if key == "off_without_dev_mode":
+        logger.error(
+            "ENFORCE_AGENT_TOKENS=off is only allowed with DEV_MODE=true; "
+            "enforcing agent tokens instead"
+        )
+    else:
+        logger.error(
+            "Unrecognized ENFORCE_AGENT_TOKENS value %r; enforcing agent tokens "
+            "(valid: off with DEV_MODE=true, log, enforce)",
+            key.split(":", 1)[-1],
+        )
 
 
 class AgentTokenError(Exception):
@@ -58,10 +84,6 @@ class Claims:
     iat: int
     exp: int
     jti: str
-    # Informational only (v0.7.1): no enforcement point honours it. It is kept so a
-    # token signed before the exemptions were removed still verifies; it grants
-    # nothing to anyone.
-    principal: Optional[str] = None
     # The caller's OIDC groups at mint time (claim "g"): the only group source the
     # policy evaluator may trust. Empty for service identities.
     groups: tuple[str, ...] = ()
@@ -174,7 +196,6 @@ def mint(
     run_id: Optional[str] = None,
     ttl_s: Optional[int] = None,
     now: Optional[float] = None,
-    principal: Optional[str] = None,
     groups: Optional[Iterable[str]] = None,
     parent_run_id: Optional[str] = None,
 ) -> str:
@@ -193,8 +214,6 @@ def mint(
         "x": issued + ttl,
         "j": uuid.uuid4().hex,
     }
-    if principal:
-        payload["k"] = str(principal)
     # Omitted when empty so a service identity's token is byte-identical to a
     # pre-groups token (and reads back as "no groups", never as "all groups").
     normalized = normalize_groups(groups)
@@ -266,7 +285,6 @@ def verify(token: Optional[str], *, now: Optional[float] = None) -> Claims:
         iat=issued,
         exp=expires,
         jti=jti,
-        principal=payload.get("k"),
         groups=groups,
         parent_run_id=parent_run_id,
     )
@@ -323,7 +341,6 @@ def mint_for_run(
     user_email: Optional[str] = None,
     run_id: Optional[str] = None,
     ttl_s: Optional[int] = None,
-    principal: Optional[str] = None,
     groups: Optional[Iterable[str]] = None,
     parent_run_id: Optional[str] = None,
 ) -> str:
@@ -335,18 +352,21 @@ def mint_for_run(
             user_email=user_email,
             run_id=run_id,
             ttl_s=ttl_s,
-            principal=principal,
             groups=groups,
             parent_run_id=parent_run_id,
         )
     except AgentTokenError as exc:
-        # Rollout (off/log) without a key must not break calls; enforce does.
-        if exc.code == "missing_secret" and mode() != "enforce":
-            logger.debug("No AGENT_TOKEN_SECRET; minting is disabled")
-            return ""
+        if exc.code == "missing_secret":
+            # Never mint nothing: a run that silently got "" would be unauthenticated
+            # at every enforcement point (the old rollout-mode behaviour), and the
+            # symptom -- calls denied far from the cause -- is hard to trace.
+            raise AgentTokenError(
+                "missing_secret",
+                f"cannot mint an agent token for '{agent}': {exc.message}. Set "
+                "AGENT_TOKEN_SECRET (DEV_MODE=true uses the local dev key, and "
+                "ENFORCE_AGENT_TOKENS=off skips enforcement).",
+            ) from None
         raise
-    if not token:
-        return ""
     try:
         from core.auth import agent_token_var, run_id_var
 
@@ -388,7 +408,6 @@ def refresh(token: Optional[str], *, min_validity_s: int = 60) -> Optional[str]:
             user_id=claims.user_id,
             user_email=claims.user_email,
             run_id=claims.run_id,
-            principal=claims.principal,
             groups=claims.groups,
             parent_run_id=claims.parent_run_id,
         )
@@ -404,10 +423,22 @@ def refresh(token: Optional[str], *, min_validity_s: int = 60) -> Optional[str]:
 
 
 def mode() -> str:
-    """``off`` | ``log`` | ``enforce`` (compose ships ``enforce``)."""
-    value = (os.getenv("ENFORCE_AGENT_TOKENS") or "log").strip().lower()
-    return value if value in {"off", "log", "enforce"} else "log"
+    """``off`` | ``log`` | ``enforce`` -- code default ``enforce``.
 
-
-def deny_message(agent: str, target: str) -> str:
-    return f"access_denied: tool '{target}' is not in agent '{agent}' allowlist"
+    ``enforce`` is the default when the variable is unset or unrecognized: a stack
+    that forgot the knob must not silently run without token enforcement. ``off`` is
+    a local-development posture only and is refused outside ``DEV_MODE`` (it logs an
+    error and behaves as ``enforce``). ``log`` is the one intentional rollout window.
+    """
+    raw = (os.getenv("ENFORCE_AGENT_TOKENS") or "").strip().lower()
+    if not raw:
+        return "enforce"
+    if raw in {"log", "enforce"}:
+        return raw
+    if raw == "off":
+        if _dev_mode():
+            return "off"
+        _warn("off_without_dev_mode")
+        return "enforce"
+    _warn(f"unrecognized:{raw}")
+    return "enforce"

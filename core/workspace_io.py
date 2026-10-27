@@ -8,7 +8,8 @@ docker-compose.yml), and ``scripts/sync_to_db.py`` reconciles etcd from those fi
 every ``docker compose up``. So whenever the UI (admin editor, workflow editor,
 marketplace) changes a config, it must ALSO write the matching file here -- otherwise
 the next rebuild re-applies the old file over the etcd change, or prunes an entity that
-exists only in etcd.
+exists only in etcd. The same applies to the tool-access group rules in
+``workspace/policies/tool_access.yaml`` (see :func:`write_tool_access_policy`).
 
 This replaces the old GitHub-API write-back (``commit_to_github``): a local write needs
 no token, applies immediately, and leaves version control to the operator (the workspace
@@ -88,3 +89,20 @@ def delete_repo_path(rel_path: str) -> bool:
     except OSError as e:
         logger.warning("Could not delete workspace file %s: %s", rel_path, e)
         return False
+
+
+# --- tool-access policy ------------------------------------------------------ #
+
+TOOL_ACCESS_POLICY_REL = "workspace/policies/tool_access.yaml"
+
+
+def write_tool_access_policy(text: str) -> bool:
+    """Dual-write the tool-access group-rule file (``workspace/policies/``).
+
+    ``core.tool_access`` reads the *etcd* copy at runtime, so a writer must update the
+    registry first and the file second: the next rebuild's sync re-applies the file
+    over etcd, and a file left behind silently reverts the change. The v0.7.1 admin
+    page is read-only, so nothing calls this yet -- it is the write half an editor (or
+    a CLI) needs, and it shares the fail-soft contract of :func:`write_repo_file`.
+    """
+    return write_repo_file(TOOL_ACCESS_POLICY_REL, text)

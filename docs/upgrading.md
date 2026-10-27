@@ -118,19 +118,17 @@ user id, `e` email) and the rest of the stack reads the claims instead of a body
 `trellis-proxy` verifies nothing: the relay authenticated the caller, verified the token
 and built the frame identity from its claims, and the edge trusts that identity over the
 authenticated tunnel (the same trust it already placed in the relay's authorization
-decision). The signing key is still part of an edge install, but only for the **runner**
-— and only for Phase 4's benefit: the runner verifies nothing yet (`ENFORCE_AGENT_TOKENS`
-is fixed at `off` there), while Phase 4 turns enforcement on and derives the agent and the
-output dir from the token's claims. `RUNNER_AUTHORIZATION` stays until the next phase
-deletes it.
+decision). The signing key is still part of an edge install, but only for the **runner**:
+it verifies the forwarded token's signature and expiry and derives the agent and the
+output dir from that token's claims. It makes no authorization decision of its own —
+`RUNNER_AUTHORIZATION` and the runner's manifest allowlist check are gone.
 
 **What to do instead**
 
 - Keep `AGENT_TOKEN_SECRET` in the edge's `.env`: the sample
   `deploy/proxy/docker-compose.yml` requires it on the runner service (`:?` — compose
-  refuses to start without it) and does not set it on `trellis-proxy`. Do not set
-  `ENFORCE_AGENT_TOKENS` yourself; the sample pins it to `off` on the edge runner so a
-  leftover value cannot re-enable verification early.
+  refuses to start without it) and does not set it on `trellis-proxy`. It must be the
+  same value central signs with, or every forwarded token fails verification.
 - The **central** install still needs it on host/hub/gateway/relay/taskiq/runner — that is
   where verification happens today.
 - Upgrade the edge to the same image tag as central in the same change. The frame carries
@@ -192,6 +190,80 @@ fingerprint and keeps the form disabled.
 - During a rotation overlap the previously approved fingerprint stays approved, so blobs
   sealed to the old key keep opening. Approving the new fingerprint is what re-enables
   sealing; `--drop-old-key` still ends the overlap.
+
+#### Tool authorization: one evaluator, one mode, rules in the workspace
+
+The three-switch etcd policy stack is gone. Admin → **Tool Authorization** (`/admin/tool-authz`)
+is now a **read-only** page: it shows the loaded group rules and policy version, the current
+`TOOL_ACCESS_MODE`, every agent's effective allowlist and recent shadow denials. Removed from
+the page (and from the routing table): the policy editor, the three per-surface mode switches
+(`tool_authz_mode`, `bound_tools_mode`, `hub_call_mode`), **Bootstrap**, **Clear log** and the
+principal-groups editor. The matching etcd keys are gone too: `/registry/tool_policies`,
+`/config/framework/{tool_authz_mode,bound_tools_mode,hub_call_mode,principal_groups}` and the
+`/registry/tool_authz_denies` ring (shadow denials now live in a bounded, shared ring owned by
+the evaluator). One evaluator (`core/tool_access.py`) now decides every call — hub, relay,
+host-before-runner and bound tools — and a policy read that fails **fails closed**.
+
+**What to do instead**
+
+- Put group rules in `workspace/policies/tool_access.yaml` (synced to the registry on every
+  rebuild, watched by every enforcing process, so an edit lands in a couple of seconds). The
+  format is `rules: [{name, targets, groups}]`; a target matched by a rule is usable only by a
+  caller whose token groups intersect that rule's groups.
+- Set the one switch in the deployment environment: `TOOL_ACCESS_MODE=off|shadow|enforce`
+  (default `enforce`; an unrecognized value behaves as `enforce`).
+- Leftover policy keys in an upgraded etcd (`/registry/tool_policies`,
+  `/config/framework/tool_authz_mode`, … `/bound_tools_mode`, … `/hub_call_mode`,
+  `/config/framework/principal_groups`, `/registry/tool_authz_denies`) are simply never read
+  again; delete them or leave them, nothing migrates from them. Copy any hand-tuned rules out
+  of the old document into `workspace/policies/tool_access.yaml` first — the new format is one
+  rule per target pattern with a group list, not principal/scope rules.
+- Group membership now reaches the decision only through the agent token's `g` claim (minted
+  per run from the user record). The `principal_groups` mapping and the middleware's
+  stored-group publication are gone, so a user whose groups exist only in that mapping has no
+  groups for tool access.
+- The `principal` claim (`k`) and the `principal=` argument on `agent_token.mint` /
+  `mint_for_run` are **removed**. No enforcement point honoured them after the exemptions
+  went, so a token minted for `gateway`/`system` is now an ordinary token: it gets no elevated
+  identity and no extra grant (its only possible grant is the target's own public exposure).
+  If a script of yours passes `principal=`, delete the argument; existing tokens still verify
+  and the extra claim is ignored.
+
+##### Three behaviours that surprise people in the new evaluator
+
+**(a) Service and workflow identities carry NO groups.** A `background_agent` or
+`background_script` run mints `svc_agent_<name>` with an empty group claim (there is no IdP
+login behind it), so **any rule that matches one of its tools denies that run** — the caller
+holds no group, and a rule admits only holders. The same is true of a delegated sub-agent
+whose token was minted from a service identity. If a workflow must reach a rule-guarded tool,
+either run with `TOOL_ACCESS_MODE=off`/`shadow` (a deliberate trade: `off` drops the group
+half for *everyone* in that process) or do not put that tool under a rule. There is no
+group-less "everyone" rule by design — an empty `groups` list is a validation error.
+
+**(b) `default_action: deny` is gone: the allowlist decides unless a rule matches.** v0.7's
+policy document could deny a call for lack of a matching rule. The new file has no
+`default_action` key (it is a validation error if present); a target **no rule matches** is
+governed by the **agent's own allowlist alone**. So a call the old policy denied for lack of a
+matching rule can now be **allowed** if the agent's `allowed_tools`/`allowed_mcps` grants it.
+That is an explicit widening: audit each agent's allowlist during the upgrade, because the
+allowlist — not the policy file — is now the grant. A rule can only narrow a call, never widen
+one.
+
+**(c) A malformed `workspace/policies/tool_access.yaml` stops the whole stack.** The sync is
+strict on purpose: an unparseable file, an unknown key, a rule with an empty `groups`, a
+duplicate rule or a duplicate name makes `scripts/sync_to_db.py` print the errors and exit
+**2**, writing nothing. Because every app service declares
+`depends_on: db-sync: condition: service_completed_successfully`, a non-zero exit keeps host,
+UI, gateway and the worker from starting at all — the intended fail-closed posture, and why the
+policy ships as a reviewed file rather than an admin form. Fix the file and re-run
+`docker compose up -d` (or `trellis sync`); the registry still holds the last valid policy, so
+the running stack keeps its previous rules until the new document validates.
+
+A rule naming a console tool other than `execute` (`read_file`, `write_file`, `edit_file`,
+`ls`, `glob`, `grep`) is **not** an error — it is a warning printed by the sync and shown on
+Admin → Tool Authorization, because those tools never pass through the evaluator. Only the
+console `execute` tool is covered by rules; the file tools stay constrained by the agent's
+console allowlist.
 
 <!-- v0.7.1: further removals are appended below this marker before the tag. -->
 

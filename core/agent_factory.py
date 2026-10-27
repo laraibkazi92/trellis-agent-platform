@@ -701,8 +701,13 @@ def _is_session_failure(exc: BaseException) -> bool:
     """A dead transport/session, as opposed to an ordinary tool-level error.
 
     Only a session failure should evict the cached client: evicting on a tool's
-    own error would throw away a warm login state for nothing.
+    own error would throw away a warm login state for nothing. An authorization
+    verdict is never a session failure, whatever its text says.
     """
+    from core.tool_gate import ToolAccessDenied
+
+    if isinstance(exc, ToolAccessDenied):
+        return False
     name = type(exc).__name__
     if name in {"RunnerCallError", "RunnerUnavailable", "ClosedResourceError", "BrokenResourceError"}:
         return True
@@ -727,6 +732,19 @@ async def _open_external_mcp_client(mcp_name: str, user_id: str) -> FastMCPClien
     env = _inject_config(env, config.variables, identity_mgr, user_id, "variables", is_background)
 
     if config.transport == "stdio":
+        # Pre-runner authorization: the runner proves the token but cannot decide this
+        # (no registry, no manifests), so the host gates the session before asking for
+        # a container. The evaluator resolves the token agent's own allowlist; a caller
+        # with no agent record (the gateway front door) is granted only by the server's
+        # own `public` flag, which `deny_reason` reads for us.
+        from core.tool_gate import ToolAccessDenied, deny_reason
+
+        denial = await deny_reason(config.name, surface="host", session=True)
+        if denial is not None:
+            # A distinct type: an authorization verdict must not be reported to the
+            # caller as a lost session ("try again later" would be a lie).
+            raise ToolAccessDenied(denial)
+
         # The server runs in a runner session container: only the manifest's
         # declared keys cross the socket (the runner rejects anything else), and
         # the control plane's own environment stays here. The session's identity is
@@ -838,53 +856,36 @@ async def discover_external_mcps(force: bool = False):
     _last_discovery_time = now
 
 async def _bound_tool_denial(policy_tool_name: str) -> Optional[str]:
-    """Gate one bound-tool call: a denial message, or ``None`` when it may execute.
+    """Gate one bound-tool call with the ONE evaluator: a denial message, or ``None``.
 
     Tools bound to an agent from ``allowed_tools``/``allowed_mcps`` are called straight
     through their wrapper and never reach ``use_tool``, so this is their only gate. It
-    uses the same evaluator, scope and principal as ``use_tool``, but reads the
-    ``bound_tools_mode`` rollout key and tags its deny-ring entries
-    ``surface="bound_tool"``.
-
-    ``off`` (the default) is a no-I/O fast path once the authz cache is warm: the mode
-    is read from the last snapshot and the principal is never resolved. A cold cache
-    (first call after a start, or after a config change invalidated it) costs one read,
-    as on the ``use_tool`` boundary.
+    is the same evaluator every other surface asks (:mod:`core.tool_access`): the
+    agent and its groups come from the run's verified token, the allowlist from the
+    agent record that token names, and ``surface="bound_tool"`` tags the verdict for
+    the shadow ring.
 
     A denial is the recoverable string ``use_tool`` hands the model -- never a raised
-    exception: one ungranted tool must not fail the whole turn. An exception inside the
-    check also fails closed. Note the engine's documented caveat: if the authz state
-    has *never* been readable, the cold snapshot says ``off``; this gate fails open
-    only while the framework has never seen a policy, exactly like ``use_tool``.
+    exception: one ungranted tool must not fail the whole turn. An exception inside
+    the check also fails closed.
     """
-    from core import tool_authz
-
-    surface = tool_authz.BOUND_TOOL_SURFACE
-
-    def _verdict() -> Optional[str]:
-        mode = tool_authz.cached_mode_for_surface(surface)
-        if mode is None:
-            mode = tool_authz.mode_for_surface(surface)
-        if mode == "off":
-            return None
-        principal = tool_authz.resolve_current_principal()
-        if tool_authz.allowed(
-            principal, policy_tool_name, "tools:call", surface=surface, mode=mode
-        ):
-            return None
-        return (
-            f"SYSTEM: Access denied. Tool '{policy_tool_name}' is not permitted "
-            "for this principal."
-        )
+    from core.tool_gate import deny_reason
 
     try:
-        return await asyncio.to_thread(_verdict)
+        denial = await deny_reason(policy_tool_name, surface="bound_tool")
     except Exception:
         logger.exception("Bound-tool authorization check failed for %r", policy_tool_name)
         return (
             f"SYSTEM: Error checking tool access for '{policy_tool_name}'. "
             "Please try again later."
         )
+    if denial is None:
+        return None
+    logger.warning("bound_tool: denied %r: %s", policy_tool_name, denial)
+    return (
+        f"SYSTEM: Access denied. Tool '{policy_tool_name}' is not permitted "
+        "for this principal."
+    )
 
 
 def _register_mcp_tool(agent: Agent, mcp_tool: Any):
@@ -943,10 +944,15 @@ def _register_external_mcp_tool(
             return "SYSTEM: Tool offline."
         user_id = user_id_var.get()
         if not user_id: raise Exception("No user_id found")
+        from core.tool_gate import ToolAccessDenied
+
         try:
             client = await get_external_mcp_client(mcp_name, user_id)
             result = await client.call_tool(safe_mcp_tool.name, kwargs)
             return result.content
+        except ToolAccessDenied as e:
+            # A verdict, not a transient failure: say "denied", never "try again".
+            return f"SYSTEM: {e.reason}"
         except Exception as e:
             if _is_session_failure(e):
                 # Respawn lazily: the next call rebuilds the client and its
@@ -1462,21 +1468,6 @@ async def prewarm_agents() -> None:
 def _register_admin_tools(agent: Agent):
     identity_mgr = get_identity_manager()
 
-    def _current_authz_principal() -> Optional[str]:
-        """Best-effort authorization principal for the tool seams below.
-
-        Taskiq/host turns resolve from the caller's token via the tool-authz
-        engine; when that is unavailable we pass None and let the callee resolve
-        (or fail closed) on its own rather than breaking the agent turn.
-        """
-        try:
-            from core import tool_authz
-
-            return tool_authz.resolve_current_principal()
-        except Exception:
-            logger.debug("Could not resolve tool-authorization principal", exc_info=True)
-            return None
-
     @agent.tool_plain(
         name="search_agents",
         description=(
@@ -1550,12 +1541,7 @@ def _register_admin_tools(agent: Agent):
     async def search_tools(query: str, limit: Optional[int] = None) -> List[Dict]:
         from core.tool_search import search_tools as _search_tools_ranked
         user_id = user_id_var.get()
-        return await _search_tools_ranked(
-            query,
-            limit=limit,
-            user_id=user_id,
-            principal=_current_authz_principal(),
-        )
+        return await _search_tools_ranked(query, limit=limit, user_id=user_id)
 
     @agent.tool_plain(
         name="describe_tool",
@@ -1593,7 +1579,6 @@ def _register_admin_tools(agent: Agent):
             get_hub_client_fn=get_hub_client,
             get_external_mcp_client_fn=get_external_mcp_client,
             call_edge_mcp_fn=call_edge_mcp,
-            principal=_current_authz_principal(),
         )
 
     @agent.tool_plain(name="manage_agent", description="Enable, disable or reload an agent.")

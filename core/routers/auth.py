@@ -104,15 +104,16 @@ async def auth_callback(request: Request):
         if not user.get('name'):
             user['name'] = user.get('email') or user.get('preferred_username') or user.get('sub')
 
-        # Group membership travels with the etcd record; `group:` policy rules read it.
+        # Group membership travels with the etcd record; the agent-token mint reads it
+        # into the token's `g` claim, and `group:` policy rules match token groups.
         # Deliberately NOT in the session: Starlette sessions are a signed cookie with a
         # browser 4 KB budget, and a large IdP claim (100+ groups) would drop the cookie
         # and lock the user out. Nothing renders groups from the session.
         profile = {**user, "groups": claim_groups(user)}
         if not profile["groups"]:
             logger.info(
-                "Login for %s produced no groups from claim %r; group: rules fall back "
-                "to /config/framework/principal_groups.",
+                "Login for %s produced no groups from claim %r; group rules will not "
+                "match this user until the IdP asserts one.",
                 user.get("email"), groups_claim_name(),
             )
 

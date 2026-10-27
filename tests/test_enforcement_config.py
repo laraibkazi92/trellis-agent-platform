@@ -31,6 +31,18 @@ ENFORCING_SERVICES = {
     "runner",
 }
 
+# Services that evaluate the tool-access decision or render it (the admin page reads
+# the mode and the loaded policy). `runner` is deliberately absent: it has no registry
+# and makes no allowlist/group-rule decision.
+TOOL_ACCESS_SERVICES = (
+    "host",
+    "hub",
+    "gateway",
+    "taskiq-worker",
+    "edge-relay",
+    "ui",
+)
+
 
 @pytest.fixture(autouse=True)
 def _secret(monkeypatch):
@@ -51,15 +63,32 @@ def test_central_compose_configures_every_enforcement_point():
         assert env["ENFORCE_AGENT_TOKENS"].endswith("enforce)") or "enforce" in str(
             env["ENFORCE_AGENT_TOKENS"]
         )
-    assert services["runner"]["environment"]["RUNNER_AUTHORIZATION"] == "allowlist"
+    # The runner has no allowlist to check any more: its knob is gone.
+    assert "RUNNER_AUTHORIZATION" not in services["runner"]["environment"]
+
+
+def test_compose_passes_the_tool_access_switch_to_every_enforcing_process():
+    """`TOOL_ACCESS_MODE` must be interpolated for all six services.
+
+    `host` and `ui` are `.env`-fed, hub/edge-relay/gateway/taskiq-worker only read the
+    variables listed here. `.env` is read from the file, NOT from the shell, so a shell
+    override (`TOOL_ACCESS_MODE=shadow docker compose up`) would flip the four while
+    leaving host and ui on the code default -- a stack where the console/MCP gate and
+    the admin page disagree with the hub. Every service that can evaluate or render the
+    mode must carry the interpolation.
+    """
+    services = _services(ROOT / "docker-compose.yml")
+    for name in TOOL_ACCESS_SERVICES:
+        env = services[name].get("environment") or {}
+        assert env.get("TOOL_ACCESS_MODE", "").endswith("enforce}"), name
 
 
 def test_the_edge_proxy_never_verifies_an_agent_token():
     """v0.7.1: the edge trusts the relay's frame identity; the proxy has no key.
 
-    The **runner** keeps the key (temporary Phase 2 posture): it verifies nothing
-    today, and Phase 4 turns enforcement on and derives the agent / output dir from
-    the token's claims.
+    The **runner** keeps the key: it verifies signature and expiry, derives the agent
+    and the output dir from the token's claims, and (since Phase 4) makes no allowlist
+    decision at all -- the relay already made it for the call it forwarded.
     """
     services = _services(ROOT / "deploy" / "proxy" / "docker-compose.yml")
 
@@ -70,10 +99,10 @@ def test_the_edge_proxy_never_verifies_an_agent_token():
     runner_env = services["runner"]["environment"]
     assert "AGENT_TOKEN_SECRET" in runner_env
     assert "set AGENT_TOKEN_SECRET" in runner_env["AGENT_TOKEN_SECRET"]
-    # The edge runner is pinned out of verification even if a stale .env sets it.
-    assert runner_env["ENFORCE_AGENT_TOKENS"] == "off"
-    # Deleted in the next phase, kept here on purpose.
-    assert runner_env["RUNNER_AUTHORIZATION"] == "signature"
+    # Enforcing by default: the edge runner verifies the token the relay forwarded.
+    assert "off" not in runner_env["ENFORCE_AGENT_TOKENS"]
+    # Gone in Phase 4 with the runner's own allowlist check.
+    assert "RUNNER_AUTHORIZATION" not in runner_env
 
 
 def _config(**overrides) -> ToolConfig:

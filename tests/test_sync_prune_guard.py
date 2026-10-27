@@ -16,6 +16,15 @@ from scripts import sync_to_db
 class _FakeClient:
     def __init__(self, manager):
         self._manager = manager
+        # The tool-access policy is published before the prune pass; those writes are
+        # not deletions, so they stay out of `manager.deleted`.
+        self.documents = {}
+
+    def put(self, path, value):
+        self.documents[path] = value
+
+    def get(self, path, **_kwargs):
+        return self.documents.get(path), None
 
     def delete(self, path):
         self._manager.deleted.append(path)

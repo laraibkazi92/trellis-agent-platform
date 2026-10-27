@@ -342,6 +342,28 @@ def _clean_relay():
     relay_app.relay.sites.clear()
 
 
+@pytest.fixture(autouse=True)
+def _relay_rollout_mode(monkeypatch):
+    """These cases are about the sealed blob, not who may call.
+
+    The token rollout window (``log``) keeps the relay's authorization gate out of the
+    way -- it is covered in tests/test_edge_relay.py and test_enforcement_matrix.py --
+    and an empty policy keeps the evaluator off etcd.
+    """
+    from core import tool_access
+
+    class _NoPolicy:
+        def put(self, key, value):
+            raise AssertionError(f"no write expected: {key}")
+
+        def get(self, key, **_kwargs):
+            return None, None
+
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "log")
+    monkeypatch.setattr(tool_access, "_client", lambda: _NoPolicy())
+    tool_access.reset_snapshot()
+
+
 def test_relay_forwards_sealed_verbatim_and_audits_only_presence(monkeypatch):
     conn, ws = _install_conn()
     blob = _fake_blob()

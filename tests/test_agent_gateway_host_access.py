@@ -28,6 +28,19 @@ from core import gateway
 from core import host
 from core.auth import DEV_MODE_AUTH_TOKEN, auth_token_var, user_id_var
 
+HOST_RUN_SECRET = "host-run-unit-secret-0123456789abcdef"
+
+
+@pytest.fixture(autouse=True)
+def _mintable_tokens(monkeypatch):
+    """Every host/gateway run mints a token: without a key, minting is a hard error.
+
+    Enforcing is the code default, so an unkeyed run is refused up front instead of
+    silently running unauthenticated (that was the old rollout behaviour).
+    """
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", HOST_RUN_SECRET)
+    monkeypatch.delenv("DEV_MODE", raising=False)
+
 
 # --- core.agent_search.search_agents ----------------------------------------
 
@@ -741,36 +754,33 @@ def test_chat_completions_exempts_supervisor(monkeypatch):
     assert result["choices"][0]["message"]["content"] == "supervisor reply"
 
 
-def test_a_supervisor_run_mints_an_ordinary_token_and_uses_its_group_claim(monkeypatch):
-    """v0.7.1 Phase 3: the supervisor gets no elevated principal, and the run's
-    `group:` rules come from the token claim the mint wrote.
+def test_a_supervisor_run_mints_an_ordinary_token_with_the_group_claim(monkeypatch):
+    """v0.7.1 Phase 4: the supervisor gets no elevated principal, and the run's group
+    rules are decided by the token claim the mint wrote.
 
-    The identity read happens ONCE, at mint. Inside the run the gates (bound tools,
-    use_tool) must resolve groups from that claim -- not from a second user-record
-    read -- so the host and the hub cannot reach different verdicts for one call.
+    The identity read happens ONCE, at mint. Inside the run the evaluator sees those
+    groups -- not a second user-record read -- so the host and the hub cannot reach
+    different verdicts for one call.
     """
-    import _hub_authz_registry as hub_authz
-    from core import agent_token, tool_authz
+    import json
 
-    group_rule = {
-        "default_action": "deny",
-        "rules": [
-            {
-                "tools": ["text_stats"],
-                "allow_principals": ["group:ops"],
-                "scopes": ["tools:call"],
-            }
-        ],
-    }
-    # The stored record disagrees with the claim on purpose: the claim is the authority.
-    hub_authz.install(
-        monkeypatch,
-        policy=group_rule,
-        mode="enforcing",
-        users={"user-1": {"groups": ["stale"]}},
-    )
-    monkeypatch.setenv("AGENT_TOKEN_SECRET", "host-run-claim-groups-secret-01234567")
-    monkeypatch.delenv("DEV_MODE", raising=False)
+    from core import agent_token, tool_access
+
+    group_policy = {"rules": [{"targets": ["text_stats"], "groups": ["ops"]}]}
+
+    class FakeEtcd:
+        def get(self, key, **_kwargs):
+            if key == tool_access.POLICY_PATH:
+                meta = type("M", (), {"mod_revision": 1})()
+                return json.dumps(group_policy).encode("utf-8"), meta
+            return None, None
+
+        def put(self, key, value):
+            raise AssertionError(f"no write expected: {key}")
+
+    monkeypatch.setattr(tool_access, "_client", lambda: FakeEtcd())
+    monkeypatch.delenv(tool_access.MODE_ENV, raising=False)
+    tool_access.reset_snapshot()
     monkeypatch.setattr(host.identity_mgr, "get_disabled_standard_agents", lambda: [])
     monkeypatch.setattr(
         host.identity_mgr,
@@ -799,10 +809,20 @@ def test_a_supervisor_run_mints_an_ordinary_token_and_uses_its_group_claim(monke
     async def fake_get_agent(name):
         class FakeAgent:
             async def run(self, *a, **k):
-                seen["claims"] = agent_token.verify(host.agent_token_var.get())
-                seen["principal"] = tool_authz.resolve_current_principal()
-                seen["permitted"] = tool_authz.allowed(
-                    seen["principal"], "text_stats", "tools:call"
+                claims = agent_token.verify(host.agent_token_var.get())
+                seen["claims"] = claims
+                seen["decision"] = tool_access.enforce(
+                    tool_access.authorize_claims(
+                        claims,
+                        target="text_stats",
+                        allowed=None,
+                        public=True,
+                        surface="host",
+                    ),
+                    agent=claims.agent,
+                    groups=claims.groups,
+                    target="text_stats",
+                    surface="host",
                 )
                 return FakeResult()
         return FakeAgent()
@@ -813,17 +833,15 @@ def test_a_supervisor_run_mints_an_ordinary_token_and_uses_its_group_claim(monke
     try:
         asyncio.run(host.chat_completions(_make_request("supervisor")))
     finally:
-        # The authz snapshot is process-global: leave the fake policy behind and the
-        # next test in this session would evaluate against it.
-        tool_authz.reset_cache()
+        tool_access.reset_snapshot()
 
     claims = seen["claims"]
     assert claims.agent == "supervisor"
-    assert claims.principal is None
+    assert not hasattr(claims, "principal")  # the dead `k` claim API is gone
     assert claims.groups == ("ops", "sre")
-    assert seen["principal"] == "agent:supervisor"
-    # Allowed by the claim's `ops` group, not the record's `stale` one.
-    assert seen["permitted"] is True
+    # Allowed by the claim's `ops` group.
+    assert seen["decision"].allowed is True
+    assert seen["decision"].reason == tool_access.REASON_GROUP_MATCH
     assert record_reads == ["user-1"]  # the mint's single identity read
 
 

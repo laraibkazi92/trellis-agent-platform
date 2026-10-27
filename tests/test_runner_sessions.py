@@ -85,7 +85,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("TRELLIS_INSTALL_ID", "test-install")
     monkeypatch.delenv("DEV_MODE", raising=False)
     monkeypatch.setenv("AGENT_TOKEN_SECRET", SECRET)
-    monkeypatch.delenv("ENFORCE_AGENT_TOKENS", raising=False)
+    # The runner verifies tokens now (enforcing is the code default), so keep this
+    # suite in its rollout window: these cases are about session mechanics.
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "log")
     monkeypatch.setenv("TRELLIS_UID", "1000")
     monkeypatch.setenv("TRELLIS_GID", "1000")
 
@@ -614,7 +616,7 @@ def test_exec_rejects_session_kinds(env):
         async with _client() as client:
             return await client.post(
                 "/v1/exec",
-                json={"kind": "mcp_session", "target": "stateful"},
+                json={"kind": "mcp_session", "target": "stateful", "agent_token": _token()},
                 headers=AUTH,
             )
 

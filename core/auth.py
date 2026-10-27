@@ -1393,153 +1393,6 @@ class IdentityManager:
         return None
 
     @retry_etcd()
-    def save_tool_policies(self, policy: Dict[str, Any]) -> None:
-        """Persist the tool-authorization policy document."""
-        self.client.put("/registry/tool_policies", json.dumps(policy))
-
-    @retry_etcd()
-    def get_tool_policies(self) -> Dict[str, Any]:
-        """Retrieve the tool-authorization policy document ({} when absent)."""
-        value, _ = self.client.get("/registry/tool_policies")
-        if value:
-            data = json.loads(value.decode('utf-8'))
-            return data if isinstance(data, dict) else {}
-        return {}
-
-    def get_tool_authz_mode(self) -> str:
-        """Retrieve the tool-authorization rollout mode.
-
-        An absent key means ``off`` (ships dark). A *present but unrecognized* value
-        fails closed to ``enforcing`` and logs: a typo must not silently disable the
-        gate. Not itself @retry_etcd()-decorated: get_config() already retries -- see
-        get_disabled_standard_agents above for the single-retry-layer rationale."""
-        value = self.get_config("tool_authz_mode", None)
-        if value is None or value == "":
-            return "off"
-        if value in ("off", "shadow", "enforcing"):
-            return value
-        logger.error(
-            "Unrecognized tool_authz_mode %r; failing closed to 'enforcing'", value
-        )
-        return "enforcing"
-
-    def set_tool_authz_mode(self, mode: str) -> None:
-        """Set the tool-authorization rollout mode (off | shadow | enforcing).
-
-        Not itself @retry_etcd()-decorated -- see get_tool_authz_mode above."""
-        if mode not in ("off", "shadow", "enforcing"):
-            raise ValueError(
-                f"invalid tool_authz_mode {mode!r}: expected one of off, shadow, enforcing"
-            )
-        self.set_config("tool_authz_mode", mode)
-
-    def get_bound_tools_mode(self) -> str:
-        """Retrieve the agent-bound-tool rollout mode.
-
-        An absent key means ``off`` (ships dark). A *present but unrecognized* value
-        fails closed to ``enforcing`` and logs: a typo must not silently disable the
-        gate. Not itself @retry_etcd()-decorated: get_config() already retries -- see
-        get_disabled_standard_agents above for the single-retry-layer rationale."""
-        value = self.get_config("bound_tools_mode", None)
-        if value is None or value == "":
-            return "off"
-        if value in ("off", "shadow", "enforcing"):
-            return value
-        logger.error(
-            "Unrecognized bound_tools_mode %r; failing closed to 'enforcing'", value
-        )
-        return "enforcing"
-
-    def set_bound_tools_mode(self, mode: str) -> None:
-        """Set the agent-bound-tool rollout mode (off | shadow | enforcing).
-
-        Not itself @retry_etcd()-decorated -- see get_bound_tools_mode above."""
-        if mode not in ("off", "shadow", "enforcing"):
-            raise ValueError(
-                f"invalid bound_tools_mode {mode!r}: expected one of off, shadow, enforcing"
-            )
-        self.set_config("bound_tools_mode", mode)
-
-    def get_hub_call_mode(self) -> str:
-        """Retrieve the direct hub ``/tools/call`` rollout mode.
-
-        An absent key means ``off`` (ships dark). A *present but unrecognized* value
-        fails closed to ``enforcing`` and logs: a typo must not silently disable the
-        gate. Not itself @retry_etcd()-decorated: get_config() already retries -- see
-        get_disabled_standard_agents above for the single-retry-layer rationale."""
-        value = self.get_config("hub_call_mode", None)
-        if value is None or value == "":
-            return "off"
-        if value in ("off", "shadow", "enforcing"):
-            return value
-        logger.error(
-            "Unrecognized hub_call_mode %r; failing closed to 'enforcing'", value
-        )
-        return "enforcing"
-
-    def set_hub_call_mode(self, mode: str) -> None:
-        """Set the direct hub ``/tools/call`` rollout mode (off | shadow | enforcing).
-
-        Not itself @retry_etcd()-decorated -- see get_hub_call_mode above."""
-        if mode not in ("off", "shadow", "enforcing"):
-            raise ValueError(
-                f"invalid hub_call_mode {mode!r}: expected one of off, shadow, enforcing"
-            )
-        self.set_config("hub_call_mode", mode)
-
-    def get_principal_groups(self) -> Dict[str, List[str]]:
-        """Retrieve the principal -> group mapping ({} when absent or malformed).
-
-        Not itself @retry_etcd()-decorated -- see get_disabled_standard_agents above."""
-        value = self.get_config("principal_groups", {})
-        if not isinstance(value, dict):
-            return {}
-        return {
-            str(principal): [str(group) for group in groups]
-            for principal, groups in value.items()
-            if isinstance(groups, list)
-        }
-
-    def set_principal_groups(self, groups: Dict[str, List[str]]) -> None:
-        """Set the principal -> group mapping.
-
-        Not itself @retry_etcd()-decorated -- see get_tool_authz_mode above."""
-        self.set_config("principal_groups", groups)
-
-    def append_tool_authz_deny(self, entry: Dict[str, Any], cap: int = 200) -> None:
-        """Prepend one denial to the shared ring at ``/registry/tool_authz_denies``.
-
-        Shared (etcd) rather than in-process because the Admin UI runs in its own
-        process and never evaluates a tool call itself.
-        """
-        def update(current: Dict[str, Any]) -> Dict[str, Any]:
-            denies = current.get("denies")
-            denies = list(denies) if isinstance(denies, list) else []
-            denies.insert(0, entry)
-            return {"denies": denies[:cap]}
-
-        self._atomic_update_usage_json("/registry/tool_authz_denies", update)
-
-    @retry_etcd()
-    def get_tool_authz_denies(self) -> List[Dict[str, Any]]:
-        """Read the shared denial ring, newest first ([], malformed tolerated)."""
-        value, _ = self.client.get("/registry/tool_authz_denies")
-        if not value:
-            return []
-        try:
-            data = json.loads(value.decode("utf-8"))
-        except Exception as e:
-            logger.warning(f"Failed to decode tool_authz denies ring: {e}")
-            return []
-        denies = data.get("denies") if isinstance(data, dict) else None
-        return [deny for deny in denies if isinstance(deny, dict)] if isinstance(denies, list) else []
-
-    @retry_etcd()
-    def clear_tool_authz_denies(self) -> None:
-        """Empty the shared denial ring."""
-        self.client.put("/registry/tool_authz_denies", json.dumps({"denies": []}))
-
-    @retry_etcd()
     def get_health_status(self, entity_type: str, name: str) -> Optional[Dict]:
         """Retrieve the health status of an agent or tool."""
         value, _ = self.client.get(f"/health/{entity_type}/{name}")
@@ -2308,10 +2161,6 @@ class AuthMiddleware:
         if scope["type"] not in ("http", "websocket"):
             return await self.app(scope, receive, send)
 
-        # Imported here rather than at module scope: the authz engine imports this
-        # module lazily, and keeping the import one-directional avoids a cycle at boot.
-        from core import tool_authz
-
         try:
             path = scope.get("path", "")
             normalized_path = re.sub(r'/+', '/', path)
@@ -2367,22 +2216,10 @@ class AuthMiddleware:
                 scope["state"] = scope.get("state", {})
                 scope["state"]["user_id"] = user_id
 
-                # Publish the IdP groups for `group:` policy rules. Uses the record
-                # already fetched for the ban check -- no second etcd read. An absent
-                # record means "no groups"; the groups-claim contextvar takes
-                # precedence over re-reading the record inside the authz engine.
-                tool_authz.set_request_groups(
-                    normalize_groups((user or {}).get("groups"))
-                )
-
             return await self.app(scope, receive, send)
         except Exception as e:
             logger.error(f"Unhandled exception in ASGI AuthMiddleware: {e}", exc_info=True)
             await self._send_error(scope, send, 500, b'{"error": "Internal Server Error"}')
-        finally:
-            # The contextvar outlives the request inside this task; clear it so a
-            # reused task/connection cannot serve one user's groups to the next call.
-            tool_authz.clear_request_groups()
 
     async def _validate_jwt(self, token: str) -> Optional[str]:
         """Validate an MCP OAuth JWT and return the sub (user_id) if valid."""

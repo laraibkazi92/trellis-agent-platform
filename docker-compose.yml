@@ -110,11 +110,11 @@ services:
       TRELLIS_GID: ${TRELLIS_GID:-1000}
       # Stamped on every container as `trellis.install` so a sweep can find them.
       TRELLIS_INSTALL_ID: ${TRELLIS_INSTALL_ID:-default}
-      # Agent-token enforcement for sessions/console. The central runner owns the
-      # workspace agent manifests, so it resolves the allowlist itself.
+      # Agent-token verification (signature/expiry) for every exec and session. The
+      # runner holds no registry and no manifests, so it makes no allowlist decision:
+      # the hub authorizes tool calls and the caller authorizes its own sessions.
       AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET in .env (openssl rand -hex 32)}
       ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
-      RUNNER_AUTHORIZATION: allowlist
       PYTHONDONTWRITEBYTECODE: "1"
     healthcheck:
       test: ["CMD-SHELL", "python -m core.execution.runner --healthcheck"]
@@ -176,6 +176,10 @@ services:
       AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET in .env (openssl rand -hex 32)}
       # Server-side allowlist enforcement: off | log | enforce (phase 3).
       ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
+      # The ONE tool-authorization switch (v0.7.1): off | shadow | enforce. Repeated
+      # here (not only in .env) so a shell override reaches this process too, exactly
+      # like the other enforcement points.
+      TOOL_ACCESS_MODE: ${TOOL_ACCESS_MODE:-enforce}
     volumes:
       - health-data:/app/data
       - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace
@@ -258,6 +262,10 @@ services:
       AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET in .env (openssl rand -hex 32)}
       # Server-side allowlist enforcement: off | log | enforce (phase 3).
       ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
+      # The ONE tool-authorization switch (v0.7.1): off | shadow | enforce. Group
+      # rules come from workspace/policies/tool_access.yaml; the agent allowlist half
+      # is always enforced. Inert until an operator sets it in .env.
+      TOOL_ACCESS_MODE: ${TOOL_ACCESS_MODE:-enforce}
       # How often the hub re-reads the tool registry so a newly connected edge's tools
       # become executable without a restart. 0 disables the watcher.
       EDGE_TOOL_RECONCILE_SECONDS: ${EDGE_TOOL_RECONCILE_SECONDS:-10}
@@ -321,6 +329,8 @@ services:
       # off | log | enforce. Enforce makes this relay the authority for edge tool and
       # MCP calls: no/invalid token or an out-of-allowlist reference is a 403.
       ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
+      # The ONE tool-authorization switch (v0.7.1): off | shadow | enforce.
+      TOOL_ACCESS_MODE: ${TOOL_ACCESS_MODE:-enforce}
     volumes:
       # Health events for remote tool calls. Deliberately no workspace mount: the relay
       # has no local tools and must not be able to read the content repo.
@@ -356,6 +366,8 @@ services:
       # record, so the tool's own `public` exposure is its only grant.
       AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET in .env (openssl rand -hex 32)}
       ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
+      # The ONE tool-authorization switch (v0.7.1): off | shadow | enforce.
+      TOOL_ACCESS_MODE: ${TOOL_ACCESS_MODE:-enforce}
     volumes:
       # Read-only: the gateway never writes workspace content. Tool output dirs are
       # created by the runner; tool containers get their own ro suite/shared mounts.
@@ -425,6 +437,8 @@ services:
       # Phase 3: the worker mints `svc_agent_<name>` tokens per background run.
       AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET in .env (openssl rand -hex 32)}
       ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
+      # The ONE tool-authorization switch (v0.7.1): off | shadow | enforce.
+      TOOL_ACCESS_MODE: ${TOOL_ACCESS_MODE:-enforce}
     volumes:
       - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace
       - runner-run:/run/trellis
@@ -522,6 +536,10 @@ services:
       REDIS_URL: redis://redis:6379/0
       # Admin -> Edges "check tunnel" reads the relay's health endpoint.
       EDGE_RELAY_URL: ${EDGE_RELAY_URL:-http://edge-relay:8100}
+      # The ONE tool-authorization switch (v0.7.1): off | shadow | enforce. The admin
+      # page renders the mode it loaded, so a shell override must reach this process
+      # rather than leaving it on the code default.
+      TOOL_ACCESS_MODE: ${TOOL_ACCESS_MODE:-enforce}
     volumes:
       - health-data:/app/data
       - ${TRELLIS_WORKSPACE_DIR:-./workspace}:/app/workspace

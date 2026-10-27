@@ -397,3 +397,93 @@ def test_is_tool_configured_no_user_id_reports_global_requirements_only(monkeypa
 
     assert result["configured"] is False
     assert result["missing_secrets"] == ["SOME_REQUIRED_SECRET"]
+
+
+# --- the search read-filter: front door vs an agent run ------------------------ #
+
+
+def _install_group_policy(monkeypatch, target, group="ops"):
+    """A policy with one group rule, read through the module's registry seam."""
+    import json
+
+    from core import auth as auth_module
+    from core import agent_token, tool_access
+
+    policy = {"rules": [{"targets": [target], "groups": [group]}]}
+
+    class FakeEtcd:
+        def get(self, key, **_kwargs):
+            if key == tool_access.POLICY_PATH:
+                meta = type("M", (), {"mod_revision": 1})()
+                return json.dumps(policy).encode("utf-8"), meta
+            return None, None
+
+        def put(self, key, value):
+            raise AssertionError(f"no write expected: {key}")
+
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", "tool-search-unit-secret-0123456789abcdef")
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+    monkeypatch.delenv(tool_access.MODE_ENV, raising=False)
+    monkeypatch.setattr(tool_access, "_client", lambda: FakeEtcd())
+    tool_access.reset_snapshot()
+    monkeypatch.setattr(auth_module, "agent_token_var", _FreshVar())
+    return agent_token
+
+
+class _FreshVar:
+    """A context var per test, so no token leaks in from another test."""
+
+    def __init__(self):
+        import contextvars
+
+        self._var = contextvars.ContextVar("test-agent-token", default=None)
+
+    def get(self):
+        return self._var.get()
+
+    def set(self, value):
+        return self._var.set(value)
+
+
+def test_the_front_door_keeps_its_cards_when_no_token_carries_groups(monkeypatch):
+    """No verified token ⇒ no group claims ⇒ the read filter must not run.
+
+    Applying a group rule to an empty group set on the front door would hide cards
+    from the very users who do hold the group (the search runs before any run minted
+    a token). Execution still enforces the rule when the tool is called.
+    """
+    _install_group_policy(monkeypatch, "opsctl")
+    _patch_registry(monkeypatch, tool_configs=TOOL_CONFIGS, mcp_configs={})
+    monkeypatch.setattr(tool_search, "embed_text", lambda text, task_type: None)
+
+    results = asyncio.run(tool_search.search_tools("opsctl connector diagnostics"))
+    names = {r["name"] for r in results}
+
+    assert "opsctl" in names
+
+
+def test_an_agent_run_still_filters_cards_by_its_group_rules(monkeypatch):
+    """An agent run's cards ARE narrowed: its token carries the groups to decide with."""
+    agent_token = _install_group_policy(monkeypatch, "opsctl")
+    _patch_registry(monkeypatch, tool_configs=TOOL_CONFIGS, mcp_configs={})
+    monkeypatch.setattr(tool_search, "embed_text", lambda text, task_type: None)
+
+    from core import auth as auth_module
+
+    auth_module.agent_token_var.set(
+        agent_token.mint("agent-a", user_id="user-1", groups=("sre",))
+    )
+
+    results = asyncio.run(tool_search.search_tools("opsctl connector diagnostics"))
+    names = {r["name"] for r in results}
+
+    assert "opsctl" not in names  # the rule admits `ops` only
+
+    auth_module.agent_token_var.set(
+        agent_token.mint("agent-a", user_id="user-1", groups=("ops",))
+    )
+    allowed = {
+        r["name"]
+        for r in asyncio.run(tool_search.search_tools("opsctl connector diagnostics"))
+    }
+    assert "opsctl" in allowed

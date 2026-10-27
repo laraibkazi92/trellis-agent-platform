@@ -627,6 +627,10 @@ def _discard_background(coro, name):
 
 
 def _patch_host_agent(monkeypatch, agent_name, config):
+    # A host run mints its agent token: enforcing is the default, so an unkeyed run
+    # is refused up front (see core.agent_token.mint_for_run).
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", "guardrails-host-unit-secret-0123456789")
+    monkeypatch.delenv("DEV_MODE", raising=False)
     monkeypatch.setattr(host.identity_mgr, "get_disabled_standard_agents", lambda: [])
     monkeypatch.setattr(host.identity_mgr, "get_agent_config", lambda name: config)
     monkeypatch.setattr(host.identity_mgr, "record_guardrail_hits", lambda *a, **k: None)

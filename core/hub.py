@@ -18,9 +18,10 @@ from starlette.responses import JSONResponse
 from core import agent_token as agent_token_module
 from core import allowlist
 from core import edge_secrets_central
+from core import tool_access
 from core.models import ToolConfig
 from core.auth import get_identity_manager
-from core.caller_identity import identity_incomplete_error, resolve_mint_identity
+from core.caller_identity import identity_incomplete_error
 from core.env_sanitize import sanitized_env
 from core.devmode import enforce_dev_mode_safety
 # The execution core lives in core.tool_runtime so the edge proxy
@@ -158,18 +159,21 @@ def load_tool_configs() -> Optional[Dict[str, tuple[ToolConfig, Optional[Path]]]
 async def _authorize_call(
     config: ToolConfig, raw_token: Optional[str]
 ) -> tuple[Optional[agent_token_module.Claims], Optional[Dict[str, Any]]]:
-    """Verify the agent token and the agent's effective allowlist.
+    """Verify the agent token, then ask the ONE tool-access evaluator about this call.
 
     Returns ``(claims, denial)``. ``denial`` is the result dict to send back, or
-    ``None`` when the call may proceed. In ``log`` mode a refusal is recorded and
-    the call still runs (one rollout window); ``off`` skips everything.
+    ``None`` when the call may proceed.
 
     There are no exempt callers: the token's agent is resolved in the registry and
-    checked against its own ``allowed_tools``, whoever minted it. A caller with no
-    agent record (the gateway front door mints for the external client it serves)
-    has no allowlist to resolve, so the tool's own ``public`` exposure is the only
-    grant that can apply -- the same rule the gateway already applied before
-    dispatching.
+    its own allowlist is the grant, whoever minted it. A caller with no agent record
+    (the gateway front door mints for the external client it serves) has no allowlist
+    to resolve, so the tool's own ``public`` exposure is its only possible grant.
+    Group rules from ``workspace/policies/tool_access.yaml`` apply on top, under
+    ``TOOL_ACCESS_MODE`` (see :mod:`core.tool_access`).
+
+    ``ENFORCE_AGENT_TOKENS=off`` skips the whole gate; ``log`` is its rollout window --
+    a rejected token or an allowlist refusal is logged and the call still runs, while
+    a group-rule verdict (which has its own switch) is applied.
     """
     mode = agent_token_module.mode()
     if mode == "off":
@@ -187,42 +191,43 @@ async def _authorize_call(
             return None, None
         return None, {"error": message}
 
-    config_data = await asyncio.to_thread(identity_mgr.get_agent_config, claims.agent)
-    if not config_data:
-        if config.public:
-            return claims, None
-        message = f"access_denied: unknown agent '{claims.agent}'"
-        if mode == "log":
-            logger.warning("hub: would deny %r: %s", config.name, message)
-            return claims, None
-        return claims, {"error": message}
+    record = await asyncio.to_thread(identity_mgr.get_agent_config, claims.agent)
+    decision = await tool_access.enforce_async(
+        await tool_access.authorize_claims_async(
+            claims,
+            target=config.name,
+            allowed=allowlist.resolve(record) if record else None,
+            public=bool(config.public) if not record else False,
+            surface="hub",
+        ),
+        agent=claims.agent,
+        groups=claims.groups,
+        target=config.name,
+        surface="hub",
+    )
+    if decision.allowed:
+        return claims, None
+    if mode == "log" and decision.reason in {
+        tool_access.REASON_NOT_IN_ALLOWLIST,
+        tool_access.REASON_UNKNOWN_TARGET,
+    }:
+        # Token/allowlist rollout only: the group-rule verdict above is final.
+        logger.warning("hub: would deny %r: %s", config.name, decision.message)
+        return claims, None
+    return claims, {"error": decision.message}
 
-    allowed = allowlist.resolve(config_data)
-    if not allowlist.permits_tool(allowed, config.name):
-        message = agent_token_module.deny_message(claims.agent, config.name)
-        if mode == "log":
-            logger.warning("hub: would deny %r: %s", config.name, message)
-            return claims, None
-        return claims, {"error": message}
-    return claims, None
 
-
-async def _caller_attributes(
-    claims: Optional[agent_token_module.Claims], user_id: Optional[str]
+def _caller_attributes(
+    claims: Optional[agent_token_module.Claims],
 ) -> tuple[Optional[str], tuple[str, ...]]:
-    """The caller's ``(email, groups)``: claims when a token verified, else the record.
+    """The caller's ``(email, groups)`` -- from the verified token and nowhere else.
 
     A verified token is the ONLY identity authority, so nothing is re-read from the
-    registry for a token-bearing call. The record read below exists for the no-token
-    dev/rollout path (``ENFORCE_AGENT_TOKENS=off``, or a DEV_MODE deployment with no
-    minting secret), where there are no claims to trust.
+    registry for a token-bearing call.
     """
-    if claims is not None:
-        return claims.user_email, claims.groups
-    if not user_id:
+    if claims is None:
         return None, ()
-    resolved = await resolve_mint_identity(identity_mgr, user_id)
-    return resolved["user_email"], resolved["groups"]
+    return claims.user_email, claims.groups
 
 
 @stamina.retry(on=TransientToolError, attempts=3)
@@ -304,7 +309,7 @@ async def _build_tool_env(
             env.update(safe_vars)
 
         # Auto-inject user identity: the caller the token proves, not the body's claim.
-        email, _groups = await _caller_attributes(claims, user_id)
+        email, _groups = _caller_attributes(claims)
         env["TRELLIS_USER_ID"] = str(user_id)
         if email:
             env["TRELLIS_USER_EMAIL"] = email
@@ -597,88 +602,6 @@ async def _run_remote(
     return {"error": error}
 
 
-_HUB_CALL_DENIED = (
-    "SYSTEM: Access denied. Tool '{name}' is not permitted for this principal."
-)
-_HUB_CALL_CHECK_FAILED = (
-    "SYSTEM: Error checking tool access for '{name}'. Please try again later."
-)
-
-
-async def _authorize_hub_call(
-    config: ToolConfig, raw_token: Optional[str], user_id: Optional[str]
-) -> Optional[Dict[str, Any]]:
-    """Default-deny check for a direct hub ``/tools/call`` (``hub_call_mode``).
-
-    Agent-driven calls already carry the run's agent token, so this resolves the same
-    principal ``use_tool`` would and runs the same evaluator under its own rollout key
-    and its own ``surface="hub_direct"`` ring tag. Returns the result dict to send back
-    or ``None`` when the tool may run.
-
-    ``off`` (the default) is a no-I/O fast path once the authz snapshot is warm: no
-    token verification, no policy evaluation. A malformed or expired token is not an
-    error here -- the principal falls back to the call's ``user_id`` (which is itself
-    claims-derived or the no-token dev fallback) or ``anonymous``, because rejecting
-    tokens belongs to the agent-token gate above, not to this one. The token's ``g``
-    claim also supplies the caller's groups (the stored record is read only when the
-    claim is empty): this process has no request for the middleware to publish them
-    from, and without them a ``group:`` rule would match on the host and deny here for
-    the same call. Everything else fails closed: an exception inside the check never
-    runs the tool.
-
-    Note the same caveat as the other surfaces: if the authz state has never been
-    readable, the cold snapshot says ``off`` and the gate fails open until a read
-    succeeds.
-    """
-    from core import tool_authz
-
-    surface = tool_authz.HUB_DIRECT_SURFACE
-
-    def _verdict() -> Optional[Dict[str, Any]]:
-        mode = tool_authz.cached_mode_for_surface(surface)
-        if mode is None:
-            mode = tool_authz.mode_for_surface(surface)
-        if mode == "off":
-            return None
-        claims = agent_token_module.verify_or_none(raw_token)
-        if claims is None and raw_token:
-            logger.warning(
-                "hub: agent token presented for %r did not verify; resolving the "
-                "principal without claims (agent:/workflow: rules cannot match)",
-                config.name,
-            )
-        if (
-            claims is not None
-            and claims.user_id
-            # Service identities (`svc_agent_*`) never have a profile record, and a
-            # synthetic one must not grant a workflow groups the host would not see.
-            and not str(claims.user_id).startswith("svc_agent_")
-        ):
-            # The mint read the user record once: its claim is the caller's authority,
-            # so only a token WITHOUT groups falls back to the record here.
-            tool_authz.set_request_groups(
-                list(claims.groups) or tool_authz.stored_user_groups(claims.user_id)
-            )
-        try:
-            principal = tool_authz.principal_for(claims, user_id)
-            if tool_authz.allowed(
-                principal, config.name, "tools:call", surface=surface, mode=mode
-            ):
-                return None
-            return {"error": _HUB_CALL_DENIED.format(name=config.name)}
-        finally:
-            # `to_thread` copies the context, so the copy would be discarded anyway;
-            # clear it so a future non-threaded caller cannot leak one verdict's groups
-            # into the next.
-            tool_authz.clear_request_groups()
-
-    try:
-        return await asyncio.to_thread(_verdict)
-    except Exception:
-        logger.exception("Hub tool authorization check failed for %r", config.name)
-        return {"error": _HUB_CALL_CHECK_FAILED.format(name=config.name)}
-
-
 def _caller_user_id(
     claims: Optional[agent_token_module.Claims],
     presented_token: Optional[str],
@@ -716,11 +639,6 @@ async def run_tool(config: ToolConfig, tool_dir: Optional[Path], arguments: Dict
     try:
         if denial is not None:
             return denial
-        # Direct hub traffic has no principal until the call proves one: gate it before
-        # anything is executed (locally or on an edge).
-        hub_denial = await _authorize_hub_call(config, raw_token, user_id)
-        if hub_denial is not None:
-            return hub_denial
         if config.remote is not None:
             return await _run_remote(config, arguments, agent_token=raw_token, claims=claims)
         return await _run_tool_attempt(
@@ -935,15 +853,12 @@ if __name__ == "__main__":
 
     install_redaction()
     require_secret("hub")
-    # Policy and rollout-mode changes have to reach the last mile as fast as the other
-    # surfaces: without this watch the hub only notices them when its 30 s snapshot
-    # cache expires, so an operator's rollback to `shadow` would not be immediate.
+    # A policy edit has to reach this process as fast as the others: without the
+    # watch the hub would keep the document it last loaded until the snapshot TTL.
     try:
-        from core.tool_authz import install_tool_authz_watch
-
-        install_tool_authz_watch()
+        tool_access.install_watch()
     except Exception:
-        logger.exception("Failed to install tool-authorization watch; using the cache TTL")
+        logger.exception("Failed to install the tool-access watch; using the cache TTL")
     register_tools()
     # Edge catalogs are published at runtime, so the tool table has to follow etcd
     # instead of being read once at boot. 0 disables the watcher (tests/CI).

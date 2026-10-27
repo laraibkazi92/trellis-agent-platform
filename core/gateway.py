@@ -44,20 +44,18 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app):
     enforce_dev_mode_safety("gateway")
-    try:
-        from core.tool_authz import install_tool_authz_watch
+    from core import tool_access
 
-        install_tool_authz_watch()
+    try:
+        tool_access.install_watch()
     except Exception:
-        logger.exception("Failed to install tool-authorization watch; continuing startup")
+        logger.exception("Failed to install the tool-access watch; continuing startup")
     app.state.http_client = httpx.AsyncClient(timeout=30.0)
     yield
     try:
-        from core.tool_authz import cancel_tool_authz_watch
-
-        cancel_tool_authz_watch()
+        tool_access.cancel_watch()
     except Exception:
-        logger.exception("Failed to cancel tool-authorization watch")
+        logger.exception("Failed to cancel the tool-access watch")
     await app.state.http_client.aclose()
 
 # Initialize FastMCP server with host and port
@@ -547,7 +545,6 @@ async def search_tools(ctx: Context, query: str, limit: Optional[int] = None) ->
         query=query,
         limit=limit,
         user_id=user_id,
-        principal=f"user:{user_id}" if user_id else None,
     )
 
     names = [r["name"] for r in results]
@@ -622,7 +619,6 @@ async def use_tool(ctx: Context, tool_name: str, arguments: Dict[str, Any]) -> A
         get_hub_client_fn=get_hub_client,
         get_external_mcp_client_fn=get_external_mcp_client,
         call_edge_mcp_fn=call_edge_mcp,
-        principal=f"user:{user_id}" if user_id else None,
     )
     if not (isinstance(output, str) and output.startswith("SYSTEM:")):
         await ctx.report_progress(3, 3, message=f"Tool '{tool_name}' execution complete.")

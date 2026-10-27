@@ -155,7 +155,7 @@ The variables below are the ones you must touch for a first deployment. Everythi
 | `TRELLIS_IMAGE` | Optional | Pins the engine image tag or digest, e.g. `ghcr.io/laraibkazi92/trellis-agent-platform:v0.4.0`. |
 | `TRELLIS_UID` / `TRELLIS_GID` | Optional | Container uid:gid for workspace file ownership. Defaults to `1000:1000`. |
 | `DEV_MODE` | No | Keep `false` for anything shared. `true` disables **all** authentication. |
-| `OIDC_GROUPS_CLAIM` | Optional | Identity-provider claim holding group membership for `group:` tool-authz rules (default `groups`). Accepted as a list or a comma-separated string. |
+| `OIDC_GROUPS_CLAIM` | Optional | Identity-provider claim holding group membership for the tool-access group rules (default `groups`). Accepted as a list or a comma-separated string. |
 | `HOST_BIND` | Optional | Host address published ports bind to. Default `0.0.0.0`. |
 | `SYNC_FORCE_PRUNE` | Optional | Escape hatch for the registry prune guard. Default `false`. |
 | `SSL_ENABLED` | Optional | Set `True` to serve the front door over HTTPS. Default `False`. |
@@ -245,7 +245,7 @@ docker compose exec host python scripts/trellis logs [AGENT] --limit 20
 
 ## Content authoring workflow
 
-The workspace files are the source of truth on every rebuild. The `db-sync` init container runs once at startup (`python scripts/sync_to_db.py`) and pushes `workspace/agents`, `workspace/tools`, `workspace/workflows`, and `workspace/mcps` into the etcd registry. Agent and tool edits made in the UI are **dual-written** back to the matching workspace file, so a UI change surfaces as a diff in your content repo — commit it there.
+The workspace files are the source of truth on every rebuild. The `db-sync` init container runs once at startup (`python scripts/sync_to_db.py`) and pushes `workspace/agents`, `workspace/tools`, `workspace/workflows`, `workspace/mcps`, and `workspace/policies/tool_access.yaml` (tool-access group rules) into the etcd registry. Agent and tool edits made in the UI are **dual-written** back to the matching workspace file, so a UI change surfaces as a diff in your content repo — commit it there.
 
 Two consequences worth internalizing:
 

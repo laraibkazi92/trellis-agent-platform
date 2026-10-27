@@ -229,14 +229,14 @@ def _install_llm_key_watch_on_startup(state) -> None:
     install_llm_defaults_watch()
     warm_key_cache()
     warm_defaults_cache()
-    # The worker is its own process, so the tool-authorization policy watch must be
+    # The worker is its own process, so the tool-access policy watch must be
     # registered here too. A failure must never block worker startup.
     try:
-        from core.tool_authz import install_tool_authz_watch
+        from core import tool_access
 
-        install_tool_authz_watch()
+        tool_access.install_watch()
     except Exception as e:
-        print(f"Failed to install tool-authorization watch: {e}")
+        print(f"Failed to install the tool-access watch: {e}")
 
 scheduler = TaskiqScheduler(
     broker=broker,

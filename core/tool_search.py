@@ -18,6 +18,7 @@ from typing import List, Dict, Any, Optional
 import httpx
 
 from core.auth import get_identity_manager
+from core import allowlist
 from core.embeddings import embed_text, cosine
 from core.discovery import is_tool_configured, resolve_edge_mcp_target
 from core.tunables import resolve as resolve_tunable
@@ -360,7 +361,6 @@ async def search_tools(
     query: str,
     limit: Optional[int] = None,
     user_id: Optional[str] = None,
-    principal: Optional[str] = None,
     detail: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return up to ``limit`` publicly-whitelisted tools most relevant to ``query``.
@@ -377,10 +377,9 @@ async def search_tools(
     ``is_tool_configured``; unconfigured tools get ``configured: False`` and their
     description gains a trailing note naming the missing secrets/variables.
 
-    When the tool-authorization engine is enforced (any mode but ``off``), candidates
-    the principal may not read are dropped before ranking; ``shadow`` mode logs the
-    would-be denial and keeps the tool. ``principal`` defaults to the caller's
-    context principal, resolved once via ``tool_authz.resolve_current_principal``.
+    Candidates the caller's token groups may not use are dropped before ranking
+    (``TOOL_ACCESS_MODE``; ``shadow`` logs the would-be denial and keeps the card).
+    Groups come from the run's verified token only.
 
     Pass ``limit <= 0`` to get the full ranked list (mirrors ``search_agents``).
     ``limit=None`` (the default) resolves to the admin-tunable ``tool_search_limit``
@@ -460,19 +459,42 @@ async def search_tools(
     if not candidates:
         return []
 
-    # Default-deny read filter. `off` bypasses the engine entirely; in `shadow` the
-    # engine logs the would-be denial and still returns True, so one comprehension
-    # covers both enforce modes. A failure here is fail-closed: no tools at all.
+    # Group-rule filter. The catalog above is already the *public* one (every
+    # candidate carries `public: true`), so the evaluator's front-door rule is what
+    # applies: no allowlist narrowing (a search may show a tool this run cannot call --
+    # execution is gated elsewhere), group rules only. `off` skips them; `shadow`
+    # logs and keeps the card. A failure here is fail-closed: no tools at all.
+    #
+    # No verified token means no group claims, and a group rule evaluated against an
+    # empty group set would hide cards from the very users who do hold the group (the
+    # search runs on the front door, before any run minted a token). So the read filter
+    # applies only to an agent run; execution still enforces the rule when the tool is
+    # actually called.
     try:
-        from core import tool_authz
+        from core import tool_access
+        from core.tool_gate import current_claims
+
+        claims = current_claims()
 
         def _filter_readable(cands: List[Dict]) -> List[Dict]:
-            if tool_authz.get_mode() == "off":
+            if claims is None:
                 return cands
-            authz_principal = principal or tool_authz.resolve_current_principal()
             return [
-                c for c in cands
-                if tool_authz.allowed(authz_principal, c["name"], "tools:read")
+                c
+                for c in cands
+                if tool_access.enforce(
+                    tool_access.authorize_claims(
+                        claims,
+                        target=c["name"],
+                        allowed=None,
+                        public=True,
+                        surface="host",
+                    ),
+                    agent=getattr(claims, "agent", None),
+                    groups=getattr(claims, "groups", ()) or (),
+                    target=c["name"],
+                    surface="host",
+                ).allowed
             ]
 
         candidates = await asyncio.to_thread(_filter_readable, candidates)
@@ -555,13 +577,15 @@ async def search_tools(
     return results
 
 
-async def is_tool_publicly_whitelisted(tool_name: str, identity_manager: Optional[Any] = None) -> bool:
-    """Authorization Guard for `use_tool`: check `public`/`public_tools` directly against
-    the tool's/MCP's own registry config, independent of `search_tools`.
+async def published_exposure(tool_name: str, identity_manager: Optional[Any] = None) -> bool:
+    """Is this tool/MCP tool exposed for direct execution by a caller with no record?
 
-    Fails closed on anything unexpected (unknown tool, malformed `mcp__` name, non-`True`
-    `public` value, non-list `public_tools`) — mirrors the secure-by-default checks
-    already applied in `is_tool_configured`/`search_tools`.
+    This is the ``public=`` input of the one evaluator (:mod:`core.tool_access`) for
+    the external front door: a gateway client has no agent record, so the tool's own
+    published exposure replaces the allowlist half. Fails closed on anything
+    unexpected (unknown tool, malformed ``mcp__`` name, non-``True`` ``public`` value,
+    non-list ``public_tools``) — mirrors the secure-by-default checks already applied
+    in ``is_tool_configured``/``search_tools``.
 
     MCP tool names resolve through ``resolve_edge_mcp_target``: a name is an
     edge-exported server only when its ``<site>__<mcp>`` key is a registered config with
@@ -636,9 +660,8 @@ async def execute_whitelisted_tool(
     get_hub_client_fn=None,
     get_external_mcp_client_fn=None,
     call_edge_mcp_fn=None,
-    principal: Optional[str] = None,
 ) -> Any:
-    """Shared use_tool execution flow: whitelist check -> authorization check -> configuration check -> dispatch -> output extraction.
+    """Shared use_tool execution flow: authorization -> configuration check -> dispatch -> output extraction.
 
     Returns the raw structured tool output, or a 'SYSTEM: ...' error string. Callers inject
     their own module-level seams (`is_configured`, hub/external client getters, the edge
@@ -646,33 +669,55 @@ async def execute_whitelisted_tool(
     to this module's `identity_mgr` (the `is_configured` default binds this module's name
     at def time).
 
-    `principal` is the authorization principal for `tools:call`; when omitted it is
-    resolved from the caller's context. Any failure of the authorization engine fails
-    closed (the call is denied) because this is a security boundary, not observability.
+    Authorization is the one evaluator (:mod:`core.tool_access`): the agent and its
+    groups come from the run's verified token, the allowlist from that agent's record.
+    A caller with no agent record (the external gateway front door) is granted by the
+    target's own published exposure instead. Any failure of the evaluator fails closed
+    (the call is denied) because this is a security boundary, not observability.
     """
     mgr = identity_manager or identity_mgr
+    from core import tool_access
+    from core.tool_gate import current_claims
+
+    claims = current_claims()
+    agent = getattr(claims, "agent", None)
+    groups = getattr(claims, "groups", ()) or ()
+    record = (
+        await asyncio.to_thread(mgr.get_agent_config, agent) if agent else None
+    )
 
     try:
-        whitelisted = await is_tool_publicly_whitelisted(tool_name, mgr)
-    except Exception as e:
-        logger.error("Error checking tool access for %r: %s", tool_name, e, exc_info=True)
-        return f"SYSTEM: Error checking tool access for '{tool_name}'. Please try again later."
-    if not whitelisted:
-        return f"SYSTEM: Access denied. Tool '{tool_name}' is internal and not exposed for direct execution."
-
-    try:
-        from core import tool_authz
-
-        def _authorized_call() -> bool:
-            authz_principal = principal or tool_authz.resolve_current_principal()
-            return tool_authz.allowed(authz_principal, tool_name, "tools:call")
-
-        permitted = await asyncio.to_thread(_authorized_call)
+        exposure = False if record else await published_exposure(tool_name, mgr)
+        decision = await tool_access.enforce_async(
+            await tool_access.authorize_claims_async(
+                claims,
+                target=tool_name,
+                allowed=allowlist.resolve(record) if record else None,
+                public=exposure,
+                surface="host",
+            ),
+            agent=agent,
+            groups=groups,
+            target=tool_name,
+            surface="host",
+        )
     except Exception:
         logger.exception("Tool authorization check failed for %r", tool_name)
         return f"SYSTEM: Error checking tool access for '{tool_name}'. Please try again later."
-    if not permitted:
-        return f"SYSTEM: Access denied. Tool '{tool_name}' is not permitted for this principal."
+    if not decision.allowed:
+        logger.warning("use_tool: denied %r: %s", tool_name, decision.message)
+        if not record and decision.reason in {
+            tool_access.REASON_NOT_IN_ALLOWLIST,
+            tool_access.REASON_UNKNOWN_TARGET,
+        }:
+            return (
+                f"SYSTEM: Access denied. Tool '{tool_name}' is internal and not "
+                "exposed for direct execution."
+            )
+        return (
+            f"SYSTEM: Access denied. Tool '{tool_name}' is not permitted "
+            "for this principal."
+        )
 
     try:
         status = await is_configured(tool_name, user_id)

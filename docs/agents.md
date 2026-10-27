@@ -95,6 +95,8 @@ workspace/agents/
 
 Both files are required. After creating them, restart the containers (`docker compose up -d --build`) to register the agent.
 
+Group-based tool access is not configured per agent: it lives in one workspace file, `workspace/policies/tool_access.yaml`, alongside the per-agent `allowed_tools` allowlist.
+
 ---
 
 ### `config.yaml` — All Fields

@@ -166,11 +166,39 @@ def _clean_relay():
 def _agent_token_env(monkeypatch):
     """Startup refuses to run without a key, so every test gets one.
 
-    ``ENFORCE_AGENT_TOKENS`` stays unset (``log``) here: the enforcement tests set
-    ``enforce`` explicitly, and the rest of the suite keeps its pre-v0.6 behaviour.
+    ``ENFORCE_AGENT_TOKENS=log`` here: the enforcement tests set ``enforce``
+    explicitly, and the rest of the suite keeps its pre-token behaviour (a call with
+    no token is logged and forwarded).
     """
     monkeypatch.setenv("AGENT_TOKEN_SECRET", AGENT_SECRET)
-    monkeypatch.delenv("ENFORCE_AGENT_TOKENS", raising=False)
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "log")
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_tool_access(monkeypatch):
+    """The relay asks :mod:`core.tool_access`; keep it off etcd.
+
+    An absent policy document means "no group rules", so the agent allowlist alone
+    decides -- the pre-v0.7.1 behaviour these tests were written against.
+    """
+    from core import tool_access
+
+    class _NoPolicy:
+        def put(self, key, value):
+            raise AssertionError(f"no write expected: {key}")
+
+        def get(self, key, **_kwargs):
+            return None, None
+
+    monkeypatch.setattr(tool_access, "_client", lambda: _NoPolicy())
+    monkeypatch.delenv(tool_access.MODE_ENV, raising=False)
+    tool_access.reset_snapshot()
+    with tool_access._shadow_lock:
+        tool_access._shadow_ring.clear()
+    yield
+    tool_access.reset_snapshot()
+    with tool_access._shadow_lock:
+        tool_access._shadow_ring.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -2311,14 +2339,15 @@ def test_an_unknown_agent_is_refused(enforcing):
     )
 
     assert response.status_code == 403
-    assert "unknown agent" in response.json()["error"]["message"]
+    assert "agent 'ghost'" in response.json()["error"]["message"]
 
 
 def test_the_front_door_gets_no_exemption(enforcing):
     """The gateway has no agent record, so it has no allowlist either.
 
-    v0.7.1 Phase 3: `principal="system"` and the `gateway` agent name grant nothing.
-    Its only possible grant on the edge is the export's own public exposure.
+    v0.7.1 Phase 3/4: there is no elevated principal any more (the `k` claim and the
+    `principal=` kwarg are gone). The `gateway` agent name grants nothing; its only
+    possible grant on the edge is the export's own public exposure.
     """
     conn = _install_conn()
     conn.request = pytest.fail
@@ -2328,13 +2357,13 @@ def test_the_front_door_gets_no_exemption(enforcing):
         json={
             "tool": "echo",
             "args": {"q": "x"},
-            "agent_token": _mint("gateway", principal="system"),
+            "agent_token": _mint("gateway"),
         },
     )
 
     assert response.status_code == 403
     assert response.json()["error"]["code"] == "access_denied"
-    assert "unknown agent" in response.json()["error"]["message"]
+    assert "agent 'gateway'" in response.json()["error"]["message"]
     assert conn.ws.sent == []
 
 
@@ -2373,7 +2402,9 @@ def test_a_public_export_is_the_front_doors_grant(enforcing):
     conn = _install_conn()
     seen = {}
     conn.request = _capture(seen)
-    enforcing.tools["site-a__echo"] = {"name": "site-a__echo", "public": True}
+    enforcing.save_edge_config(
+        "site-a", {"name": "site-a", "enabled": True, "public": True, "public_tools": []}
+    )
 
     response = TestClient(app_module.app).post(
         "/v1/sites/site-a/call",
@@ -2389,7 +2420,9 @@ def test_a_public_export_does_not_widen_an_agents_allowlist(enforcing):
     conn = _install_conn()
     conn.request = pytest.fail
     enforcing.agents["agent-a"] = _agent(tools=[])
-    enforcing.tools["site-a__echo"] = {"name": "site-a__echo", "public": True}
+    enforcing.save_edge_config(
+        "site-a", {"name": "site-a", "enabled": True, "public": True, "public_tools": []}
+    )
 
     response = TestClient(app_module.app).post(
         "/v1/sites/site-a/call",
@@ -2417,11 +2450,16 @@ def test_a_public_mcp_tool_list_is_the_front_doors_grant(enforcing):
     assert denied.status_code == 403
     assert denied.json()["error"]["code"] == "access_denied"
 
-    enforcing.mcps["site-a__devops-cli"] = {
-        "name": "site-a__devops-cli",
-        "public": False,
-        "public_tools": ["tenant_account_tools"],
-    }
+    enforcing.save_edge_config(
+        "site-a",
+        {
+            "name": "site-a",
+            "enabled": True,
+            "public": False,
+            # A site record names an MCP tool by its documented reference form.
+            "public_tools": ["mcp__site-a__devops-cli__tenant_account_tools"],
+        },
+    )
     allowed = client.post("/v1/sites/site-a/mcps/devops-cli/call", json=body)
     assert allowed.status_code == 200
     assert seen["call"][0] == "devops-cli"

@@ -11,6 +11,7 @@ an exception inside the agent turn.
 
 import asyncio
 
+import pytest
 from pydantic_ai_backends.backends.local import DEFAULT_EXECUTE_TIMEOUT
 
 from core.console_backend import RunnerConsoleBackend, _run_sync
@@ -18,6 +19,48 @@ from core.execution.client import RunnerCallError, RunnerUnavailable
 from core.execution.contract import ExecResult
 
 MAX_OUTPUT = 100_000
+CONSOLE_SECRET = "console-runner-unit-secret-0123456789abcdef"
+
+
+@pytest.fixture(autouse=True)
+def _console_authorized(monkeypatch):
+    """`execute` asks the evaluator before it asks the runner.
+
+    These tests pin the request shape, so the run gets a valid token whose agent's
+    allowlist carries the console tool -- the pre-runner gate itself is covered in
+    tests/test_enforcement_matrix.py.
+    """
+    from core import agent_token, tool_access
+
+    class _NoPolicy:
+        def put(self, key, value):
+            raise AssertionError(f"no write expected: {key}")
+
+        def get(self, key, **_kwargs):
+            return None, None
+
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", CONSOLE_SECRET)
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+    monkeypatch.delenv(tool_access.MODE_ENV, raising=False)
+    monkeypatch.setattr(tool_access, "_client", lambda: _NoPolicy())
+    tool_access.reset_snapshot()
+    monkeypatch.setattr(
+        agent_token,
+        "current_token",
+        lambda: agent_token.mint("console-agent", user_id="user-1"),
+    )
+    from core import auth
+
+    auth.agent_token_var.set(agent_token.mint("console-agent", user_id="user-1"))
+    monkeypatch.setattr(
+        auth,
+        "get_identity_manager",
+        lambda: __import__("types").SimpleNamespace(
+            get_agent_config=lambda name: {"allowed_tools": ["execute"]}
+        ),
+    )
+    yield
+    auth.agent_token_var.set(None)
 
 
 class FakeRunnerClient:
@@ -141,6 +184,58 @@ def test_a_denial_never_reaches_the_runner():
         exit_code=1,
         truncated=False,
     )
+    assert client.requests == []
+
+
+def test_a_run_without_the_execute_grant_is_denied_and_never_reaches_the_runner(monkeypatch):
+    """The console gate is deny-by-default: no `execute` in the record, no container."""
+    import types
+
+    from core import auth, tool_access
+
+    client = FakeRunnerClient()
+    backend = _backend(client)
+    tool_access.reset_snapshot()
+    monkeypatch.setattr(
+        auth,
+        "get_identity_manager",
+        lambda: types.SimpleNamespace(
+            get_agent_config=lambda name: {"allowed_tools": ["read_file"]}
+        ),
+    )
+
+    response = backend.execute("echo hi", timeout=5)
+
+    assert "access_denied" in response.output
+    assert "'execute'" in response.output
+    assert response.exit_code == 1
+    assert client.requests == []
+
+
+def test_a_registry_failure_during_the_gate_returns_an_error_response(monkeypatch):
+    """A failed access check must not raise out of the agent's shell tool."""
+    import types
+
+    from core import auth, tool_access
+
+    client = FakeRunnerClient()
+    backend = _backend(client)
+    tool_access.reset_snapshot()
+
+    def boom(name):
+        raise RuntimeError("etcd unavailable")
+
+    monkeypatch.setattr(
+        auth,
+        "get_identity_manager",
+        lambda: types.SimpleNamespace(get_agent_config=boom),
+    )
+
+    response = backend.execute("echo hi", timeout=5)
+
+    assert response.output.startswith("Error: access check failed")
+    assert "etcd unavailable" in response.output
+    assert response.exit_code == 1
     assert client.requests == []
 
 

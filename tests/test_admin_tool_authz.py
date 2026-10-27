@@ -1,59 +1,46 @@
 # Copyright (C) 2026 Laraib Kazi
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for Admin -> Tool Authorization (`/admin/tool-authz`).
+"""Tests for Admin -> Tool Authorization (`/admin/tool-authz`), v0.7.1 read-only.
 
-Covers the bound-tools rollout form (v0.7.1 Phase 1) alongside the original
-`use_tool` mode form: the page must render both current modes and the shared deny
-ring's `surface` tag, and each POST must keep the "no change without confirmation"
-rule. Everything runs against a fake identity manager and stubbed authz reads: no
-etcd, no network, no template surprises.
+The page is a window onto the one evaluator (`core/tool_access`): the loaded group
+rules and policy version, the `TOOL_ACCESS_MODE` switch, each agent's effective
+allowlist and the shadow-denial ring. It must render all of that and must not write
+anything -- the policy editor, the three per-surface mode switches, bootstrap,
+clear-shadow and the principal-groups editor are gone, and their routes are gone with
+them.
+
+Rendering runs against a fake identity manager and stubbed evaluator reads (no etcd,
+no network); the removed routes are probed through a real Starlette app so the
+assertions are about the actual routing table, not a helper's name.
 """
 
 import asyncio
 from types import SimpleNamespace
 
 import pytest
-from starlette.datastructures import FormData
+from fastapi import FastAPI, Request
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.testclient import TestClient
 
-from core import tool_authz
+from core import tool_access
 from core.routers import admin
 
 ADMIN_EMAIL = "admin@example.com"
+SESSION_SECRET = "test-session-secret"
 
 
-class FakeAuthzIdentityManager:
-    """Registry stand-in recording the mode writes the routes perform."""
+class FakeIdentityManager:
+    """Only the reads the read-only page performs."""
 
-    def __init__(self):
-        self.tool_authz_modes = []
-        self.bound_tools_modes = []
-        self.hub_call_modes = []
-        self.saved_policies = []
-
-    def set_tool_authz_mode(self, mode):
-        self.tool_authz_modes.append(mode)
-
-    def set_bound_tools_mode(self, mode):
-        self.bound_tools_modes.append(mode)
-
-    def set_hub_call_mode(self, mode):
-        self.hub_call_modes.append(mode)
-
-    def save_tool_policies(self, policy):
-        self.saved_policies.append(policy)
-
-    def get_principal_groups(self):
-        return {}
-
-    def get_all_tool_configs(self):
-        return {}
-
-    def get_all_mcp_configs(self):
-        return {}
+    def __init__(self, agents=None, agents_error=None):
+        self.agents = agents if agents is not None else {}
+        self.agents_error = agents_error
 
     def get_all_agent_configs(self):
-        return {}
+        if self.agents_error is not None:
+            raise self.agents_error
+        return self.agents
 
 
 class _FakeURL:
@@ -61,14 +48,10 @@ class _FakeURL:
 
 
 class FakeRequest:
-    def __init__(self, session=None, form_data=None):
+    def __init__(self, session=None):
         self.session = session if session is not None else {}
-        self._form_data = form_data
         self.url = _FakeURL()
         self.app = SimpleNamespace(state=SimpleNamespace(http_client=None))
-
-    async def form(self):
-        return self._form_data
 
 
 @pytest.fixture(autouse=True)
@@ -77,19 +60,39 @@ def _admin_users(monkeypatch):
 
 
 @pytest.fixture
-def authz(monkeypatch):
-    """Stub the page reads and record cache resets; returns the fake manager."""
-    fake = FakeAuthzIdentityManager()
-    resets = []
+def registry(monkeypatch):
+    """Stub the evaluator reads; returns the fake identity manager for overrides."""
+    fake = FakeIdentityManager(
+        agents={
+            "demo": {
+                "type": "user_agent",
+                "allowed_tools": ["text_stats", "execute"],
+                "allowed_mcps": ["coralogix", "dc1__*"],
+            },
+            "nightly": {"type": "background_agent"},
+        }
+    )
     monkeypatch.setattr(admin, "identity_mgr", fake)
-    monkeypatch.setattr(tool_authz, "load_policy", lambda: {"default_action": "deny", "rules": []})
-    monkeypatch.setattr(tool_authz, "get_mode", lambda: "shadow")
-    monkeypatch.setattr(tool_authz, "get_bound_tools_mode", lambda: "off")
-    monkeypatch.setattr(tool_authz, "get_hub_call_mode", lambda: "off")
-    monkeypatch.setattr(tool_authz, "shadow_denies", lambda: [])
-    monkeypatch.setattr(tool_authz, "resolved_groups", lambda principal: [])
-    monkeypatch.setattr(tool_authz, "reset_cache", lambda: resets.append(1))
-    fake.resets = resets
+    monkeypatch.setattr(
+        tool_access,
+        "policy_snapshot",
+        lambda: tool_access.PolicySnapshot(
+            rules=(
+                tool_access.GroupRule(
+                    targets=("text_stats",), groups=frozenset({"platform-ops"})
+                ),
+                tool_access.GroupRule(
+                    targets=("dc1__*", "mcp__coralogix__*"),
+                    groups=frozenset({"edge-operators", "sre"}),
+                    name="edge-and-mcp",
+                ),
+            ),
+            version="42",
+            loaded_at=1.0,
+        ),
+    )
+    monkeypatch.setattr(tool_access, "tool_access_mode", lambda: "shadow")
+    monkeypatch.setattr(tool_access, "recent_shadow_denials", lambda: [])
     return fake
 
 
@@ -97,268 +100,285 @@ def _admin_session():
     return {"user": {"email": ADMIN_EMAIL, "sub": "admin-sub"}}
 
 
-def _form(pairs):
-    return FormData(pairs)
+def _render(session=None):
+    response = asyncio.run(
+        admin.admin_tool_authz_page(
+            FakeRequest(session=_admin_session() if session is None else session)
+        )
+    )
+    return response
 
 
-# --- GET /admin/tool-authz ----------------------------------------------------
+def _html(response):
+    assert response.status_code == 200
+    return response.body.decode()
 
-def test_page_renders_both_modes(authz):
-    response = asyncio.run(admin.admin_tool_authz_page(FakeRequest(session=_admin_session())))
+
+# --- GET /admin/tool-authz: what it shows -------------------------------------
+
+
+def test_page_renders_the_loaded_rules_and_policy_version(registry):
+    html = _html(_render())
+
+    # Rule labels (explicit and derived from the target list).
+    assert "platform-ops-only" not in html  # unnamed rule -> target list is the label
+    assert "text_stats" in html
+    assert "edge-and-mcp" in html
+    # Targets and the groups each rule admits.
+    assert "dc1__*" in html
+    assert "mcp__coralogix__*" in html
+    assert "edge-operators" in html
+    assert "sre" in html
+    assert "42" in html  # policy version
+    assert "2 rules" in html
+
+
+def test_page_shows_the_mode_and_the_env_var_that_owns_it(registry, monkeypatch):
+    monkeypatch.setattr(tool_access, "tool_access_mode", lambda: "enforce")
+
+    html = _html(_render())
+
+    assert "CURRENT: enforce" in html
+    assert "TOOL_ACCESS_MODE" in html
+    assert "off, shadow, enforce" in html
+
+
+def test_page_shows_each_agents_effective_allowlist(registry):
+    html = _html(_render())
+
+    assert "Effective allowlists" in html
+    assert "2 agents" in html
+    assert "demo" in html
+    assert "nightly" in html
+    # Resolved the way the evaluator resolves it: bare tools, MCP servers, wildcards,
+    # and console names pulled out of `allowed_tools`.
+    assert "coralogix" in html
+    assert "dc1__*" in html
+    assert "execute" in html
+
+
+def test_page_renders_the_shadow_ring(registry, monkeypatch):
+    monkeypatch.setattr(
+        tool_access,
+        "recent_shadow_denials",
+        lambda: [
+            {
+                "ts": "2026-10-26T10:00:00+00:00",
+                "agent": "supervisor",
+                "target": "text_stats",
+                "reason": "group_denied",
+                "rule": "platform-ops-only",
+                "groups": ["engineering"],
+                "surface": "hub",
+                "mode": "shadow",
+            }
+        ],
+    )
+
+    html = _html(_render())
+
+    assert "2026-10-26T10:00:00+00:00" in html
+    assert "supervisor" in html
+    assert "group_denied" in html
+    assert "platform-ops-only" in html
+    assert "engineering" in html
+    assert "hub" in html
+
+
+def test_page_shows_load_warnings_for_inert_rule_targets(registry, monkeypatch):
+    """A rule naming a console file tool decides nothing: the page must say so."""
+    monkeypatch.setattr(
+        tool_access,
+        "policy_snapshot",
+        lambda: tool_access.PolicySnapshot(
+            rules=(
+                tool_access.GroupRule(
+                    targets=("read_file",), groups=frozenset({"ops"}), name="files"
+                ),
+            ),
+            version="9",
+            warnings=tuple(
+                tool_access.policy_warnings(
+                    {"rules": [{"name": "files", "targets": ["read_file"], "groups": ["ops"]}]}
+                )
+            ),
+        ),
+    )
+
+    html = _html(_render())
+
+    assert "console tool &#39;read_file&#39; is not covered" in html or (
+        "console tool 'read_file' is not covered" in html
+    )
+    # The page also states which console tools rules DO cover.
+    assert "console allowlist" in html
+    assert "can never match" in html
+
+
+def test_page_escapes_rule_and_group_names(registry, monkeypatch):
+    monkeypatch.setattr(
+        tool_access,
+        "policy_snapshot",
+        lambda: tool_access.PolicySnapshot(
+            rules=(
+                tool_access.GroupRule(
+                    targets=("<script>alert('t')</script>",),
+                    groups=frozenset({"<script>alert('g')</script>"}),
+                    name="<b>rule</b>",
+                ),
+            ),
+            version="7",
+        ),
+    )
+
+    html = _html(_render())
+
+    assert "<script>alert('t')</script>" not in html
+    assert "<script>alert('g')</script>" not in html
+    assert "<b>rule</b>" not in html
+    assert "&lt;script&gt;" in html
+
+
+def test_empty_states_are_explicit(registry, monkeypatch):
+    monkeypatch.setattr(
+        tool_access, "policy_snapshot", lambda: tool_access.PolicySnapshot(version="absent")
+    )
+
+    html = _html(_render())
+
+    assert "No group rules loaded" in html
+    assert "absent" in html
+
+
+def test_no_agents_registered(registry):
+    registry.agents = {}
+
+    html = _html(_render())
+
+    assert "No agents registered" in html
+
+
+def test_registry_outage_still_renders_the_policy_state(registry):
+    registry.agents_error = RuntimeError("etcd unreachable")
+
+    html = _html(_render())
+
+    assert "Agent records unavailable" in html
+    assert "etcd unreachable" in html
+    # The rules are the part that matters during an outage, so they still render.
+    assert "edge-and-mcp" in html
+
+
+# --- fail-closed policy state --------------------------------------------------
+
+
+def test_unavailable_policy_is_shown_prominently(registry, monkeypatch):
+    monkeypatch.setattr(
+        tool_access,
+        "policy_snapshot",
+        lambda: tool_access.PolicySnapshot(error="policy read failed: etcd unreachable"),
+    )
+
+    html = _html(_render())
+
+    assert "Policy unavailable" in html
+    assert "failing closed" in html
+    assert "policy read failed: etcd unreachable" in html
+    assert "unknown" in html  # no version to report
+    # No rules can be loaded, and the empty state must not claim the policy is empty.
+    assert "No group rules loaded" in html
+    assert "nothing is loaded" in html
+
+
+# --- read-only: no forms, no POST routes ---------------------------------------
+
+
+def test_page_has_no_forms_and_no_write_controls(registry):
+    html = _html(_render())
+
+    assert "<form" not in html
+    assert "csrf_token" not in html
+    for removed in (
+        "/admin/tool-authz/policy",
+        "/admin/tool-authz/mode",
+        "/admin/tool-authz/bound-mode",
+        "/admin/tool-authz/hub-mode",
+        "/admin/tool-authz/bootstrap",
+        "/admin/tool-authz/clear-shadow",
+        "/admin/tool-authz/groups",
+    ):
+        assert removed not in html
+    # The banner names where the knobs moved to instead.
+    assert "This page does not write anything" in html
+    assert "workspace/policies/tool_access.yaml" in html
+
+
+@pytest.fixture
+def client(registry):
+    app = FastAPI()
+    app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
+    app.include_router(admin.router)
+
+    @app.get("/__test/login")
+    async def test_login(request: Request):
+        request.session["user"] = {"email": ADMIN_EMAIL, "sub": "admin-sub"}
+        return {"ok": True}
+
+    @app.get("/__test/session")
+    async def test_session(request: Request):
+        return {"keys": sorted(request.session.keys())}
+
+    return TestClient(app, follow_redirects=False)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/admin/tool-authz/policy",
+        "/admin/tool-authz/mode",
+        "/admin/tool-authz/bound-mode",
+        "/admin/tool-authz/hub-mode",
+        "/admin/tool-authz/bootstrap",
+        "/admin/tool-authz/clear-shadow",
+        "/admin/tool-authz/groups",
+    ],
+)
+def test_removed_write_routes_are_gone(client, path):
+    assert client.post(path, data={}).status_code == 404
+
+
+def test_the_page_route_is_get_only(client):
+    assert client.post("/admin/tool-authz").status_code == 405
+
+
+def test_get_needs_no_csrf_token(client):
+    """A read path must not depend on a CSRF token -- only writes ever did."""
+    assert client.get("/__test/login").status_code == 200
+    # The session carries a user and nothing else; the page renders anyway.
+    assert client.get("/__test/session").json() == {"keys": ["user"]}
+
+    response = client.get("/admin/tool-authz")
 
     assert response.status_code == 200
-    html = response.body.decode()
-    assert "/admin/tool-authz/mode" in html
-    assert "/admin/tool-authz/bound-mode" in html
-    assert "/admin/tool-authz/hub-mode" in html
-    assert "Bound tools" in html
-    assert "Direct hub calls" in html
-    assert "CURRENT: shadow" in html
-    assert "CURRENT: off" in html
-    # The old "not gated yet" caveat must be gone now that the surface has a switch.
-    assert "not gated yet" not in html
+    assert "Tool Authorization" in response.text
+    assert "csrf_token" not in response.text
 
 
-def test_page_shows_the_hub_call_mode(monkeypatch, authz):
-    monkeypatch.setattr(tool_authz, "get_hub_call_mode", lambda: "enforcing")
-
-    response = asyncio.run(admin.admin_tool_authz_page(FakeRequest(session=_admin_session())))
-
-    html = response.body.decode()
-    assert "CURRENT: enforcing" in html
-    assert 'value="enforcing" class="peer sr-only" checked' in html
+# --- admin gate ----------------------------------------------------------------
 
 
-def test_page_shows_the_denial_surface(monkeypatch, authz):
-    monkeypatch.setattr(tool_authz, "shadow_denies", lambda: [
-        {
-            "ts": "2026-10-26T10:00:00Z",
-            "principal": "agent:supervisor",
-            "tool": "opsctl",
-            "scope": "tools:call",
-            "mode": "shadow",
-            "surface": "bound_tool",
-        },
-        {
-            "ts": "2026-10-26T10:00:01Z",
-            "principal": "user:alice",
-            "tool": "netctl",
-            "scope": "tools:call",
-            "mode": "shadow",
-        },
-    ])
-
-    response = asyncio.run(admin.admin_tool_authz_page(FakeRequest(session=_admin_session())))
-
-    html = response.body.decode()
-    assert "agent:supervisor" in html
-    assert "bound_tool" in html
-    # Legacy entries (no surface key) still render, labelled as the use_tool gate.
-    assert "use_tool" in html
-
-
-def test_non_admin_cannot_see_the_page(authz):
+def test_non_admin_cannot_see_the_page(registry):
     session = {"user": {"email": "someone@example.com"}}
 
-    response = asyncio.run(admin.admin_tool_authz_page(FakeRequest(session=session)))
+    response = _render(session=session)
 
     assert response.status_code == 303
     assert response.headers["location"] == "/admin"
     assert session["flash_msg"] == "Unauthorized access."
 
 
-# --- resolved groups for the signed-in admin (v0.7.1 Phase 3) -----------------
-
-
-def test_page_shows_the_admin_resolved_groups(monkeypatch, authz):
-    seen = []
-
-    def fake_resolved(principal):
-        seen.append(principal)
-        return ["oncall", "ops"]
-
-    monkeypatch.setattr(tool_authz, "resolved_groups", fake_resolved)
-
-    response = asyncio.run(admin.admin_tool_authz_page(FakeRequest(session=_admin_session())))
-
-    html = response.body.decode()
-    assert seen == ["user:admin-sub"]  # resolved for the session's `sub`, not the email
-    assert "Your resolved groups" in html
-    assert "2 groups" in html
-    assert "user:admin-sub" in html
-    assert "oncall" in html
-    assert "ops" in html
-    assert "Read-only" in html
-
-
-def test_page_labels_an_empty_resolution(monkeypatch, authz):
-    response = asyncio.run(admin.admin_tool_authz_page(FakeRequest(session=_admin_session())))
-
-    html = response.body.decode()
-    assert "0 groups" in html
-    assert "No groups resolved" in html
-
-
-def test_page_without_a_session_sub_resolves_anonymous(monkeypatch, authz):
-    seen = []
-    monkeypatch.setattr(
-        tool_authz, "resolved_groups", lambda principal: seen.append(principal) or []
-    )
-    session = {"user": {"email": ADMIN_EMAIL}}
-
-    asyncio.run(admin.admin_tool_authz_page(FakeRequest(session=session)))
-
-    assert seen == ["anonymous"]
-
-
-def test_page_escapes_group_names(monkeypatch, authz):
-    monkeypatch.setattr(
-        tool_authz, "resolved_groups", lambda principal: ["<script>alert('x')</script>"]
-    )
-
-    response = asyncio.run(admin.admin_tool_authz_page(FakeRequest(session=_admin_session())))
-
-    html = response.body.decode()
-    assert "<script>alert('x')</script>" not in html
-    assert "&lt;script&gt;" in html
-
-
-# --- POST /admin/tool-authz/bound-mode ---------------------------------------
-
-def test_bound_mode_enforcing_needs_confirmation(authz):
-    session = _admin_session()
-    request = FakeRequest(session=session, form_data=_form([("mode", "enforcing")]))
-
-    response = asyncio.run(admin.save_bound_tools_mode(request))
-
-    assert response.status_code == 303
-    assert authz.bound_tools_modes == []
-    assert authz.resets == []
-    assert "Confirmation required" in session["flash_msg"]
-
-
-def test_bound_mode_enforcing_with_confirmation_is_saved(authz):
-    session = _admin_session()
-    request = FakeRequest(
-        session=session, form_data=_form([("mode", "enforcing"), ("confirm", "on")])
-    )
-
-    response = asyncio.run(admin.save_bound_tools_mode(request))
-
-    assert response.status_code == 303
-    assert response.headers["location"] == "/admin/tool-authz"
-    assert authz.bound_tools_modes == ["enforcing"]
-    assert authz.resets == [1]  # the cached snapshot is dropped after the write
-    assert "set to 'enforcing'" in session["flash_msg"]
-
-
-@pytest.mark.parametrize("mode", ["shadow", "off"])
-def test_bound_mode_shadow_and_off_need_no_confirmation(authz, mode):
-    request = FakeRequest(session=_admin_session(), form_data=_form([("mode", mode)]))
-
-    asyncio.run(admin.save_bound_tools_mode(request))
-
-    assert authz.bound_tools_modes == [mode]
-
-
-def test_bound_mode_rejects_an_unknown_value(authz):
-    session = _admin_session()
-    request = FakeRequest(session=session, form_data=_form([("mode", "enforcin")]))
-
-    asyncio.run(admin.save_bound_tools_mode(request))
-
-    assert authz.bound_tools_modes == []
-    assert "Unknown bound-tools mode" in session["flash_msg"]
-
-
-def test_bound_mode_is_independent_of_the_use_tool_mode(authz):
-    request = FakeRequest(
-        session=_admin_session(), form_data=_form([("mode", "enforcing"), ("confirm", "on")])
-    )
-
-    asyncio.run(admin.save_bound_tools_mode(request))
-
-    assert authz.bound_tools_modes == ["enforcing"]
-    assert authz.tool_authz_modes == []
-
-
-# --- POST /admin/tool-authz/hub-mode ----------------------------------------
-
-def test_hub_mode_enforcing_needs_confirmation(authz):
-    session = _admin_session()
-    request = FakeRequest(session=session, form_data=_form([("mode", "enforcing")]))
-
-    response = asyncio.run(admin.save_hub_call_mode(request))
-
-    assert response.status_code == 303
-    assert authz.hub_call_modes == []
-    assert authz.resets == []
-    assert "Confirmation required" in session["flash_msg"]
-
-
-def test_hub_mode_enforcing_with_confirmation_is_saved(authz):
-    session = _admin_session()
-    request = FakeRequest(
-        session=session, form_data=_form([("mode", "enforcing"), ("confirm", "on")])
-    )
-
-    response = asyncio.run(admin.save_hub_call_mode(request))
-
-    assert response.status_code == 303
-    assert response.headers["location"] == "/admin/tool-authz"
-    assert authz.hub_call_modes == ["enforcing"]
-    assert authz.resets == [1]  # the cached snapshot is dropped after the write
-    assert "set to 'enforcing'" in session["flash_msg"]
-
-
-@pytest.mark.parametrize("mode", ["shadow", "off"])
-def test_hub_mode_shadow_and_off_need_no_confirmation(authz, mode):
-    request = FakeRequest(session=_admin_session(), form_data=_form([("mode", mode)]))
-
-    asyncio.run(admin.save_hub_call_mode(request))
-
-    assert authz.hub_call_modes == [mode]
-
-
-def test_hub_mode_rejects_an_unknown_value(authz):
-    session = _admin_session()
-    request = FakeRequest(session=session, form_data=_form([("mode", "enforcin")]))
-
-    asyncio.run(admin.save_hub_call_mode(request))
-
-    assert authz.hub_call_modes == []
-    assert "Unknown hub-call mode" in session["flash_msg"]
-
-
-def test_hub_mode_is_independent_of_the_other_two_modes(authz):
-    request = FakeRequest(
-        session=_admin_session(), form_data=_form([("mode", "enforcing"), ("confirm", "on")])
-    )
-
-    asyncio.run(admin.save_hub_call_mode(request))
-
-    assert authz.hub_call_modes == ["enforcing"]
-    assert authz.tool_authz_modes == []
-    assert authz.bound_tools_modes == []
-
-
-# --- POST /admin/tool-authz/bootstrap ---------------------------------------
-
-def test_bootstrap_includes_per_agent_bound_tool_rules(monkeypatch, authz):
-    authz.get_all_tool_configs = lambda: {"text_stats": {"name": "text_stats", "public": False}}
-    authz.get_all_mcp_configs = lambda: {}
-    authz.get_all_agent_configs = lambda: {
-        "demo": {"type": "user_agent", "allowed_tools": ["text_stats"]}
-    }
-
-    request = FakeRequest(session=_admin_session(), form_data=_form([("csrf_token", "t")]))
-    response = asyncio.run(admin.bootstrap_tool_authz_policy(request))
-
-    assert response.status_code == 303
-    [policy] = authz.saved_policies
-    assert {
-        "tools": ["text_stats"],
-        "allow_principals": ["agent:demo"],
-        "scopes": list(tool_authz.SCOPES),
-    } in policy["rules"]
-    assert "bound tools" in request.session["flash_msg"].lower()
+def test_anonymous_visitor_is_sent_to_login(registry):
+    response = _render(session={})
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "/login"

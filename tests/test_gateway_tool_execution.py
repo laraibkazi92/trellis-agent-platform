@@ -8,7 +8,7 @@ from typing import Any, List, Optional
 
 import pytest
 
-from core import auth, gateway, tool_authz, tool_search
+from core import auth, gateway, tool_access, tool_search
 from core.auth import user_id_var
 from core.tool_search import execute_whitelisted_tool
 
@@ -63,10 +63,9 @@ def test_search_tools_delegates_to_ranked_search_and_reports_progress(monkeypatc
         {"name": "netctl", "description": "Inspect cluster nodes.", "parameters": {}, "configured": True, "status": "Online", "source": "local"},
     ]
 
-    async def fake_ranked(query, limit=8, user_id=None, principal=None):
+    async def fake_ranked(query, limit=8, user_id=None):
         assert query == "inspect cluster nodes"
         assert user_id == "user-1"
-        assert principal == "user:user-1"
         return cards
 
     monkeypatch.setattr(gateway, "_search_tools_ranked", fake_ranked)
@@ -265,39 +264,108 @@ def test_use_tool_surfaces_execution_errors(monkeypatch, caplog):
     assert "hub unreachable" in caplog.text
 
 
-# --- tool authorization (core.tool_authz) seams ------------------------------
+# --- the evaluator seams ------------------------------------------------------
 #
-# `execute_whitelisted_tool` runs whitelist -> authorization -> configuration ->
-# dispatch, and `search_tools` filters candidates before ranking. Both reach the
-# authz engine through the lazily imported `core.auth.get_identity_manager`, so a
-# fake registry makes these tests free of etcd, network and sleeps.
+# `execute_whitelisted_tool` asks `core.tool_access` exactly once: the agent and its
+# groups come from the run's token, the allowlist from that agent's record, and a
+# caller with NO record (the gateway front door) is granted by the target's own
+# published exposure. `search_tools` applies the group rules to the public catalog.
+# A fake policy registry keeps all of it free of etcd, network and sleeps.
 
-class FakeAuthzRegistry:
-    """Registry stand-in carrying only the three tool-authz reads."""
 
-    def __init__(self, *, policy=None, mode="off", groups=None):
-        self.policy = {} if policy is None else policy
-        self.mode = mode
-        self.groups = {} if groups is None else groups
-        self.policy_reads = 0
+class FakePolicyEtcd:
+    """The policy document plus the shared shadow ring."""
 
-    def get_tool_policies(self):
-        self.policy_reads += 1
-        return self.policy
+    def __init__(self):
+        self.policy = None
+        self.shared_ring = None
+        self.error = None
+        self.revision = 1
 
-    def get_tool_authz_mode(self):
-        return self.mode
+    def get(self, key, **_kwargs):
+        import json
 
-    def get_principal_groups(self):
-        return self.groups
+        if self.error is not None:
+            raise RuntimeError(self.error)
+        if key == tool_access.POLICY_PATH:
+            if self.policy is None:
+                return None, None
+            meta = type("M", (), {"mod_revision": self.revision})()
+            return json.dumps(self.policy).encode("utf-8"), meta
+        if key == tool_access.SHADOW_DENIAL_PATH:
+            return self.shared_ring, None
+        return None, None
+
+    def put(self, key, value):
+        if self.error is not None:
+            raise RuntimeError(self.error)
+        payload = value.encode("utf-8") if isinstance(value, str) else value
+        if key == tool_access.SHADOW_DENIAL_PATH:
+            self.shared_ring = payload
+
+    def add_watch_callback(self, key, callback):
+        return 1
+
+    def cancel_watch(self, watch_id):
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _front_door_env(monkeypatch):
+    """`use_tool` mints for the caller it serves; the evaluator then reads records.
+
+    ``gateway`` has no agent record (that is what makes it the front door), and the
+    user record read at mint is faked so no test touches etcd.
+    """
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", GATEWAY_SECRET)
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+    monkeypatch.delenv("DEV_MODE", raising=False)
+    monkeypatch.delenv("DEV_USER_EMAIL", raising=False)
+    monkeypatch.setattr(gateway.identity_mgr, "get_agent_config", lambda name: None)
+    monkeypatch.setattr(gateway.identity_mgr, "get_user", lambda user_id: None)
+    auth.agent_token_var.set(None)
+    user_id_var.set(None)
+    yield
+    auth.agent_token_var.set(None)
+    user_id_var.set(None)
+
+
+@pytest.fixture(autouse=True)
+def tool_access_policy(monkeypatch):
+    """A per-test policy document (absent by default: no group rules)."""
+    import json
+
+    fake = FakePolicyEtcd()
+    monkeypatch.setattr(tool_access, "_client", lambda: fake)
+    monkeypatch.delenv(tool_access.MODE_ENV, raising=False)
+    monkeypatch.setattr(tool_access, "_last_shadow_persist", 0.0)
+    tool_access.reset_snapshot()
+    with tool_access._shadow_lock:
+        tool_access._shadow_ring.clear()
+    yield fake
+    tool_access.reset_snapshot()
+    with tool_access._shadow_lock:
+        tool_access._shadow_ring.clear()
+
+
+def _policy(*rules):
+    return {"rules": [dict(rule) for rule in rules]}
+
+
+def _rule(targets, groups=("ops",), name=None):
+    rule = {"targets": list(targets), "groups": list(groups)}
+    if name is not None:
+        rule["name"] = name
+    return rule
 
 
 class FakeToolRegistry:
-    """The two registry lookups the whitelist guard performs."""
+    """The two registry lookups the front-door exposure rule performs."""
 
-    def __init__(self, tool_configs=None, mcp_configs=None):
+    def __init__(self, tool_configs=None, mcp_configs=None, agent_configs=None):
         self.tool_configs = tool_configs or {}
         self.mcp_configs = mcp_configs or {}
+        self.agent_configs = agent_configs or {}
 
     def get_tool_config(self, name):
         return self.tool_configs.get(name)
@@ -305,38 +373,12 @@ class FakeToolRegistry:
     def get_mcp_config(self, name):
         return self.mcp_configs.get(name)
 
-
-@pytest.fixture(autouse=True)
-def _authz_isolation():
-    """The authz snapshot/ring/caller-group state is process global; isolate it."""
-    tool_authz.reset_cache()
-    tool_authz.clear_shadow_denies()
-    tool_authz.clear_request_groups()
-    yield
-    tool_authz.reset_cache()
-    tool_authz.clear_shadow_denies()
-    tool_authz.clear_request_groups()
+    def get_agent_config(self, name):
+        return self.agent_configs.get(name)
 
 
-def _install_authz(monkeypatch, *, policy=None, mode="off"):
-    fake = FakeAuthzRegistry(policy=policy, mode=mode)
-    monkeypatch.setattr(auth, "get_identity_manager", lambda: fake)
-    tool_authz.reset_cache()
-    return fake
-
-
-def _authz_policy(*rules):
-    return {"default_action": "deny", "rules": list(rules)}
-
-
-def _authz_rule(tools, principals=("*",), scopes=None):
-    rule = {"tools": list(tools), "allow_principals": list(principals)}
-    if scopes is not None:
-        rule["scopes"] = list(scopes)
-    return rule
-
-
-PUBLIC_OPSCTL = {"opsctl": {"name": "opsctl", "public": True}}
+def _public_opsctl():
+    return {"opsctl": {"name": "opsctl", "public": True}}
 
 
 def _configured_ok(calls=None):
@@ -360,152 +402,193 @@ def _forbidden_hub():
     return _fail
 
 
-# --- execute_whitelisted_tool: authorization guard ---------------------------
-
-def test_execute_whitelisted_tool_denies_principal_without_a_matching_rule(monkeypatch):
-    _install_authz(monkeypatch, policy=_authz_policy(), mode="enforcing")
-    configured_calls = []
-
-    result = asyncio.run(
+def _run_execute(*, tool="opsctl", registry=None, configured=None, hub=None):
+    return asyncio.run(
         execute_whitelisted_tool(
-            "opsctl",
+            tool,
             {"args": ["--help"]},
             "user-1",
-            identity_manager=FakeToolRegistry(PUBLIC_OPSCTL),
-            is_configured=_configured_ok(configured_calls),
-            get_hub_client_fn=_forbidden_hub(),
-            principal="user:alice",
+            identity_manager=registry or FakeToolRegistry(_public_opsctl()),
+            is_configured=configured or _configured_ok(),
+            get_hub_client_fn=hub or _forbidden_hub(),
         )
     )
 
-    assert result == "SYSTEM: Access denied. Tool 'opsctl' is not permitted for this principal."
-    assert configured_calls == []  # denial happens before the configuration guard
+
+# --- execute_whitelisted_tool: the front door ---------------------------------
 
 
-def test_execute_whitelisted_tool_uses_the_principal_kwarg(monkeypatch):
-    _install_authz(
-        monkeypatch,
-        policy=_authz_policy(_authz_rule(["opsctl"], ["user:bob"])),
-        mode="enforcing",
-    )
-    registry = FakeToolRegistry(PUBLIC_OPSCTL)
-
-    denied = asyncio.run(
-        execute_whitelisted_tool(
-            "opsctl",
-            {"args": ["--help"]},
-            "user-1",
-            identity_manager=registry,
-            is_configured=_configured_ok(),
-            get_hub_client_fn=_forbidden_hub(),
-            principal="user:alice",
-        )
-    )
-    assert denied == "SYSTEM: Access denied. Tool 'opsctl' is not permitted for this principal."
-
+def test_the_front_door_executes_a_published_tool():
     fake_client = FakeMCPClient(FakeCallToolResult(data={"stdout": "ok"}))
 
     async def fake_get_hub_client():
         return fake_client
 
-    allowed = asyncio.run(
-        execute_whitelisted_tool(
-            "opsctl",
-            {"args": ["--help"]},
-            "user-1",
-            identity_manager=registry,
-            is_configured=_configured_ok(),
-            get_hub_client_fn=fake_get_hub_client,
-            principal="user:bob",
-        )
-    )
+    result = _run_execute(hub=fake_get_hub_client)
 
-    assert allowed == {"stdout": "ok"}
+    assert result == {"stdout": "ok"}
     assert len(fake_client.calls) == 1
 
 
-def test_execute_whitelisted_tool_shadow_executes_and_records_the_denial(monkeypatch):
-    _install_authz(monkeypatch, policy=_authz_policy(), mode="shadow")
+def test_the_front_door_is_denied_an_internal_tool():
+    configured_calls = []
+
+    result = _run_execute(
+        registry=FakeToolRegistry({"opsctl": {"name": "opsctl", "public": False}}),
+        configured= _configured_ok(configured_calls),
+    )
+
+    assert result == (
+        "SYSTEM: Access denied. Tool 'opsctl' is internal and not exposed for "
+        "direct execution."
+    )
+    assert configured_calls == []  # denial happens before the configuration guard
+
+
+def test_an_unknown_tool_is_denied():
+    assert "Access denied" in _run_execute(registry=FakeToolRegistry({}))
+
+
+def test_a_malformed_mcp_name_is_denied():
+    assert "Access denied" in _run_execute(tool="mcp__onlyserver")
+
+
+def test_a_group_rule_denies_the_front_door(tool_access_policy):
+    tool_access_policy.policy = _policy(_rule(["opsctl"], name="platform-ops"))
+
+    result = _run_execute()
+
+    assert "not permitted for this principal" in result
+
+
+def _gateway_call_with_groups(monkeypatch, record):
+    """Drive `gateway.use_tool` so the minted token carries the record's groups."""
+    monkeypatch.setattr(
+        gateway.identity_mgr, "get_user", lambda user_id: record
+    )
+    monkeypatch.setattr(
+        gateway.identity_mgr, "get_tool_config", lambda name: {"name": name, "public": True}
+    )
+    fake_client = FakeMCPClient(FakeCallToolResult(data={"stdout": "ok"}))
+
+    async def fake_get_hub_client():
+        return fake_client
+
+    monkeypatch.setattr(gateway, "get_hub_client", fake_get_hub_client)
+    user_id_var.set("user-1")
+    return asyncio.run(gateway.use_tool(FakeContext(), "opsctl", {"args": ["--help"]}))
+
+
+def test_a_group_rule_admits_the_callers_group(monkeypatch, tool_access_policy):
+    """The front door's groups come from the token the gateway minted (claim "g")."""
+    tool_access_policy.policy = _policy(_rule(["opsctl"], name="platform-ops"))
+
+    result = _gateway_call_with_groups(
+        monkeypatch, {"email": "ops@example.com", "groups": ["ops"]}
+    )
+
+    assert result == {"stdout": "ok"}
+
+
+def test_a_group_rule_denies_a_caller_without_the_group(monkeypatch, tool_access_policy):
+    tool_access_policy.policy = _policy(_rule(["opsctl"], name="platform-ops"))
+
+    result = _gateway_call_with_groups(
+        monkeypatch, {"email": "ops@example.com", "groups": ["support"]}
+    )
+
+    assert "not permitted for this principal" in result
+
+
+def test_shadow_executes_and_records_the_host_surface(monkeypatch, tool_access_policy):
+    monkeypatch.setenv(tool_access.MODE_ENV, "shadow")
+    tool_access_policy.policy = _policy(_rule(["opsctl"], name="platform-ops"))
     fake_client = FakeMCPClient(FakeCallToolResult(data={"stdout": "{}"}))
 
     async def fake_get_hub_client():
         return fake_client
 
-    result = asyncio.run(
-        execute_whitelisted_tool(
-            "opsctl",
-            {"args": ["--help"]},
-            "user-1",
-            identity_manager=FakeToolRegistry(PUBLIC_OPSCTL),
-            is_configured=_configured_ok(),
-            get_hub_client_fn=fake_get_hub_client,
-            principal="user:alice",
-        )
-    )
+    result = _run_execute(hub=fake_get_hub_client)
 
     assert result == {"stdout": "{}"}  # shadow still executes
-    entries = tool_authz.shadow_denies()
-    assert [(e["principal"], e["tool"], e["scope"]) for e in entries] == [
-        ("user:alice", "opsctl", "tools:call")
-    ]
+    [entry] = tool_access.recent_shadow_denials()
+    # No run token in this direct call, so no agent is invented: the front door.
+    assert (entry["agent"], entry["target"], entry["surface"]) == (None, "opsctl", "host")
+    assert entry["reason"] == tool_access.REASON_GROUP_DENIED
 
 
-def test_execute_whitelisted_tool_with_authz_off_is_unchanged(monkeypatch):
-    _install_authz(monkeypatch, policy=_authz_policy(), mode="off")
-    fake_client = FakeMCPClient(
-        FakeCallToolResult(data={"stdout": "{}", "stderr": "", "exit_code": 0})
-    )
+def test_off_skips_the_group_rules(monkeypatch, tool_access_policy):
+    monkeypatch.setenv(tool_access.MODE_ENV, "off")
+    tool_access_policy.policy = _policy(_rule(["opsctl"]))
+    fake_client = FakeMCPClient(FakeCallToolResult(data={"stdout": "{}"}))
 
     async def fake_get_hub_client():
         return fake_client
 
-    result = asyncio.run(
-        execute_whitelisted_tool(
-            "opsctl",
-            {"args": ["--help"]},
-            "user-42",
-            identity_manager=FakeToolRegistry(PUBLIC_OPSCTL),
-            is_configured=_configured_ok(),
-            get_hub_client_fn=fake_get_hub_client,
-            principal="user:alice",
-        )
-    )
-
-    assert result == {"stdout": "{}", "stderr": "", "exit_code": 0}
-    name, arguments, raise_on_error = fake_client.calls[0]
-    assert name == "opsctl"
-    arguments.pop("__agent_token", None)
-    assert arguments == {"args": ["--help"], "__user_id": "user-42"}
-    assert raise_on_error is False
-    assert tool_authz.shadow_denies() == []
+    assert _run_execute(hub=fake_get_hub_client) == {"stdout": "{}"}
+    assert tool_access.recent_shadow_denials() == []
 
 
-def test_execute_whitelisted_tool_fails_closed_when_authz_raises(monkeypatch):
-    _install_authz(monkeypatch, policy=_authz_policy(), mode="enforcing")
-    configured_calls = []
+def test_an_unreadable_policy_fails_closed(tool_access_policy):
+    tool_access_policy.error = "etcd is unreachable"
+    tool_access_policy.policy = _policy(_rule(["opsctl"]))
 
-    def boom(*args, **kwargs):
-        raise RuntimeError("policy engine exploded")
+    result = _run_execute()
 
-    monkeypatch.setattr(tool_authz, "allowed", boom)
+    assert "not permitted for this principal" in result  # never dispatched
 
-    result = asyncio.run(
-        execute_whitelisted_tool(
-            "opsctl",
-            {"args": ["--help"]},
-            "user-1",
-            identity_manager=FakeToolRegistry(PUBLIC_OPSCTL),
-            is_configured=_configured_ok(configured_calls),
-            get_hub_client_fn=_forbidden_hub(),
-            principal="user:alice",
-        )
-    )
+
+def test_an_evaluator_exception_fails_closed(monkeypatch):
+    async def boom(*args, **kwargs):
+        raise RuntimeError("evaluator exploded")
+
+    # The gate is async now (the policy read must leave the event loop).
+    monkeypatch.setattr(tool_access, "authorize_claims_async", boom)
+
+    result = _run_execute()
 
     assert result == "SYSTEM: Error checking tool access for 'opsctl'. Please try again later."
-    assert configured_calls == []
 
 
-# --- search_tools: pre-rank authorization filter -----------------------------
+# --- execute_whitelisted_tool: an agent with a record ------------------------
+
+
+def test_an_agent_record_uses_the_allowlist_not_the_public_flag():
+    """A bindable (non-public) tool is usable by the agent whose manifest names it."""
+    from core import agent_token
+
+    auth.agent_token_var.set(agent_token.mint("researcher", user_id="user-1"))
+    fake_client = FakeMCPClient(FakeCallToolResult(data={"stdout": "ok"}))
+
+    async def fake_get_hub_client():
+        return fake_client
+
+    result = _run_execute(
+        registry=FakeToolRegistry(
+            {"opsctl": {"name": "opsctl", "public": False}},
+            agent_configs={"researcher": {"allowed_tools": ["opsctl"]}},
+        ),
+        hub=fake_get_hub_client,
+    )
+
+    assert result == {"stdout": "ok"}
+
+
+def test_an_agent_outside_its_allowlist_is_denied():
+    from core import agent_token
+
+    auth.agent_token_var.set(agent_token.mint("researcher", user_id="user-1"))
+
+    result = _run_execute(
+        registry=FakeToolRegistry(
+            _public_opsctl(), agent_configs={"researcher": {"allowed_tools": ["netctl"]}}
+        )
+    )
+
+    assert "not permitted for this principal" in result
+
+
+# --- search_tools: the group-rule filter over the public catalog -------------
 
 SEARCH_TOOL_CONFIGS = {
     "opsctl": {
@@ -539,54 +622,77 @@ def _patch_search_registry(monkeypatch):
     monkeypatch.setattr(tool_search, "embed_text", lambda text, task_type: None)
 
 
-def test_search_tools_filters_denied_tools_before_ranking(monkeypatch):
-    _patch_search_registry(monkeypatch)
-    _install_authz(
-        monkeypatch, policy=_authz_policy(_authz_rule(["netctl"])), mode="enforcing"
-    )
+def _search_token(*, agent="gateway", groups=()):
+    from core import agent_token
 
-    results = asyncio.run(
-        tool_search.search_tools("cluster nodes", limit=0, principal="user:bob")
-    )
+    auth.agent_token_var.set(agent_token.mint(agent, user_id="user-1", groups=groups))
+
+
+def test_search_tools_filters_group_denied_tools_before_ranking(
+    monkeypatch, tool_access_policy
+):
+    _patch_search_registry(monkeypatch)
+    tool_access_policy.policy = _policy(_rule(["opsctl"], name="platform-ops"))
+    _search_token(groups=[])
+
+    results = asyncio.run(tool_search.search_tools("cluster nodes", limit=0))
     assert [r["name"] for r in results] == ["netctl"]
 
     # opsctl ranks first for this query, so a limit of 1 only returns netctl if the
     # filter ran before ranking.
-    ranked = asyncio.run(
-        tool_search.search_tools(
-            "opsctl CLI commands", limit=1, principal="user:bob"
-        )
-    )
+    ranked = asyncio.run(tool_search.search_tools("opsctl CLI commands", limit=1))
     assert [r["name"] for r in ranked] == ["netctl"]
 
 
-def test_search_tools_keeps_denied_tools_and_records_them_in_shadow(monkeypatch):
+def test_search_tools_admits_a_matching_group(monkeypatch, tool_access_policy):
     _patch_search_registry(monkeypatch)
-    _install_authz(monkeypatch, policy=_authz_policy(), mode="shadow")
+    tool_access_policy.policy = _policy(_rule(["opsctl"], groups=["ops"]))
+    _search_token(groups=["ops"])
 
-    results = asyncio.run(
-        tool_search.search_tools("cluster nodes", limit=0, principal="user:bob")
-    )
+    results = asyncio.run(tool_search.search_tools("cluster nodes", limit=0))
 
     assert {r["name"] for r in results} == {"opsctl", "netctl"}
-    entries = tool_authz.shadow_denies()  # newest first
-    assert {e["tool"] for e in entries} == {"opsctl", "netctl"}
-    assert {e["scope"] for e in entries} == {"tools:read"}
 
 
-def test_search_tools_with_authz_off_returns_all_candidates_and_records_nothing(monkeypatch):
+def test_search_tools_keeps_denied_tools_and_records_them_in_shadow(
+    monkeypatch, tool_access_policy
+):
     _patch_search_registry(monkeypatch)
-    _install_authz(monkeypatch, policy=_authz_policy(), mode="off")
+    monkeypatch.setenv(tool_access.MODE_ENV, "shadow")
+    tool_access_policy.policy = _policy(_rule(["opsctl"]))
+    _search_token()
 
-    results = asyncio.run(
-        tool_search.search_tools("cluster nodes", limit=0, principal="user:bob")
-    )
+    results = asyncio.run(tool_search.search_tools("cluster nodes", limit=0))
 
     assert {r["name"] for r in results} == {"opsctl", "netctl"}
-    assert tool_authz.shadow_denies() == []
+    entries = tool_access.recent_shadow_denials()
+    assert [entry["target"] for entry in entries] == ["opsctl"]
+    assert entries[0]["surface"] == "host"
 
 
-def test_use_tool_forwards_the_user_principal(monkeypatch):
+def test_search_tools_with_the_switch_off_returns_every_candidate(
+    monkeypatch, tool_access_policy
+):
+    _patch_search_registry(monkeypatch)
+    monkeypatch.setenv(tool_access.MODE_ENV, "off")
+    tool_access_policy.policy = _policy(_rule(["opsctl"]))
+    _search_token()
+
+    results = asyncio.run(tool_search.search_tools("cluster nodes", limit=0))
+
+    assert {r["name"] for r in results} == {"opsctl", "netctl"}
+    assert tool_access.recent_shadow_denials() == []
+
+
+def test_search_tools_never_shows_an_internal_tool(monkeypatch):
+    _patch_search_registry(monkeypatch)
+
+    results = asyncio.run(tool_search.search_tools("restart internal services", limit=0))
+
+    assert "system_restart" not in {r["name"] for r in results}
+
+
+def test_use_tool_passes_the_user_to_the_executor(monkeypatch):
     monkeypatch.setattr(
         gateway.identity_mgr, "get_tool_config",
         lambda name: {"name": name, "public": True},
@@ -603,9 +709,10 @@ def test_use_tool_forwards_the_user_principal(monkeypatch):
     result = asyncio.run(gateway.use_tool(FakeContext(), "opsctl", {"x": 1}))
 
     assert result == "ok"
-    assert seen["principal"] == "user:user-1"
+    assert seen["tool_name"] == "opsctl"
     assert seen["user_id"] == "user-1"
-
+    # No principal is threaded through any more: the evaluator reads the token.
+    assert "principal" not in seen
 
 # --- use_tool: the minted gateway token carries the caller's identity ---------
 #
@@ -660,9 +767,9 @@ def test_use_tool_mints_a_gateway_token_with_the_callers_email_and_groups(monkey
 
     claims = agent_token.verify(minted["token"])
     assert claims.agent == "gateway"
-    # An ordinary agent token: no elevated principal, so the hub/relay treat the front
-    # door like any other caller (its grant is the tool's own public exposure).
-    assert claims.principal is None
+    # An ordinary agent token: the hub/relay treat the front door like any other caller
+    # (its grant is the tool's own public exposure). No elevated-principal claim exists.
+    assert not hasattr(claims, "principal")
     assert claims.user_id == "user-1"
     assert claims.user_email == "ops@example.com"
     # Sorted and de-duplicated, exactly as the token claim requires.

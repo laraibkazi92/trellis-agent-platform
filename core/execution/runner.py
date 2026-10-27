@@ -44,7 +44,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from core import agent_token as agent_token_module
-from core import allowlist
 from core.execution import canary, spec
 from core.execution.backend import (
     AttachHandle,
@@ -576,38 +575,6 @@ async def startup(backend: Optional[ContainerBackend] = None) -> list[Check]:
 # authorization
 # --------------------------------------------------------------------------- #
 
-# The runner has no etcd client (deliberate: tool execution must not depend on
-# the registry). Agent allowlists are read from the workspace manifests instead,
-# with a short mtime cache so an operator edit lands without a restart.
-_AGENT_MANIFESTS = (("agents", "agent"), ("workflows", "workflow"))
-_agent_cache: dict[str, tuple[tuple[int, int], Optional[dict]]] = {}
-
-
-def _agent_manifest(agent: str) -> Optional[dict]:
-    if not agent or "/" in agent or agent in {".", ".."}:
-        return None
-    root = _workspace_root()
-    for subdir, _kind in _AGENT_MANIFESTS:
-        path = os.path.join(root, subdir, agent, "config.yaml")
-        try:
-            stat = os.stat(path)
-        except OSError:
-            continue
-        stamp = (stat.st_mtime_ns, stat.st_size)
-        cached = _agent_cache.get(path)
-        if cached is not None and cached[0] == stamp:
-            return cached[1]
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                payload = yaml.safe_load(handle)
-        except (OSError, yaml.YAMLError):
-            logger.error("runner: cannot read agent manifest %s", path)
-            return None
-        data = payload if isinstance(payload, dict) else None
-        _agent_cache[path] = (stamp, data)
-        return data
-    return None
-
 
 def _verified_claims(payload: Any) -> Optional[agent_token_module.Claims]:
     """The caller's verified claims, or ``None`` when the request carries no verified token.
@@ -625,91 +592,34 @@ def _verified_claims(payload: Any) -> Optional[agent_token_module.Claims]:
         return None
 
 
-# The resource kinds the runner itself owns: a session container and a console
-# container are created and kept alive here, so the runner is the party that has to
-# check the allowlist. Everything else is somebody else's decision (see _authorize).
-_RUNNER_OWNED_KINDS = {"console", "mcp_session"}
-
-
 def _authorize(payload: Any) -> Optional[JSONResponse]:
-    """Verify the agent token and, where it owns the resource, the allowlist.
+    """Verify the agent token: signature, expiry and shape -- nothing else.
 
-    ``tool`` callers are authorized by the hub, which read the same registry the tool
-    was registered from and dispatched the call; the runner only proves the token is
-    valid. Requiring an on-disk manifest here would refuse every front-door/gateway
-    call -- neither has an agent record -- and the supervisor, whose manifest ships
-    inside the image (``core/assets/supervisor``) and is never materialised under
-    ``workspace/``.
+    The runner has no registry and no agent manifests, so it cannot resolve an
+    allowlist. Every authorization decision is made *before* the request reaches this
+    process: the hub authorizes tool calls, and the process that owns the agent
+    runtime authorizes the sessions and console containers it asks for
+    (``core.tool_gate``, surface ``host``, in v0.7.1 Phase 4). Re-deriving a verdict
+    here from a workspace manifest only ever denied calls that were already allowed.
 
-    A session/console container *is* owned by the runner, so the agent's on-disk
-    manifest is checked here, and an unrecognized kind is refused rather than trusted.
-
-    No caller is exempt: whoever minted the token, a resource the runner owns is
-    checked against that token agent's own allowlist. The one non-agent path is a
-    ``kind: "discovery"`` catalog read, which carries no agent run at all and is
-    gated by the runner bearer token on the control socket.
+    The one non-agent path is a ``kind: "discovery"`` catalog read, which carries no
+    agent run at all and is gated by the runner bearer token on the control socket.
     """
     mode = agent_token_module.mode()
     if mode == "off":
         return None
     if payload.kind == "discovery" and not getattr(payload, "agent_token", None):
         # A throwaway catalog read has no agent/run behind it. The socket already
-        # requires the runner bearer token; a supplied agent token must still verify.
+        # requires the runner bearer token.
         return None
     try:
-        claims = agent_token_module.verify(getattr(payload, "agent_token", None))
+        agent_token_module.verify(getattr(payload, "agent_token", None))
     except agent_token_module.AgentTokenError as exc:
         if mode == "log" and exc.code in {"missing", "missing_secret"}:
             # Rollout mode with no key/token: nothing to enforce yet, and warning
             # on every call would drown the log.
             return None
         message = f"access_denied: agent token rejected ({exc.code})"
-        if mode == "log":
-            logger.warning("runner: would deny %r: %s", payload.kind, message)
-            return None
-        return _error(403, "access_denied", message)
-
-    if payload.kind == "discovery":
-        # Throwaway catalog read: no agent owns it, and the socket already
-        # requires the runner bearer token.
-        return None
-
-    claimed_agent = claims.agent
-
-    # The edge runner has no agent manifests and no registry: the relay already
-    # made the allowlist decision on the same call. Signature/expiry only there.
-    if (os.getenv("RUNNER_AUTHORIZATION") or "allowlist").strip().lower() == "signature":
-        return None
-
-    if payload.kind == "tool":
-        # The hub authorized this call before dispatch (local and edge tools alike),
-        # against the same registry the target was resolved from. Re-deriving an
-        # allowlist from a workspace manifest here cannot work: the gateway has no
-        # agent record at all and the supervisor's manifest is an image asset.
-        return None
-
-    if payload.kind not in _RUNNER_OWNED_KINDS:
-        message = f"access_denied: unrecognized exec kind '{payload.kind}'"
-        if mode == "log":
-            logger.warning("runner: would deny %r: %s", payload.kind, message)
-            return None
-        return _error(403, "access_denied", message)
-
-    manifest = _agent_manifest(claimed_agent)
-    if manifest is None:
-        message = f"access_denied: unknown agent '{claimed_agent}'"
-        if mode == "log":
-            logger.warning("runner: would deny %r: %s", payload.kind, message)
-            return None
-        return _error(403, "access_denied", message)
-
-    allowed = allowlist.resolve(manifest)
-    if payload.kind == "mcp_session":
-        permitted = allowlist.permits_mcp_session(allowed, payload.target)
-    else:  # console: the runtime's own console tools
-        permitted = "execute" in allowed.console
-    if not permitted:
-        message = agent_token_module.deny_message(claimed_agent, payload.target)
         if mode == "log":
             logger.warning("runner: would deny %r: %s", payload.kind, message)
             return None

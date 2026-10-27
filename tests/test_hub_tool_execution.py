@@ -44,21 +44,34 @@ def _reset_registered_tools():
 
 
 @pytest.fixture(autouse=True)
-def _hermetic_authz_registry(monkeypatch):
-    """Every hub call now asks the direct-call gate (``hub_call_mode``, default off).
+def _hermetic_tool_access(monkeypatch):
+    """Keep the evaluator hermetic and in its rollout window.
 
-    ``core.tool_authz`` imports ``get_identity_manager`` from ``core.auth`` lazily, so
-    patching the hub's own binding is not enough: without this stub the first tool call
-    in each cache window would attempt a real etcd read.
+    Every hub call asks ``core.tool_access`` once. These tests are about execution,
+    not authorization, so the policy registry is faked (no document ⇒ no group rules,
+    zero etcd reads) and ``ENFORCE_AGENT_TOKENS`` is ``log``: a call without a token is
+    logged and runs, exactly like the pre-token posture these cases describe.
     """
-    import _hub_authz_registry as authz_registry
+    from core import tool_access
 
-    authz_registry.install(monkeypatch)
+    class _NoPolicy:
+        """An empty registry: no policy document, so the allowlist alone decides."""
+
+        def put(self, key, value):
+            raise AssertionError(f"no write expected: {key}")
+
+        def get(self, key, **_kwargs):
+            return None, None
+
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "log")
+    monkeypatch.setattr(tool_access, "_client", lambda: _NoPolicy())
+    tool_access.reset_snapshot()
+    with tool_access._shadow_lock:
+        tool_access._shadow_ring.clear()
     yield
-    from core import tool_authz
-
-    tool_authz.reset_cache()
-    tool_authz.clear_shadow_denies()
+    tool_access.reset_snapshot()
+    with tool_access._shadow_lock:
+        tool_access._shadow_ring.clear()
 
 
 ENTRYPOINT_SOURCE = "import json, sys\nprint(json.dumps({}))\n"
@@ -239,7 +252,8 @@ def test_run_tool_preserves_user_id_across_retries(monkeypatch, tmp_path):
     assert fake_identity.execution_token_calls == []
     resolved_user_ids = [call["identity"] for call in fake_identity.resolved_config_calls]
     assert resolved_user_ids.count("user-1") >= 2
-    assert fake_identity.get_user_calls.count("user-1") >= 2
+    # No user-record read for identity: without a token there is no email to inject.
+    assert fake_identity.get_user_calls == []
     assert ("user-1", "tmpltool") in fake_identity.record_tool_usage_calls
 
 
@@ -274,7 +288,7 @@ def test_run_tool_does_not_mutate_caller_arguments(monkeypatch, tmp_path):
 def test_tool_env_identity_comes_from_the_verified_token(monkeypatch, tmp_path):
     """A verified token is the only identity authority: the body cannot override it."""
     monkeypatch.setenv("AGENT_TOKEN_SECRET", SECRET)
-    monkeypatch.delenv("ENFORCE_AGENT_TOKENS", raising=False)
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "log")
     fake_identity = install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
     runner = install_fake_runner(monkeypatch, ok_result())
@@ -304,7 +318,7 @@ def test_tool_env_identity_comes_from_the_verified_token(monkeypatch, tmp_path):
 def test_tool_env_ignores_the_body_user_when_a_token_does_not_verify(monkeypatch, tmp_path):
     """A presented-but-invalid token drops the caller's identity entirely."""
     monkeypatch.setenv("AGENT_TOKEN_SECRET", SECRET)
-    monkeypatch.delenv("ENFORCE_AGENT_TOKENS", raising=False)
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "log")
     fake_identity = install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
     runner = install_fake_runner(monkeypatch, ok_result())
@@ -328,6 +342,7 @@ def test_tool_env_ignores_the_body_user_when_a_token_does_not_verify(monkeypatch
 def test_off_mode_falls_back_to_the_body_user_id(monkeypatch, tmp_path):
     """The documented dev/rollout fallback: nothing is verified in ``off``."""
     monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "off")
+    monkeypatch.setenv("DEV_MODE", "true")
     fake_identity = install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
     runner = install_fake_runner(monkeypatch, ok_result())
@@ -340,7 +355,9 @@ def test_off_mode_falls_back_to_the_body_user_id(monkeypatch, tmp_path):
 
     env = runner.requests[0].env
     assert env["TRELLIS_USER_ID"] == "user-1"
-    assert env["TRELLIS_USER_EMAIL"] == "u@example.com"
+    # Identity is the token's alone, and this run has none: no email is invented from
+    # the user record (v0.7.1 Phase 4 dropped that fallback).
+    assert "TRELLIS_USER_EMAIL" not in env
 
 
 def test_run_tool_args_carry_no_identity_fields_across_retries(monkeypatch, tmp_path):

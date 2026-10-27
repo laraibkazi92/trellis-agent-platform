@@ -23,7 +23,7 @@ from core.agent_token import mint_for_run
 from core.caller_identity import resolve_mint_identity
 from core.devmode import configure_cors, enforce_dev_mode_safety
 from core.models import is_agent_external, is_routable_agent_type
-from core import tool_authz
+from core import tool_access
 from core.health import compute_agent_operational_status
 from core.background.tasks import (
     background_tasks as _background_tasks,
@@ -52,12 +52,12 @@ async def lifespan(app: FastAPI):
     _memory_isolation_watch_id = identity_mgr.client.add_watch_prefix_callback("/config/framework/agent_memory_isolated_per_user", on_memory_flag_change)
     install_llm_key_watch()
     install_llm_defaults_watch()
+    # The host is an enforcing process: bind the policy watch here too, so a policy
+    # edit lands within the watch's ~2 s instead of the snapshot TTL.
     try:
-        from core.tool_authz import install_tool_authz_watch
-
-        install_tool_authz_watch()
+        tool_access.install_watch()
     except Exception:
-        logger.exception("Failed to install tool-authorization watch; continuing startup")
+        logger.exception("Failed to install the tool-access watch; using the cache TTL")
     # Warm the LLM provider-key cache off the event loop so the first request-path
     # lookup is a cache hit instead of a (possibly ~20s) etcd round-trip.
     await asyncio.to_thread(warm_key_cache)
@@ -82,11 +82,9 @@ async def lifespan(app: FastAPI):
     cancel_llm_key_watch()
     cancel_llm_defaults_watch()
     try:
-        from core.tool_authz import cancel_tool_authz_watch
-
-        cancel_tool_authz_watch()
+        tool_access.cancel_watch()
     except Exception:
-        logger.exception("Failed to cancel tool-authorization watch")
+        logger.exception("Failed to cancel the tool-access watch")
     hub_client = await get_hub_client()
     if hub_client:
         await hub_client.__aexit__(None, None, None)
@@ -320,14 +318,8 @@ async def chat_completions(request: ChatRequest):
         groups=mint_identity["groups"],
         run_id=uuid.uuid4().hex,
     )
-    # Publish the run's groups so the in-process gates (bound tools, use_tool) resolve
-    # `group:` rules from the claim the mint wrote instead of re-reading the record --
-    # the rule the hub's last mile applies. Mirrored exactly: a token minted without a
-    # `g` claim falls back to the stored record, so both sides of the boundary reach
-    # one verdict. (Phase 4 drops the fallback and reads the claim only.)
-    tool_authz.set_request_groups(
-        mint_identity["groups"] or tool_authz.stored_user_groups(captured_user_id)
-    )
+    # No group cache is published here: every in-process gate reads the groups off
+    # this run's token (claim "g"), the same claim the hub and relay consume.
 
     async def handle_success(result, user_id, ttft_ms=None):
         # Measure before usage/memory side effects so p95 reflects the model call,

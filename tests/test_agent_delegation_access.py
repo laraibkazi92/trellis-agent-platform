@@ -20,10 +20,8 @@ from typing import Dict, Optional
 
 import pytest
 
-import _hub_authz_registry as hub_authz
-from core import agent_factory, agent_token, auth, hub
+from core import agent_factory, agent_token, auth, hub, tool_access
 from core.models import ToolConfig
-from core import tool_authz
 from subagents_pydantic_ai import SubAgentConfig
 from subagents_pydantic_ai.types import CompiledSubAgent
 
@@ -222,6 +220,13 @@ def _setup_build_agent_common(monkeypatch):
     async def fake_discover_external_mcps(force=False):
         return None
 
+    monkeypatch.setattr(
+        auth,
+        "get_identity_manager",
+        lambda: SimpleNamespace(
+            get_agent_config=lambda name: {"allowed_tools": ["text_stats"]}
+        ),
+    )
     monkeypatch.setattr(agent_factory, "get_hub_client", fake_get_hub_client)
     monkeypatch.setattr(agent_factory, "discover_external_mcps", fake_discover_external_mcps)
 
@@ -428,12 +433,26 @@ def delegation_tokens(monkeypatch):
 
 
 @pytest.fixture
-def hub_authz_off(monkeypatch):
-    """Every authz mode off, and no real registry read from the bound-tool gate."""
-    fake = hub_authz.install(monkeypatch, mode="off", bound_mode="off", hub_mode="off")
-    tool_authz.reset_cache()
-    yield fake
-    tool_authz.reset_cache()
+def no_group_rules(monkeypatch):
+    """An empty tool-access policy: no group rules, so the allowlist alone decides."""
+    from core import tool_access
+
+    class _NoPolicy:
+        def put(self, key, value):
+            raise AssertionError(f"no write expected: {key}")
+
+        def get(self, key, **_kwargs):
+            return None, None
+
+    monkeypatch.setattr(tool_access, "_client", lambda: _NoPolicy())
+    monkeypatch.delenv(tool_access.MODE_ENV, raising=False)
+    tool_access.reset_snapshot()
+    with tool_access._shadow_lock:
+        tool_access._shadow_ring.clear()
+    yield
+    tool_access.reset_snapshot()
+    with tool_access._shadow_lock:
+        tool_access._shadow_ring.clear()
 
 
 def _parent_token(agent="supervisor", run_id="run-parent", email="dev@example.com"):
@@ -575,7 +594,7 @@ def test_delegation_without_a_parent_token_mints_nothing(delegation_tokens):
     assert minted == [None, None, None]
 
 
-def test_child_token_reaches_the_hub_tool_call(delegation_tokens, hub_authz_off, monkeypatch):
+def test_child_token_reaches_the_hub_tool_call(delegation_tokens, no_group_rules, monkeypatch):
     """The bound-tool wrapper forwards whatever token is installed, so a delegated
     child's call arrives at the hub as ITS token, not the caller's."""
     captured = []
@@ -605,6 +624,13 @@ def test_child_token_reaches_the_hub_tool_call(delegation_tokens, hub_authz_off,
         async with agent_factory._delegated_run("data-parser"):
             await recording_agent.tools["text_stats"](None)
 
+    monkeypatch.setattr(
+        auth,
+        "get_identity_manager",
+        lambda: SimpleNamespace(
+            get_agent_config=lambda name: {"allowed_tools": ["text_stats"]}
+        ),
+    )
     monkeypatch.setattr(agent_factory, "get_hub_client", fake_get_hub_client)
     monkeypatch.setattr(
         agent_factory,
@@ -634,7 +660,9 @@ class FakeHubRegistry:
         return self._configs.get(name)
 
 
-def test_hub_authorizes_the_child_against_its_own_allowlist(delegation_tokens, monkeypatch):
+def test_hub_authorizes_the_child_against_its_own_allowlist(
+    delegation_tokens, no_group_rules, monkeypatch
+):
     """The real hub decision: the parent's manifest grants `text_stats`, the child's
     does not, and the child's token is what reaches the hub mid-delegation."""
     monkeypatch.setattr(
@@ -665,10 +693,55 @@ def test_hub_authorizes_the_child_against_its_own_allowlist(delegation_tokens, m
     parent_after = asyncio.run(scenario())
 
     assert outcome["child_agent"] == "data-parser"
-    assert outcome["denial"] == {
-        "error": agent_token.deny_message("data-parser", "text_stats")
-    }
+    # The evaluator's own message names the agent and the target it refused.
+    assert "access_denied" in outcome["denial"]["error"]
+    assert "'data-parser'" in outcome["denial"]["error"]
+    assert "'text_stats'" in outcome["denial"]["error"]
     assert parent_after is None
+
+
+def test_a_delegated_child_is_authorized_by_its_own_token(delegation_tokens, monkeypatch):
+    """The bound-tool gate answers for the CHILD mid-delegation: its own allowlist and
+    the groups its token inherited from the parent's claims (never a record read)."""
+    from types import SimpleNamespace
+
+    from core import tool_access
+
+    class _NoPolicy:
+        def put(self, key, value):
+            raise AssertionError(f"no write expected: {key}")
+
+        def get(self, key, **_kwargs):
+            return None, None
+
+    monkeypatch.setattr(tool_access, "_client", lambda: _NoPolicy())
+    tool_access.reset_snapshot()
+    monkeypatch.setattr(
+        auth,
+        "get_identity_manager",
+        lambda: SimpleNamespace(
+            get_agent_config=lambda name: {"allowed_tools": ["text_stats"] if name == "data-parser" else []}
+        ),
+    )
+    seen = {}
+
+    async def scenario():
+        _parent_token()  # supervisor: no tools of its own
+        seen["parent"] = await agent_factory._bound_tool_denial("text_stats")
+        async with agent_factory._delegated_run("data-parser"):
+            claims = agent_token.verify(auth.agent_token_var.get())
+            seen["child_groups"] = claims.groups
+            seen["child"] = await agent_factory._bound_tool_denial("text_stats")
+        return await agent_factory._bound_tool_denial("text_stats")
+
+    seen["parent_after"] = asyncio.run(scenario())
+
+    # The parent is refused, the child is granted, and the parent's refusal is back.
+    assert seen["parent"] is not None
+    assert seen["child"] is None
+    assert seen["parent_after"] is not None
+    # Groups travel in the token, inherited from the parent claims at mint.
+    assert seen["child_groups"] == ("dev", "ops")
 
 
 # --- seam installation on both delegation paths ------------------------------

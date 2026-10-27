@@ -13,328 +13,279 @@
         <i data-lucide="arrow-left" class="w-4 h-4"></i> BACK TO ADMIN DASHBOARD
     </a>
 
-    <div class="mb-8">
+    <div class="mb-6">
         <h1 class="text-3xl font-bold tracking-tight uppercase mb-2">Tool Authorization</h1>
         <p class="text-neutral-500 dark:text-neutral-400 font-mono text-sm">
-            Default-deny boundary for tool calls. A call is allowed only when an ordered rule matches its
-            principal, tool and scope &mdash; no match means deny. Roll out in stages:
-            <code class="bg-neutral-200 dark:bg-neutral-800 px-1 py-0.5 rounded-sm">off</code> &rarr;
-            <code class="bg-neutral-200 dark:bg-neutral-800 px-1 py-0.5 rounded-sm">shadow</code> (log would-be
-            denials, still allow) &rarr;
-            <code class="bg-neutral-200 dark:bg-neutral-800 px-1 py-0.5 rounded-sm">enforcing</code>.
-        </p>
-        <p class="text-neutral-500 dark:text-neutral-400 font-mono text-xs mt-2">
-            All writes apply immediately: the etcd watch invalidates the policy cache, so no restart is needed.
-            Rolling back is the same operation &mdash; set the mode back to shadow or off.
-        </p>
-        <p class="text-amber-600 dark:text-amber-400 font-mono text-xs mt-2">
-            Scope: this gate covers calls that go through <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">use_tool</code>
-            (direct gateway use, and agent <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">use_tool</code>)
-            and the <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">search_tools</code> listing. Tools bound
-            directly to an agent are gated separately below (<strong>Bound tools</strong>), and direct hub
-            <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">/tools/call</code>
-            traffic has its own switch (<strong>Direct hub calls</strong>). Agent-driven calls resolve to
-            <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">agent:&lt;name&gt;</code> /
-            <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">workflow:&lt;name&gt;</code>, not the end user.
+            Read-only view of the single tool-access decision: an agent's own allowlist, plus the group
+            rules from the workspace policy file, under one mode switch.
         </p>
     </div>
+
+    <!-- Read-only banner: where the knobs actually live -->
+    <div class="border border-accent/40 bg-accent/5 dark:bg-accent-dark/10 rounded p-5 space-y-2 mb-6">
+        <div class="flex items-center gap-2">
+            <i data-lucide="lock" class="w-4 h-4 text-neutral-700 dark:text-neutral-300"></i>
+            <h2 class="font-bold text-neutral-900 dark:text-neutral-100">This page does not write anything</h2>
+        </div>
+        <p class="font-mono text-xs text-neutral-600 dark:text-neutral-300">
+            Group rules live in
+            <code class="bg-neutral-100 dark:bg-neutral-800 px-1 py-0.5 rounded-sm">workspace/policies/tool_access.yaml</code>
+            in the workspace, so they are version-controlled and reviewed like any other manifest. The mode is
+            the deployment variable
+            <code class="bg-neutral-100 dark:bg-neutral-800 px-1 py-0.5 rounded-sm">{{ mode_env }}</code>.
+            Changes ship with the workspace: edit the file, commit it, then sync/rebuild &mdash; the sync writes
+            the document to the registry and every enforcing process picks it up through its watch within a
+            couple of seconds, no restart needed. There is no editor here, no policy upload and no per-surface
+            mode switch to flip.
+        </p>
+        <p class="font-mono text-xs text-neutral-600 dark:text-neutral-300">
+            Scope: every tool call the framework dispatches &mdash; hub tools
+            (<code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">use_tool</code>),
+            tools bound directly to an agent, edge tools and MCP servers (through the relay), and the console
+            <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">execute</code> tool. The console file
+            tools (<code>read_file</code>, <code>write_file</code>, <code>edit_file</code>, <code>ls</code>,
+            <code>glob</code>, <code>grep</code>) do not pass through this evaluator: a rule naming one of them
+            decides nothing, and they stay constrained by the agent's console allowlist alone.
+            The allowlist half is always enforced; the group-rule half is what the mode relaxes.
+        </p>
+    </div>
+
+    {% if not policy_available %}
+    <!-- A failed read is fail-closed at runtime: say so first, loudly. -->
+    <div class="border border-red-500/40 bg-red-50 dark:bg-red-950/20 rounded p-5 space-y-2 mb-6">
+        <div class="flex items-center gap-2">
+            <i data-lucide="shield-alert" class="w-4 h-4 text-red-600 dark:text-red-400"></i>
+            <h2 class="font-bold text-red-700 dark:text-red-300">Policy unavailable &mdash; the evaluator is failing closed</h2>
+        </div>
+        <p class="font-mono text-xs text-red-700/90 dark:text-red-300/90 break-all">{{ policy_error }}</p>
+        <p class="font-mono text-[11px] text-red-700/80 dark:text-red-300/80">
+            Until the registry read succeeds again, every call a group rule could have decided is denied (the
+            allowlist alone no longer authorizes it). Fix the document or the registry, then reload this page.
+        </p>
+    </div>
+    {% endif %}
 
     {% set mode_styles = {
         'off': 'border-neutral-500/30 bg-neutral-100 text-neutral-600 dark:bg-neutral-800/40 dark:text-neutral-400',
         'shadow': 'border-amber-500/30 bg-amber-50 text-amber-600 dark:bg-amber-950/20 dark:text-amber-400',
-        'enforcing': 'border-red-500/30 bg-red-50 text-red-600 dark:bg-red-950/20 dark:text-red-400'
+        'enforce': 'border-red-500/30 bg-red-50 text-red-600 dark:bg-red-950/20 dark:text-red-400'
     } %}
 
-    <!-- Mode selector -->
-    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm space-y-4 mb-6">
+    <!-- Mode (read-only) -->
+    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm space-y-3 mb-6">
         <div class="flex flex-wrap items-center gap-3">
-            <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Mode
-                <span class="font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">use_tool</span>
-            </h2>
+            <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Mode</h2>
             <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-mono font-bold uppercase rounded border {{ mode_styles.get(mode, mode_styles['off']) }}">
-                {% if mode == 'enforcing' %}<i data-lucide="shield-alert" class="w-3 h-3 mr-1"></i>{% elif mode == 'shadow' %}<i data-lucide="eye" class="w-3 h-3 mr-1"></i>{% else %}<i data-lucide="shield-off" class="w-3 h-3 mr-1"></i>{% endif %}
+                {% if mode == 'enforce' %}<i data-lucide="shield-alert" class="w-3 h-3 mr-1"></i>{% elif mode == 'shadow' %}<i data-lucide="eye" class="w-3 h-3 mr-1"></i>{% else %}<i data-lucide="shield-off" class="w-3 h-3 mr-1"></i>{% endif %}
                 CURRENT: {{ mode }}
             </span>
-        </div>
-        <p class="font-mono text-xs text-neutral-500 dark:text-neutral-400">
-            {% if mode == 'enforcing' %}
-            Enforcing &mdash; calls with no matching rule are denied. Set the mode back to shadow or off to roll back immediately.
-            {% elif mode == 'shadow' %}
-            Shadow &mdash; would-be denials are recorded below and the call still proceeds. Check the table for false positives before enforcing.
-            {% else %}
-            Off &mdash; authorization is not evaluated at all. The policy below is stored but unused.
-            {% endif %}
-        </p>
-
-        <form action="/admin/tool-authz/mode" method="POST" class="space-y-4">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            {% set mode_options = [
-                ('off', 'Off', 'No checks. Policy is stored but not evaluated.'),
-                ('shadow', 'Shadow', 'Evaluate and log would-be denials, still allow.'),
-                ('enforcing', 'Enforcing', 'Deny any call with no matching rule.')
-            ] %}
-            <div class="grid gap-2 sm:grid-cols-3">
-                {% for value, label, description in mode_options %}
-                <label class="cursor-pointer block">
-                    <input type="radio" name="mode" value="{{ value }}" class="peer sr-only" {% if mode == value %}checked{% endif %}>
-                    <span class="block h-full border border-neutral-200 dark:border-neutral-800 rounded px-4 py-3 transition-colors text-neutral-900 dark:text-neutral-100 peer-checked:border-accent dark:peer-checked:border-accent-dark peer-checked:bg-accent/5 dark:peer-checked:bg-accent-dark/10 peer-focus-visible:ring-2 peer-focus-visible:ring-accent">
-                        <span class="block font-mono font-bold text-xs uppercase tracking-widest">{{ label }}</span>
-                        <span class="block font-mono text-[10px] text-neutral-500 dark:text-neutral-400 mt-1">{{ description }}</span>
-                    </span>
-                </label>
-                {% endfor %}
-            </div>
-
-            <div class="border border-red-500/40 bg-red-50 dark:bg-red-950/20 rounded p-4 space-y-2">
-                <label class="inline-flex items-start gap-2 cursor-pointer select-none">
-                    <input type="checkbox" name="confirm" value="on" class="mt-0.5 accent-current">
-                    <span class="font-mono text-xs text-red-700 dark:text-red-300">
-                        I understand that switching to
-                        <strong>enforcing</strong> denies every tool call without a matching rule.
-                    </span>
-                </label>
-                <p class="font-mono text-[11px] text-red-700/80 dark:text-red-300/80">
-                    Only required for enforcing. Rollback is immediate: set the mode back to shadow/off and the
-                    next call uses the old mode (cache invalidated by the etcd watch, no restart).
-                </p>
-            </div>
-
-            <div class="flex justify-end">
-                <button type="submit" class="bg-accent hover:bg-accent-dark text-white font-mono font-bold text-sm uppercase py-2.5 px-6 transition-colors rounded">
-                    Save mode
-                </button>
-            </div>
-        </form>
-    </div>
-
-    <!-- Bound-tool mode selector -->
-    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm space-y-4 mb-6">
-        <div class="flex flex-wrap items-center gap-3">
-            <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Bound tools</h2>
-            <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-mono font-bold uppercase rounded border {{ mode_styles.get(bound_mode, mode_styles['off']) }}">
-                {% if bound_mode == 'enforcing' %}<i data-lucide="shield-alert" class="w-3 h-3 mr-1"></i>{% elif bound_mode == 'shadow' %}<i data-lucide="eye" class="w-3 h-3 mr-1"></i>{% else %}<i data-lucide="shield-off" class="w-3 h-3 mr-1"></i>{% endif %}
-                CURRENT: {{ bound_mode }}
-            </span>
-        </div>
-        <p class="font-mono text-xs text-neutral-500 dark:text-neutral-400">
-            Tools listed in an agent's <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">allowed_tools</code> /
-            <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">allowed_mcps</code> are registered straight onto the
-            agent and never go through <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">use_tool</code>, so they
-            have their own switch and their own rollout. Console tools, A2A delegation and admin tools are not covered.
-            {% if bound_mode == 'enforcing' %}
-            Enforcing &mdash; a bound tool with no matching rule returns an access-denied message to the model instead of running.
-            {% elif bound_mode == 'shadow' %}
-            Shadow &mdash; would-be denials are recorded below with <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">surface=bound_tool</code>, and the tool still runs.
-            {% else %}
-            Off &mdash; bound tools run without any authorization check. Default for this release.
-            {% endif %}
-        </p>
-
-        <form action="/admin/tool-authz/bound-mode" method="POST" class="space-y-4">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            {% set mode_options = [
-                ('off', 'Off', 'No checks for bound tools.'),
-                ('shadow', 'Shadow', 'Evaluate and log would-be denials, still run the tool.'),
-                ('enforcing', 'Enforcing', 'Deny bound-tool calls with no matching rule.')
-            ] %}
-            <div class="grid gap-2 sm:grid-cols-3">
-                {% for value, label, description in mode_options %}
-                <label class="cursor-pointer block">
-                    <input type="radio" name="mode" value="{{ value }}" class="peer sr-only" {% if bound_mode == value %}checked{% endif %}>
-                    <span class="block h-full border border-neutral-200 dark:border-neutral-800 rounded px-4 py-3 transition-colors text-neutral-900 dark:text-neutral-100 peer-checked:border-accent dark:peer-checked:border-accent-dark peer-checked:bg-accent/5 dark:peer-checked:bg-accent-dark/10 peer-focus-visible:ring-2 peer-focus-visible:ring-accent">
-                        <span class="block font-mono font-bold text-xs uppercase tracking-widest">{{ label }}</span>
-                        <span class="block font-mono text-[10px] text-neutral-500 dark:text-neutral-400 mt-1">{{ description }}</span>
-                    </span>
-                </label>
-                {% endfor %}
-            </div>
-
-            <div class="border border-red-500/40 bg-red-50 dark:bg-red-950/20 rounded p-4 space-y-2">
-                <label class="inline-flex items-start gap-2 cursor-pointer select-none">
-                    <input type="checkbox" name="confirm" value="on" class="mt-0.5 accent-current">
-                    <span class="font-mono text-xs text-red-700 dark:text-red-300">
-                        I understand that switching bound tools to <strong>enforcing</strong> denies every bound-tool
-                        call without a matching rule, which can break agents already using those tools.
-                    </span>
-                </label>
-                <p class="font-mono text-[11px] text-red-700/80 dark:text-red-300/80">
-                    Only required for enforcing. Run shadow first: the policy was written for
-                    <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">use_tool</code> traffic and rarely has
-                    rules for <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">agent:&lt;name&gt;</code> bound calls yet.
-                </p>
-            </div>
-
-            <div class="flex justify-end">
-                <button type="submit" class="bg-accent hover:bg-accent-dark text-white font-mono font-bold text-sm uppercase py-2.5 px-6 transition-colors rounded">
-                    Save bound-tools mode
-                </button>
-            </div>
-        </form>
-    </div>
-
-    <!-- Direct hub call mode selector -->
-    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm space-y-4 mb-6">
-        <div class="flex flex-wrap items-center gap-3">
-            <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Direct hub calls</h2>
-            <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-mono font-bold uppercase rounded border {{ mode_styles.get(hub_mode, mode_styles['off']) }}">
-                {% if hub_mode == 'enforcing' %}<i data-lucide="shield-alert" class="w-3 h-3 mr-1"></i>{% elif hub_mode == 'shadow' %}<i data-lucide="eye" class="w-3 h-3 mr-1"></i>{% else %}<i data-lucide="shield-off" class="w-3 h-3 mr-1"></i>{% endif %}
-                CURRENT: {{ hub_mode }}
-            </span>
-        </div>
-        <p class="font-mono text-xs text-neutral-500 dark:text-neutral-400">
-            Every call the hub dispatches passes this switch &mdash; including traffic that already went through
-            <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">use_tool</code> or a bound tool. The other two modes
-            decide whether <em>that</em> surface lets a call reach the hub; this one decides whether the hub executes it, so
-            promoting it enforces for agent traffic regardless of their state. The principal comes from the agent token the
-            framework forwards on the call (the same token agents already use), falling back to the caller's user id and then
-            to <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">anonymous</code>; an unverifiable token is not an
-            error, it just contributes no claims. This assumes the hub port stays reachable only from the framework.
-            {% if hub_mode == 'enforcing' %}
-            Enforcing &mdash; a direct call with no matching rule returns an access-denied error and the tool does not run.
-            {% elif hub_mode == 'shadow' %}
-            Shadow &mdash; would-be denials are recorded below with <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">surface=hub_direct</code>, and the tool still runs.
-            {% else %}
-            Off &mdash; direct hub calls run without an authorization check. Default for this release.
-            {% endif %}
-        </p>
-
-        <form action="/admin/tool-authz/hub-mode" method="POST" class="space-y-4">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            {% set mode_options = [
-                ('off', 'Off', 'No checks for direct hub calls.'),
-                ('shadow', 'Shadow', 'Evaluate and log would-be denials, still run the tool.'),
-                ('enforcing', 'Enforcing', 'Deny direct hub calls with no matching rule.')
-            ] %}
-            <div class="grid gap-2 sm:grid-cols-3">
-                {% for value, label, description in mode_options %}
-                <label class="cursor-pointer block">
-                    <input type="radio" name="mode" value="{{ value }}" class="peer sr-only" {% if hub_mode == value %}checked{% endif %}>
-                    <span class="block h-full border border-neutral-200 dark:border-neutral-800 rounded px-4 py-3 transition-colors text-neutral-900 dark:text-neutral-100 peer-checked:border-accent dark:peer-checked:border-accent-dark peer-checked:bg-accent/5 dark:peer-checked:bg-accent-dark/10 peer-focus-visible:ring-2 peer-focus-visible:ring-accent">
-                        <span class="block font-mono font-bold text-xs uppercase tracking-widest">{{ label }}</span>
-                        <span class="block font-mono text-[10px] text-neutral-500 dark:text-neutral-400 mt-1">{{ description }}</span>
-                    </span>
-                </label>
-                {% endfor %}
-            </div>
-
-            <div class="border border-red-500/40 bg-red-50 dark:bg-red-950/20 rounded p-4 space-y-2">
-                <label class="inline-flex items-start gap-2 cursor-pointer select-none">
-                    <input type="checkbox" name="confirm" value="on" class="mt-0.5 accent-current">
-                    <span class="font-mono text-xs text-red-700 dark:text-red-300">
-                        I understand that switching the hub to <strong>enforcing</strong> denies every hub call without a
-                        matching rule &mdash; including agent traffic &mdash; regardless of the use_tool and bound-tool modes.
-                    </span>
-                </label>
-                <p class="font-mono text-[11px] text-red-700/80 dark:text-red-300/80">
-                    Only required for enforcing. Run shadow first and confirm the principals read
-                    <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">agent:&lt;name&gt;</code> /
-                    <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">workflow:&lt;name&gt;</code> &mdash; an
-                    unverifiable agent token resolves to <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">user:&lt;id&gt;</code>
-                    or <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">anonymous</code> and no
-                    <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">agent:</code> rule can match it.
-                </p>
-            </div>
-
-            <div class="flex justify-end">
-                <button type="submit" class="bg-accent hover:bg-accent-dark text-white font-mono font-bold text-sm uppercase py-2.5 px-6 transition-colors rounded">
-                    Save hub-call mode
-                </button>
-            </div>
-        </form>
-    </div>
-
-    <!-- Policy editor -->
-    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm space-y-4 mb-6">
-        <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-            <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Policy</h2>
             <span class="font-mono text-[11px] text-neutral-500 dark:text-neutral-400">
-                Ordered rules &mdash; the first match wins. Unknown or invalid fields are rejected on save.
+                from <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">{{ mode_env }}</code>
+                (valid: {{ modes | join(', ') }})
             </span>
         </div>
+        <p class="font-mono text-xs text-neutral-500 dark:text-neutral-400">
+            {% if mode == 'enforce' %}
+            Enforce &mdash; group-rule denials are final. A target no rule matches is still governed by the agent's
+            allowlist alone.
+            {% elif mode == 'shadow' %}
+            Shadow &mdash; a group-rule denial is logged and pushed onto the ring below, then the call proceeds.
+            The allowlist half is still enforced, so nothing new executes.
+            {% else %}
+            Off &mdash; the group-rule half is skipped entirely; only the agent's own allowlist decides.
+            {% endif %}
+        </p>
+    </div>
 
-        {% if bootstrap_available %}
-        <form action="/admin/tool-authz/bootstrap" method="POST" class="flex flex-wrap items-center justify-between gap-3 border border-neutral-200 dark:border-neutral-800 rounded p-4">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <p class="font-mono text-[11px] text-neutral-500 dark:text-neutral-400 max-w-xl">
-                Bootstrap generates one explicit rule per currently-public tool (and per MCP tool list) with
-                <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">allow_principals: ["*"]</code>
-                and both scopes &mdash; a self-documenting starting point. Tighten by deleting lines. The mode is
-                left unchanged.
+    <!-- Group rules (loaded policy) -->
+    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm space-y-3 mb-6">
+        <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+            <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Group rules</h2>
+            <span class="font-mono text-[11px] text-neutral-500 dark:text-neutral-400">
+                policy version
+                <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">{{ policy_version }}</code>
+                &middot; {{ rules | length }} rule{% if rules | length != 1 %}s{% endif %}
+                &middot; loaded from
+                <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">workspace/policies/tool_access.yaml</code>
+            </span>
+        </div>
+        <p class="font-mono text-[11px] text-neutral-500 dark:text-neutral-400">
+            A target matched by at least one rule is usable only by a caller whose token groups intersect that
+            rule's group set (any matching rule is enough &mdash; the rules are allow-lists, not an ordered
+            policy). A target no rule matches is governed by the agent's allowlist alone.
+        </p>
+
+        {% if policy_warnings %}
+        <!-- Warnings, not errors: the policy loaded, but these rules decide nothing. -->
+        <div class="border border-amber-500/40 bg-amber-50 dark:bg-amber-950/20 rounded p-4 space-y-1">
+            <div class="flex items-center gap-2">
+                <i data-lucide="alert-triangle" class="w-4 h-4 text-amber-600 dark:text-amber-400"></i>
+                <p class="font-mono text-xs font-bold text-amber-700 dark:text-amber-300">
+                    Warnings &mdash; {{ policy_warnings | length }} rule target{% if policy_warnings | length != 1 %}s{% endif %} can never match
+                </p>
+            </div>
+            {% for warning in policy_warnings %}
+            <p class="font-mono text-[11px] text-amber-700/90 dark:text-amber-300/90 break-all">{{ warning }}</p>
+            {% endfor %}
+            <p class="font-mono text-[11px] text-amber-700/80 dark:text-amber-300/80">
+                Only the console <code class="bg-amber-100 dark:bg-amber-900/40 px-1 rounded">execute</code> tool is
+                gated by these rules. The console file tools
+                (<code>read_file</code>, <code>write_file</code>, <code>edit_file</code>, <code>ls</code>,
+                <code>glob</code>, <code>grep</code>) are not covered by tool-access rules at all &mdash; they stay
+                constrained by the agent's console allowlist.
             </p>
-            <button type="submit" class="border border-neutral-300 dark:border-neutral-700 text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 font-mono font-bold text-xs uppercase tracking-widest px-4 py-2 transition-colors rounded shrink-0">
-                Bootstrap from registry
-            </button>
-        </form>
+        </div>
         {% endif %}
 
-        <form action="/admin/tool-authz/policy" method="POST" class="space-y-3">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <label for="toolAuthzPolicy" class="block font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Policy YAML</label>
-            <textarea name="policy_yaml" id="toolAuthzPolicy" rows="18" spellcheck="false" wrap="off"
-                      class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-xs leading-relaxed focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded whitespace-pre overflow-x-auto">{{ policy_yaml }}</textarea>
-            <p class="font-mono text-[10px] text-neutral-500 dark:text-neutral-400">
-                <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">default_action: deny</code> is the only
-                accepted value. Rules take <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">tools</code> (globs),
-                <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">allow_principals</code> and
-                <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">scopes</code>
-                (<code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">tools:read</code>,
-                <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">tools:call</code>).
-                <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">rate_limit_per_min</code> is accepted
-                for schema compatibility but not enforced in v1. Unknown fields are rejected on save.
+        {% if rules %}
+        <div class="overflow-x-auto border border-neutral-200 dark:border-neutral-800 rounded">
+            <table class="w-full text-left font-mono text-xs">
+                <thead class="bg-neutral-50 dark:bg-neutral-950 text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">
+                    <tr>
+                        <th scope="col" class="px-3 py-2 font-normal">Rule</th>
+                        <th scope="col" class="px-3 py-2 font-normal">Targets</th>
+                        <th scope="col" class="px-3 py-2 font-normal">Groups</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-neutral-200 dark:divide-neutral-800">
+                    {% for rule in rules %}
+                    <tr>
+                        <td class="px-3 py-2 text-neutral-500 dark:text-neutral-400 whitespace-nowrap">{{ rule.label }}</td>
+                        <td class="px-3 py-2 text-neutral-900 dark:text-neutral-100 break-all">
+                            {% for target in rule.targets %}<div>{{ target }}</div>{% endfor %}
+                        </td>
+                        <td class="px-3 py-2 text-neutral-700 dark:text-neutral-300 break-all">
+                            {% for group in rule.groups %}<div>{{ group }}</div>{% endfor %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="border border-dashed border-neutral-300 dark:border-neutral-700 rounded p-8 text-center">
+            <p class="font-mono text-sm font-bold uppercase tracking-widest text-neutral-700 dark:text-neutral-300">No group rules loaded</p>
+            <p class="font-mono text-xs text-neutral-500 dark:text-neutral-400 mt-2">
+                {% if policy_available %}
+                The policy is empty (or not present yet), so every call is decided by the agent's allowlist alone.
+                Add rules to <span class="font-bold">workspace/policies/tool_access.yaml</span> to require group
+                membership for specific tools.
+                {% else %}
+                The policy could not be read, so nothing is loaded and group-rule decisions fail closed.
+                {% endif %}
             </p>
-            <div class="flex justify-end">
-                <button type="submit" class="bg-accent hover:bg-accent-dark text-white font-mono font-bold text-sm uppercase py-2.5 px-6 transition-colors rounded">
-                    Save policy
-                </button>
-            </div>
-        </form>
+        </div>
+        {% endif %}
     </div>
 
-    <!-- Shadow-deny log -->
+    <!-- Effective allowlist per agent -->
     <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm space-y-3 mb-6">
-        <div class="flex flex-wrap items-center justify-between gap-3">
-            <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-                <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Shadow denials</h2>
-                <span class="font-mono text-[11px] text-neutral-500 dark:text-neutral-400">
-                    Newest first &mdash; denials from every service process (sampled at most one per second per
-                    process, capped at 200). Shadow entries are would-be denials; enforcing entries were denied.
-                    The surface column names the gate: <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">use_tool</code>,
-                    <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">bound_tool</code> or
-                    <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">hub_direct</code>.
-                </span>
-            </div>
-            {% if shadow_denies %}
-            <form action="/admin/tool-authz/clear-shadow" method="POST">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                <button type="submit" class="text-xs text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300 font-mono uppercase transition-colors">
-                    Clear log
-                </button>
-            </form>
-            {% endif %}
+        <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+            <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Effective allowlists</h2>
+            <span class="font-mono text-[11px] text-neutral-500 dark:text-neutral-400">
+                resolved from each agent record &mdash; {{ agents | length }} agent{% if agents | length != 1 %}s{% endif %}
+            </span>
         </div>
+        <p class="font-mono text-[11px] text-neutral-500 dark:text-neutral-400">
+            What each agent may call before any group rule narrows it further. A bare tool name grants exactly
+            that tool, never a same-named MCP tool; MCP tools are reachable through
+            <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">allowed_mcps</code> or their full
+            <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">mcp__...</code> name.
+        </p>
 
-        {% if shadow_denies %}
+        {% if agents_error %}
+        <div class="border border-amber-500/40 bg-amber-50 dark:bg-amber-950/20 rounded p-4">
+            <p class="font-mono text-xs text-amber-700 dark:text-amber-300 break-all">
+                Agent records unavailable: {{ agents_error }}
+            </p>
+        </div>
+        {% elif agents %}
+        <div class="overflow-x-auto border border-neutral-200 dark:border-neutral-800 rounded">
+            <table class="w-full text-left font-mono text-xs">
+                <thead class="bg-neutral-50 dark:bg-neutral-950 text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">
+                    <tr>
+                        <th scope="col" class="px-3 py-2 font-normal">Agent</th>
+                        <th scope="col" class="px-3 py-2 font-normal">Tools</th>
+                        <th scope="col" class="px-3 py-2 font-normal">MCP servers</th>
+                        <th scope="col" class="px-3 py-2 font-normal">Wildcards</th>
+                        <th scope="col" class="px-3 py-2 font-normal">Console</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-neutral-200 dark:divide-neutral-800">
+                    {% for agent in agents %}
+                    <tr>
+                        <td class="px-3 py-2 text-neutral-900 dark:text-neutral-100 whitespace-nowrap align-top">
+                            {{ agent.name }}
+                            <span class="block text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">{{ agent.type }}</span>
+                        </td>
+                        {% for column in [agent.tools, agent.mcps, agent.wildcards, agent.console] %}
+                        <td class="px-3 py-2 text-neutral-700 dark:text-neutral-300 break-all align-top">
+                            {% if column %}
+                                {% for entry in column %}<div>{{ entry }}</div>{% endfor %}
+                            {% else %}
+                            <span class="text-neutral-400 dark:text-neutral-600">&mdash;</span>
+                            {% endif %}
+                        </td>
+                        {% endfor %}
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="border border-dashed border-neutral-300 dark:border-neutral-700 rounded p-8 text-center">
+            <p class="font-mono text-sm font-bold uppercase tracking-widest text-neutral-700 dark:text-neutral-300">No agents registered</p>
+            <p class="font-mono text-xs text-neutral-500 dark:text-neutral-400 mt-2">
+                Every agent record carries the allowlist that half of the decision uses; there is nothing to show yet.
+            </p>
+        </div>
+        {% endif %}
+    </div>
+
+    <!-- Shadow denials -->
+    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm space-y-3 mb-6">
+        <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+            <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Shadow denials</h2>
+            <span class="font-mono text-[11px] text-neutral-500 dark:text-neutral-400">
+                Newest first &mdash; what a group rule would have denied in <span class="font-bold">shadow</span> mode,
+                shared across service processes (sampled at most once per second per process, bounded ring).
+            </span>
+        </div>
+        <p class="font-mono text-[11px] text-neutral-500 dark:text-neutral-400">
+            The surface column names the enforcement point that raised it:
+            <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">hub</code>,
+            <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">relay</code>,
+            <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">host</code>,
+            <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">bound_tool</code>.
+            Entries never carry a user id, an email or tool arguments.
+        </p>
+
+        {% if shadow_denials %}
         <div class="overflow-x-auto border border-neutral-200 dark:border-neutral-800 rounded">
             <table class="w-full text-left font-mono text-xs">
                 <thead class="bg-neutral-50 dark:bg-neutral-950 text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">
                     <tr>
                         <th scope="col" class="px-3 py-2 font-normal">Timestamp</th>
-                        <th scope="col" class="px-3 py-2 font-normal">Principal</th>
-                        <th scope="col" class="px-3 py-2 font-normal">Tool</th>
-                        <th scope="col" class="px-3 py-2 font-normal">Scope</th>
-                        <th scope="col" class="px-3 py-2 font-normal">Mode</th>
+                        <th scope="col" class="px-3 py-2 font-normal">Agent</th>
+                        <th scope="col" class="px-3 py-2 font-normal">Target</th>
+                        <th scope="col" class="px-3 py-2 font-normal">Reason</th>
+                        <th scope="col" class="px-3 py-2 font-normal">Rule</th>
+                        <th scope="col" class="px-3 py-2 font-normal">Groups</th>
                         <th scope="col" class="px-3 py-2 font-normal">Surface</th>
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-neutral-200 dark:divide-neutral-800">
-                    {% for deny in shadow_denies %}
+                    {% for deny in shadow_denials %}
                     <tr>
-                        <td class="px-3 py-2 text-neutral-500 dark:text-neutral-400 whitespace-nowrap">{{ deny.ts }}</td>
-                        <td class="px-3 py-2 text-neutral-900 dark:text-neutral-100 break-all">{{ deny.principal }}</td>
-                        <td class="px-3 py-2 text-neutral-900 dark:text-neutral-100 break-all">{{ deny.tool }}</td>
-                        <td class="px-3 py-2 text-neutral-700 dark:text-neutral-300">{{ deny.scope }}</td>
-                        <td class="px-3 py-2 text-neutral-500 dark:text-neutral-400">{{ deny.mode or 'shadow' }}</td>
-                        <td class="px-3 py-2 text-neutral-700 dark:text-neutral-300">{{ deny.surface or 'use_tool' }}</td>
+                        <td class="px-3 py-2 text-neutral-500 dark:text-neutral-400 whitespace-nowrap">{{ deny.ts or '—' }}</td>
+                        <td class="px-3 py-2 text-neutral-900 dark:text-neutral-100 break-all">{{ deny.agent or 'caller with no agent record' }}</td>
+                        <td class="px-3 py-2 text-neutral-900 dark:text-neutral-100 break-all">{{ deny.target or '—' }}</td>
+                        <td class="px-3 py-2 text-neutral-700 dark:text-neutral-300">{{ deny.reason or '—' }}</td>
+                        <td class="px-3 py-2 text-neutral-500 dark:text-neutral-400 break-all">{{ deny.rule or '—' }}</td>
+                        <td class="px-3 py-2 text-neutral-700 dark:text-neutral-300 break-all">
+                            {% if deny.groups %}{{ deny.groups | join(', ') }}{% else %}<span class="text-neutral-400 dark:text-neutral-600">&mdash;</span>{% endif %}
+                        </td>
+                        <td class="px-3 py-2 text-neutral-700 dark:text-neutral-300">{{ deny.surface or '—' }}</td>
                     </tr>
                     {% endfor %}
                 </tbody>
@@ -344,66 +295,10 @@
         <div class="border border-dashed border-neutral-300 dark:border-neutral-700 rounded p-8 text-center">
             <p class="font-mono text-sm font-bold uppercase tracking-widest text-neutral-700 dark:text-neutral-300">No shadow denials recorded</p>
             <p class="font-mono text-xs text-neutral-500 dark:text-neutral-400 mt-2">
-                Switch any mode (use_tool, bound tools or direct hub calls) to <span class="font-bold">shadow</span> to log calls that the current policy would deny, without blocking them.
+                Run with <span class="font-bold">{{ mode_env }}=shadow</span> while the policy is being written: calls the
+                rules would deny are listed here without being blocked.
             </p>
         </div>
-        {% endif %}
-    </div>
-
-    <!-- Principal groups -->
-    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm space-y-4">
-        <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-            <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Principal groups</h2>
-            <span class="font-mono text-[11px] text-neutral-500 dark:text-neutral-400">
-                Manual grant for <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">group:</code> rules,
-                unioned with the identity provider's groups claim (it can add a group, not remove one). A string or a
-                list of strings per principal.
-            </span>
-        </div>
-
-        <form action="/admin/tool-authz/groups" method="POST" class="space-y-3">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <label for="toolAuthzGroups" class="block font-mono text-[10px] uppercase tracking-widest text-neutral-500 dark:text-neutral-400">Groups YAML</label>
-            <textarea name="groups_yaml" id="toolAuthzGroups" rows="8" spellcheck="false" wrap="off"
-                      class="w-full bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 p-3 font-mono text-xs leading-relaxed focus:outline-none focus:border-accent dark:focus:border-accent-dark transition-colors text-neutral-900 dark:text-neutral-100 rounded whitespace-pre overflow-x-auto">{{ principal_groups_yaml }}</textarea>
-            <p class="font-mono text-[10px] text-neutral-500 dark:text-neutral-400">
-                Example:
-                <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">user:alice: [ops, oncall]</code>.
-                Submitted principals outside this map belong to no group.
-            </p>
-            <div class="flex justify-end">
-                <button type="submit" class="bg-accent hover:bg-accent-dark text-white font-mono font-bold text-sm uppercase py-2.5 px-6 transition-colors rounded">
-                    Save groups
-                </button>
-            </div>
-        </form>
-    </div>
-
-    <!-- What the signed-in admin resolves to (read-only) -->
-    <div class="bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded p-5 shadow-sm space-y-3 mt-6">
-        <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-            <h2 class="font-bold text-neutral-900 dark:text-neutral-100">Your resolved groups</h2>
-            <span class="inline-flex items-center px-2 py-0.5 text-[10px] font-mono font-bold uppercase rounded border border-neutral-500/30 bg-neutral-100 text-neutral-600 dark:bg-neutral-800/40 dark:text-neutral-400">
-                {{ my_groups | length }} group{% if my_groups | length != 1 %}s{% endif %}
-            </span>
-        </div>
-        <p class="font-mono text-xs text-neutral-500 dark:text-neutral-400">
-            Read-only. Resolved for
-            <code class="bg-neutral-100 dark:bg-neutral-800 px-1 py-0.5 rounded-sm">{{ my_principal }}</code>
-            from the identity provider's groups claim (stored on the user record at sign-in) unioned with the
-            mapping above &mdash; the mapping is a manual grant and cannot remove a claim group.
-        </p>
-        {% if my_groups %}
-        <div class="flex flex-wrap gap-2">
-            {% for group in my_groups %}
-            <span class="inline-flex items-center px-2 py-0.5 text-[11px] font-mono rounded border border-accent/30 bg-accent/5 dark:bg-accent-dark/10 text-neutral-900 dark:text-neutral-100 break-all">{{ group }}</span>
-            {% endfor %}
-        </div>
-        {% else %}
-        <p class="font-mono text-[11px] text-neutral-500 dark:text-neutral-400">
-            No groups resolved &mdash; a <code class="bg-neutral-100 dark:bg-neutral-800 px-1 rounded">group:</code>
-            rule cannot match for this account.
-        </p>
         {% endif %}
     </div>
 </div>

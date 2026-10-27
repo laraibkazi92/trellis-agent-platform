@@ -117,6 +117,19 @@ def _embedding_changed(previous: Dict[str, Any], current: Dict[str, Any]) -> boo
     )
 
 
+def tool_visibility(site_config: Dict[str, Any], tool_name: str) -> bool:
+    """Is one edge tool exposed to callers with no agent record?
+
+    The site record is the only source: a site marked ``public`` publishes every tool
+    it exports, otherwise ``public_tools`` names the individual ones. The edge itself
+    never widens this (it publishes no exposure flag).
+    """
+    if site_config.get("public") is True:
+        return True
+    entries = site_config.get("public_tools") or []
+    return isinstance(entries, list) and tool_name in entries
+
+
 def _tool_config(
     site: str,
     tool: EdgeTool,
@@ -139,7 +152,7 @@ def _tool_config(
         "managed_by": MANAGED_BY,
         # tool_search only honours `public` for non-mcp tools, so a per-tool
         # whitelist entry has to be folded into the flag to mean anything.
-        "public": bool(site_config.get("public")) or tool.name in (site_config.get("public_tools") or []),
+        "public": tool_visibility(site_config, tool.name),
         "public_tools": site_config.get("public_tools", []),
         # A dropped call cannot be replayed safely: the caller may already have
         # caused a side effect on the edge.
@@ -360,7 +373,7 @@ def publish_catalog(
     return published
 
 
-def _mcp_visibility(
+def mcp_visibility(
     site: str, mcp: EdgeMcp, site_config: Dict[str, Any]
 ) -> tuple[bool, List[str]]:
     """``(public, public_tools)`` for one edge MCP server, derived like an edge tool's.
@@ -409,7 +422,7 @@ def _mcp_config(
     Visibility comes from the site record, never from the edge: an edge must not be able
     to widen its own public surface by publishing a flag.
     """
-    public, public_tools = _mcp_visibility(site, mcp, site_config)
+    public, public_tools = mcp_visibility(site, mcp, site_config)
     config: Dict[str, Any] = {
         "name": mcp_registry_name(site, mcp.name),
         # EdgeMcp carries no server description yet; keep the key populated for the

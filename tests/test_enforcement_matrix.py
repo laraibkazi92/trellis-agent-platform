@@ -1,16 +1,20 @@
 # Copyright (C) 2026 Laraib Kazi
 # SPDX-License-Identifier: Apache-2.0
 
-"""The enforcement matrix: {hub, runner} x {no token, bad sig, expired, X for Y}.
+"""The enforcement matrix: one evaluator, four enforcement points, one mode switch.
 
-Both enforcement points are driven directly, without a container backend or a live
-relay: ``core.hub._authorize_call`` (local tools) and
-``core.execution.runner._authorize`` (tool calls, sessions, console, discovery). The
-two relay routes are covered in ``tests/test_edge_relay.py``.
+Every surface is driven directly, with no container backend and no live relay:
 
-The property under test is the one in the plan's invariant 9: no call executes
-without a valid, unexpired token, and every party re-resolves the allowlist for the
-resources it owns (the hub for tools, the runner for sessions and console).
+* ``hub``        -- ``core.hub._authorize_call`` (local and edge tools)
+* ``relay``      -- ``services.edge_relay.app._authorize_agent`` (edge tools / MCPs)
+* ``host``       -- ``core.tool_gate.deny_reason`` (console + MCP-session pre-runner)
+* ``bound_tool`` -- ``core.agent_factory._bound_tool_denial`` (tools bound to an agent)
+
+The property under test is the plan's acceptance gate: the group-rule combinations
+(no rule / matching group / non-matching group / shadow) decide identically at every
+surface, ``shadow`` records without denying, ``enforce`` denies, and an unreadable
+registry or policy fails closed. The runner no longer decides anything (it only
+verifies the token), which is pinned at the end.
 """
 
 import asyncio
@@ -18,247 +22,478 @@ import json
 import time
 
 import pytest
-import yaml
 
-from core import agent_token, hub
+from core import agent_token, hub, tool_access
+from core import auth as core_auth
 from core.execution import runner as runner_module
 from core.execution.contract import ExecRequest, SessionCreateRequest
 from core.models import ToolConfig
+from services.edge_relay import app as relay_app
 
 SECRET = "enforcement-matrix-secret-0123456789abcdef"
 SESSION_KEY = "a" * 32
-ECHO = ToolConfig(
-    name="echo", description="Echo a block of text back.", runtime="python", entrypoint="echo.py"
-)
 
-HUB_AGENTS = {
-    "agent-a": {"allowed_tools": ["echo", "execute"]},
-    "agent-b": {"allowed_tools": []},
-    # The supervisor is an agent like any other: its own manifest decides.
-    "supervisor": {"allowed_tools": ["echo"]},
-}
+TOOL = "text_stats"
+OTHER_TOOL = "netctl"
+GROUP = "ops"
 
-RUNNER_AGENTS = {
-    "agent-a": {
-        "name": "agent-a",
-        "type": "user_agent",
-        "allowed_tools": ["execute"],
-        "allowed_mcps": ["coralogix"],
-    },
-    "agent-b": {
-        "name": "agent-b",
-        "type": "user_agent",
-        "allowed_tools": [],
-        "allowed_mcps": [],
-    },
-}
-# Deliberately NOT here: `supervisor`. Its manifest is an image asset
-# (`core/assets/supervisor/config.yaml`, read by scripts/sync_to_db.py) and is never
-# materialised under `workspace/`, so fabricating one here would test a layout that
-# does not exist -- and hide the runner bug that layout causes.
+SUPERVISOR_AGENTS = {"supervisor": {"allowed_tools": [TOOL], "allowed_mcps": []}}
 
-# A second, non-public tool: no agent's allowlist grants it here, so it is the
-# denial probe for callers that used to be exempt.
-NETCTL = ToolConfig(
-    name="netctl", description="Inspect cluster nodes.", runtime="python", entrypoint="netctl.py"
-)
-PUBLIC_ECHO = ToolConfig(
-    name="echo",
-    description="Echo a block of text back.",
-    runtime="python",
-    entrypoint="echo.py",
-    public=True,
-)
+
+class FakeEtcd:
+    """The policy document, the shared shadow ring and the watch API."""
+
+    def __init__(self):
+        self.policy = None
+        self.shared_ring = None
+        self.error = None
+        self.revision = 1
+        self.watches = []
+
+    def get(self, key, **_kwargs):
+        if self.error is not None:
+            raise RuntimeError(self.error)
+        if key == tool_access.POLICY_PATH:
+            if self.policy is None:
+                return None, None
+            metadata = type("M", (), {"mod_revision": self.revision})()
+            return json.dumps(self.policy).encode("utf-8"), metadata
+        if key == tool_access.SHADOW_DENIAL_PATH:
+            return self.shared_ring, None
+        return None, None
+
+    def put(self, key, value):
+        if self.error is not None:
+            raise RuntimeError(self.error)
+        payload = value.encode("utf-8") if isinstance(value, str) else value
+        if key == tool_access.POLICY_PATH:
+            self.policy = json.loads(payload.decode("utf-8"))
+            self.revision += 1
+        elif key == tool_access.SHADOW_DENIAL_PATH:
+            self.shared_ring = payload
+
+    def add_watch_callback(self, key, callback):
+        self.watches.append((key, callback))
+        return len(self.watches)
+
+    def cancel_watch(self, watch_id):
+        pass
+
+    def set_policy(self, document):
+        self.policy = document
+        self.revision += 1
+        tool_access.reset_snapshot()
+
+
+class FakeRegistry:
+    """Agent/edge records the surfaces resolve their allowlists from."""
+
+    def __init__(self, agents=None, site=None):
+        self.agents = agents or {}
+        self.site = site or {"public": False, "public_tools": []}
+
+    def get_agent_config(self, name):
+        return self.agents.get(name)
+
+    def get_edge_config(self, site):
+        return self.site
+
+
+@pytest.fixture
+def registry(monkeypatch):
+    """A hermetic policy registry, a clean snapshot/ring, and fake agent records."""
+    fake = FakeEtcd()
+    monkeypatch.setattr(tool_access, "_client", lambda: fake)
+    monkeypatch.delenv(tool_access.MODE_ENV, raising=False)
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", SECRET)
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+    monkeypatch.delenv("DEV_MODE", raising=False)
+    tool_access.reset_snapshot()
+    with tool_access._shadow_lock:
+        tool_access._shadow_ring.clear()
+    monkeypatch.setattr(tool_access, "_last_shadow_persist", 0.0)
+    yield fake
+    tool_access.reset_snapshot()
+    with tool_access._shadow_lock:
+        tool_access._shadow_ring.clear()
+
+
+@pytest.fixture
+def records(monkeypatch):
+    """Install one fake record store behind every surface's ``get_identity_manager``.
+
+    Each surface refs its target differently (a bare hub name, an ``<site>__<tool>``
+    edge reference), so the caller passes the surface in and its agent fixtures carry
+    that surface's own grant: the allowlist and the group rule always name the same
+    reference the surface evaluates.
+    """
+
+    def install(surface):
+        fake = FakeRegistry(
+            {
+                "agent-a": {"allowed_tools": [surface.target], "allowed_mcps": []},
+                "agent-b": {"allowed_tools": [], "allowed_mcps": []},
+            }
+        )
+        monkeypatch.setattr(hub.identity_mgr, "get_agent_config", fake.get_agent_config)
+        monkeypatch.setattr(relay_app, "_identity_manager", lambda: fake)
+        monkeypatch.setattr(core_auth, "get_identity_manager", lambda: fake)
+        return fake
+
+    return install
+
+
+@pytest.fixture(autouse=True)
+def _clean_token_context():
+    agent_token_var = core_auth.agent_token_var
+    agent_token_var.set(None)
+    yield
+    agent_token_var.set(None)
+
+
+def _policy(*rules):
+    return {"rules": [dict(rule) for rule in rules]}
+
+
+def _rule(targets, groups, name=None):
+    rule = {"targets": list(targets), "groups": list(groups)}
+    if name is not None:
+        rule["name"] = name
+    return rule
+
+
+def _token(agent="agent-a", *, groups=(), **kwargs) -> str:
+    return agent_token.mint(agent, user_id="user-1", groups=groups, **kwargs)
+
+
+def _tool_config(name=TOOL, public=False) -> ToolConfig:
+    return ToolConfig(
+        name=name,
+        description="A deterministic tool.",
+        runtime="python",
+        entrypoint="tool.py",
+        public=public,
+    )
 
 
 # --------------------------------------------------------------------------- #
-# token fixtures: the four grid columns
+# the four surfaces, behind one shape
 # --------------------------------------------------------------------------- #
 
 
-def _bad_token(case: str, agent: str = "agent-a") -> str | None:
+class Surface:
+    """One enforcement point, adapted to ``(allowed?, denial text)``.
+
+    ``target`` is the reference this surface evaluates (the hub/bound-tool/console
+    forms are bare names, the edge form is ``<site>__<tool>``), and
+    ``reason_visible`` says whether the denial message carries the evaluator's reason
+    or only the stable model-facing string.
+    """
+
+    def __init__(self, name, call, *, target=TOOL, reason_visible=True, token_context=None):
+        self.name = name
+        self.target = target
+        self.reason_visible = reason_visible
+        self._call = call
+        self._token_context = token_context
+
+    def verdict(self, token, target=None):
+        if self._token_context is not None:
+            self._token_context(token)
+        denial = self._call(token, target or self.target)
+        return denial
+
+    def __repr__(self) -> str:  # pytest ids
+        return self.name
+
+
+def _hub_surface():
+    def call(token, target):
+        _claims, denial = asyncio.run(hub._authorize_call(_tool_config(target), token))
+        return denial["error"] if denial else None
+
+    return Surface("hub", call)
+
+
+def _relay_surface():
+    def call(token, target):
+        _claims, denial = asyncio.run(
+            relay_app._authorize_agent(token, site="dc1", tool=target.split("__", 1)[1])
+        )
+        return denial[1] if denial else None
+
+    return Surface("relay", call, target=f"dc1__{TOOL}")
+
+
+def _host_surface():
+    from core import tool_gate
+
+    def call(token, target):
+        return asyncio.run(tool_gate.deny_reason(target, surface="host"))
+
+    return Surface(
+        "host", call, token_context=lambda token: core_auth.agent_token_var.set(token)
+    )
+
+
+def _bound_tool_surface():
+    from core import agent_factory
+
+    def call(token, target):
+        return asyncio.run(agent_factory._bound_tool_denial(target))
+
+    return Surface(
+        "bound_tool",
+        call,
+        # The model-facing string is deliberately stable; the reason goes to the log.
+        reason_visible=False,
+        token_context=lambda token: core_auth.agent_token_var.set(token),
+    )
+
+
+SURFACES = [_hub_surface, _relay_surface, _host_surface, _bound_tool_surface]
+
+
+@pytest.fixture(params=SURFACES, ids=lambda factory: factory().__repr__())
+def surface(request):
+    return request.param()
+
+
+# --------------------------------------------------------------------------- #
+# group-rule combinations, identical at every surface
+# --------------------------------------------------------------------------- #
+
+
+def test_no_rule_leaves_the_allowlist_alone(surface, registry, records):
+    """No rule constrains the target: agent-a's allowlist admits, agent-b's does not."""
+    records(surface)
+    registry.policy = _policy()
+
+    assert surface.verdict(_token("agent-a")) is None
+    deny = surface.verdict(_token("agent-b"))
+    assert deny is not None
+    assert "denied" in deny.lower()
+
+
+def test_a_matching_group_rule_admits(surface, registry, records):
+    records(surface)
+    registry.policy = _policy(_rule([surface.target], [GROUP], name="platform-ops"))
+
+    assert surface.verdict(_token(groups=[GROUP])) is None
+
+
+def test_a_non_matching_group_rule_denies(surface, registry, records, caplog):
+    """Enforce (the default): one rule, one group, and this token holds neither."""
+    records(surface)
+    registry.policy = _policy(_rule([surface.target], [GROUP], name="platform-ops"))
+
+    with caplog.at_level("WARNING"):
+        deny = surface.verdict(_token(groups=["sre"]))
+
+    assert deny is not None
+    # The rule label is named so an operator can find it in the policy file, and it
+    # is named identically wherever the decision was made.
+    assert "platform-ops" in (deny if surface.reason_visible else caplog.text)
+    assert "user-1" not in deny  # never a user, an email or an argument
+
+
+def test_a_token_without_groups_is_denied_by_a_group_rule(surface, registry, records):
+    records(surface)
+    registry.policy = _policy(_rule([surface.target], [GROUP]))
+
+    assert surface.verdict(_token()) is not None
+
+
+def test_shadow_records_without_denying(surface, registry, records, monkeypatch):
+    records(surface)
+    monkeypatch.setenv(tool_access.MODE_ENV, "shadow")
+    registry.policy = _policy(_rule([surface.target], [GROUP], name="platform-ops"))
+
+    assert surface.verdict(_token(groups=["sre"])) is None
+
+    [entry] = tool_access.recent_shadow_denials()
+    assert entry["target"] == surface.target
+    assert entry["agent"] == "agent-a"
+    assert entry["rule"] == "platform-ops"
+    assert entry["reason"] == tool_access.REASON_GROUP_DENIED
+    assert entry["surface"] == surface.name
+    assert entry["groups"] == ["sre"]
+
+
+def test_off_skips_the_group_rules_entirely(surface, registry, records, monkeypatch):
+    records(surface)
+    monkeypatch.setenv(tool_access.MODE_ENV, "off")
+    registry.policy = _policy(_rule([surface.target], [GROUP]))
+
+    assert surface.verdict(_token(groups=["sre"])) is None
+    assert tool_access.recent_shadow_denials() == []
+
+
+def test_the_allowlist_half_is_enforced_in_every_mode(surface, registry, records, monkeypatch):
+    """`shadow`/`off` relax group rules only: a caller outside the manifest still fails."""
+    records(surface)
+    registry.policy = _policy()
+    for mode in ("shadow", "off", "enforce"):
+        monkeypatch.setenv(tool_access.MODE_ENV, mode)
+        assert surface.verdict(_token("agent-b")) is not None, mode
+
+
+def test_an_unreadable_registry_fails_closed(surface, registry, records, caplog):
+    records(surface)
+    registry.error = "etcd is unreachable"
+
+    with caplog.at_level("WARNING"):
+        deny = surface.verdict(_token(groups=[GROUP]))
+
+    assert deny is not None
+    assert "unavailable" in (deny if surface.reason_visible else caplog.text)
+
+
+def test_an_invalid_policy_fails_closed(surface, registry, records, caplog):
+    records(surface)
+    registry.policy = {"rules": [{"targets": [surface.target], "groups": []}]}
+
+    with caplog.at_level("WARNING"):
+        deny = surface.verdict(_token(groups=[GROUP]))
+
+    assert deny is not None
+    assert "unavailable" in (deny if surface.reason_visible else caplog.text)
+
+
+@pytest.mark.parametrize("case", ["missing", "bad_sig", "expired"])
+def test_the_token_verifying_surfaces_refuse_a_bad_token(surface, registry, records, case):
+    records(surface)
+    if surface.name not in ("hub", "relay"):
+        pytest.skip("the in-process gates reach the token through the run context")
+    token = _bad_token(case)
+
+    deny = surface.verdict(token)
+
+    assert deny is not None
+    assert "agent token" in deny
+
+
+def test_the_in_process_gates_deny_a_run_without_a_token(registry, records):
+    records(_hub_surface())
+    from core import agent_factory, tool_gate
+
+    assert asyncio.run(tool_gate.deny_reason(TOOL, surface="host")) is not None
+    assert asyncio.run(agent_factory._bound_tool_denial(TOOL)) is not None
+
+
+def _bad_token(case: str) -> str | None:
     """One token per refusal column; ``expired`` is relative to the real clock."""
     if case == "missing":
         return None
     if case == "bad_sig":
-        token = agent_token.mint(agent)
-        head, signature = token.rsplit(".", 1)
+        good = agent_token.mint("agent-a")
+        head, signature = good.rsplit(".", 1)
         index = len(signature) // 2
         flipped = "A" if signature[index] != "A" else "B"
         return f"{head}.{signature[:index]}{flipped}{signature[index + 1:]}"
     if case == "expired":
-        # ttl 1 s, minted 120 s ago: past exp + CLOCK_SKEW_S by a wide margin.
-        return agent_token.mint(agent, ttl_s=1, now=time.time() - 120)
+        return agent_token.mint("agent-a", ttl_s=1, now=time.time() - 120)
     raise AssertionError(f"unknown case {case!r}")
 
 
-BAD_TOKEN_CASES = ["missing", "bad_sig", "expired"]
-
-
 # --------------------------------------------------------------------------- #
-# hub: core.hub._authorize_call
+# hub-specific: the front door and the rollout window
 # --------------------------------------------------------------------------- #
 
 
-@pytest.fixture
-def hub_env(monkeypatch):
-    monkeypatch.setenv("AGENT_TOKEN_SECRET", SECRET)
-    monkeypatch.delenv("DEV_MODE", raising=False)
-    monkeypatch.setattr(
-        hub.identity_mgr, "get_agent_config", lambda name: HUB_AGENTS.get(name)
-    )
-    return HUB_AGENTS
+def _hub_call(token, config=None):
+    return asyncio.run(hub._authorize_call(config or _tool_config(), token))
 
 
-def _hub_call(token, config=ECHO):
-    """``_authorize_call`` is async because it reads the registry off-loop."""
-    return asyncio.run(hub._authorize_call(config, token))
+def test_the_front_door_is_limited_to_public_tools(registry, records):
+    """The gateway mints for the caller it serves and has no record of its own; the
+    tool's own `public` exposure is its only possible grant."""
+    records(_hub_surface())
+    registry.policy = _policy()
 
+    claims, denial = _hub_call(_token("gateway"), _tool_config(OTHER_TOOL))
+    assert denial is not None and claims.user_id == "user-1"
 
-def _assert_hub_denied(denial, *, contains: str = "access_denied") -> None:
-    assert denial is not None, "expected the hub to refuse the call"
-    assert contains in denial["error"], denial
-
-
-@pytest.mark.parametrize("case", BAD_TOKEN_CASES)
-def test_hub_enforce_refuses_a_bad_token(hub_env, monkeypatch, case):
-    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
-
-    claims, denial = _hub_call(_bad_token(case))
-
-    assert claims is None
-    _assert_hub_denied(denial)
-
-
-def test_hub_enforce_refuses_a_token_for_an_agent_without_the_tool(hub_env, monkeypatch):
-    """Agent X's token presented for Y's tool: Y's allowlist does not grant `echo`."""
-    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
-
-    claims, denial = _hub_call(agent_token.mint("agent-b"))
-
-    assert claims is not None and claims.agent == "agent-b"
-    _assert_hub_denied(denial, contains="not in agent 'agent-b' allowlist")
-
-
-def test_hub_enforce_refuses_an_unknown_agent(hub_env, monkeypatch):
-    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
-
-    _, denial = _hub_call(agent_token.mint("ghost"))
-
-    _assert_hub_denied(denial, contains="unknown agent 'ghost'")
-
-
-def test_hub_enforce_allows_the_granted_tool(hub_env, monkeypatch):
-    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
-
-    claims, denial = _hub_call(agent_token.mint("agent-a", user_id="user-1"))
-
-    assert denial is None
-    assert claims is not None
-    assert claims.agent == "agent-a"
-    assert claims.user_id == "user-1"
-
-
-# --- no exempt principals ----------------------------------------------------
-#
-# v0.7.1 Phase 3 removed every "this caller is special" branch. These pin the three
-# names that used to be exempt (a `system` principal, `gateway`, `supervisor`) against
-# the allowlist they actually have -- not against a bypass.
-
-
-def test_hub_enforce_checks_the_supervisor_against_its_own_allowlist(hub_env, monkeypatch):
-    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
-
-    allowed_claims, denial = _hub_call(agent_token.mint("supervisor", user_id="user-1"))
+    claims, denial = _hub_call(_token("gateway"), _tool_config(TOOL, public=True))
     assert denial is None, denial
-    assert allowed_claims.agent == "supervisor"
-
-    _, denied = _hub_call(agent_token.mint("supervisor", user_id="user-1"), NETCTL)
-    _assert_hub_denied(denied, contains="not in agent 'supervisor' allowlist")
-
-
-def test_hub_enforce_a_system_principal_is_not_exempt(hub_env, monkeypatch):
-    """A token claiming `principal="system"` gets no bypass: no agent record, no grant."""
-    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
-
-    _, denial = _hub_call(agent_token.mint("gateway", principal="system"), NETCTL)
-
-    _assert_hub_denied(denial, contains="unknown agent 'gateway'")
-
-
-def test_hub_enforce_the_front_door_is_limited_to_public_tools(hub_env, monkeypatch):
-    """The gateway mints for the caller it serves and has no manifest of its own.
-
-    Its only possible grant is the tool's own `public` exposure -- the same rule the
-    gateway applied before dispatching; everything else is denied.
-    """
-    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
-    gateway_token = agent_token.mint("gateway", user_id="user-1")
-
-    _, denial = _hub_call(gateway_token, NETCTL)
-    _assert_hub_denied(denial, contains="unknown agent 'gateway'")
-
-    claims, allowed = _hub_call(gateway_token, PUBLIC_ECHO)
-    assert allowed is None
     assert claims.user_id == "user-1"
 
 
-def test_hub_enforce_public_exposure_does_not_widen_an_agents_allowlist(
-    hub_env, monkeypatch
-):
-    """`public` is the grant for a caller with no manifest -- never a shortcut for an
-    agent whose own allowlist does not name the tool."""
-    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+def test_public_exposure_does_not_widen_an_agents_allowlist(registry, records):
+    records(_hub_surface())
+    registry.policy = _policy()
 
-    _, denial = _hub_call(agent_token.mint("agent-b"), PUBLIC_ECHO)
+    _claims, denial = _hub_call(_token("agent-b"), _tool_config(TOOL, public=True))
 
-    _assert_hub_denied(denial, contains="not in agent 'agent-b' allowlist")
+    assert denial is not None
+    assert "access_denied" in denial["error"]
 
 
-@pytest.mark.parametrize("case", BAD_TOKEN_CASES)
-def test_hub_log_mode_only_records_the_denial(hub_env, monkeypatch, case):
+def test_the_supervisor_is_checked_against_its_own_allowlist(registry, records, monkeypatch):
+    records(_hub_surface())
+    fake = FakeRegistry(SUPERVISOR_AGENTS)
+    monkeypatch.setattr(hub.identity_mgr, "get_agent_config", fake.get_agent_config)
+
+    _claims, denial = _hub_call(_token("supervisor"))
+    assert denial is None, denial
+
+    _claims, denied = _hub_call(_token("supervisor"), _tool_config(OTHER_TOOL))
+    assert denied is not None
+
+
+def test_an_ordinary_front_door_token_grants_nothing_extra(registry, records):
+    """v0.7.1 Phase 4: the `principal` claim is gone; only the public flag grants.
+
+    An ordinary token for the gateway agent (= no agent record) is checked exactly
+    like any other: the tool's own exposure is its only possible grant, so a
+    non-public tool is denied.
+    """
+    records(_hub_surface())
+    registry.policy = _policy()
+
+    _claims, denial = _hub_call(
+        agent_token.mint("gateway", user_id="user-1"),
+        _tool_config(OTHER_TOOL),
+    )
+
+    assert denial is not None
+
+
+def test_hub_log_mode_still_runs_an_allowlist_refusal(registry, records, monkeypatch):
+    """The token/allowlist rollout window: log and run, but never silently."""
+    records(_hub_surface())
     monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "log")
+    registry.policy = _policy()
 
-    claims, denial = _hub_call(_bad_token(case))
+    claims, denial = _hub_call(_token("agent-b"))
 
-    assert denial is None
-    assert claims is None
+    assert claims is not None and denial is None
 
 
-def test_hub_off_mode_short_circuits(hub_env, monkeypatch):
+def test_hub_log_mode_applies_a_group_rule(registry, records, monkeypatch):
+    """`shadow`/`enforce` is the group-rule switch, not the token-mode one."""
+    records(_hub_surface())
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "log")
+    registry.policy = _policy(_rule([TOOL], [GROUP]))
+
+    _claims, denial = _hub_call(_token(groups=["sre"]))
+
+    assert denial is not None
+
+
+def test_hub_off_mode_short_circuits(registry, records, monkeypatch):
+    records(_hub_surface())
     monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "off")
+    monkeypatch.setenv("DEV_MODE", "true")
 
-    claims, denial = _hub_call("not-a-token")
-
-    assert (claims, denial) == (None, None)
+    assert _hub_call("not-a-token") == (None, None)
 
 
 # --------------------------------------------------------------------------- #
-# runner: core.execution.runner._authorize
+# the runner decides nothing: signature, expiry and the discovery kind only
 # --------------------------------------------------------------------------- #
 
 
-@pytest.fixture
-def runner_env(tmp_path, monkeypatch):
-    root = tmp_path / "workspace"
-    for name, config in RUNNER_AGENTS.items():
-        directory = root / "agents" / name
-        directory.mkdir(parents=True)
-        (directory / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
-
-    monkeypatch.setenv("WORKSPACE_ROOT", str(root))
-    monkeypatch.setenv("AGENT_TOKEN_SECRET", SECRET)
-    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
-    monkeypatch.delenv("DEV_MODE", raising=False)
-    runner_module.reset_for_tests()
-    try:
-        yield root
-    finally:
-        runner_module.reset_for_tests()
-
-
-# The requests carry NO identity fields (v0.7.1 Phase 2): the agent, user, email and
-# groups all come from the token's claims, and the runner derives them itself.
 def _session(token, *, target="coralogix", kind="mcp_session"):
     return SessionCreateRequest(
         kind=kind, target=target, session_key=SESSION_KEY, agent_token=token
@@ -267,162 +502,97 @@ def _session(token, *, target="coralogix", kind="mcp_session"):
 
 def _console(token):
     return ExecRequest(
-        kind="console",
-        target="console",
-        command="echo hi",
-        agent_token=token,
+        kind="console", target="console", command="echo hi", agent_token=token
     )
 
 
-def _tool(token, target="echo"):
+def _tool(token, target=TOOL):
     return ExecRequest(kind="tool", target=target, agent_token=token)
 
 
 def _assert_runner_denied(denial) -> None:
-    assert denial is not None, "expected the runner to refuse the call"
+    assert denial is not None, "expected the runner to refuse the request"
     assert denial.status_code == 403
     assert json.loads(denial.body)["detail"]["code"] == "access_denied"
 
 
-@pytest.mark.parametrize("case", BAD_TOKEN_CASES)
-def test_runner_enforce_refuses_a_bad_token(runner_env, case):
-    denial = runner_module._authorize(_session(_bad_token(case)))
-
-    _assert_runner_denied(denial)
-
-
-def test_runner_enforce_refuses_a_session_for_an_mcp_outside_the_allowlist(runner_env):
-    """Agent X's token, Y's MCP: agent-b declares no MCPs at all."""
-    denial = runner_module._authorize(_session(agent_token.mint("agent-b")))
-
-    _assert_runner_denied(denial)
+@pytest.fixture
+def runner_env(monkeypatch):
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", SECRET)
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+    monkeypatch.delenv("DEV_MODE", raising=False)
+    runner_module.reset_for_tests()
+    try:
+        yield
+    finally:
+        runner_module.reset_for_tests()
 
 
-def test_runner_enforce_allows_the_granted_mcp(runner_env):
-    assert runner_module._authorize(_session(agent_token.mint("agent-a"))) is None
+@pytest.mark.parametrize("case", ["missing", "bad_sig", "expired"])
+def test_runner_refuses_a_bad_token(runner_env, case):
+    for payload in (
+        _session(_bad_token(case)),
+        _console(_bad_token(case)),
+        _tool(_bad_token(case)),
+    ):
+        _assert_runner_denied(runner_module._authorize(payload))
 
 
-def test_runner_console_requires_execute(runner_env):
-    assert runner_module._authorize(_console(agent_token.mint("agent-a"))) is None
-    _assert_runner_denied(
-        runner_module._authorize(_console(agent_token.mint("agent-b")))
-    )
+@pytest.mark.parametrize("agent", ["agent-a", "agent-b", "ghost", "gateway", "supervisor"])
+@pytest.mark.parametrize("kind", ["tool", "console", "mcp_session"])
+def test_the_runner_makes_no_allowlist_decision(runner_env, agent, kind):
+    """Whatever the target and whoever the agent: a valid token is all the runner checks.
 
-
-def test_runner_discovery_needs_no_token(runner_env):
-    """A discovery run is a throwaway catalog read: no agent owns it.
-
-    The runner control socket already requires the runner bearer token, and the
-    caller (central MCP registration / edge catalog refresh) has no agent run to
-    mint from -- so a missing agent token must not break discovery.
+    The hub authorized tool calls before dispatch and the process that owns the agent
+    runtime authorized sessions/console (``core.tool_gate``) -- neither of which the
+    runner can re-derive from a manifest it does not have.
     """
-    assert runner_module._authorize(_session(None, target="catalog", kind="discovery")) is None
+    token = _token(agent)
 
-
-def test_runner_discovery_still_accepts_a_valid_token(runner_env):
-    payload = _session(agent_token.mint("agent-a"), target="x", kind="discovery")
+    if kind == "tool":
+        payload = _tool(token)
+    elif kind == "console":
+        payload = _console(token)
+    else:
+        payload = _session(token)
 
     assert runner_module._authorize(payload) is None
 
 
-def test_runner_ignores_a_forged_body_agent(runner_env):
-    """A body cannot name the agent: the token is the only identity authority.
-
-    ``agent`` is a removed field, so pydantic ignores it; agent-b's token stays
-    agent-b's, and agent-b declares no MCPs.
-    """
-    payload = SessionCreateRequest(
-        kind="mcp_session",
-        target="coralogix",
-        session_key=SESSION_KEY,
-        agent="agent-a",
-        agent_token=agent_token.mint("agent-b"),
-    )
-
-    _assert_runner_denied(runner_module._authorize(payload))
+def test_runner_discovery_needs_no_token(runner_env):
+    """The one non-agent path: a throwaway catalog read, gated by the socket token."""
+    assert runner_module._authorize(_session(None, target="catalog", kind="discovery")) is None
 
 
-def test_runner_refuses_an_unknown_agent(runner_env):
+def test_runner_discovery_still_accepts_a_valid_token(runner_env):
+    payload = _session(_token(), target="x", kind="discovery")
+
+    assert runner_module._authorize(payload) is None
+
+
+def test_runner_discovery_still_refuses_a_bad_token(runner_env):
     _assert_runner_denied(
-        runner_module._authorize(_session(agent_token.mint("ghost")))
+        runner_module._authorize(_session(_bad_token("bad_sig"), target="x", kind="discovery"))
     )
 
 
-def test_runner_enforce_a_system_principal_is_not_exempt(runner_env):
-    """A `system` principal gets no session/console bypass: it is not on disk at all."""
-    _assert_runner_denied(
-        runner_module._authorize(
-            _console(agent_token.mint("gateway", principal="system"))
-        )
-    )
-    # And neither does the front door's ordinary token.
-    _assert_runner_denied(runner_module._authorize(_console(agent_token.mint("gateway"))))
+def test_runner_off_mode_short_circuits(runner_env, monkeypatch):
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "off")
+    monkeypatch.setenv("DEV_MODE", "true")
+    bad = _bad_token("bad_sig")
+
+    assert runner_module._authorize(_session(bad)) is None
+    assert runner_module._authorize(_console(bad)) is None
 
 
-# --- the runner authorizes only what it owns ---------------------------------
-#
-# v0.7.1 Phase 3: `kind="tool"` is the hub's decision. The runner used to re-derive
-# the allowlist from a workspace manifest, which denied EVERY front-door/gateway call
-# (no agent record exists) and every supervisor call (its manifest ships inside the
-# image). The regression tests below use the real shipping layout: no supervisor
-# directory under `workspace/agents`, per the fixture above.
+def test_runner_log_mode_runs_a_bad_token(runner_env, monkeypatch):
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "log")
 
-
-@pytest.mark.parametrize("agent", ["supervisor", "gateway"])
-def test_runner_enforce_allows_a_tool_call_from_a_manifestless_caller(
-    runner_env, agent
-):
-    """A tool call is authorized by the hub; the runner must not demand a manifest.
-
-    Neither caller has an on-disk agent record here (the supervisor's is an image
-    asset, the gateway has none at all), which is exactly the shipping layout.
-    """
-    token = agent_token.mint(agent, user_id="user-1")
-
-    assert runner_module._authorize(_tool(token)) is None
-
-
-def test_runner_enforce_a_tool_call_from_an_unknown_agent_is_not_the_runners_call(
-    runner_env,
-):
-    """Even a name with no record anywhere passes the runner: the hub already denied
-    or admitted it before dispatch, and the runner cannot re-derive that verdict."""
-    assert runner_module._authorize(_tool(agent_token.mint("ghost"))) is None
-
-
-@pytest.mark.parametrize("agent", ["supervisor", "gateway"])
-def test_runner_owned_resources_stay_locked_without_a_manifest(runner_env, agent):
-    """Sessions and console containers ARE the runner's: no manifest, no call.
-
-    The same manifest-less tokens that may run a hub-authorized tool are refused a
-    container the runner would create and keep alive on its own authority.
-    """
-    token = agent_token.mint(agent, user_id="user-1")
-
-    _assert_runner_denied(runner_module._authorize(_session(token)))
-    _assert_runner_denied(runner_module._authorize(_console(token)))
-
-
-def test_runner_refuses_an_unrecognized_kind(runner_env):
-    """A kind the runner does not know is denied outright, never silently authorized.
-
-    ``ExecKind`` is validated by the contract today; this pins the behaviour for the
-    next kind added (workflows in v0.7.1 Phase 6) before it has an owner here.
-    """
-    payload = _tool(agent_token.mint("agent-a"))
-    payload.kind = "workflow"
-
-    _assert_runner_denied(runner_module._authorize(payload))
+    assert runner_module._authorize(_session(_bad_token("expired"))) is None
 
 
 def test_the_shipped_supervisor_manifest_is_an_image_asset():
-    """Layout guard: the supervisor is read from the package, not from the workspace.
-
-    ``scripts/sync_to_db.py`` syncs it from ``core/assets/supervisor`` into etcd, and
-    nothing materialises it under ``workspace/agents``. If this ever changes, the
-    runner's manifest-free tool path above would start being exercised against a
-    directory that exists -- so assert the layout the tests assume.
-    """
+    """Layout guard: the supervisor is read from the package, not from the workspace."""
     from scripts import sync_to_db
 
     manifest = sync_to_db.SUPERVISOR_DIR / "config.yaml"
@@ -432,30 +602,6 @@ def test_the_shipped_supervisor_manifest_is_an_image_asset():
     )
     assert not (sync_to_db.AGENTS_DIR / "supervisor").exists()
 
-    config = yaml.safe_load(manifest.read_text(encoding="utf-8"))
-    assert config["name"] == "supervisor"
-    # The hub checks the supervisor against this list, so it must be a real one.
-    assert config["allowed_tools"] == ["text_stats"]
-
-
-def test_runner_discovery_is_the_one_non_agent_path(runner_env):
-    """The legitimate remaining bypass by KIND: a catalog read no agent owns.
-
-    Its agent token (even a `system` one) is not an identity to authorize -- the
-    runner bearer token on the control socket is the gate. ``kind="tool"`` is not a
-    bypass of the same sort: the hub authorized it (see the tests above); every
-    resource the runner owns still needs a manifest.
-    """
-    payload = _session(
-        agent_token.mint("gateway", principal="system"), target="x", kind="discovery"
-    )
-
-    assert runner_module._authorize(payload) is None
-
-
-def test_runner_off_mode_short_circuits(runner_env, monkeypatch):
-    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "off")
-    bad = _bad_token("bad_sig")
-
-    assert runner_module._authorize(_session(bad)) is None
-    assert runner_module._authorize(_console(bad)) is None
+    assert sync_to_db.SUPERVISOR_DIR.joinpath("config.yaml").read_text(
+        encoding="utf-8"
+    ).find("allowed_tools") > 0

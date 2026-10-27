@@ -30,6 +30,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from core import agent_token as agent_token_module
 from core import allowlist
+from core import tool_access
 from services.edge_relay import audit, protocol, registry
 from services.edge_relay.ratelimit import SiteLimiter, normalise_rate
 from services.edge_relay.protocol import (
@@ -454,6 +455,14 @@ async def _lifespan(_app: FastAPI):
 
     install_redaction()
     agent_token_module.require_secret("edge-relay")
+    # The relay is an enforcing process: a policy edit must land here within the
+    # watch's ~2 s, not on the 30 s snapshot TTL.
+    try:
+        await asyncio.to_thread(tool_access.install_watch)
+    except Exception:
+        logger.exception(
+            "Failed to install the tool-access watch; using the cache TTL"
+        )
     audit.configure()
     # The site map is in-process: after a restart nothing is connected, so any
     # `connected: true` left in the registry is stale. Clear it before serving,
@@ -669,45 +678,54 @@ def _claims_identity(
     return user, email
 
 
-async def _publicly_exposed(site: str, tool: str, mcp: Optional[str]) -> bool:
-    """Is this edge export exposed to external clients?
+async def _export_public(
+    site: str, tool: str, mcp: Optional[str], conn: Optional[EdgeConn] = None
+) -> bool:
+    """Is this edge export exposed to a caller with no agent record?
 
-    A caller with no agent record has no allowlist to resolve, so the export's own
-    published exposure -- the same ``public``/``public_tools`` decision
-    ``tool_search.is_tool_publicly_whitelisted`` applied before dispatching -- is the
-    only grant that can apply. Read from the ``<site>__…`` records the relay itself
-    published, so it reflects the site record an admin edited.
+    Read from the site record through ``services.edge_relay.registry`` -- the same
+    derivation the catalog publish writes -- so there is exactly one public rule on
+    this side rather than a per-call copy of it.
     """
-    mgr = _identity_manager()
-    if mcp is not None:
-        record = await asyncio.to_thread(mgr.get_mcp_config, f"{site}__{mcp}") or {}
-        if record.get("public") is True:
-            return True
-        names = record.get("public_tools")
-        return isinstance(names, list) and tool in names
-    record = await asyncio.to_thread(mgr.get_tool_config, f"{site}__{tool}")
-    return bool(record) and record.get("public") is True
+    config = await asyncio.to_thread(
+        registry.effective_site_config, _identity_manager(), site
+    )
+    if not config:
+        return False
+    if mcp is None:
+        return registry.tool_visibility(config, tool)
+    edge_mcp = conn.mcps.get(mcp) if conn is not None else None
+    if edge_mcp is None:
+        return False
+    public, public_tools = registry.mcp_visibility(site, edge_mcp, config)
+    return public or tool in public_tools
 
 
 async def _authorize_agent(
-    raw_token: Optional[str], *, site: str, tool: str, mcp: Optional[str] = None
+    raw_token: Optional[str],
+    *,
+    site: str,
+    tool: str,
+    mcp: Optional[str] = None,
+    conn: Optional[EdgeConn] = None,
 ) -> tuple[Optional[agent_token_module.Claims], Optional[tuple[str, str]]]:
-    """Verify the agent token and the agent's effective allowlist for one edge call.
+    """Verify the agent token, then ask the ONE tool-access evaluator about this call.
 
     Returns ``(claims, denial)``. ``denial`` is ``(code, message)`` for a 403, or
     ``None`` when the call may proceed. The allowlist is resolved from the registry
-    here, at call time, so a caller cannot assert permissions it does not hold.
+    here, at call time, so a caller cannot assert permissions it does not hold; the
+    caller's groups come from its token (claim ``"g"``) and never from a record.
 
     This is the **only** token verification on the edge path: the identity in the
     forwarded frame is built from these claims (``_claims_identity``) and the edge
     trusts it over the authenticated tunnel.
 
     No caller is exempt. A token whose agent has no record (the gateway front door
-    mints for the external client it serves) is left with the export's own public
+    mints for the external client it serves) is left with the export's own published
     exposure as its only possible grant.
 
-    In ``log`` mode a refusal is logged and the call still runs (one rollout window);
-    ``off`` skips the check entirely.
+    ``ENFORCE_AGENT_TOKENS=off`` skips the gate; ``log`` is the token/allowlist rollout
+    window (a group-rule verdict is still applied -- that has its own switch).
     """
     mode = agent_token_module.mode()
     if mode == "off":
@@ -724,37 +742,39 @@ async def _authorize_agent(
             return None, None
         return None, ("access_denied", message)
 
-    config = await asyncio.to_thread(
-        _identity_manager().get_agent_config, claims.agent
+    record = await asyncio.to_thread(_identity_manager().get_agent_config, claims.agent)
+    reference = f"{site}__{tool}" if mcp is None else f"mcp__{site}__{mcp}__{tool}"
+    exposure = False
+    if not record:
+        exposure = await _export_public(site, tool, mcp, conn)
+    decision = await tool_access.enforce_async(
+        await tool_access.authorize_claims_async(
+            claims,
+            target=reference,
+            allowed=allowlist.resolve(record) if record else None,
+            public=exposure,
+            surface="relay",
+        ),
+        agent=claims.agent,
+        groups=claims.groups,
+        target=reference,
+        surface="relay",
     )
-    permitted = False
-    reference = f"{site}__{tool}"
-    if not config:
-        permitted = await _publicly_exposed(site, tool, mcp)
-        message = f"access_denied: unknown agent '{claims.agent}'"
-    else:
-        allowed = allowlist.resolve(config)
-        if mcp is None:
-            permitted = allowlist.permits_tool(allowed, reference)
-        else:
-            # The composed reference already folds in the server grant, the
-            # wildcard and a per-tool grant — the same rule that registers tools.
-            reference = f"mcp__{site}__{mcp}__{tool}"
-            permitted = allowlist.permits_tool(allowed, reference)
-        message = agent_token_module.deny_message(claims.agent, reference)
-
-    if permitted:
+    if decision.allowed:
         return claims, None
-    if mode == "log":
+    if mode == "log" and decision.reason in {
+        tool_access.REASON_NOT_IN_ALLOWLIST,
+        tool_access.REASON_UNKNOWN_TARGET,
+    }:
         logger.warning(
             "relay: would deny site=%s tool=%r agent=%s: %s",
             site,
             tool,
             claims.agent,
-            message,
+            decision.message,
         )
         return claims, None
-    return claims, ("access_denied", message)
+    return claims, ("access_denied", decision.message)
 
 
 class McpCallBody(CallBody):
@@ -1104,7 +1124,7 @@ async def call_site_tool(site: str, body: CallBody) -> JSONResponse:
     # Authorization before export lookup: an unauthenticated caller must not be
     # able to enumerate a site's exports through 404 vs 403.
     claims, denial = await _authorize_agent(
-        body.agent_token, site=site, tool=body.tool
+        body.agent_token, site=site, tool=body.tool, conn=conn
     )
     if denial is not None:
         code, message = denial
@@ -1269,7 +1289,7 @@ async def call_site_mcp(site: str, mcp: str, body: McpCallBody) -> JSONResponse:
         return _error(400, "invalid_arguments", str(exc))
 
     claims, denial = await _authorize_agent(
-        body.agent_token, site=site, tool=body.tool, mcp=mcp
+        body.agent_token, site=site, tool=body.tool, mcp=mcp, conn=conn
     )
     if denial is not None:
         code, message = denial

@@ -172,6 +172,36 @@ def _no_real_identity_lookup(monkeypatch):
     monkeypatch.setattr(remote_mcp.edge_secrets_central, "get", lambda *args, **kwargs: None)
 
 
+@pytest.fixture(autouse=True)
+def _bound_edge_tool_granted(monkeypatch):
+    """An edge MCP tool bound to an agent is gated by the evaluator, so the run needs
+    a token whose agent record grants it (and an empty policy: no group rules)."""
+    from core import auth, agent_token, tool_access
+
+    class _NoPolicy:
+        def put(self, key, value):
+            raise AssertionError(f"no write expected: {key}")
+
+        def get(self, key, **_kwargs):
+            return None, None
+
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", "remote-mcp-central-unit-secret-0123456789")
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+    monkeypatch.setattr(tool_access, "_client", lambda: _NoPolicy())
+    monkeypatch.delenv(tool_access.MODE_ENV, raising=False)
+    tool_access.reset_snapshot()
+    monkeypatch.setattr(
+        auth,
+        "get_identity_manager",
+        lambda: SimpleNamespace(
+            get_agent_config=lambda name: {"allowed_mcps": [SERVER_KEY]}
+        ),
+    )
+    agent_token.mint_for_run("edge-agent", "user-1", run_id="run-edge")
+    yield
+    auth.agent_token_var.set(None)
+
+
 # --- 1. call_edge_mcp: request shape and response mapping -----------------------
 
 
@@ -913,7 +943,10 @@ def test_gateway_use_tool_denies_four_part_name_of_internal_edge_mcp(monkeypatch
     assert result.startswith("SYSTEM: Access denied.")
 
 
-# --- 5. is_tool_publicly_whitelisted: 4-part forms -----------------------------
+# --- 5. published_exposure: 4-part forms ----------------------------
+#
+# The front-door exposure rule the evaluator takes as `public=`: a caller with no
+# agent record may call exactly what a tool/MCP record publishes.
 #
 # The edge reading is registry-backed: these configs must carry the relay-written
 # `remote` block, exactly like production. A 4-part name whose `<site>__<mcp>` key has
@@ -923,7 +956,7 @@ def test_gateway_use_tool_denies_four_part_name_of_internal_edge_mcp(monkeypatch
 def whitelisted(tool_name, mcp_config, key=SERVER_KEY):
     config = None if mcp_config is None else {"remote": {"site": SITE, "mcp": MCP}, **mcp_config}
     mgr = SimpleNamespace(get_mcp_config=lambda name: config if name == key else None)
-    return asyncio.run(tool_search.is_tool_publicly_whitelisted(tool_name, mgr))
+    return asyncio.run(tool_search.published_exposure(tool_name, mgr))
 
 
 def test_whitelist_allows_public_edge_mcp():
@@ -959,7 +992,7 @@ def test_whitelist_central_three_part_name_unchanged():
         get_mcp_config=lambda name: {"public": True} if name == "example-mcp" else None
     )
     assert asyncio.run(
-        tool_search.is_tool_publicly_whitelisted("mcp__example-mcp__list", mgr)
+        tool_search.published_exposure("mcp__example-mcp__list", mgr)
     ) is True
 
 
@@ -981,7 +1014,7 @@ def test_whitelist_treats_a_four_part_central_name_as_central():
         )
     )
 
-    assert asyncio.run(tool_search.is_tool_publicly_whitelisted(CENTRAL_NAME, mgr)) is True
+    assert asyncio.run(tool_search.published_exposure(CENTRAL_NAME, mgr)) is True
 
 
 def test_is_tool_configured_keeps_a_four_part_central_name_central(monkeypatch):
@@ -1006,7 +1039,9 @@ def test_is_tool_configured_keeps_a_four_part_central_name_central(monkeypatch):
 
 def test_gateway_dispatches_a_four_part_central_name_to_the_central_client(monkeypatch):
     mgr = SimpleNamespace(
-        get_mcp_config=lambda name: {"public": True} if name == CENTRAL_SRV else None
+        get_mcp_config=lambda name: {"public": True} if name == CENTRAL_SRV else None,
+        # The evaluator resolves the caller's record: no record = the front door.
+        get_agent_config=lambda name: None,
     )
     calls = []
 
