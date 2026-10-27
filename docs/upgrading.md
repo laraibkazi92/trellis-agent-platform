@@ -87,7 +87,7 @@ Tools have executed in runner containers since v0.6, so the change is mostly del
 - **Dev machines without gVisor** run the same runner with
   `CONTAINER_DEFAULT_RUNTIME=runc` (the default stays `runsc`). A per-tool
   `container_runtime: runc` still works. See
-  [deploy.md → Dev machine](deploy.md#dev-machine-docker-desktop).
+  [deploy.md → Dev machine](deploy.md#dev-machine-runc).
 
 #### Network: `network:` is `egress` or `none`, and the default changes
 
@@ -265,8 +265,13 @@ MCP session call, and the bound-tool wrappers an agent gets from its own allowli
 Two halves decide one call:
 
 1. **The agent's allowlist**, resolved from its record (`allowed_tools`, `allowed_mcps`,
-   `<site>__*` wildcards, console names). This half is enforced in every mode. A caller
-   with **no agent record** is decided by the target's own `public`/`public_tools` flag.
+   `<site>__*` wildcards, console names). This half is enforced in every mode. A caller at
+   the **front door** — the gateway identity (`gateway`), or a call that carries no agent
+   identity at all — is decided by the target's own `public`/`public_tools` flag. A token
+   that *names* an agent with no record (deleted, or a typo in the model name) is denied:
+   "no record" is not the front door, so it no longer inherits the public set. `gateway` is
+   therefore a **reserved agent name** — the sync refuses a workspace agent directory that
+   uses it, and `AgentConfig` rejects it at load.
 2. **Group rules** from `workspace/policies/tool_access.yaml`. A target matched by at
    least one rule is usable only by a caller whose token groups intersect one of those
    rules; a target no rule matches is governed by the allowlist alone. Rules are
@@ -557,8 +562,9 @@ Four behaviours to plan around:
   `EGRESS_*`, `RUNNER_AUTHORIZATION`. `AGENT_TOKEN_SECRET` is required on central and on
   each edge runner, and `RUNNER_IMAGE` must be v0.7.1 or newer.
 - **Registry sync:** new `workspace/policies/tool_access.yaml` (published to
-  `/registry/tool_access`); an invalid policy file or an invalid workflow config now
-  aborts the sync with exit 2. `/registry/tool_policies`, `/registry/tool_authz_denies` and
+  `/registry/tool_access`); an invalid policy file, an invalid workflow config or an agent
+  directory named `gateway` (the reserved front-door identity) now aborts the sync with
+  exit 2. `/registry/tool_policies`, `/registry/tool_authz_denies` and
   `/config/framework/{tool_authz_mode,bound_tools_mode,hub_call_mode,principal_groups}` are
   never read again.
 - **Tool protocol / `workspace/` layout:** the stdin/stdout protocol is unchanged; add

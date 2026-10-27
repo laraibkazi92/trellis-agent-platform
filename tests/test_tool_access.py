@@ -204,6 +204,64 @@ def test_public_does_not_bypass_group_rules(registry):
     assert allowed.reason == tool_access.REASON_GROUP_MATCH
 
 
+def test_the_reserved_front_door_identity_gets_the_public_exposure(registry):
+    decision = _authorize(
+        LOCAL_TOOL,
+        agent=tool_access.FRONT_DOOR_AGENT,
+        allowed=None,
+        public=True,
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == tool_access.REASON_PUBLIC
+
+
+def test_a_token_naming_an_unregistered_agent_does_not_inherit_the_front_door(registry):
+    """The defect this closed: "no record" is not the front door.
+
+    A valid token for a deleted (or typo'd) agent name used to be granted exactly
+    what a public tool grants. The front door is a reserved identity now, so that
+    token is denied instead.
+    """
+    decision = _authorize(LOCAL_TOOL, agent="deleted-agent", allowed=None, public=True)
+
+    assert decision.allowed is False
+    assert decision.reason == tool_access.REASON_UNKNOWN_AGENT
+    assert "deleted-agent" in decision.message
+    assert tool_access.FRONT_DOOR_AGENT in decision.message
+
+
+def test_an_unregistered_agent_is_denied_even_with_a_matching_group_rule(registry):
+    # The identity check is part of the allowlist half, which runs before the group
+    # half: a rule that matches cannot resurrect a token that names no agent.
+    registry.set_policy(_policy(_rule([LOCAL_TOOL], ["ops"])))
+
+    decision = _authorize(
+        LOCAL_TOOL, agent="deleted-agent", groups=["ops"], allowed=None, public=True
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == tool_access.REASON_UNKNOWN_AGENT
+
+
+def test_the_rollout_window_treats_an_unregistered_agent_like_an_allowlist_miss():
+    # `ENFORCE_AGENT_TOKENS=log` relaxes the whole allowlist half, so every
+    # enforcement point must see the same reason set (one definition, no copies).
+    assert tool_access.REASON_UNKNOWN_AGENT in tool_access.ROLLOUT_REASONS
+    assert tool_access.REASON_NOT_IN_ALLOWLIST in tool_access.ROLLOUT_REASONS
+    # ... and it is never relaxed by the group-rule switch.
+    assert tool_access.REASON_UNKNOWN_AGENT not in tool_access.GROUP_HALF_REASONS
+
+
+def test_the_reserved_name_is_not_an_agent(registry):
+    from pydantic import ValidationError
+
+    from core.models import AgentConfig
+
+    with pytest.raises(ValidationError, match="reserved for the gateway front door"):
+        AgentConfig(name=tool_access.FRONT_DOOR_AGENT)
+
+
 # --- 3. target forms -----------------------------------------------------------
 
 

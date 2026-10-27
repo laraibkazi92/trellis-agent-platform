@@ -412,8 +412,11 @@ Two independent halves decide one call:
 
 1. **The agent's own allowlist**, resolved from its record (`allowed_tools`, `allowed_mcps`,
    `<site>__*` wildcards, console names — see `core/allowlist.py`). This half is always
-   enforced. A caller with **no agent record** (a gateway client, a directly exposed tool) is
-   decided by the tool's own `public` flag instead.
+   enforced. A caller at the **front door** — the gateway identity (`gateway`), or a call
+   carrying no agent identity at all — is decided by the tool's own `public` flag instead.
+   A token that *names* an agent with no record (a deleted agent, a typo in the model name)
+   is denied: "no record" is not the front door. Because that identity must stay unambiguous,
+   `gateway` is a reserved name — no agent directory may use it (the sync refuses it).
 2. **Group rules**, from `workspace/policies/tool_access.yaml`. A target matched by at least
    one rule is usable only by a caller whose token groups intersect one of those rules'
    group sets; a target no rule matches is governed by the allowlist alone. Rules are

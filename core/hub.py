@@ -207,10 +207,7 @@ async def _authorize_call(
     )
     if decision.allowed:
         return claims, None
-    if mode == "log" and decision.reason in {
-        tool_access.REASON_NOT_IN_ALLOWLIST,
-        tool_access.REASON_UNKNOWN_TARGET,
-    }:
+    if mode == "log" and decision.reason in tool_access.ROLLOUT_REASONS:
         # Token/allowlist rollout only: the group-rule verdict above is final.
         logger.warning("hub: would deny %r: %s", config.name, decision.message)
         return claims, None

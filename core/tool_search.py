@@ -459,11 +459,11 @@ async def search_tools(
     if not candidates:
         return []
 
-    # Group-rule filter. The catalog above is already the *public* one (every
-    # candidate carries `public: true`), so the evaluator's front-door rule is what
-    # applies: no allowlist narrowing (a search may show a tool this run cannot call --
-    # execution is gated elsewhere), group rules only. `off` skips them; `shadow`
-    # logs and keeps the card. A failure here is fail-closed: no tools at all.
+    # Group-rule filter. The catalog above is already the *public* one, so what is
+    # left to decide is the group half: `may_discover` applies exactly that half and
+    # nothing else (no allowlist narrowing -- a search may show a tool this run cannot
+    # call, execution is gated elsewhere). `off` skips it; `shadow` logs and keeps the
+    # card. A failure here is fail-closed: no tools at all.
     #
     # No verified token means no group claims, and a group rule evaluated against an
     # empty group set would hide cards from the very users who do hold the group (the
@@ -483,13 +483,7 @@ async def search_tools(
                 c
                 for c in cands
                 if tool_access.enforce(
-                    tool_access.authorize_claims(
-                        claims,
-                        target=c["name"],
-                        allowed=None,
-                        public=True,
-                        surface="host",
-                    ),
+                    tool_access.may_discover(claims, target=c["name"], surface="host"),
                     agent=getattr(claims, "agent", None),
                     groups=getattr(claims, "groups", ()) or (),
                     target=c["name"],

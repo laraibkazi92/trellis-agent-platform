@@ -762,10 +762,7 @@ async def _authorize_agent(
     )
     if decision.allowed:
         return claims, None
-    if mode == "log" and decision.reason in {
-        tool_access.REASON_NOT_IN_ALLOWLIST,
-        tool_access.REASON_UNKNOWN_TARGET,
-    }:
+    if mode == "log" and decision.reason in tool_access.ROLLOUT_REASONS:
         logger.warning(
             "relay: would deny site=%s tool=%r agent=%s: %s",
             site,

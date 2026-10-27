@@ -23,12 +23,6 @@ from core import agent_token, allowlist, tool_access
 
 logger = logging.getLogger(__name__)
 
-# Reasons the token/allowlist rollout window (`ENFORCE_AGENT_TOKENS=log`) relaxes.
-# The group-rule half always applies: it has its own switch (``TOOL_ACCESS_MODE``).
-_ROLLOUT_REASONS = frozenset(
-    {tool_access.REASON_NOT_IN_ALLOWLIST, tool_access.REASON_UNKNOWN_TARGET}
-)
-
 
 class ToolAccessDenied(PermissionError):
     """A pre-runner refusal: an authorization verdict, not a transient failure.
@@ -133,7 +127,7 @@ async def deny_reason(
     )
     if decision.allowed:
         return None
-    if mode == "log" and decision.reason in _ROLLOUT_REASONS:
+    if mode == "log" and decision.reason in tool_access.ROLLOUT_REASONS:
         logger.warning(
             "%s: would deny agent=%s target=%s: %s",
             surface,

@@ -34,7 +34,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from core import agent_factory, agent_token, discovery, gateway, remote_mcp, tool_search
+from core import agent_factory, agent_token, discovery, gateway, remote_mcp, tool_access, tool_search
 from core.auth import user_id_var
 from core.models import MCPConfig, MCPToolDefinition, RemoteMcpSpec
 
@@ -878,6 +878,15 @@ def install_gateway(monkeypatch, mcp_config, edge_caller):
         "get_mcp_config",
         lambda name: config if name == SERVER_KEY else None,
     )
+    # The external MCP client sits at the front door: the gateway mints the reserved
+    # identity, which has no agent record of its own, so the target's published
+    # exposure -- not an agent allowlist -- is what decides. Same as production.
+    monkeypatch.setattr(
+        gateway.identity_mgr, "get_agent_config", lambda name: None
+    )
+    agent_token.mint_for_run(
+        tool_access.FRONT_DOOR_AGENT, "user-1", run_id="run-gateway"
+    )
 
     async def fake_configured(tool_name, user_id=None):
         return dict(CONFIGURED)
@@ -1038,9 +1047,14 @@ def test_is_tool_configured_keeps_a_four_part_central_name_central(monkeypatch):
 
 
 def test_gateway_dispatches_a_four_part_central_name_to_the_central_client(monkeypatch):
+    # The gateway's external client sits at the front door: the reserved identity, no
+    # record of its own, so the server's `public` flag decides.
+    agent_token.mint_for_run(
+        tool_access.FRONT_DOOR_AGENT, "user-1", run_id="run-gateway"
+    )
     mgr = SimpleNamespace(
         get_mcp_config=lambda name: {"public": True} if name == CENTRAL_SRV else None,
-        # The evaluator resolves the caller's record: no record = the front door.
+        # The evaluator resolves the caller's record: the front door has none.
         get_agent_config=lambda name: None,
     )
     calls = []

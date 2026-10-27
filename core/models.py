@@ -10,6 +10,7 @@ from typing import List, Optional, Literal, Dict, Any, Union
 from enum import Enum
 
 from core.llm_providers import ALLOWED_PROVIDERS, provider_requires_base_url
+from core.tool_access import RESERVED_AGENT_NAMES
 from core.execution.env import (
     INVALID_ENV_NAME_HELP,
     declared_names,
@@ -161,6 +162,22 @@ class AgentConfig(BaseModel):
     external: bool = Field(default=True, description="Available for direct consumption by users, Host API, Gateway MCP, and Supervisor agent.")
     internal: bool = Field(default=True, description="Available to be called by other specialized agents via a2a_access.")
     rules: List[AgentRule] = Field(default_factory=list, description="Declarative routing rules evaluated by the Trellis Rules Engine before semantic search.")
+
+    @field_validator("name")
+    @classmethod
+    def _reject_reserved_name(cls, value: str) -> str:
+        """The gateway front door is a reserved identity, never a real agent.
+
+        An agent occupying that name would either shadow the front door (its record
+        would replace the public exposure the gateway's clients rely on) or be
+        mistaken for it. Refused here and at sync, so the identity stays unambiguous.
+        """
+        if str(value).strip() in RESERVED_AGENT_NAMES:
+            raise ValueError(
+                f"'{value}' is reserved for the gateway front door and cannot be an "
+                f"agent name"
+            )
+        return value
 
     @field_validator("provider")
     @classmethod

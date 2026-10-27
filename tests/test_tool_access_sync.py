@@ -261,6 +261,34 @@ def test_a_bad_mcp_env_block_key_fails_the_sync(tmp_path, monkeypatch, capsys):
 
 
 # --------------------------------------------------------------------------- #
+# Reserved agent identities (scripts/sync_to_db.py)
+# --------------------------------------------------------------------------- #
+# The gateway front door is an identity, not a missing record: a workspace agent
+# directory that takes its name would replace the public exposure that identity's
+# callers rely on, so the sync refuses the name before any write.
+
+
+def test_a_clean_workspace_has_no_reserved_agent_names(tmp_path, monkeypatch):
+    agents = tmp_path / "workspace" / "agents"
+    (agents / "demo-assistant").mkdir(parents=True)
+    monkeypatch.setattr(sync_to_db, "AGENTS_DIR", agents)
+
+    assert sync_to_db.validate_reserved_agent_names() == []
+
+
+def test_an_agent_directory_named_gateway_fails_the_sync(tmp_path, monkeypatch):
+    agents = tmp_path / "workspace" / "agents"
+    (agents / tool_access.FRONT_DOOR_AGENT).mkdir(parents=True)
+    monkeypatch.setattr(sync_to_db, "AGENTS_DIR", agents)
+
+    errors = sync_to_db.validate_reserved_agent_names()
+
+    assert len(errors) == 1
+    assert tool_access.FRONT_DOOR_AGENT in errors[0]
+    assert "reserved" in errors[0]
+
+
+# --------------------------------------------------------------------------- #
 # Workflow manifest keys (scripts/sync_to_db.py)
 # --------------------------------------------------------------------------- #
 # A workflow config is an unvalidated registry document: a misspelled `limits` knob,

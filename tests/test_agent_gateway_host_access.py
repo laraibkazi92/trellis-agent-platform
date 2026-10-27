@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import pytest
 
 from core import agent_search
+from core import allowlist
 from core import gateway
 from core import host
 from core.auth import DEV_MODE_AUTH_TOKEN, auth_token_var, user_id_var
@@ -815,8 +816,9 @@ def test_a_supervisor_run_mints_an_ordinary_token_with_the_group_claim(monkeypat
                     tool_access.authorize_claims(
                         claims,
                         target="text_stats",
-                        allowed=None,
-                        public=True,
+                        # The supervisor's own manifest grants it; the claim's groups
+                        # still decide the group-rule half.
+                        allowed=allowlist.resolve({"allowed_tools": ["text_stats"]}),
                         surface="host",
                     ),
                     agent=claims.agent,

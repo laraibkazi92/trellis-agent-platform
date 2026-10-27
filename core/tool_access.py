@@ -35,17 +35,17 @@ Two independent halves decide one call
    special "everyone" group (an empty ``groups`` list is a validation error, so a
    rule can never accidentally grant everybody).
 
-``public=True`` means "this caller has no agent record" -- the front door (a
-gateway client, a directly-exposed tool). It replaces half 1 with the tool's own
-published exposure and leaves half 2 unchanged.
+``public=True`` means "hand this call to the tool's own published exposure" and it
+is granted to the reserved :data:`FRONT_DOOR_AGENT` -- the agent name the gateway
+mints for the external client it serves, which has no record of its own by design --
+and to a caller carrying no agent identity at all (a tokenless call, which every
+enforcement point refuses under ``enforce``). Half 2 (group rules) is unchanged.
 
-Note what ``public`` cannot express: "this token names an agent that has no record"
-(the agent was deleted, or the token was minted for a typo'd name) is
-indistinguishable here from "this caller sits at the front door", because both hand
-the evaluator ``agent`` with no allowlist. The front door is a reserved *identity*,
-not a missing record, and telling the two apart needs a caller-supplied flag at the
-mint sites (a Phase 5 follow-up): until then a token for an unregistered agent is
-granted exactly what a public tool grants, and nothing more.
+A token that NAMES an agent with no record -- the agent was deleted, or the name was
+a typo -- is a terminal denial rather than a silent fallback to the public set: the
+front door is a reserved identity, not "a missing record".
+:data:`RESERVED_AGENT_NAMES` is refused as an agent name at sync (exit 2) and at
+config load, so no real agent can occupy that identity and inherit its exposure.
 
 The policy document (``workspace/policies/tool_access.yaml``, synced to etcd)
 ---------------------------------------------------------------------------
@@ -134,10 +134,20 @@ MODES = ("off", "shadow", "enforce")
 DEFAULT_MODE = "enforce"
 MODES_HELP = "off, shadow, enforce"
 
+# The one identity that may use the public front door. The gateway mints it for the
+# external client it serves (it has no agent record of its own), so its allowlist half
+# is the target's own published exposure. Every other agent name resolves to a record;
+# a token naming one that does not exist is denied rather than widened to public.
+FRONT_DOOR_AGENT = "gateway"
+# Agent names an operator may not occupy: a real agent here would either shadow the
+# front door or inherit its exposure. Refused at sync (exit 2) and at config load.
+RESERVED_AGENT_NAMES = frozenset({FRONT_DOOR_AGENT})
+
 # Denial reasons -- stable machine strings, safe to branch on / show in a UI.
 REASON_NOT_IN_ALLOWLIST = "not_in_allowlist"
 REASON_GROUP_DENIED = "group_denied"
 REASON_UNKNOWN_TARGET = "unknown_target"
+REASON_UNKNOWN_AGENT = "unknown_agent"
 REASON_POLICY_UNAVAILABLE = "policy_unavailable"
 
 # Allow reasons -- informational only (``Decision.allowed`` is the verdict).
@@ -146,10 +156,18 @@ REASON_PUBLIC = "public"
 REASON_GROUP_MATCH = "group_match"
 REASON_MODE_OFF = "mode_off"
 REASON_SHADOW = "shadow"
+REASON_DISCOVERY = "discovery"
 
 # Denial reasons produced by the group-rule half. ``off`` relaxes exactly these:
 # everything else (allowlist, unusable reference) is enforced in every mode.
 GROUP_HALF_REASONS = frozenset({REASON_GROUP_DENIED, REASON_POLICY_UNAVAILABLE})
+
+# The allowlist-half denials an ``ENFORCE_AGENT_TOKENS=log`` rollout window relaxes
+# (it logs "would deny" and lets the call through). Every enforcement point uses this
+# one set so the rollout posture is identical at the hub, the relay and the host.
+ROLLOUT_REASONS = frozenset(
+    {REASON_NOT_IN_ALLOWLIST, REASON_UNKNOWN_TARGET, REASON_UNKNOWN_AGENT}
+)
 
 POLICY_TTL_S = 30.0
 # Negative window: a failed read must not turn every tool call into a full etcd
@@ -848,10 +866,19 @@ def _decide(
         )
 
     # 1. The allowlist half -- always enforced, in every mode.
-    # `public` is the front door: the caller has no agent record, so the target's own
-    # published exposure stands in for the allowlist. It cannot express "this token
-    # names an agent that has no record" -- see the module docstring's Phase 5 note.
+    # `public` is the front door: the reserved gateway identity has no record, so the
+    # target's own published exposure stands in for the allowlist. A caller with no
+    # identity at all is the same shape (every enforcement point refuses it under
+    # `enforce`). Any OTHER agent NAME without a record -- a deleted agent, a typo'd
+    # name in a valid token -- is denied here; it must not inherit the front door.
     if public:
+        if agent is not None and agent != FRONT_DOOR_AGENT:
+            return deny(
+                REASON_UNKNOWN_AGENT,
+                f"access_denied{where}: '{agent}' names no agent record and is not "
+                f"the reserved front door ('{FRONT_DOOR_AGENT}'); '{reference}' is "
+                f"not granted",
+            )
         base = allow(REASON_PUBLIC, message=f"'{reference}' is publicly exposed")
     elif _allowlist_grants(allowed, reference, session):
         base = allow(REASON_ALLOWLIST)
@@ -862,6 +889,30 @@ def _decide(
         )
 
     # 2. The group-rule half -- one policy read, never a stale one.
+    verdict = _group_verdict(
+        snapshot, agent=agent, groups=groups, reference=reference, surface=surface
+    )
+    # No rule constrains this target: the allowlist (or the public front door)
+    # decides alone.
+    return base if verdict is None else verdict
+
+
+def _group_verdict(
+    snapshot: PolicySnapshot,
+    *,
+    agent: Optional[str],
+    groups: Sequence[str],
+    reference: str,
+    surface: str,
+) -> Optional[Decision]:
+    """The group-rule half alone: ``None`` means "no rule constrains this target".
+
+    One implementation, used by the full decision (:func:`_decide`) and by the
+    discovery filter (:func:`may_discover`), so the two can never disagree about a
+    rule.
+    """
+    where = f" [{surface}]" if surface else ""
+    who = f"agent '{agent}'" if agent else "caller with no agent record"
     if not snapshot.available:
         return deny(
             REASON_POLICY_UNAVAILABLE,
@@ -871,9 +922,7 @@ def _decide(
 
     matching = tuple(rule for rule in snapshot.rules if rule.matches(reference))
     if not matching:
-        # No rule constrains this target: the allowlist (or the public front door)
-        # decides alone.
-        return base
+        return None
 
     held = {str(group).strip() for group in groups or () if str(group).strip()}
     for rule in matching:
@@ -891,6 +940,44 @@ def _decide(
         f"'{reference}' (rule: {labels})",
         rule=labels,
     )
+
+
+def may_discover(
+    claims: Optional[Any], *, target: str, surface: str = "host"
+) -> Decision:
+    """Read-filter verdict for the discovery catalog: **group rules only**.
+
+    ``search_tools`` shows the catalog a caller could use, so the allowlist half is
+    deliberately not applied here -- execution enforces it, and hiding everything
+    outside a manifest would leave an agent unable to discover anything. The group
+    half IS applied, so a group-restricted tool never appears for a caller who could
+    not call it. Identical to the full decision's second half by construction.
+
+    Synchronous (one cached registry read): call it from a worker thread, like the
+    ``search_tools`` card filter does.
+    """
+    verdict = _group_verdict(
+        policy_snapshot(),
+        agent=getattr(claims, "agent", None),
+        groups=getattr(claims, "groups", ()) or (),
+        reference=(target or "").strip(),
+        surface=surface,
+    )
+    return allow(REASON_DISCOVERY) if verdict is None else verdict
+
+
+async def may_discover_async(
+    claims: Optional[Any], *, target: str, surface: str = "host"
+) -> Decision:
+    """:func:`may_discover` without blocking the event loop."""
+    verdict = _group_verdict(
+        await asyncio.to_thread(policy_snapshot),
+        agent=getattr(claims, "agent", None),
+        groups=getattr(claims, "groups", ()) or (),
+        reference=(target or "").strip(),
+        surface=surface,
+    )
+    return allow(REASON_DISCOVERY) if verdict is None else verdict
 
 
 def authorize_claims(

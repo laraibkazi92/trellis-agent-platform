@@ -188,6 +188,26 @@ def test_a_missing_token_is_denied(executions):
     assert executions == []
 
 
+def test_a_token_for_an_unregistered_agent_is_denied_a_public_tool(executions):
+    """The front door is a reserved identity, not "an agent with no record"."""
+    result = call(
+        {"__agent_token": token("ghost-agent")}, config=make_config(public=True)
+    )
+
+    assert "reserved front door" in result["error"]
+    assert executions == []
+
+
+def test_the_front_door_identity_gets_a_public_tool(executions):
+    result = call(
+        {"__agent_token": token(tool_access.FRONT_DOOR_AGENT)},
+        config=make_config(public=True),
+    )
+
+    assert result == {"ok": True}
+    assert [entry["tool"] for entry in executions] == [TOOL]
+
+
 def test_the_body_cannot_assert_identity(executions):
     """``__user_id`` is not identity: a forged one changes nothing about the verdict."""
     result = call({"__user_id": "someone-else", "__agent_token": token("agent-b")})

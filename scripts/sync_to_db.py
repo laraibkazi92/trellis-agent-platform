@@ -278,6 +278,26 @@ def _workflow_manifest_errors(config: dict, directory, label: str) -> list[str]:
     return errors
 
 
+def validate_reserved_agent_names() -> list[str]:
+    """Agent directory names that would occupy a reserved identity.
+
+    The gateway front door is an identity, not a missing record (see
+    ``core.tool_access``), so a real agent may not take its name: the record would
+    replace the public exposure that identity's callers rely on. Same posture as a
+    malformed policy -- refuse before any write, loudly.
+    """
+    errors: list[str] = []
+    if not AGENTS_DIR.exists():
+        return errors
+    for agent_dir in sorted(AGENTS_DIR.iterdir()):
+        if agent_dir.is_dir() and agent_dir.name in tool_access.RESERVED_AGENT_NAMES:
+            errors.append(
+                f"agent directory '{agent_dir.name}' uses a reserved identity name "
+                f"(the gateway front door); rename it"
+            )
+    return errors
+
+
 def validate_workflow_manifests() -> list[str]:
     """Every workflow-manifest problem of that kind, as printable lines.
 
@@ -666,6 +686,15 @@ def main(argv=None):
     if workflow_errors:
         print("\nREFUSING TO SYNC: invalid workflow manifest keys, nothing was written.")
         for error in workflow_errors:
+            print(f"  ERROR: {error}")
+        return 2
+
+    # 0d. Reserved agent identities. A directory named `gateway` would either shadow
+    #     the front door or inherit its exposure, so it never reaches the registry.
+    reserved_errors = validate_reserved_agent_names()
+    if reserved_errors:
+        print("\nREFUSING TO SYNC: reserved agent name, nothing was written.")
+        for error in reserved_errors:
             print(f"  ERROR: {error}")
         return 2
     
