@@ -566,7 +566,9 @@ async def _check_runsc_version() -> Check:
     a gate. The minimum is the release the feature set is validated against; an older
     ``runsc`` may start containers and still fail on the networking model.
     """
-    version = _runsc_version()
+    # In a thread: this can shell out to a host binary, and the runner serves /v1/exec
+    # and /v1/stop on this one event loop. A hung `runsc` must not stall a cancellation.
+    version = await asyncio.to_thread(_runsc_version)
     if not version:
         return Check(
             "runsc_version",
@@ -614,7 +616,10 @@ def _runsc_version() -> str:
         line = line.strip()
         if line:
             return line[:200]
-    return (result.stderr or "").strip().splitlines()[0][:200] if result.stderr else ""
+    # Some builds write the version to stderr. A whitespace-only stream is empty, not
+    # a first line -- indexing it raised out of a check documented as never failing.
+    errors = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
+    return errors[0][:200] if errors else ""
 
 
 def _release_stamp(text: str) -> Optional[int]:
@@ -1307,7 +1312,7 @@ async def healthz(request: Request):
 
 @app.post("/v1/preflight")
 async def preflight(request: Request):
-    """Full diagnostic (four gates + canary); ``ok`` in the body is the verdict."""
+    """Full diagnostic (every gate plus the canary); ``ok`` in the body is the verdict."""
     denied = _authenticate(request)
     if denied is not None:
         return denied

@@ -25,11 +25,14 @@ run **kills its container**, a saturated runner pool **waits** instead of failin
 the startup canary **runs as the tool user** (so a root uid/gid now refuses to start), one
 env-name check **covers every manifest surface**, and three identity rules are tightened.
 
-Three changes can refuse something `v0.7.1` accepted: an edge left on the `v0.7.1` build
+Four changes can refuse something `v0.7.1` accepted: an edge left on the `v0.7.1` build
 (protocol `proto: 2` is refused at the handshake), a stack whose
-`TRELLIS_UID`/`TRELLIS_GID` is `0`, and a manifest whose declared names are not environment
-identifiers. Nothing else needs an action: the tool stdin/stdout protocol and the
-`workspace/` layout are untouched, and the new container variables are additive.
+`TRELLIS_UID`/`TRELLIS_GID` is `0`, a manifest whose declared names are not environment
+identifiers, and a `per_user_required` edge export called by an identity with no email
+claim. Two more change behaviour without refusing anything: a body `__user_id` is no
+longer an identity (it is ignored), and a workflow's first saturation is a wait. Nothing
+else needs an action: the tool stdin/stdout protocol and the `workspace/` layout are
+untouched, and the new container variables are additive.
 
 Central keeps its services, ports, volumes and `.env` keys. **An edge is upgraded in the
 same window as central**, because the edge/relay wire protocol moved to `proto: 3`.
@@ -54,7 +57,9 @@ dev-machine and per-tool escape hatch.
 3. **Set a non-root `TRELLIS_UID`/`TRELLIS_GID`** and `chown -R` the workspace if you have
    been running `0:0`.
 4. **Remove `AGENT_TOKEN_SECRET` and `ENFORCE_AGENT_TOKENS` from every edge service** and
-   set `RUNNER_ROLE=edge` on the edge runner.
+   set `RUNNER_ROLE=edge` on the edge runner. Do **not** restart an edge between this step
+   and the next one: a `v0.7.1` runner still requires the key and dies in `require_secret`
+   without it. The two steps are one edit window.
 5. **Deploy central and every edge from the same tag, in one window.** `docker compose
    pull && docker compose up -d` on central (or `up -d --build` from source), then
    recreate the edge services from the same image tag.
@@ -281,15 +286,22 @@ one, at sync time and at parse time:
 
 Three ordering fixes, all fail-closed:
 
-- **`identity_incomplete` is reported before `missing_credentials`.** When a target needs
-  per-user credentials and the caller's identity has no email, the refusal is
-  `identity_incomplete` — with or without a sealed set, at the edge resolver, the hub's
-  remote path and remote MCP. `missing_credentials` would tell an operator to re-seal a set,
-  which cannot fix a token that carries no address.
+- **`identity_incomplete` is reported before `missing_credentials`.** A
+  `per_user_required` edge export called by an identity with no email is refused with
+  `identity_incomplete` — with or without a sealed set — instead of `missing_credentials`,
+  which would tell an operator to re-seal a set nobody could have sealed. The edge owns
+  that decision because it is the only side that knows the export's `credential_mode`.
+  A sealed set that *did* arrive is still opened: it is sealed to the caller's email, or
+  to their user id when the identity has no email, so an email-less identity can
+  legitimately hold one (`webhook` runs are the shipped example).
 - **The body `__user_id` fallback is gone in every mode**, `off` and `log` included. Caller
   identity comes only from a verified token; a call with no token has no user identity, so
-  it has no user-scoped secrets. A custom caller that relied on `__user_id` loses them until
-  it presents a token.
+  it has no user-scoped secrets, no `TRELLIS_USER_*` and no usage row. A custom caller that
+  relied on `__user_id` loses them until it presents a token. Be aware what this means in
+  **`off`**: tokens are not verified there, so nothing is attributed — user-scoped secrets,
+  `TRELLIS_USER_*` and `/usage` counters stop for *every* tool, not just a custom caller.
+  Run `log` or `enforce` if you need attribution; `log` keeps it whenever the token
+  verifies.
 - **Minted emails are lowercased** after trimming, so the token claim, `TRELLIS_USER_EMAIL`,
   the MCP session key and the sealed-credential AAD all use one normalized form.
 
@@ -1671,7 +1683,8 @@ tool call reports `sandbox_unavailable`.
 1. Install `runsc` on every host that runs a `runner` (central and each edge), pinned to a
    version you have tested. The validated minimum is the release tag
    **`release-20261019.0`**; use the GitHub release assets — the
-   `storage.googleapis.com/gvisor/releases/release/latest/...` URLs printed in older guides
+   per-binary `runsc` / `runsc.sha512` files under
+   `storage.googleapis.com/gvisor/releases/release/latest/...` printed in older guides
    return 404 for current releases. On x86_64 (`gvisor-aarch64` assets on arm hosts), and
    note that current releases ship a **`gvisor-bin/` directory next to the binary**:
 

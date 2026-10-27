@@ -27,10 +27,12 @@ statement and the edge never second-guesses it:
 * ``per_user_required``: the sealed set **only**; nothing sealed for this caller is
   a hard refusal (``missing_credentials``) -- the call must not run at all.
 
-A refusal is about *credentials* only when the identity can carry one: a per-user
-call (``per_user_required``, or a blob that arrived) whose identity has **no email**
-is refused with ``identity_incomplete`` first, with or without a blob. Nothing the
-operator seals can fix a caller whose identity has no address.
+One refusal is about *identity*, not credentials: ``per_user_required`` for a caller
+whose identity has **no email** is refused with ``identity_incomplete`` before the
+credentials are even looked at -- with or without a blob -- because nothing is sealed
+for an identity that has never had an address to seal to. A blob that *did* arrive is
+not refused for that reason: it was sealed to the email, or to the user id when the
+identity has none, so it still opens.
 
 The per-user set is all-or-nothing (plan §5 Phase 4 R8): once a blob is present, a
 declared secret it omits stays missing and is never filled from the shared file.
@@ -329,21 +331,27 @@ class CredentialStore:
         (v0.7.1): it is visible to every tool in the container and to any operator
         inspecting it, so a declared secret comes from ``secrets_dir`` or is absent.
 
-        Either way a per-user call needs the caller's email, so an identity with none is
-        refused first -- see :func:`_identity_incomplete`. Side-effect free and
+        Either way ``per_user_required`` needs the caller's **email**: nothing is sealed
+        for an identity without one, and a mixed-up caller is sent to their identity
+        provider rather than to the seal form. That refusal comes first -- see
+        :func:`_identity_incomplete`. A blob that *did* arrive needs no email (it was
+        also sealed under the user id), so it still opens. Side-effect free and
         synchronous: no directory is created, and the only log lines name files and keys.
         """
         declared = edge_env.declared_keys_for(config)
         resolved_mode = _mode(mode)
         variables = declared_variable_keys(config)
 
-        # Identity before credentials (v0.7.2 R7.1): a sealed set is bound to the
-        # caller's email and only a sealed set can satisfy ``per_user_required``, so
-        # when either needs one and the identity has none, that IS the refusal -- with
-        # or without a blob. Answered before the ``missing_credentials`` path below so
-        # the operator is not sent to re-seal a key that cannot fix a missing address.
-        needs_caller_email = sealed is not None or resolved_mode == "per_user_required"
-        if needs_caller_email and not _caller_email(email):
+        # Identity before credentials (v0.7.2 R7.1). ``per_user_required`` can only be
+        # satisfied by a set sealed for this caller, and sealing happens against the
+        # caller's email; an identity without one has nothing sealed and nothing to
+        # match, so that IS the refusal -- with or without a blob. Answered before the
+        # ``missing_credentials`` path below, which would send the operator to re-seal a
+        # key that cannot fix a missing address.
+        #
+        # A *blob that arrived* is not gated on the email: ``sealed_identity`` falls back
+        # to the user id, so an identity with no address can legitimately hold one.
+        if resolved_mode == "per_user_required" and not _caller_email(email):
             raise _identity_incomplete(name, site)
 
         if sealed is not None:

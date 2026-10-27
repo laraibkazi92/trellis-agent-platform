@@ -164,12 +164,10 @@ async def call_edge_mcp(
             )
 
     if lacks_credential_identity(claims, sealed=sealed is not None):
-        # Per-user credentials are sealed to the caller's email: refuse with the real
-        # reason (missing identity) rather than let the edge call it
-        # ``credential_rejected``/``missing_credentials``, which would send an operator
-        # to re-seal a key that cannot fix a caller with no email. Not gated on a blob
-        # already existing (v0.7.2): a caller who has not sealed one yet is exactly who
-        # ``per_user_required`` refuses.
+        # A sealed set with nothing to attribute it to: refuse with the real reason
+        # (missing identity) rather than let the edge answer ``credential_rejected``.
+        # An email-less caller's per-user *mode* is the edge's decision -- see
+        # ``core.caller_identity.lacks_credential_identity`` (v0.7.2 R7.1).
         return identity_incomplete_error(f"MCP tool '{label}'", site)
 
     try:

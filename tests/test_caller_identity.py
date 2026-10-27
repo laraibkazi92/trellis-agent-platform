@@ -230,14 +230,16 @@ class Claims:
         self.user_email = user_email
 
 
-def test_a_user_token_without_an_email_cannot_serve_a_per_user_set():
-    """Central cannot see the edge's credential_mode, so an emailless user is refused.
+def test_an_email_less_user_is_left_to_the_edge_without_a_blob():
+    """Central cannot see the edge's ``credential_mode``, so it does not guess.
 
-    Letting it through would end in ``missing_credentials`` (a set the caller could
-    never seal) or ``credential_rejected`` (the blob opens with an email it does not
-    have) -- neither is fixable by re-sealing.
+    ``per_user_required`` is refused by the edge, which knows the mode and answers with
+    the same ``identity_incomplete`` code (v0.7.2 R7.1). Refusing centrally on "no
+    email" alone would break a shipped caller: a webhook run mints the literal user id
+    ``webhook`` and has no email by design, and the shared edge file serves it fine.
     """
-    assert lacks_credential_identity(Claims("user-1")) is True
+    assert lacks_credential_identity(Claims("user-1")) is False
+    assert lacks_credential_identity(Claims("webhook")) is False
 
 
 def test_an_email_claim_makes_the_identity_complete():
@@ -249,12 +251,14 @@ def test_no_token_asserts_nothing_and_leaves_it_to_the_edge():
 
 
 def test_a_service_identity_is_email_less_by_design():
-    """A background run never holds a seal: refusing it would break shared-mode calls."""
+    """A background run has no address for a blob, so a paired one is a contradiction."""
     assert lacks_credential_identity(Claims("svc_agent_nightly")) is False
-    # A blob can only exist for a browser session's user, so a service id holding one
-    # is a contradiction -- refused rather than forwarded unattributable.
-    assert lacks_credential_identity(Claims("svc_agent_nightly"), sealed=True) is True
 
 
-def test_a_sealed_set_needs_the_email_even_for_a_service_identity():
-    assert lacks_credential_identity(Claims("user-1"), sealed=True) is True
+def test_a_sealed_set_needs_a_subject_not_an_email():
+    """A blob is sealed to the email *or the user id*, so a user id alone is enough."""
+    assert lacks_credential_identity(Claims("user-1"), sealed=True) is False
+
+
+def test_a_sealed_set_without_a_token_has_no_subject():
+    assert lacks_credential_identity(None, sealed=True) is True

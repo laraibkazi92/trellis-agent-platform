@@ -38,31 +38,30 @@ def is_service_identity(user_id: Any) -> bool:
 
 
 def lacks_credential_identity(claims: Any, *, sealed: bool = False) -> bool:
-    """Whether a per-user credential call cannot be attributed to this identity.
+    """Whether a *sealed* credential set cannot be attributed to this identity.
 
-    ``claims`` is a verified ``agent_token.Claims`` (or ``None`` when no token was
-    presented). A sealed set is bound to the caller's email, so an identity without one
-    can never open -- or be matched to -- any per-user material. Central cannot see an
-    edge export's ``credential_mode`` either, so a real *user* identity with no email is
-    refused here instead of letting the edge answer ``missing_credentials`` (or
-    ``credential_rejected``), which sends the operator to re-seal a key that was never
-    the problem.
+    A blob is sealed to ``edge_secrets_central.sealed_identity``: the caller's
+    lowercased email, **else their user id**. So the identity a blob needs is "an email
+    or a user id", not "an email" -- that fallback is what lets an identity with no
+    email address still use per-user credentials, and refusing it would break a working
+    path (a webhook-triggered run mints the literal user id ``webhook`` and has no email
+    by design).
 
-    Two cases stay allowed, because refusing them would break what is not per-user:
-
-    * no claims at all -- nothing is asserted, and the edge's ``credential_mode`` is the
-      only authority (the documented no-token rollout posture);
-    * a service identity (``svc_agent_*``) with no sealed set -- email-less by design,
-      and it can never hold one.
+    Central cannot see an edge export's ``credential_mode``, so this only answers the
+    question it *can*: a blob arrived and there is nothing to attribute it to. Whether a
+    per-user *mode* may run for an email-less caller is the edge's decision -- it knows
+    the mode, and ``core.edge_user_secrets.resolve`` refuses it with the same
+    ``identity_incomplete`` code.
     """
-    if claims is None:
+    if not sealed:
         return False
+    if claims is None:
+        # A blob with no token: nothing was verified, so there is no subject at all.
+        return True
     if getattr(claims, "user_email", None):
         return False
-    if sealed:
-        return True
-    user_id = getattr(claims, "user_id", None)
-    return bool(user_id) and not is_service_identity(user_id)
+    # The seal's own fallback: a user id is a usable subject when there is no email.
+    return not getattr(claims, "user_id", None)
 
 
 async def resolve_mint_identity(identity_mgr: Any, user_id: Optional[str]) -> dict:

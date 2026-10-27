@@ -343,10 +343,12 @@ def test_call_edge_mcp_service_token_carries_no_email(monkeypatch):
 def test_call_edge_mcp_per_user_credentials_need_an_email_claim(monkeypatch):
     """A token with no email cannot serve a sealed per-user set.
 
-    The refusal is ``identity_incomplete`` and never ``credential_rejected``: re-sealing
-    a key cannot fix a caller whose identity has no email.
+    A blob is sealed to the email *or the user id*, so an email-less identity that
+    holds one is a legitimate caller (a webhook run mints the literal id ``webhook``).
+    Only a blob with nothing to attribute it to is refused, and never as
+    ``credential_rejected``: re-sealing cannot fix a missing subject.
     """
-    install_transport(monkeypatch, json_response(200, {"result": {"content": []}}))
+    requests, _ = install_transport(monkeypatch, json_response(200, {"result": {"content": []}}))
     monkeypatch.setattr(
         remote_mcp.edge_secrets_central,
         "get",
@@ -356,22 +358,9 @@ def test_call_edge_mcp_per_user_credentials_need_an_email_claim(monkeypatch):
 
     result = call_edge(user_id="svc_agent_reporter", token=token)
 
-    assert "identity_incomplete" in result["error"]
-    assert "no email" in result["error"]
-    assert "credential_rejected" not in result["error"]
-
-
-def test_call_edge_mcp_identity_incomplete_is_not_dispatched(monkeypatch):
-    """The refusal happens before the relay sees the call."""
-    requests, _ = install_transport(monkeypatch, json_response(200, {"result": {}}))
-    monkeypatch.setattr(
-        remote_mcp.edge_secrets_central, "get", lambda *args, **kwargs: {"v": 1, "ciphertext": "x"}
-    )
-
-    result = call_edge(token=mint("agent-a", user_id="user-1"))
-
-    assert requests == []
-    assert "identity_incomplete" in result["error"]
+    # Dispatched: the edge owns the per-user decision (it knows its credential_mode).
+    assert requests
+    assert "identity_incomplete" not in str(result)
 
 
 def test_call_edge_mcp_malformed_token_supplies_no_identity(monkeypatch):

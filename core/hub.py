@@ -461,12 +461,12 @@ async def _run_remote(
             )
 
     if lacks_credential_identity(claims, sealed=sealed is not None):
-        # Per-user credentials are sealed to the caller's email, which is a verified
-        # claim. Refusing here names the real problem (identity, not credentials)
-        # instead of letting the edge report ``credential_rejected`` for a token that
-        # has no email to match, or ``missing_credentials`` for a set the caller could
-        # never seal. Not gated on a blob existing (v0.7.2): a user who has not sealed
-        # one yet is exactly the caller ``per_user_required`` would refuse.
+        # A sealed set with nothing to attribute it to (no token, or a token that is
+        # neither an email nor a user id). Refusing here names the real problem
+        # (identity, not credentials) instead of letting the edge report
+        # ``credential_rejected``. Whether an email-less caller may use a per-user
+        # *mode* is the edge's call: it knows the ``credential_mode`` and answers with
+        # the same code (v0.7.2 R7.1).
         error = identity_incomplete_error(f"tool '{config.name}'", site)["error"]
         await record_health(False, error)
         return {"error": error}

@@ -424,8 +424,9 @@ startup refusal.
    sudo chmod 0755 /usr/bin/runsc /usr/bin/containerd-shim-runsc-v1 /usr/bin/gvisor-bin/*
    ```
 
-   (The `storage.googleapis.com/gvisor/releases/release/latest/...` URLs printed in
-   older guides return 404 for current releases; use the GitHub release assets.)
+   (The per-binary `runsc` / `runsc.sha512` files under
+   `storage.googleapis.com/gvisor/releases/release/latest/...` printed in older guides
+   return 404 for current releases; use the GitHub release assets.)
 
 2. Register it with the Docker daemon and restart Docker:
 

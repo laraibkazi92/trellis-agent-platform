@@ -299,8 +299,14 @@ def test_remote_dispatch_forwards_the_callers_sealed_blob(monkeypatch):
     assert json.loads(requests[0].content)["sealed"] == blob
 
 
-def test_remote_dispatch_refuses_a_sealed_call_without_an_email_claim(monkeypatch):
-    """``identity_incomplete``, never ``credential_rejected``: re-sealing cannot fix it."""
+def test_remote_dispatch_forwards_a_sealed_call_for_an_email_less_user(monkeypatch):
+    """A blob is sealed to the email *or* the user id, so an id-only caller works.
+
+    A webhook-triggered run mints the literal user id ``webhook`` with no email and
+    may legitimately hold a set; refusing it centrally (which cannot see the edge's
+    ``credential_mode``) would break a shipped path. ``per_user_required`` without an
+    identity is the edge's refusal to make -- it knows the mode.
+    """
     install_fake_health(monkeypatch)
     blob = {"v": 1, "ciphertext": "opaque", "keys": ["NODE_SSH_USER"]}
     monkeypatch.setattr(hub.edge_secrets_central, "get", lambda *args, **kwargs: dict(blob))
@@ -308,27 +314,20 @@ def test_remote_dispatch_refuses_a_sealed_call_without_an_email_claim(monkeypatc
         monkeypatch, json_response(200, {"tool": TOOL, "result": {"temp": 1}})
     )
 
-    # A verified token whose claims carry no email: the set is opened with that
-    # email, so forwarding it could only end in the edge's ``credential_rejected``.
     result = run_remote(
-        make_remote_config(),
-        {"unit": "1"},
-        claims=claims_for(email=None),
+        make_remote_config(), {"unit": "1"}, claims=claims_for(email=None)
     )
 
-    assert "identity_incomplete" in result["error"]
-    assert "no email" in result["error"]
-    # Nothing was dispatched to the edge.
-    assert requests == []
+    assert result == {"temp": 1}
+    assert json.loads(requests[0].content)["sealed"] == blob
 
 
-def test_remote_dispatch_refuses_a_per_user_call_without_an_email_and_no_blob(monkeypatch):
-    """``identity_incomplete`` whether or not a sealed set exists (v0.7.2 R7.1).
+def test_remote_dispatch_lets_an_identity_less_call_through_to_the_edge(monkeypatch):
+    """No blob, no email: central has nothing to judge, so the edge decides.
 
-    Central cannot see the edge export's ``credential_mode``, and gating the refusal on
-    a blob existing made the *unsealed* case fall through to the edge, which answered
-    ``missing_credentials`` -- advice to seal a set under an email the token does not
-    carry. A verified user identity with no email is therefore refused here first.
+    ``per_user_required`` refuses it there with the same ``identity_incomplete`` code;
+    a ``shared`` export serves it, which is what a webhook run (user id ``webhook``,
+    no email by design) relies on.
     """
     install_fake_health(monkeypatch)
     monkeypatch.setattr(hub.edge_secrets_central, "get", lambda *args, **kwargs: None)
@@ -338,9 +337,8 @@ def test_remote_dispatch_refuses_a_per_user_call_without_an_email_and_no_blob(mo
 
     result = run_remote(make_remote_config(), {"unit": "1"}, claims=claims_for(email=None))
 
-    assert "identity_incomplete" in result["error"]
-    assert "credential_rejected" not in result["error"]
-    assert requests == []
+    assert result == {"temp": 1}
+    assert json.loads(requests[0].content)["sealed"] is None
 
 
 def test_remote_dispatch_still_serves_a_shared_call_without_a_token(monkeypatch):

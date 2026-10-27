@@ -489,28 +489,27 @@ def test_per_user_required_refuses_a_missing_identity_even_with_a_sealed_set(tmp
 
 
 @pytest.mark.parametrize("mode", ["shared", "per_user"])
-def test_a_mode_that_does_not_require_per_user_still_refuses_a_sealed_set_without_an_email(
-    tmp_path, mode
-):
-    """A sealed set wins in every mode, so its identity requirement does too.
+def test_a_sealed_set_still_resolves_without_an_email(tmp_path, mode):
+    """A blob is sealed to the email *or* the user id, so no address is needed for it.
 
-    Without an email the blob can only be matched against the user id -- a
-    ``credential_rejected`` that tells the operator to re-seal something already sealed.
+    Only ``per_user_required`` has an email requirement (nothing is sealed for a caller
+    without one, and the caller is sent to the identity provider, not the seal form).
+    Refusing a decrypted blob here would break an identity that is legitimately
+    email-less -- a webhook run's ``webhook`` user id, for one.
     """
     store = make_store(tmp_path)
     write_shared(store, DEVOPS_PASSWORD=SECRET_VALUE)
 
-    with pytest.raises(secrets.MissingCredentials) as caught:
-        store.resolve(
-            tool_config(secrets=["DEVOPS_PASSWORD"]),
-            name="devops",
-            email=None,
-            site="dc1",
-            mode=mode,
-            sealed={"DEVOPS_PASSWORD": "mine"},
-        )
+    resolved = store.resolve(
+        tool_config(secrets=["DEVOPS_PASSWORD"]),
+        name="devops",
+        email=None,
+        site="dc1",
+        mode=mode,
+        sealed={"DEVOPS_PASSWORD": "mine"},
+    )
 
-    assert caught.value.code == "identity_incomplete"
+    assert resolved["DEVOPS_PASSWORD"] == "mine"
 
 
 def test_a_blank_email_counts_as_no_email(tmp_path):
