@@ -254,6 +254,38 @@ def test_execute_from_inside_a_running_loop_uses_a_fresh_thread():
     assert len(client.requests) == 1
 
 
+def test_a_console_container_configured_env_carries_no_secret(monkeypatch):
+    """`execute` ends up in a container; its configuration carries only fixed vars.
+
+    The console request has no env at all today, so this pins the shape at the spec
+    level: identity (and the run id) stay in the container's configuration, and
+    anything else a caller might one day pass -- a secret included -- is only ever
+    written to stdin.
+    """
+    from core.execution import docker_backend
+    from core.execution.spec import build_console_spec
+
+    monkeypatch.setenv("TRELLIS_UID", "1000")
+    monkeypatch.setenv("TRELLIS_GID", "1000")
+
+    container_spec = build_console_spec(
+        "echo hi",
+        env={"CONSOLE_TOKEN": "console-unit-secret-value"},
+        user_id="user-1",
+        user_email="u@example.test",
+        run_id="run-1",
+    )
+    payload = docker_backend._create_payload(container_spec)
+
+    assert payload["Entrypoint"] == ["/usr/local/bin/trellis-exec"]
+    assert payload["Cmd"] == ["bash", "-lc", "echo hi"]
+    assert "CONSOLE_TOKEN" not in container_spec.env
+    assert container_spec.preamble_env["CONSOLE_TOKEN"] == "console-unit-secret-value"
+    assert all("console-unit-secret-value" not in entry for entry in payload["Env"])
+    assert "TRELLIS_USER_ID=user-1" in payload["Env"]
+    assert "TRELLIS_RUN_ID=run-1" in payload["Env"]
+
+
 def test_run_sync_works_without_a_running_loop():
     result = _run_sync(asyncio.sleep(0, result="ok"))
 

@@ -19,6 +19,7 @@ import secrets
 from dataclasses import dataclass
 from typing import Optional
 
+from core.execution import env
 from core.execution.backend import ContainerBackend
 from core.execution.spec import ContainerSpec, Mount
 
@@ -46,6 +47,47 @@ def _remediation(detail: str, host_workspace: str, container_workspace: str) -> 
         f"workspace (the directory that is mounted at {container_workspace} inside the runner); "
         f"pointing it at a container path makes every bind mount resolve to the wrong files."
     )
+
+
+# Bounded so a chatty container cannot turn a one-line diagnostic into a wall of
+# text; the canary's own stderr is a `sh` error, never tool output.
+_STDERR_EXCERPT_BYTES = 240
+
+
+def _stderr_excerpt(stderr: bytes) -> str:
+    """``(stderr: ...)`` for a diagnostic, or ``''`` when there is nothing to add."""
+    text = (stderr or b"")[:_STDERR_EXCERPT_BYTES].decode("utf-8", "replace").strip()
+    if not text:
+        return ""
+    return f" (stderr: {' '.join(text.split())})"
+
+
+def _shim_missing_detail(image: str, evidence: str = "") -> str:
+    """The failure that is NOT a workspace problem: an image without the shim.
+
+    Every container now starts through ``/usr/local/bin/trellis-exec``, so a runner
+    image older than v0.7.1 fails to start anything at all (exit 126/127, or a
+    docker ``exec: "/usr/local/bin/trellis-exec": stat ...: no such file`` error on
+    start). Reporting that as a ``TRELLIS_HOST_WORKSPACE`` mistake sends the
+    operator after the wrong thing entirely, so it gets its own detail.
+    """
+    return (
+        f"the runner image has no {env.EXEC_SHIM} — RUNNER_IMAGE must be built from "
+        f"v0.7.1 or newer (image {image!r} cannot start any tool container: this "
+        f"release runs every command through that shim){evidence}"
+    )
+
+
+def _looks_like_missing_shim(exit_code: Optional[int], text: str) -> bool:
+    """True when a failed probe points at the shim rather than at the mounts.
+
+    126/127 from this canary cannot be the read command going missing (it is plain
+    ``sh -c cat``), so it is the entrypoint that failed. Docker more often fails
+    *start* instead, whose message names the missing path.
+    """
+    if exit_code in (126, 127):
+        return True
+    return "trellis-exec" in (text or "").lower()
 
 
 def _spec(name: str, *, image: str, runtime: str, host_workspace: str,
@@ -102,9 +144,17 @@ async def _probe(
         container_workspace=container_workspace,
     )
     try:
-        raw = await backend.run(container_spec, b"", CANARY_TIMEOUT_S)
+        raw = await backend.run(
+            container_spec,
+            # Every container starts through the trellis-exec shim, so the canary
+            # sends the (empty) preamble line too: no env needs applying here.
+            env.with_preamble(container_spec.preamble_env, b""),
+            CANARY_TIMEOUT_S,
+        )
     except Exception as exc:  # a backend failure is a failed canary, not a crash
         logger.error("host-path canary container failed: %s", exc)
+        if _looks_like_missing_shim(None, str(exc)):
+            return CanaryResult(False, _shim_missing_detail(image))
         return CanaryResult(
             False,
             _remediation(
@@ -118,11 +168,20 @@ async def _probe(
         return CanaryResult(
             True, f"container read {len(payload)} canary bytes back through the host path"
         )
+    stderr_text = (raw.stderr or b"").decode("utf-8", "replace")
+    if _looks_like_missing_shim(raw.exit_code, stderr_text):
+        return CanaryResult(
+            False,
+            _shim_missing_detail(
+                image,
+                _stderr_excerpt(raw.stderr) or f" (exit {raw.exit_code})",
+            ),
+        )
     return CanaryResult(
         False,
         _remediation(
             f"the canary container read {len(raw.stdout)} of {len(payload)} expected "
-            f"bytes (exit {raw.exit_code})",
+            f"bytes (exit {raw.exit_code}){_stderr_excerpt(raw.stderr)}",
             host_workspace,
             container_workspace,
         ),

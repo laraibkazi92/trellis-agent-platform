@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 Laraib Kazi
+# SPDX-License-Identifier: Apache-2.0
+"""Apply the stdin environment preamble, then exec the real command.
+
+Secrets must never live in a container's configuration, where ``docker inspect``
+shows them. The runner therefore starts every tool / MCP-session command through
+this shim and writes ONE JSON line to the container's stdin ahead of the call's
+own stream::
+
+    {"env": {"NAME": "value", ...}}\\n
+    <the child's stdin, starting at the very next byte>
+
+This shim consumes exactly that line, merges the values into the current
+environment (a preamble value wins over an inherited one), and ``execvpe``s the
+rest of argv in place: no fork, no wrapper process left behind, fds 0/1/2
+inherited untouched. Anything after the newline reaches the child byte-exact —
+a tool route reading ``stdin`` for JSON arguments or MCP stdio framing starts
+immediately after the preamble and must see it unchanged.
+
+The first line is read from fd 0 ONE BYTE AT A TIME (``os.read(0, 1)``) on
+purpose, and this module never touches ``sys.stdin``. Any buffered reader
+(``sys.stdin``, ``io.BufferedReader``, ``readline()``, ``text IOBase``) pulls a
+block into userspace, so it consumes bytes *past* the newline. Those bytes
+belong to the child, and a Python buffer holding them is destroyed when
+``execvpe`` replaces this process — the child would then block forever (MCP
+stdio) or parse a truncated argument document. One syscall per preamble byte is
+the price of that guarantee; a preamble is a few KB, not a payload.
+
+Values are parsed and discarded: nothing in the preamble is ever logged or
+echoed, so a malformed line reports a fixed reason string and never a key or a
+value.
+
+Usage::
+
+    trellis-exec <cmd> [args...]
+
+Exit codes (the shim itself only ever exits non-zero):
+
+* ``2`` — usage error: no command given.
+* ``78`` — ``EX_CONFIG``: stdin ended early, the preamble exceeded the size cap
+  (total or per value), or it was not a valid ``{"env": {<name>: <str>}}`` object.
+  Nothing ran.
+* ``126`` / ``127`` — the command is not executable / not found.
+"""
+
+import json
+import os
+import re
+import sys
+
+# Caps sized for what the kernel will actually accept at ``execvpe`` time, not for
+# "a preamble is a few KB": Linux refuses any single env string over 128 KiB
+# (MAX_ARG_STRLEN) and the whole environment near 2 MiB (ARG_MAX), and a value that
+# blows either limit dies inside execve with E2BIG — reported to the caller as a
+# plain "cannot execute", with no hint that a secret was too big. So: 64 KiB for
+# the entire preamble line, 16 KiB for one value. A preamble past either cap exits
+# ``78`` with the size in the reason (never the key or the value), which keeps the
+# failure honest and keeps the byte-at-a-time read cheap.
+MAX_PREAMBLE_BYTES = 64 * 1024  # 64 KiB total
+MAX_VALUE_BYTES = 16 * 1024  # 16 KiB per value
+
+EX_USAGE = 2
+EX_CONFIG = 78
+EX_NOT_EXECUTABLE = 126
+EX_NOT_FOUND = 127
+
+_VALID_ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _die(code: int, reason: str):
+    """Write one fixed line to stderr and exit. Never includes preamble data."""
+    sys.stderr.write(f"trellis-exec: {reason}\n")
+    sys.stderr.flush()
+    raise SystemExit(code)
+
+
+def _read_first_line() -> bytes:
+    """Read up to (not including) the first ``\\n`` from fd 0, one byte at a time.
+
+    ``os.read`` is called with a size of 1 so the kernel hands over exactly one
+    byte: no read-ahead buffer exists anywhere between fd 0 and the returned
+    line, so the file offset / pipe position after this returns is the first
+    byte the child must see.
+    """
+    line = bytearray()
+    while True:
+        try:
+            chunk = os.read(0, 1)
+        except OSError:
+            _die(EX_CONFIG, "cannot read the environment preamble from stdin")
+        if not chunk:
+            _die(EX_CONFIG, "stdin ended before the environment preamble line")
+        if chunk == b"\n":
+            return bytes(line)
+        line += chunk
+        if len(line) > MAX_PREAMBLE_BYTES:
+            _die(
+                EX_CONFIG,
+                f"environment preamble exceeds {MAX_PREAMBLE_BYTES} bytes",
+            )
+
+
+def _parse_preamble(raw: bytes) -> dict[str, str]:
+    """Validate the preamble line and return the variables it declares.
+
+    Errors are reported as reasons only: the JSON document (and therefore every
+    secret it carries) is never echoed to stderr.
+    """
+    if raw.endswith(b"\r"):  # tolerate CRLF; the line is otherwise exact
+        raw = raw[:-1]
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        _die(EX_CONFIG, "environment preamble is not valid JSON")
+    if not isinstance(document, dict):
+        _die(EX_CONFIG, "environment preamble is not a JSON object")
+    env = document.get("env")
+    if not isinstance(env, dict):
+        _die(EX_CONFIG, 'environment preamble has no "env" object')
+    variables: dict[str, str] = {}
+    for key, value in env.items():
+        # JSON object keys are always strings; the charset check mirrors what a
+        # process environment can actually carry.
+        if not _VALID_ENV_KEY.match(key):
+            _die(EX_CONFIG, "environment preamble has an invalid variable name")
+        if not isinstance(value, str):
+            _die(EX_CONFIG, "environment preamble has a non-string value")
+        # Measured in encoded bytes: that is what execve charges, and a multi-byte
+        # value can be several times its character count.
+        size = len(value.encode("utf-8"))
+        if size > MAX_VALUE_BYTES:
+            _die(
+                EX_CONFIG,
+                f"environment preamble value exceeds {MAX_VALUE_BYTES} bytes",
+            )
+        if "\x00" in value:
+            _die(EX_CONFIG, "environment preamble has a NUL byte in a value")
+        variables[key] = value
+    return variables
+
+
+def main(argv: list[str]) -> None:
+    cmd = argv[1:]
+    if not cmd:
+        _die(EX_USAGE, "usage: trellis-exec <cmd> [args...]")
+
+    env = dict(os.environ)
+    env.update(_parse_preamble(_read_first_line()))
+
+    try:
+        os.execvpe(cmd[0], cmd, env)
+    except FileNotFoundError:
+        _die(EX_NOT_FOUND, f"command not found: {cmd[0]}")
+    except OSError:
+        _die(EX_NOT_EXECUTABLE, f"cannot execute: {cmd[0]}")
+
+
+if __name__ == "__main__":
+    main(sys.argv)

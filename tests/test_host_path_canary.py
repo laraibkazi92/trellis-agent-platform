@@ -124,3 +124,85 @@ def test_canary_container_failure_is_a_failed_check_not_a_crash(tmp_path):
     assert result.ok is False
     assert "did not run" in result.detail
     assert list(tmp_path.glob(".runner-canary-*")) == []
+
+
+# --------------------------------------------------------------------------- #
+# A stale runner image: the shim is missing, and that is NOT a workspace bug
+# --------------------------------------------------------------------------- #
+
+
+class _Exits(FakeBackend):
+    """Starts, then reports the exit code / stderr a shim-less image produces."""
+
+    def __init__(self, exit_code: int, stderr: bytes = b""):
+        super().__init__()
+        self._exit_code = exit_code
+        self._stderr = stderr
+
+    async def run(self, spec, stdin, timeout_s):  # type: ignore[override]
+        self.specs.append(spec)
+        return ExecRaw(exit_code=self._exit_code, stdout=b"", stderr=self._stderr)
+
+
+@pytest.mark.parametrize("exit_code", [126, 127])
+def test_a_missing_shim_is_reported_as_an_image_problem_not_a_workspace_problem(
+    tmp_path, exit_code
+):
+    result = _run(
+        canary.run(
+            _Exits(exit_code, b'exec: "/usr/local/bin/trellis-exec": not found'),
+            host_workspace=str(tmp_path),
+            workspace_root=str(tmp_path),
+            image="trellis-agent-platform:v0.7.0",
+            runtime="runsc",
+        )
+    )
+
+    assert result.ok is False
+    assert "no /usr/local/bin/trellis-exec" in result.detail
+    assert "RUNNER_IMAGE" in result.detail and "v0.7.1" in result.detail
+    # The image, not the workspace, is named -- and the workspace hint is gone.
+    assert "trellis-agent-platform:v0.7.0" in result.detail
+    assert "TRELLIS_HOST_WORKSPACE" not in result.detail
+
+
+def test_a_start_failure_naming_the_shim_is_reported_the_same_way(tmp_path):
+    class _StartFails(FakeBackend):
+        async def run(self, spec, stdin, timeout_s):
+            raise RuntimeError(
+                'OCI runtime create failed: exec: "/usr/local/bin/trellis-exec": '
+                "stat /usr/local/bin/trellis-exec: no such file or directory"
+            )
+
+    result = _run(
+        canary.run(
+            _StartFails(),
+            host_workspace=str(tmp_path),
+            workspace_root=str(tmp_path),
+            image="trellis-agent-platform:v0.6.1",
+            runtime="runsc",
+        )
+    )
+
+    assert result.ok is False
+    assert "no /usr/local/bin/trellis-exec" in result.detail
+    assert "TRELLIS_HOST_WORKSPACE" not in result.detail
+
+
+def test_an_ordinary_mismatch_still_blames_the_workspace_and_quotes_stderr(tmp_path):
+    host_path = tmp_path / "host-path"
+    host_path.mkdir()
+
+    result = _run(
+        canary.run(
+            _Exits(1, b"cat: /canary/x: No such file or directory"),
+            host_workspace=str(host_path),
+            workspace_root=host_path,  # same dir, so the marker really is there
+            image="img:test",
+            runtime="runsc",
+        )
+    )
+
+    assert result.ok is False
+    assert "TRELLIS_HOST_WORKSPACE" in result.detail
+    assert "No such file or directory" in result.detail

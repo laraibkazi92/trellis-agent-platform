@@ -260,6 +260,92 @@ def test_transient_stderr_with_retry_disabled_returns_an_error(tmp_path, monkeyp
 
 
 # --------------------------------------------------------------------------- #
+# the stdin preamble (Phase 5): first line, then the call's own bytes
+# --------------------------------------------------------------------------- #
+
+
+def test_the_first_stdin_bytes_are_the_env_preamble_then_the_arguments(tmp_path, monkeypatch):
+    """Exactly one preamble line, then the tool's JSON arguments, byte for byte.
+
+    This drives the runner's real one-shot path (``_execute_one_shot``) with the
+    in-memory backend, so it pins the composition the container actually sees: the
+    shim consumes line 1 and the tool reads the rest.
+    """
+    from core.execution import runner as runner_module
+    from core.execution import spec as spec_module
+    from core.execution.backend import set_backend
+    from core.execution.contract import ExecRequest
+    from fixtures.fake_backend import FakeBackend, RawExec
+
+    root = tmp_path / "workspace"
+    suite = root / "tools" / "echo"
+    suite.mkdir(parents=True)
+    (suite / "echo.py").write_text("print('{}')\n", encoding="utf-8")
+    monkeypatch.setenv("TRELLIS_UID", "1000")
+    monkeypatch.setenv("TRELLIS_GID", "1000")
+    monkeypatch.setenv("RUNNER_IMAGE", "trellis-agent-platform:test")
+    monkeypatch.setenv("WORKSPACE_ROOT", str(root))
+
+    config = make_config()
+    payload = ExecRequest(
+        kind="tool",
+        target="echo",
+        manifest_digest=manifest_digest(config),
+        env={
+            "API_KEY": "unit-secret-value",
+            "SERVICE_URL": "https://example.test",
+            "TRELLIS_USER_EMAIL": "u@example.test",
+        },
+        input=json.dumps({"q": "x"}),
+        deadline_ms=5_000,
+    )
+    backend = FakeBackend()
+    backend.queue(RawExec(exit_code=0, stdout=b'{"count": 3}'))
+    set_backend(backend)
+    try:
+        response = asyncio.run(
+            runner_module._execute_one_shot(
+                "echo",
+                payload,
+                lambda: spec_module.build_spec(
+                    config,
+                    kind="tool",
+                    suite_rel="tools/echo",
+                    target="echo",
+                    env=payload.env,
+                    host_workspace=str(root),
+                    workspace_root=str(root),
+                ),
+            )
+        )
+    finally:
+        set_backend(None)
+
+    assert response.exit_code == 0
+    assert response.stdout == '{"count": 3}'
+    container_spec = backend.specs[0]
+    stdin = backend.stdin[0][1]
+    first_line, newline, rest = stdin.partition(b"\n")
+
+    assert newline == b"\n"
+    assert json.loads(first_line) == {
+        "env": {
+            "API_KEY": "unit-secret-value",
+            "SERVICE_URL": "https://example.test",
+        }
+    }
+    assert rest == json.dumps({"q": "x"}).encode("utf-8")
+    # No second preamble, and the secret never reached the container's config.
+    assert stdin.count(b"\n") == 1
+    assert "API_KEY" not in container_spec.env
+    assert container_spec.env["TRELLIS_USER_EMAIL"] == "u@example.test"
+    assert container_spec.preamble_env == {
+        "API_KEY": "unit-secret-value",
+        "SERVICE_URL": "https://example.test",
+    }
+
+
+# --------------------------------------------------------------------------- #
 # the runner is the only execution path
 # --------------------------------------------------------------------------- #
 

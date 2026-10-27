@@ -25,6 +25,12 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
+from core.execution.env import (
+    INVALID_ENV_NAME_HELP,
+    declared_names,
+    invalid_env_names,
+    split_env,
+)
 from core.models import MCPConfig, ToolConfig, normalize_network_policy
 
 CONTAINER_WORKSPACE = "/app/workspace"
@@ -104,7 +110,12 @@ class ContainerSpec:
     runtime: str
     cmd: list[str]
     working_dir: str
+    # Container *configuration*: the non-secret allowlist only (``core.execution.env``).
     env: dict[str, str]
+    # Everything else the process needs (secrets, declared variables, sealed
+    # credentials). The runner writes it as one stdin line ahead of the payload;
+    # it must never reach the container's create body.
+    preamble_env: dict[str, str] = field(default_factory=dict)
     mounts: list[Mount] = field(default_factory=list)
     # container path -> size in MB (tmpfs)
     tmpfs: dict[str, int] = field(default_factory=dict)
@@ -118,36 +129,13 @@ class ContainerSpec:
     kind: str = "tool"
 
 
-def _env_names(value: Any) -> list[str]:
-    """Flatten one declared-names field into env key names.
-
-    ``secrets``/``variables`` accept a flat list *or* the documented
-    ``{general: [...], user: [...], background: [...]}`` mapping (see
-    ``core.discovery._resolve_requirements``). The env names are the leaves in
-    both forms -- never the mapping keys.
-    """
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, Mapping):
-        names: list[str] = []
-        for nested in value.values():
-            names.extend(_env_names(nested))
-        return names
-    try:
-        return [str(name) for name in value]
-    except TypeError:
-        return []
-
-
 def declared_env_keys(config: Any) -> set[str]:
     """Every env name a manifest declares, plus the identity pair."""
     keys: set[str] = set()
     for attr in ("secrets", "optional_secrets", "variables", "env"):
         # MCPConfig has a literal `env:` block: those names are part of the
         # manifest's declared environment (not caller-supplied credentials).
-        keys |= {str(name) for name in _env_names(getattr(config, attr, None))}
+        keys |= {str(name) for name in declared_names(getattr(config, attr, None))}
     for group in getattr(config, "secret_groups", None) or []:
         if not isinstance(group, Mapping):
             continue
@@ -219,6 +207,22 @@ def _base_env() -> dict[str, str]:
     return base
 
 
+def _require_carriable_env_names(env: Mapping[str, str]) -> None:
+    """Refuse a name no process environment can carry (``my-api-key``).
+
+    The last boundary before the preamble is written: the shim would otherwise
+    reject the whole line and take every valid credential down with it, and
+    ``core.execution.env`` would silently drop the entry -- which for a declared
+    secret means the tool runs without the credential it asked for.
+    """
+    unrepresentable = invalid_env_names(env)
+    if unrepresentable:
+        raise InvalidRequest(
+            f"env keys are not valid environment names "
+            f"({INVALID_ENV_NAME_HELP}): {', '.join(unrepresentable)}"
+        )
+
+
 def _merge_env(config: Any, requested: Mapping[str, str]) -> dict[str, str]:
     declared = declared_env_keys(config)
     unknown = sorted(set(requested) - declared)
@@ -246,6 +250,10 @@ def _merge_env(config: Any, requested: Mapping[str, str]) -> dict[str, str]:
     for name in RESTRICTED_ENV_VARS:
         if name != "PATH":
             env.pop(name, None)
+    # Last boundary before the preamble: a name no process environment can carry
+    # (`my-api-key`) is a manifest bug, and dropping it here would lose a declared
+    # credential silently -- the caller gets a 400 instead.
+    _require_carriable_env_names(env)
     return env
 
 
@@ -451,12 +459,18 @@ def build_spec(
     else:
         cmd = _tool_cmd(config, container_suite)  # type: ignore[arg-type]
 
+    # One split at the end: whatever is not public, fixed deployment information
+    # (a secret, a declared variable, a sealed credential) is handed to the process
+    # on stdin instead of living in the container's configuration.
+    config_env, preamble = split_env(merged)
+
     return ContainerSpec(
         image=_image(image),
         runtime=runtime_for(config, default_runtime),
         cmd=cmd,
         working_dir=container_suite,
-        env=merged,
+        env=config_env,
+        preamble_env=preamble,
         mounts=mounts,
         tmpfs={CONTAINER_TMP: tmpfs_mb},
         memory_mb=memory,
@@ -497,12 +511,17 @@ def build_console_spec(
         merged["TRELLIS_USER_ID"] = str(user_id)
     if user_email:
         merged["TRELLIS_USER_EMAIL"] = str(user_email)
+    if run_id:
+        merged["TRELLIS_RUN_ID"] = str(run_id)
+    _require_carriable_env_names(merged)
+    config_env, preamble = split_env(merged)
     return ContainerSpec(
         image=_image(image),
         runtime=runtime_for(None, default_runtime),
         cmd=["bash", "-lc", command],
         working_dir="/workspace",
-        env=merged,
+        env=config_env,
+        preamble_env=preamble,
         mounts=[],
         tmpfs={"/workspace": 256, CONTAINER_TMP: 256},
         memory_mb=1024,

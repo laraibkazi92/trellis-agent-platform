@@ -44,7 +44,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from core import agent_token as agent_token_module
-from core.execution import canary, spec
+from core.execution import canary, env, spec
 from core.execution.backend import (
     AttachHandle,
     BackendError,
@@ -822,6 +822,26 @@ async def _destroy_session(session: _Session) -> None:
     logger.info("runner: session %s closed", session.session_id)
 
 
+async def close_all_sessions() -> int:
+    """Tear down every live session -- runner shutdown, or a test's teardown.
+
+    A session container outlives nothing: its stdin socket belongs to this process,
+    so on shutdown it can never be driven again. Removing it here (instead of
+    leaving it for the next process's startup sweep) keeps a dead runner from
+    parking containers on the host.
+    """
+    closed = 0
+    for session in list(_sessions.values()):
+        try:
+            await _destroy_session(session)
+            closed += 1
+        except Exception:
+            logger.exception("runner: could not close session %s", session.session_id)
+    if closed:
+        logger.info("runner: closed %d session container(s) on shutdown", closed)
+    return closed
+
+
 async def reap_sessions(
     backend: Optional[ContainerBackend] = None,
     *,
@@ -969,6 +989,7 @@ async def lifespan(_app: FastAPI):
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await close_all_sessions()
 
 
 app = FastAPI(
@@ -1104,10 +1125,14 @@ async def _execute_one_shot(target_name: str, payload: ExecRequest, build):
 
         backend = get_backend()
         deadline_s = max(payload.deadline_ms, 1) / 1000.0
+        # One preamble line, then the call's own stdin bytes -- composed into a
+        # single write so the shim cannot see a partial line and no secret is ever
+        # part of the container's configuration (env.with_preamble).
+        stdin = env.with_preamble(
+            container_spec.preamble_env, payload.input.encode("utf-8")
+        )
         try:
-            raw = await backend.run(
-                container_spec, payload.input.encode("utf-8"), deadline_s
-            )
+            raw = await backend.run(container_spec, stdin, deadline_s)
         except spec.InvalidRequest as exc:
             return _error(400, "invalid_request", exc.message)
         except BackendError as exc:
@@ -1223,6 +1248,10 @@ async def open_session(request: Request, payload: SessionCreateRequest):
         _opening.add(container_id)
         attach = await backend.attach(container_id)
         await backend.start(container_id)
+        # The session's preamble goes first, once, before any MCP frame: the shim
+        # consumes exactly this line and everything written afterwards (the driver's
+        # JSON-RPC frames) reaches the server untouched.
+        await attach.write(env.preamble_line(container_spec.preamble_env))
         opened = True
     except BackendError as exc:
         await _discard_session_container(backend, container_id, attach)

@@ -183,3 +183,78 @@ def test_main_aborts_before_any_other_write_when_the_policy_is_invalid(tmp_path,
     # no write happened at all.
     assert manager.client.puts == []
     assert manager.client.gets == []
+
+
+# --------------------------------------------------------------------------- #
+# Declared env names (scripts/sync_to_db.py)
+# --------------------------------------------------------------------------- #
+# A tool/mcp manifest used to sync happily with `secrets: [my-api-key]`; the name
+# then resolved, and was silently dropped at the last mile, so the tool ran without
+# the credential it declared. The sync refuses it loudly instead.
+
+
+def test_a_declared_name_that_is_not_an_env_name_fails_the_sync(
+    tmp_path, monkeypatch, capsys
+):
+    workspace = tmp_path / "workspace"
+    suite = workspace / "tools" / "ops"
+    suite.mkdir(parents=True)
+    (suite / "tool.yaml").write_text(
+        "name: ops\n"
+        "description: d\n"
+        "runtime: python\n"
+        "entrypoint: run.py\n"
+        "secrets: [my-api-key]\n"
+    )
+    mcps = workspace / "mcps"
+    mcps.mkdir(parents=True)
+
+    monkeypatch.setattr(sync_to_db, "TOOLS_DIR", workspace / "tools")
+    monkeypatch.setattr(sync_to_db, "MCPS_DIR", mcps)
+    manager = FakeManager()
+    monkeypatch.setattr(sync_to_db, "IdentityManager", lambda **_kwargs: manager)
+
+    assert sync_to_db.main([]) == 2
+
+    out = capsys.readouterr().out
+    assert "REFUSING TO SYNC" in out
+    assert "my-api-key" in out
+    assert "MY_API_KEY" in out
+    # No tool config reached the registry: the sync aborted before the write pass.
+    assert not [key for key, _value in manager.client.puts if "/registry/tools/" in key]
+
+
+def test_a_clean_workspace_passes_the_env_name_check(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    suite = workspace / "tools" / "ops"
+    suite.mkdir(parents=True)
+    (suite / "tool.yaml").write_text(
+        "name: ops\nsecrets: [OPS_API_KEY]\nvariables:\n  user: [OPS_BASE_URL]\n"
+    )
+    mcp_dir = workspace / "mcps" / "demo"
+    mcp_dir.mkdir(parents=True)
+    (mcp_dir / "mcp.yaml").write_text("name: demo\nsecrets: [DEMO_TOKEN]\n")
+
+    monkeypatch.setattr(sync_to_db, "TOOLS_DIR", workspace / "tools")
+    monkeypatch.setattr(sync_to_db, "MCPS_DIR", workspace / "mcps")
+
+    assert sync_to_db.validate_declared_env_names() == []
+
+
+def test_a_bad_mcp_env_block_key_fails_the_sync(tmp_path, monkeypatch, capsys):
+    workspace = tmp_path / "workspace"
+    mcps = workspace / "mcps"
+    mcp_dir = mcps / "demo"
+    mcp_dir.mkdir(parents=True)
+    (mcp_dir / "mcp.yaml").write_text(
+        "name: demo\ncommand: srv\nenv:\n  my-key: x\n"
+    )
+
+    monkeypatch.setattr(sync_to_db, "TOOLS_DIR", workspace / "tools")
+    monkeypatch.setattr(sync_to_db, "MCPS_DIR", mcps)
+
+    errors = sync_to_db.validate_declared_env_names()
+
+    assert len(errors) == 1
+    assert "my-key" in errors[0]
+    assert "mcp 'demo'" in errors[0]

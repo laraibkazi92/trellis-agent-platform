@@ -384,6 +384,18 @@ container sees its own toolkit directory read-only, `shared/` read-only, a sized
 for `/tmp`, and (only when the tool declares `output_dirs`) the calling agent's output
 directory. The network is a deny-by-default profile.
 
+### Secrets never in container configuration
+
+Resolved secrets reach a tool only through a one-line stdin preamble
+(`{"env": {...}}`) applied by `trellis-exec`, the shim the engine image installs at
+`/usr/local/bin/trellis-exec` (derived images inherit it). `docker inspect` on a running
+tool or MCP-session container therefore shows no declared secret — only fixed variables
+such as `HOME`, `PATH`, `LANG` and `TRELLIS_USER_*` — while the process inside still reads
+them from its environment. Everything after the preamble newline is the tool's own stdin,
+so the JSON stdin/stdout protocol and MCP stdio framing are unchanged; a malformed
+preamble makes the shim exit `78` before anything runs, and it never logs a key or value.
+If you build a tool image from this one and override the entrypoint, keep that contract.
+
 ### Prerequisite: gVisor (`runsc`)
 
 The runner refuses to start when its configured runtime is missing or cannot start a

@@ -138,6 +138,67 @@ def test_handle_call_round_trip_is_byte_identical_in_the_container_env(
     assert seen["TRELLIS_USER_EMAIL"] == ALICE
 
 
+def test_a_sealed_credential_reaches_the_tool_through_the_stdin_preamble(
+    edge_key, tmp_path, monkeypatch
+):
+    """`docker inspect` never shows a sealed value; the process still receives it.
+
+    The edge hands the opened mapping to ``execute_tool`` as the call's environment
+    (above); what reaches the container is then derived by the shared spec builder.
+    Pinned here: the credential set is absent from the create payload and present,
+    byte-identical, in the one stdin preamble line -- the same path a central tool
+    takes, because both call the same builder.
+    """
+    from core.execution import docker_backend, env as env_module, spec as spec_module
+
+    key, _path = edge_key
+    seen = capture_env(monkeypatch)
+    config = tool_config(secrets=list(DECLARED))
+    suite = tmp_path / "workspace" / "tools" / TOOL
+    suite.mkdir(parents=True)
+    (suite / "main.py").write_text("print('{}')\n", encoding="utf-8")
+    monkeypatch.setenv("TRELLIS_UID", "1000")
+    monkeypatch.setenv("TRELLIS_GID", "1000")
+    monkeypatch.setenv("RUNNER_IMAGE", "trellis-agent-platform:test")
+
+    asyncio.run(
+        proxy.handle_call(
+            {TOOL: (config, suite)},
+            call_frame(sealed=seal(key, BROWSER_VALUES)),
+            proxy_config=edge_proxy_config(tmp_path),
+            edge_key=key,
+        )
+    )
+
+    container_spec = spec_module.build_spec(
+        config,
+        kind="tool",
+        suite_rel=f"tools/{TOOL}",
+        target=TOOL,
+        # What actually crosses the socket: declared keys only (core.tool_runtime).
+        env={k: v for k, v in seen.items() if k in spec_module.declared_env_keys(config)},
+        host_workspace=str(tmp_path / "workspace"),
+    )
+    payload = docker_backend._create_payload(container_spec)
+    body = json.dumps(payload)
+
+    for name in DECLARED:
+        value = BROWSER_VALUES[name]
+        assert name not in container_spec.env
+        if not value:
+            continue
+        assert value not in body, name
+        assert container_spec.preamble_env[name] == value
+    # ... and the preamble is exactly ONE line, so tool/MCP framing survives it.
+    preamble = env_module.preamble_line(container_spec.preamble_env)
+    assert preamble.count(b"\n") == 1 and preamble.endswith(b"\n")
+    assert json.loads(preamble)["env"]["NODE_SSH_PASSWORD"] == (
+        BROWSER_VALUES["NODE_SSH_PASSWORD"]
+    )
+    # Identity is a documented contract variable, not a secret: it may stay in Env.
+    assert "TRELLIS_USER_EMAIL" in body
+
+
 @pytest.mark.parametrize(
     ("overrides", "sealed_for"),
     [

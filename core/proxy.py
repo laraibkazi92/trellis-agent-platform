@@ -1952,15 +1952,26 @@ def _disable_core_dumps() -> None:
     """PR_SET_DUMPABLE=0: a decrypted credential must not reach a core file.
 
     Best effort and Linux-only; an edge on another platform simply keeps its
-    default. Called once, before the first key is loaded.
+    default. Called once, before the first key is loaded. A failure is a real
+    (if modest) exposure -- a core file could capture a decrypted credential -- so
+    it is logged at WARNING, never DEBUG.
     """
     try:
         import ctypes
 
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        libc.prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE
+        if libc.prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE
+            logger.warning(
+                "Could not set PR_SET_DUMPABLE=0 (errno %s); a core file could capture "
+                "a decrypted credential",
+                ctypes.get_errno(),
+            )
     except Exception:
-        logger.debug("Could not set PR_SET_DUMPABLE", exc_info=True)
+        logger.warning(
+            "Could not set PR_SET_DUMPABLE=0; a core file could capture a decrypted "
+            "credential",
+            exc_info=True,
+        )
 
 
 async def run(

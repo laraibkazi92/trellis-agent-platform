@@ -82,6 +82,14 @@ COPY templates/ templates/
 COPY scripts/ scripts/
 COPY docs/ docs/
 
+# `trellis-exec` is the entrypoint shim every tool / MCP-session container is
+# started through: it reads the one-line {"env": {...}} preamble from stdin,
+# applies it, and execs the real command, so secrets never appear in a
+# container's configuration (`docker inspect`). Installed on PATH so derived
+# images -- and the runner's payloads -- can name it absolutely.
+COPY docker/trellis-exec /usr/local/bin/trellis-exec
+RUN chmod 0755 /usr/local/bin/trellis-exec
+
 # Non-root runtime user. docker-compose passes the host uid:gid (TRELLIS_UID/TRELLIS_GID)
 # as PUID/PGID so files written into the bind-mounted workspace/ are owned by the operator
 # instead of root. /app/data is created here and owned by that user: the `health-data`

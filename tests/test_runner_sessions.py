@@ -9,6 +9,7 @@ one event loop (which is also true of the real single-worker runner).
 """
 
 import asyncio
+import json
 import struct
 from types import SimpleNamespace
 
@@ -185,9 +186,12 @@ def test_open_session_derives_a_read_only_session_spec(env):
     assert container_spec.labels["trellis.target"] == "stateful"
     assert container_spec.labels["trellis.session"] == SESSION_KEY
     assert container_spec.labels["trellis.run"] == ""
-    assert container_spec.env["MCP_TOKEN"] == "s3cret"
+    # A declared secret is on stdin, never in the container's configuration.
+    assert "MCP_TOKEN" not in container_spec.env
+    assert container_spec.preamble_env["MCP_TOKEN"] == "s3cret"
     assert container_spec.env["HOME"] == "/tmp"
     assert "RUNNER_TOKEN" not in container_spec.env
+    assert "RUNNER_TOKEN" not in container_spec.preamble_env
 
 
 def test_discovery_kind_uses_the_same_container_with_its_own_label(env):
@@ -250,9 +254,11 @@ def test_stdin_reaches_the_attach_and_close_half_closes_it(env):
 
     assert first.status_code == 204
     assert closed.status_code == 204
-    assert bytes(attach.written) == (
-        b'{"jsonrpc":"2.0","id":1,"method":"initialize"}\n'
-    )
+    # The preamble is the FIRST bytes on the container's stdin, written once at
+    # session open; the driver's frames follow it untouched.
+    preamble, _, frames = bytes(attach.written).partition(b"\n")
+    assert json.loads(preamble)["env"]["MCP_TOKEN"] == "s3cret"
+    assert frames == b'{"jsonrpc":"2.0","id":1,"method":"initialize"}\n'
     assert attach.stdin_closed.is_set()
 
 
@@ -540,6 +546,34 @@ def test_expired_session_is_reaped_and_its_container_removed(env):
     assert removed >= 1
     assert info["container_id"] in env.backend.removed
     assert missing.status_code == 404
+
+
+def test_runner_shutdown_removes_every_session_container(env):
+    """A live session can never outlive its stdin socket: shutdown removes it.
+
+    Leaving it for the next process's startup sweep would park a container (with a
+    writable tmpfs and the call's env on its stdin) on the host indefinitely, so the
+    lifespan teardown destroys every session it owns.
+    """
+
+    async def scenario():
+        async with _client() as client:
+            first = await _open(client, env.root)
+            second = await _open(client, env.root, session_key="b" * 32)
+            closed = await runner_module.close_all_sessions()
+            still_live = await client.get(
+                f"/v1/sessions/{first['session_id']}", headers=AUTH
+            )
+            return first, second, closed, still_live
+
+    first, second, closed, still_live = asyncio.run(scenario())
+
+    assert closed == 2
+    assert {first["container_id"], second["container_id"]} <= set(env.backend.removed)
+    assert env.backend.containers == {}
+    assert still_live.status_code == 404
+    # Idempotent: nothing left to close.
+    assert asyncio.run(runner_module.close_all_sessions()) == 0
 
 
 def test_stray_session_container_is_reaped_even_if_the_registry_is_empty(env):

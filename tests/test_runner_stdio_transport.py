@@ -271,6 +271,36 @@ def test_identity_keywords_are_gone_not_merely_ignored():
         )
 
 
+def test_the_env_travels_on_the_open_request_and_never_in_a_frame():
+    """The preamble is written once at session open; frames are pure JSON-RPC after it.
+
+    The transport's half of the Phase 5 contract: the environment rides on
+    ``SessionCreateRequest`` (which the runner turns into ONE stdin line before any
+    frame), and every byte the transport posts for a message is JSON-RPC on its own
+    -- no env line glued onto a frame. The runner's half (that line really is the
+    session's first stdin bytes, in order) is pinned in
+    ``tests/test_runner_sessions.py``.
+    """
+    client = FakeRunnerClient([_frame(1, _response(1, {"ok": True}))])
+
+    async def scenario():
+        transport = _transport(client)
+        async with transport.connect_session(
+            transport_options=TransportOptions(session_class=FakeSession)
+        ) as session:
+            await session.write_stream.send(_request(1, "initialize"))
+            await session.read_stream.receive()
+
+    asyncio.run(scenario())
+
+    assert client.requests[0].env == {"MCP_TOKEN": "s3cret"}
+    assert client.stdin
+    for chunk in client.stdin:
+        assert chunk.startswith(b'{"jsonrpc"')
+        assert chunk.endswith(b"\n")
+        assert b'"env"' not in chunk
+
+
 def test_parse_frames_tolerates_partial_headers_and_payloads():
     payload = b'{"jsonrpc":"2.0","id":1,"method":"ping"}\n'
     raw = _frame(1, payload)

@@ -10,6 +10,7 @@ parser, and the error-code mapping the runner turns into HTTP statuses.
 """
 
 import asyncio
+import json
 from contextlib import suppress
 
 import httpx
@@ -18,6 +19,7 @@ import pytest
 from core.execution import docker_backend
 from core.execution.backend import BackendError
 from core.execution.docker_backend import DockerBackend, _create_payload, parse_frames
+from core.execution.env import CONTAINER_ENV_ALLOWLIST
 from core.execution.spec import DEFAULT_NETWORK_MODE, ContainerSpec, Mount
 
 
@@ -27,7 +29,10 @@ def _spec(**overrides) -> ContainerSpec:
         runtime="runsc",
         cmd=["python3", "/app/workspace/tools/demo/demo.py"],
         working_dir="/app/workspace/tools/demo",
-        env={"B": "2", "A": "1"},
+        # Container configuration carries only the non-secret allowlist; secrets
+        # travel on stdin (see the preamble tests below).
+        env={"HOME": "/tmp", "PATH": "/usr/local/bin:/usr/bin:/bin"},
+        preamble_env={"DEMO_TOKEN": "preamble-only"},
         mounts=[
             Mount("/host/ws/tools/demo", "/app/workspace/tools/demo", True),
             Mount("/host/ws/shared", "/app/workspace/shared", True),
@@ -58,6 +63,7 @@ def test_create_payload_sets_every_hardening_flag():
 
     assert set(payload) == {
         "Image",
+        "Entrypoint",
         "Cmd",
         "Env",
         "WorkingDir",
@@ -72,7 +78,8 @@ def test_create_payload_sets_every_hardening_flag():
     assert payload["OpenStdin"] is True
     assert payload["StdinOnce"] is True
     assert payload["User"] == "1000:1000"
-    assert payload["Env"] == ["A=1", "B=2"]
+    # Only the fixed, non-secret allowlist reaches the create body.
+    assert payload["Env"] == ["HOME=/tmp", "PATH=/usr/local/bin:/usr/bin:/bin"]
     assert payload["Cmd"] == ["python3", "/app/workspace/tools/demo/demo.py"]
 
     host = payload["HostConfig"]
@@ -200,6 +207,210 @@ def test_create_payload_session_keeps_stdin_open_and_omits_default_user():
 def test_create_payload_discovery_keeps_stdin_open():
     # Discovery drives the MCP handshake, so stdin must outlive the first write.
     assert _create_payload(_spec(kind="discovery"))["StdinOnce"] is False
+
+
+# --- env split: secrets never in container configuration ------------------
+
+
+@pytest.mark.parametrize(
+    "kind", ["tool", "mcp_session", "discovery", "console", "canary"]
+)
+def test_every_kind_starts_through_the_trellis_exec_shim(kind):
+    payload = _create_payload(_spec(kind=kind))
+
+    assert payload["Entrypoint"] == ["/usr/local/bin/trellis-exec"]
+    assert payload["Cmd"] == ["python3", "/app/workspace/tools/demo/demo.py"]
+
+
+def test_the_preamble_is_one_sorted_line_and_keeps_newlines_escaped():
+    from core.execution.env import preamble_line
+
+    line = preamble_line({"B_KEY": "two\nlines", "A_KEY": "one"})
+
+    assert line == b'{"env":{"A_KEY":"one","B_KEY":"two\\nlines"}}\n'
+    assert line.count(b"\n") == 1
+    assert preamble_line() == b'{"env":{}}\n'
+
+
+def test_a_name_a_process_environment_cannot_carry_is_dropped_loudly(caplog):
+    """One malformed name must not take the tool's other credentials down with it."""
+    from core.execution.env import preamble_line
+
+    line = preamble_line({"MY-SECRET": "v1", "OK_SECRET": "v2"})
+
+    assert json.loads(line) == {"env": {"OK_SECRET": "v2"}}
+    assert "MY-SECRET" in caplog.text
+    assert "v1" not in caplog.text and "v2" not in caplog.text
+
+
+def test_a_command_with_an_absolute_path_is_passed_to_the_shim_unchanged(tmp_path):
+    """The shim execs argv[0] as given, so an absolute entrypoint still works."""
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setenv("TRELLIS_UID", "1000")
+    monkeypatch.setenv("TRELLIS_GID", "1000")
+    monkeypatch.setenv("RUNNER_IMAGE", "trellis-agent-platform:test")
+    try:
+        from core.execution.spec import build_spec
+        from core.models import ToolConfig
+
+        root = tmp_path / "workspace"
+        suite = root / "tools" / "compiled"
+        (suite / ".bin").mkdir(parents=True)
+        (suite / "tool.yaml").write_text("[]\n", encoding="utf-8")
+        config = ToolConfig(
+            name="compiled", description="d", runtime="go", entrypoint="main.go"
+        )
+        container_spec = build_spec(
+            config,
+            kind="tool",
+            suite_rel="tools/compiled",
+            target="compiled",
+            env={},
+            host_workspace=str(root),
+        )
+    finally:
+        monkeypatch.undo()
+
+    payload = _create_payload(container_spec)
+
+    assert container_spec.cmd[0].startswith("/app/workspace/tools/compiled/")
+    assert payload["Entrypoint"] == ["/usr/local/bin/trellis-exec"]
+    assert payload["Cmd"] == container_spec.cmd
+
+
+def test_the_container_env_allowlist_is_exactly_the_fixed_non_secret_set():
+    """The allowlist is the whole contract: enumerate it, and pin its shape."""
+    from core.execution import env as env_module
+
+    assert env_module.CONTAINER_ENV_ALLOWLIST == {
+        "HOME",
+        "PATH",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+        "TERM",
+        "PYTHONUNBUFFERED",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "TRELLIS_USER_ID",
+        "TRELLIS_USER_EMAIL",
+        "TRELLIS_RUN_ID",
+    }
+
+
+@pytest.mark.parametrize("name", sorted(CONTAINER_ENV_ALLOWLIST))
+def test_no_allowlisted_name_looks_like_a_credential(name):
+    from core.execution.env import is_container_env, is_secretish
+
+    assert not is_secretish(name), f"{name} is credential-shaped"
+    assert is_container_env(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "API_KEY",
+        "GITHUB_TOKEN",
+        "NODE_SSH_PASSWORD",
+        "CLIENT_SECRET",
+        "AWS_SECRET_ACCESS_KEY",
+        "SSH_PRIVATE_KEY",
+        "SEALED_CREDENTIAL",
+        "x_api_key",
+    ],
+)
+def test_credential_shaped_names_never_become_container_config(name):
+    from core.execution.env import container_env, is_container_env, preamble_env
+
+    assert not is_container_env(name)
+    assert container_env({name: "v"}) == {}
+    assert preamble_env({name: "v"}) == {name: "v"}
+
+
+def test_a_secret_name_added_to_the_allowlist_by_mistake_is_still_refused(monkeypatch):
+    """Fail closed: a typo in the allowlist cannot make a secret container config."""
+    from core.execution import env as env_module
+
+    monkeypatch.setattr(
+        env_module, "CONTAINER_ENV_ALLOWLIST", frozenset({"HOME", "SHARED_SECRET"})
+    )
+
+    assert env_module.container_env({"HOME": "/tmp", "SHARED_SECRET": "s"}) == {
+        "HOME": "/tmp"
+    }
+
+
+def test_payload_env_is_re_filtered_and_refuses_non_allowlisted_names(caplog):
+    """Defence in depth: a spec built anywhere cannot leak a name into the body."""
+    payload = _create_payload(
+        _spec(env={"HOME": "/tmp", "DB_PASSWORD": "hunter2", "SERVICE_URL": "https://x"})
+    )
+
+    assert payload["Env"] == ["HOME=/tmp"]
+    assert "hunter2" not in json.dumps(payload)
+    assert "DB_PASSWORD" in caplog.text
+    assert "hunter2" not in caplog.text
+
+
+def test_no_value_from_a_fake_secret_store_appears_anywhere_in_the_payload(
+    tmp_path,
+):
+    """The acceptance gate: `docker inspect` shows no secret for any value."""
+    from core.execution.spec import build_spec
+    from core.models import ToolConfig
+
+    fake_secret_store = {
+        "DEMO_API_KEY": "fake-store-value-0001",
+        "DEMO_PASSWORD": "fake-store-value-0002",
+        "DEMO_DEPLOY_TOKEN": "fake-store-value-0003",
+    }
+    fake_variables = {"DEMO_SERVICE_URL": "fake-store-value-0004"}
+
+    root = tmp_path / "workspace"
+    suite = root / "tools" / "demo"
+    suite.mkdir(parents=True)
+    (suite / "tool.py").write_text("print('{}')\n", encoding="utf-8")
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setenv("TRELLIS_UID", "1000")
+    monkeypatch.setenv("TRELLIS_GID", "1000")
+    monkeypatch.setenv("RUNNER_IMAGE", "trellis-agent-platform:test")
+    try:
+        config = ToolConfig(
+            name="demo",
+            description="d",
+            runtime="python",
+            entrypoint="tool.py",
+            secrets=list(fake_secret_store),
+            variables=list(fake_variables),
+        )
+        container_spec = build_spec(
+            config,
+            kind="tool",
+            suite_rel="tools/demo",
+            target="demo",
+            env={**fake_secret_store, **fake_variables, "TRELLIS_USER_ID": "user-1"},
+            host_workspace=str(root),
+        )
+    finally:
+        monkeypatch.undo()
+
+    payload = _create_payload(container_spec)
+    body = json.dumps(payload)
+
+    for value in (*fake_secret_store.values(), *fake_variables.values()):
+        assert value not in body
+    # ... while every one of them is on stdin, i.e. the process still receives it.
+    assert set(container_spec.preamble_env) == {
+        *fake_secret_store,
+        *fake_variables,
+    }
+    assert container_spec.env["TRELLIS_USER_ID"] == "user-1"
 
 
 # --- frame parsing -------------------------------------------------------
@@ -511,6 +722,53 @@ def test_run_reports_frames_truncation_and_exit_code(tmp_path, monkeypatch):
         assert ("DELETE", "/containers/abc123") in daemon.calls
 
     _run(scenario())
+
+
+def test_a_one_shot_container_is_removed_before_run_returns(tmp_path):
+    """No container survives a completed call -- the run removes it, not a sweep."""
+
+    async def scenario():
+        daemon = _FakeDaemon(tmp_path / "docker.sock", _frame(1, b"{}"))
+        await daemon.start()
+        backend = DockerBackend(socket=daemon.sock_path, transport=daemon.transport())
+        try:
+            await backend.run(_spec(), b'{"env": {}}\n{}', 5.0)
+        finally:
+            await backend.close()
+            await daemon.stop()
+        return daemon.calls
+
+    calls = _run(scenario())
+
+    removed = calls.index(("DELETE", "/containers/abc123"))
+    assert removed > calls.index(("POST", "/containers/abc123/start"))
+    assert calls[-1] == ("DELETE", "/containers/abc123")
+
+
+def test_the_container_is_removed_even_when_collecting_the_result_fails(
+    tmp_path, monkeypatch
+):
+    async def scenario():
+        daemon = _FakeDaemon(tmp_path / "docker.sock", _frame(1, b"{}"))
+        await daemon.start()
+        backend = DockerBackend(socket=daemon.sock_path, transport=daemon.transport())
+
+        async def boom(_container_id):
+            raise BackendError("internal", "inspect exploded")
+
+        monkeypatch.setattr(backend, "_exit_code", boom)
+        try:
+            with pytest.raises(BackendError):
+                await backend.run(_spec(), b'{"env": {}}\n{}', 5.0)
+        finally:
+            await backend.close()
+            await daemon.stop()
+        return daemon.calls
+
+    calls = _run(scenario())
+
+    assert ("POST", "/containers/abc123/kill") in calls
+    assert ("DELETE", "/containers/abc123") in calls
 
 
 def test_run_timeout_kills_and_removes(tmp_path):

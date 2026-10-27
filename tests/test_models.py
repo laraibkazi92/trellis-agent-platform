@@ -6,6 +6,7 @@ import threading
 import time
 
 import pytest
+from pydantic import ValidationError
 
 from core.models import (
     MCPConfig,
@@ -237,3 +238,50 @@ def test_is_agent_external_coerces_string_booleans():
     assert is_agent_internal({"internal": False}) is False
     assert is_agent_internal({"internal": True}) is True
     assert is_agent_internal({}) is True
+
+
+# --- declared env names -----------------------------------------------------------
+# A declared secret/variable name is only usable if a process can carry it as an
+# environment variable. `my-api-key` used to be accepted here, then dropped at the
+# last mile, so the tool silently ran without it.
+
+
+@pytest.mark.parametrize("field", ["secrets", "optional_secrets", "variables"])
+def test_tool_config_rejects_a_declared_name_that_is_not_an_env_name(field):
+    with pytest.raises(ValidationError) as excinfo:
+        ToolConfig(**_tool_kwargs(**{field: ["my-api-key"]}))
+
+    message = str(excinfo.value)
+    assert "my-api-key" in message
+    assert field in message
+
+
+@pytest.mark.parametrize("field", ["secrets", "variables"])
+def test_mcp_config_rejects_a_declared_name_that_is_not_an_env_name(field):
+    with pytest.raises(ValidationError) as excinfo:
+        MCPConfig(name="demo", command="srv", **{field: ["9bad", "ok_NAME"]})
+
+    assert "9bad" in str(excinfo.value)
+
+
+def test_the_grouped_declaration_form_is_validated_too():
+    with pytest.raises(ValidationError) as excinfo:
+        ToolConfig(**_tool_kwargs(secrets={"general": ["GOOD_ONE"], "user": ["my-token"]}))
+
+    assert "my-token" in str(excinfo.value)
+
+
+def test_valid_declared_names_still_load_in_both_forms():
+    config = ToolConfig(
+        **_tool_kwargs(
+            secrets={"general": ["SHARED_TOKEN"], "user": ["USER_TOKEN"]},
+            optional_secrets=["_UNDERSCORE_OK"],
+            variables=["SERVICE_URL", "lower_case_ok"],
+        )
+    )
+    assert config.variables == ["SERVICE_URL", "lower_case_ok"]
+
+
+def test_mcp_config_accepts_valid_declared_names():
+    config = MCPConfig(name="demo", command="srv", secrets=["API_KEY"], variables=["BASE_URL"])
+    assert config.secrets == ["API_KEY"]

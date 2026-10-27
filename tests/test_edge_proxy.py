@@ -350,8 +350,19 @@ def test_load_tools_skips_a_manifest_with_an_invalid_secret_name(tmp_path, caplo
 
 
 def test_credential_keys_omits_a_target_with_an_invalid_declared_name(tmp_path, caplog):
-    """Last gate before the hello: never publish a name the relay would refuse."""
-    config = make_config(secrets=["my-api-key"])
+    """Last gate before the hello: never publish a name the relay would refuse.
+
+    Manifest validation now rejects such a name at load, so the config here is built
+    with validation bypassed -- this pins the gate for a caller that bypasses the
+    loaders, which is exactly what the gate exists for.
+    """
+    config = ToolConfig.model_construct(
+        name="bad",
+        description="a",
+        runtime="python",
+        entrypoint="main.py",
+        secrets=["my-api-key"],
+    )
     tools_dir = tmp_path / "tools"
     write_tool_yaml(
         tools_dir,
@@ -1503,3 +1514,61 @@ def test_open_for_call_still_rejects_a_blob_for_another_user(tmp_path, monkeypat
         )
 
     assert "another site, target or user" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------- #
+# core dumps: a failure to disable them is WARNING, never DEBUG
+# --------------------------------------------------------------------------- #
+
+
+def test_prctl_failure_is_a_warning_that_leaks_nothing(monkeypatch, caplog):
+    """A failed PR_SET_DUMPABLE is a real exposure, so it must never be DEBUG.
+
+    The message is a fixed one-liner (plus errno): the edge has already decrypted
+    credentials by this point, and a log line is not the place for them.
+    """
+    import ctypes
+
+    class _Libc:
+        def prctl(self, *_args):
+            ctypes.set_errno(1)  # EPERM
+            return -1
+
+    monkeypatch.setattr(ctypes, "CDLL", lambda *_args, **_kwargs: _Libc())
+    caplog.set_level(logging.DEBUG)
+
+    proxy._disable_core_dumps()
+
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "core.proxy" and "PR_SET_DUMPABLE" in record.getMessage()
+    ]
+    assert records, "the failure must be logged"
+    assert all(record.levelno >= logging.WARNING for record in records)
+    assert not any(record.levelno == logging.DEBUG for record in records)
+    message = records[0].getMessage()
+    assert "\n" not in message
+    assert "decrypted credential" in message
+
+
+def test_ctypes_failure_is_also_a_warning(monkeypatch, caplog):
+    import ctypes
+
+    def _explode(*_args, **_kwargs):
+        raise OSError("libc.so.6: cannot open shared object file")
+
+    monkeypatch.setattr(ctypes, "CDLL", _explode)
+    caplog.set_level(logging.DEBUG)
+
+    proxy._disable_core_dumps()
+
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "core.proxy" and "PR_SET_DUMPABLE" in record.getMessage()
+    ]
+    assert records
+    assert all(record.levelno >= logging.WARNING for record in records)
+    assert not any(record.levelno == logging.DEBUG for record in records)
+    assert "\n" not in records[0].getMessage()

@@ -113,6 +113,18 @@ the way results reach the agent.
   `variables`, `secret_groups` fields) plus `TRELLIS_USER_ID`/`TRELLIS_USER_EMAIL` are
   present; the rest of the environment is the image's base (`PATH`, `LANG`, `TZ`, ...).
   `FRAMEWORK_API_URL` and `FRAMEWORK_EXECUTION_TOKEN` are no longer injected.
+- **Secrets never appear in the container's configuration.** The runner hands them over as
+  a one-line stdin preamble (`{"env": {...}}`) that the engine image's `trellis-exec`
+  shim applies before exec-ing your script, so `docker inspect` on a running tool shows no
+  declared secret and the tool still reads them with `os.getenv()`. The only variables a
+  container's configuration carries are the fixed allowlist in `core/execution/env.py`:
+  `HOME`, `PATH`, `TMPDIR`, `TMP`, `TEMP`, `LANG`, `LANGUAGE`, `LC_ALL`, `LC_CTYPE`, `TZ`,
+  `TERM`, `PYTHONUNBUFFERED`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`,
+  `TRELLIS_USER_ID`, `TRELLIS_USER_EMAIL`, `TRELLIS_RUN_ID`. Everything else your manifest
+  declares (secrets, `variables`, a literal `env:` block) arrives through the preamble. If
+  your manifest pins `image:` to something that is *not* derived from the engine image, that
+  image must provide `/usr/local/bin/trellis-exec` (or your own equivalent that reads the
+  same one-line preamble); a container started without it never runs its command.
 - **Identity and rootfs:** the tool runs as `TRELLIS_UID:TRELLIS_GID` with all
   capabilities dropped, a read-only root filesystem and `no-new-privileges`.
 - **Runtime:** `container_runtime` selects `runsc` (default), `runsc-variant`, or `runc`

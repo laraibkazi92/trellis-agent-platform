@@ -9,12 +9,15 @@ contract in unit form: a caller can name a target and stdin, nothing else. No
 Docker daemon, no runsc -- the spec is plain data.
 """
 
+import json
+import logging
 import os
 from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
 
+from core.execution.env import preamble_line
 from core.execution.spec import (
     CONTAINER_WORKSPACE,
     DEFAULT_NETWORK_MODE,
@@ -25,7 +28,12 @@ from core.execution.spec import (
     manifest_digest,
     runtime_for,
 )
-from core.models import ContainerLimits, ToolConfig, reset_network_policy_warnings
+from core.models import (
+    ContainerLimits,
+    MCPConfig,
+    ToolConfig,
+    reset_network_policy_warnings,
+)
 
 
 @pytest.fixture
@@ -194,11 +202,16 @@ def test_declared_env_passes_through(workspace):
         },
     )
 
-    assert spec.env["API_KEY"] == "a"
-    assert spec.env["USER_TOKEN"] == "u"
-    assert spec.env["SERVICE_URL"] == "https://example.test"
+    # Identity is part of the documented contract and stays in the container
+    # configuration; credentials/variables reach the process on stdin only.
     assert spec.env["TRELLIS_USER_ID"] == "user-1"
     assert spec.env["TRELLIS_USER_EMAIL"] == "u@example.com"
+    assert spec.preamble_env["API_KEY"] == "a"
+    assert spec.preamble_env["USER_TOKEN"] == "u"
+    assert spec.preamble_env["SERVICE_URL"] == "https://example.test"
+    assert "API_KEY" not in spec.env
+    assert "USER_TOKEN" not in spec.env
+    assert "SERVICE_URL" not in spec.env
 
 
 def test_undeclared_env_key_is_rejected(workspace):
@@ -206,6 +219,60 @@ def test_undeclared_env_key_is_rejected(workspace):
         build(workspace, make_config(), env={"SMUGGLED_SECRET": "x"})
 
     assert "SMUGGLED_SECRET" in excinfo.value.message
+
+
+def test_an_env_name_no_process_can_carry_is_a_bad_request(workspace):
+    """``my-api-key`` reaches the boundary through an MCP's literal ``env:`` block.
+
+    Declared ``secrets``/``variables`` are rejected at manifest load
+    (``core.models``), but the literal block is free-form, so the runner boundary
+    must refuse it too: dropping the entry would silently lose a credential.
+    """
+    config = MCPConfig(name="demo", command="srv", env={"my-api-key": "x"})
+
+    with pytest.raises(InvalidRequest) as excinfo:
+        build_spec(
+            config,
+            kind="mcp_session",
+            suite_rel="tools/echo",
+            target="demo",
+            env={},
+            host_workspace=str(workspace.root),
+        )
+
+    assert "my-api-key" in excinfo.value.message
+    assert "not valid environment names" in excinfo.value.message
+
+
+def test_console_spec_refuses_an_env_name_no_process_can_carry(workspace):
+    with pytest.raises(InvalidRequest) as excinfo:
+        build_console_spec("echo hi", env={"my-key": "x"})
+
+    assert "my-key" in excinfo.value.message
+
+
+def test_preamble_line_is_only_the_net_for_values_that_bypass_validation(caplog):
+    """The drops that used to be silent are now belt-and-braces.
+
+    Both exit-78 triggers (an unusable name, a NUL in a value) are rejected earlier;
+    if something still reaches ``preamble_line`` it is dropped with a warning naming
+    the key, never the value, so one bad entry cannot take the whole tool down.
+    """
+    caplog.set_level(logging.WARNING, logger="core.execution.env")
+    line = preamble_line({"GOOD_KEY": "kept", "my-api-key": "dropped-1", "NUL_KEY": "a\x00b"})
+
+    assert json.loads(line) == {"env": {"GOOD_KEY": "kept"}}
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING and record.name == "core.execution.env"
+    ]
+    assert any("my-api-key" in message for message in warnings)
+    assert any("NUL_KEY" in message for message in warnings)
+    for message in warnings:
+        assert "dropped-1" not in message
+        assert "kept" not in message
 
 
 @pytest.mark.parametrize(
@@ -492,9 +559,12 @@ def test_console_spec_is_a_scratch_workspace(monkeypatch):
     assert spec.labels["trellis.kind"] == "console"
     assert spec.labels["trellis.target"] == "console"
     assert spec.labels["trellis.run"] == "run-1"
-    assert spec.env["FOO"] == "bar"
+    # A console container's configuration is the fixed non-secret set only.
+    assert "FOO" not in spec.env
+    assert spec.preamble_env["FOO"] == "bar"
     assert spec.env["TRELLIS_USER_ID"] == "user-1"
     assert spec.env["TRELLIS_USER_EMAIL"] == "u@example.com"
+    assert spec.env["TRELLIS_RUN_ID"] == "run-1"
     assert spec.env["HOME"] == spec.env["TMPDIR"] == spec.env["TMP"] == "/tmp"
 
 

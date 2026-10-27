@@ -265,6 +265,51 @@ Admin → Tool Authorization, because those tools never pass through the evaluat
 console `execute` tool is covered by rules; the file tools stay constrained by the agent's
 console allowlist.
 
+#### Secrets no longer travel in container configuration — the `trellis-exec` stdin preamble
+
+Tool and MCP-session containers are now started through a small entrypoint shim,
+`trellis-exec`, installed in the engine image at `/usr/local/bin/trellis-exec` (derived
+images inherit it). Instead of carrying resolved secrets in the container's environment —
+where `docker inspect`, a support dump or a `docker compose` debugging session shows them —
+the runner writes one JSON line to the container's stdin first,
+`{"env": {"NAME": "value", ...}}`, and the shim merges it into the process environment
+(preamble wins) before `exec`-ing the real command. Everything after that newline is the
+tool's own stdin, byte for byte, so the stdin/stdout tool protocol and MCP stdio framing are
+unchanged; a missing, oversized or malformed preamble line makes the shim exit `78` without
+running anything, and no key or value is ever logged. There is nothing to configure:
+`docker inspect` on a running tool or MCP-session container now shows only fixed non-secret
+variables (`HOME`, `PATH`, `LANG`, `TZ`, `TRELLIS_USER_*`, ...) plus whatever your own
+compose `environment:` adds. A declared secret/variable name must be a valid environment
+name (`^[A-Za-z_][A-Za-z0-9_]*$`); one that is not (`my-secret`) is dropped from the
+preamble with a warning naming it, because it would otherwise make the shim reject the whole
+line and take the tool's other credentials down with it. Two consequences: a tool image you
+build from the engine image inherits the shim, and any workflow that replaced the entrypoint
+to read secrets out of the container's `Env` for debugging no longer can — that is the point.
+
+##### `RUNNER_IMAGE` and edge images must be v0.7.1 or newer
+
+Because every tool / MCP-session container is now started through
+`/usr/local/bin/trellis-exec`, the **runner image** has to be an image that contains it —
+i.e. built from this release or newer. The same holds for an edge's `TRELLIS_IMAGE`: the
+edge runs its own tool containers through the same shim.
+
+An older image does not degrade gracefully: every tool container fails to start (the
+entrypoint is missing, so the container exits `126`/`127`, or the daemon refuses the start
+with `exec: "/usr/local/bin/trellis-exec": ... no such file or directory`), and the
+runner's startup canary refuses to serve calls. Rebuild or re-pull `RUNNER_IMAGE` (and
+recreate each edge from a matching tag) in the same step as the rest of the upgrade:
+
+```bash
+docker pull ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.1
+# .env
+RUNNER_IMAGE=ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.1
+```
+
+The runner never pulls an image itself, so it must already be present locally
+(`docker image inspect "$RUNNER_IMAGE"`). When the shim is what is missing, the canary's
+failure message names the image instead of blaming `TRELLIS_HOST_WORKSPACE`.
+
+
 <!-- v0.7.1: further removals are appended below this marker before the tag. -->
 
 ---
@@ -1179,7 +1224,7 @@ is visible. The mount is only created when the call carries an agent identity.
 | `RUNNER_SOCKET` | runner + callers | UDS path shared through `runner-run` |
 | `TRELLIS_HOST_WORKSPACE` | runner | **host** path of the workspace |
 | `CONTAINER_DEFAULT_RUNTIME` | runner | `runsc` unless a manifest overrides it |
-| `RUNNER_IMAGE` | runner | image tool containers start from; must exist locally |
+| `RUNNER_IMAGE` | runner | image tool containers start from; must exist locally, and must be v0.7.1 or newer |
 | `RUNNER_MAX_CONTAINERS` / `RUNNER_MAX_CONTAINERS_PER_TOOL` | runner | capacity; excess returns `429` |
 | `RUNNER_REAP_INTERVAL_S` | runner | canary/orphan sweep interval |
 | `TOOLS_NET_INTERNAL_SUBNET` / `TOOLS_NET_INTERNET_SUBNET` | runner + setup script | pinned profile subnets |

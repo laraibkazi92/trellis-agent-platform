@@ -9,6 +9,7 @@ the HTTP codes the hub branches on.
 """
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import httpx
@@ -149,9 +150,15 @@ def test_tool_call_returns_result_and_derives_spec(env):
     assert container_spec.labels["trellis.kind"] == "tool"
     assert container_spec.labels["trellis.target"] == "echo"
     assert container_spec.labels["trellis.run"] == "run-1"
-    assert container_spec.env["ECHO_TOKEN"] == "s3cret"
     assert container_spec.env["HOME"] == "/tmp"
-    assert env.backend.stdin[0][1] == b'{"text":"hi"}'
+    # The declared token is a secret: it is NOT container configuration, it is on
+    # stdin (the trellis-exec preamble), and the trailing payload follows it.
+    assert "ECHO_TOKEN" not in container_spec.env
+    assert container_spec.preamble_env["ECHO_TOKEN"] == "s3cret"
+    stdin = env.backend.stdin[0][1]
+    first, _, payload = stdin.partition(b"\n")
+    assert json.loads(first)["env"]["ECHO_TOKEN"] == "s3cret"
+    assert payload == b'{"text":"hi"}'
 
 
 def test_unknown_target_returns_404(env):

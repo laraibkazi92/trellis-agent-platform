@@ -38,6 +38,7 @@ from core.execution.backend import (
     ContainerBackend,
     ExecRaw,
 )
+from core.execution.env import EXEC_SHIM, container_env
 from core.execution.spec import (
     DEFAULT_NETWORK_MODE,
     MAX_STDERR_BYTES,
@@ -79,6 +80,17 @@ def _create_payload(spec: ContainerSpec) -> dict:
     from the caller, so no field can add capabilities, devices, extra mounts,
     host namespaces, or a writable rootfs.
 
+    Environment: only the non-secret allowlist from ``core.execution.env`` is
+    emitted. Everything else the process needs (secrets, declared variables, sealed
+    credentials) is written to its stdin as one preamble line by whoever starts the
+    container, because ``docker inspect`` shows configuration to anyone with the
+    socket. The filter is applied again here -- not just in ``spec`` -- so a spec
+    built anywhere cannot put a secret into the create body by mistake.
+
+    Entrypoint: ``/usr/local/bin/trellis-exec``, the image's preamble shim, with the
+    spec's own argv as ``Cmd``. A command naming an absolute path works unchanged;
+    the shim ``exec``s it as given.
+
     Network: there is no profile machinery and no resolv.conf bind. A container
     that may use the network gets Docker's default (the default bridge), so no
     NetworkMode is emitted at all; only ``network: none`` names a network, to
@@ -109,10 +121,21 @@ def _create_payload(spec: ContainerSpec) -> dict:
     }
     if spec.network_mode != DEFAULT_NETWORK_MODE:
         host_config["NetworkMode"] = spec.network_mode
+    container_region = container_env(spec.env)
+    refused = sorted(set(spec.env) - set(container_region))
+    if refused:
+        # Names only: a value must not reach a log even when its name was wrong.
+        logger.warning(
+            "container %r: dropping non-allowlisted env name(s) from the create "
+            "payload: %s",
+            getattr(spec, "labels", {}).get("trellis.target", "?"),
+            ", ".join(refused),
+        )
     payload: dict = {
         "Image": spec.image,
+        "Entrypoint": [EXEC_SHIM],
         "Cmd": list(spec.cmd),
-        "Env": [f"{key}={value}" for key, value in sorted(spec.env.items())],
+        "Env": [f"{key}={value}" for key, value in sorted(container_region.items())],
         "WorkingDir": spec.working_dir,
         "Labels": dict(spec.labels),
         "Tty": False,
@@ -428,6 +451,13 @@ class DockerBackend(ContainerBackend):
     async def run(
         self, spec: ContainerSpec, stdin: bytes, timeout_s: float
     ) -> ExecRaw:
+        """Run one container to completion.
+
+        ``stdin`` must already begin with the environment preamble line
+        (``core.execution.env.with_preamble``): it is written in ONE
+        ``handle.write`` before EOF, so the shim reads exactly the first line and
+        the rest is the call's own payload.
+        """
         started = time.monotonic()
         deadline = started + max(0.5, float(timeout_s))
 

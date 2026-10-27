@@ -10,11 +10,35 @@ from typing import List, Optional, Literal, Dict, Any, Union
 from enum import Enum
 
 from core.llm_providers import ALLOWED_PROVIDERS, provider_requires_base_url
+from core.execution.env import (
+    INVALID_ENV_NAME_HELP,
+    declared_names,
+    invalid_env_names,
+)
 
 logger = logging.getLogger(__name__)
 
 # 15 selectable LLM providers; the registry lives in core/llm_providers.py.
 # `openai-compatible` targets any OpenAI-compatible endpoint via `base_url`.
+
+
+def _validate_declared_env_names(value, field: str):
+    """Reject a declared ``secrets``/``variables`` entry that is not an env name.
+
+    A declared credential name is only usable if the process can receive it as an
+    environment variable, and the runner hands these to the container as env vars
+    (``core.execution.env``). A name that only *looks* fine (``my-api-key``) would
+    otherwise sync and resolve happily, then be dropped at the last mile -- or make
+    the shim reject the whole preamble line. One regex, defined next to the shim's
+    own rules.
+    """
+    invalid = invalid_env_names(declared_names(value))
+    if invalid:
+        raise ValueError(
+            f"{field} must be valid environment names ({INVALID_ENV_NAME_HELP}); "
+            f"got {', '.join(invalid)}"
+        )
+    return value
 
 
 class IdentityType(str, Enum):
@@ -405,6 +429,12 @@ class MCPConfig(BaseModel):
     def _normalize_network(cls, value: str) -> str:
         return normalize_network_policy(value, "mcp")
 
+    @field_validator("secrets", "optional_secrets", "variables")
+    @classmethod
+    def _declared_env_names_are_valid(cls, value, info):
+        return _validate_declared_env_names(value, info.field_name)
+
+
 class RemoteToolSpec(BaseModel):
     """Where a remote (edge-hosted) tool actually executes.
 
@@ -446,6 +476,11 @@ class ToolConfig(BaseModel):
     @classmethod
     def _normalize_network(cls, value: str) -> str:
         return normalize_network_policy(value, "tool")
+
+    @field_validator("secrets", "optional_secrets", "variables")
+    @classmethod
+    def _declared_env_names_are_valid(cls, value, info):
+        return _validate_declared_env_names(value, info.field_name)
 
     @field_validator("container_runtime")
     @classmethod

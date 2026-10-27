@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from core import tool_access
 from core.auth import IdentityManager
 from core.embeddings import embed_text
+from core.execution.env import INVALID_ENV_NAME_HELP, declared_names, invalid_env_names
 from core.models import (
     BACKGROUND_AGENT_TYPES,
     EDGE_MCP_REF_RE,
@@ -135,6 +136,62 @@ def _warn_unresolved_edge_refs(refs, known_mcps, known_tools):
             "registry entry yet — edge not connected / catalog not published yet. "
             "The reference starts working once that edge connects; the sync continues."
         )
+
+
+def _declared_env_name_errors(config: dict, label: str) -> list[str]:
+    """Problems with the env names a manifest declares, as printable lines.
+
+    A declared secret/variable name is only useful if the process can receive it as
+    an environment variable. ``my-api-key`` used to sync, resolve and then vanish at
+    the last mile (``core.execution.env.preamble_line`` drops it), so the tool ran
+    without the credential it asked for. Reject it here, before anything is written.
+    """
+    names = []
+    for field in ("secrets", "optional_secrets", "variables"):
+        names.extend(declared_names(config.get(field)))
+    # An MCP's literal `env:` block is container configuration by the same rules.
+    env_block = config.get("env")
+    if isinstance(env_block, dict):
+        names.extend(str(name) for name in env_block)
+    invalid = invalid_env_names(names)
+    if not invalid:
+        return []
+    return [
+        f"{label}: declared name(s) {', '.join(invalid)} cannot be environment "
+        f"variables ({INVALID_ENV_NAME_HELP}); rename them in the manifest "
+        "(e.g. my-api-key -> MY_API_KEY)"
+    ]
+
+
+def validate_declared_env_names() -> list[str]:
+    """Every manifest problem of that kind in the workspace, as printable lines.
+
+    Runs before any write so a bad manifest fails the sync loudly instead of
+    leaving a half-synced registry behind.
+    """
+    errors: list[str] = []
+    for manifest_glob, label in (
+        (TOOLS_DIR.glob("**/tool.yaml"), "tool"),
+        (MCPS_DIR.glob("**/mcp.yaml"), "mcp"),
+    ):
+        for manifest in sorted(manifest_glob):
+            try:
+                with open(manifest, "r") as handle:
+                    data = yaml.safe_load(handle)
+            except (OSError, yaml.YAMLError) as e:
+                # An unreadable manifest is the loaders' business (they skip it with
+                # a warning); this pass only inspects declared names.
+                print(f"  WARNING: cannot read {manifest} for env-name validation: {e}")
+                continue
+            entries = data if isinstance(data, list) else [data]
+            for config in entries:
+                if not isinstance(config, dict):
+                    continue
+                name = config.get("name") or manifest.parent.name
+                errors.extend(
+                    _declared_env_name_errors(config, f"{label} '{name}' ({manifest})")
+                )
+    return errors
 
 
 def read_tool_access_policy(path=None):
@@ -479,6 +536,16 @@ def main(argv=None):
     if policy_status:
         print("\nREFUSING TO SYNC: nothing else was written to the registry.")
         return policy_status
+
+    # 0b. Manifest env names. Same reason as the policy: a declared name that is not
+    #     a valid environment name would sync and then be dropped at exec time, so the
+    #     tool would run without the credential it declared. Refuse before any write.
+    env_name_errors = validate_declared_env_names()
+    if env_name_errors:
+        print("\nREFUSING TO SYNC: invalid declared env names, nothing was written.")
+        for error in env_name_errors:
+            print(f"  ERROR: {error}")
+        return 2
     
     # 1. Fetch current items from etcd
     existing_agents = set(identity_mgr._get_all_configs_by_prefix("/registry/agents/").keys())
