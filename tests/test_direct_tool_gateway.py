@@ -450,15 +450,33 @@ class TestSupervisorTwoTierRouting:
 
 
 # =============================================================================
-# Live registry validation — read-only re-checks of Phase 1-5's real etcd state.
+# Live registry validation -- read-only re-checks against a REAL, SEEDED registry.
 # No secrets are mutated and no Hub subprocess is executed (that end-to-end path was
 # already manually live-validated in Phase 3/5's completion notes); this class only
-# re-proves the security/discovery properties above hold against the real registry,
-# not just mocked fixtures. Skips itself if the registry is unreachable.
+# re-proves the security/discovery properties above hold against a live registry,
+# not just mocked fixtures.
+#
+# Opt-in on purpose: "etcd is reachable" is not "etcd is the registry these assertions
+# describe". Any machine with a stray etcd on 127.0.0.1:2379 used to fail here while
+# CI (no etcd) skipped it, so the suite lied in both directions. Set
+# TRELLIS_TEST_LIVE_REGISTRY=1 against a seeded registry to run it.
 # =============================================================================
+
+def _live_registry_requested() -> bool:
+    import os
+
+    return os.getenv("TRELLIS_TEST_LIVE_REGISTRY", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
 
 def _live_identity_mgr() -> Optional[IdentityManager]:
     import os
+    if not _live_registry_requested():
+        return None
     try:
         mgr = IdentityManager(host=os.getenv("ETCD_HOST", "127.0.0.1"), port=int(os.getenv("ETCD_PORT", 2379)))
         mgr.get_all_tool_configs()
@@ -470,7 +488,11 @@ def _live_identity_mgr() -> Optional[IdentityManager]:
 _LIVE_MGR = _live_identity_mgr()
 
 
-@pytest.mark.skipif(_LIVE_MGR is None, reason="etcd registry not reachable from this environment")
+@pytest.mark.skipif(
+    _LIVE_MGR is None,
+    reason="live registry checks are opt-in: set TRELLIS_TEST_LIVE_REGISTRY=1 "
+    "against a seeded etcd",
+)
 class TestLiveRegistry:
     def test_opsctl_and_netctl_are_public_with_indexed_embeddings(self):
         tool_configs = _LIVE_MGR.get_all_tool_configs()
