@@ -1409,11 +1409,12 @@ async def open_session(request: Request, payload: SessionCreateRequest):
     if denial is not None:
         return denial
 
-    # Same identity rule as /v1/exec. A session takes its container env from the
-    # request's ``env``, so there is nothing else to resolve here.
+    # Same identity rule as /v1/exec: an edge session is created from the body
+    # identity, a central one from the token's claims.
     denial = _identity_denial(payload)
     if denial is not None:
         return denial
+    identity = _request_identity(payload)
 
     target = resolve_mcp_target(payload.target)
     if target is None:
@@ -1461,9 +1462,10 @@ async def open_session(request: Request, payload: SessionCreateRequest):
                 env=payload.env,
                 host_workspace=_host_workspace(),
                 workspace_root=_workspace_root(),
-                # A session mounts no agent-owned output directory, so there is no
-                # agent name to pass into the spec.
-                agent=None,
+                # A session mounts no agent-owned output directory, so the spec gets
+                # the agent name but no run id: a session outlives the run that
+                # opened it, and ``trellis.run`` is the label /v1/stop matches.
+                agent=identity.agent if identity else None,
                 session_key=payload.session_key,
                 run_id=None,
             )

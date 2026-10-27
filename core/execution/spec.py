@@ -562,6 +562,14 @@ def build_spec(
     # ``gateway``), the dirs from the mounts just created. They are not secrets, so
     # they stay in the container configuration: a tool needs them before it reads its
     # stdin, and subprocesses it spawns inherit them without any plumbing.
+    #
+    # Popped first, then set: an *unattributed* call (central ``off``/``log`` with no
+    # claims, or a container kind that gets no agent) must see no run context at all,
+    # even when a manifest declared one of these names and the caller supplied a
+    # value for it. Without the pop, a declared name would survive the merge and the
+    # container would announce a writable dir it was never given.
+    for _name in ("TRELLIS_AGENT_NAME", "TRELLIS_RUN_ID", *OUTPUT_DIR_VARS.values()):
+        merged.pop(_name, None)
     if agent:
         merged["TRELLIS_AGENT_NAME"] = str(agent)
     if run_id:
@@ -616,7 +624,13 @@ def build_console_spec(
         raise InvalidRequest("console command is empty")
     merged = _base_env()
     merged.update({k: v for k, v in env.items() if k not in RESTRICTED_ENV_VARS})
-    # Applied last: the scratch paths are not caller-configurable.
+    # Applied last: the scratch paths are not caller-configurable, and neither is the
+    # run context (v0.7.2 R2). A console container mounts no workspace tree at all,
+    # so any TRELLIS_AGENT_NAME/RUN_ID/dir variable in a caller's env would be a
+    # claim about a mount that does not exist -- drop it, then set the parts the
+    # runner actually resolved.
+    for name in ("TRELLIS_AGENT_NAME", "TRELLIS_RUN_ID", *OUTPUT_DIR_VARS.values()):
+        merged.pop(name, None)
     merged.update(
         {
             "HOME": CONTAINER_TMP,
@@ -718,9 +732,11 @@ def _workflow_env(
     if run_id:
         env["TRELLIS_RUN_ID"] = str(run_id)
     # v0.7.2 R2: the workflow's own writable dirs, at the paths build_workflow_spec
-    # mounts rw for every run. Applied after ``requested`` so a caller cannot
-    # redirect them. No TRELLIS_AGENT_NAME here: the workflow name already arrives
-    # in ``requested`` (core.tasks) and is that variable's value for a pipeline.
+    # mounts rw for every run, plus the workflow's name -- the ground truth is the
+    # validated ``name`` here, not whatever the caller put in ``requested`` (the
+    # worker does send TRELLIS_AGENT_NAME; a different caller may send nothing, or
+    # something else). Applied after ``requested`` so neither can be redirected.
+    env["TRELLIS_AGENT_NAME"] = name
     for output in OUTPUT_DIRS:
         env[OUTPUT_DIR_VARS[output]] = f"{CONTAINER_WORKSPACE}/{output}/{name}"
     _require_carriable_env_names(env)

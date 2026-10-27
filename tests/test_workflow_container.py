@@ -408,15 +408,18 @@ def test_a_caller_cannot_redirect_the_workflow_output_dirs(workspace):
     assert spec.env["TRELLIS_OUTPUT_DIR"] == f"{CONTAINER_WORKSPACE}/output/{WORKFLOW}"
 
 
-def test_the_workflow_name_still_arrives_from_the_caller_env(workspace):
-    """``TRELLIS_AGENT_NAME`` is core.tasks' job for a workflow -- not duplicated here.
+def test_the_workflow_name_is_derived_not_taken_from_the_caller(workspace):
+    """``TRELLIS_AGENT_NAME`` is the validated pipeline directory, not caller input.
 
-    A workflow run has no agent identity on the wire, so the name travels in the
-    caller's declared env; the spec must neither add nor drop it.
+    ``core.tasks`` sends the same value today, but the ground truth is the workflow
+    name ``build_workflow_spec`` already validated: a caller that sends nothing (or
+    something else) must not be able to rename the pipeline's run context.
     """
-    spec = build(workspace, env={"TRELLIS_AGENT_NAME": WORKFLOW})
+    spec = build(workspace, env={"TRELLIS_AGENT_NAME": "someone-else"})
 
     assert spec.env["TRELLIS_AGENT_NAME"] == WORKFLOW
+    # Even with no caller value at all.
+    assert build(workspace).env["TRELLIS_AGENT_NAME"] == WORKFLOW
     # The unmounted-dirs case does not exist for a workflow: both dirs are always
     # created, so both variables are always present.
     assert spec.env["TRELLIS_REPORTS_DIR"] == f"{CONTAINER_WORKSPACE}/reports/{WORKFLOW}"

@@ -625,7 +625,11 @@ def test_a_gateway_call_runs_as_the_reserved_gateway_identity(env):
     container_spec = env.backend.specs[0]
     assert container_spec.env["TRELLIS_AGENT_NAME"] == "gateway"
     # Everything else follows the name it was given, gateway included.
-    assert container_spec.mounts[2].source == f"/host{env.root}/reports/gateway"
+    mount = next(
+        m for m in container_spec.mounts
+        if m.target == "/app/workspace/reports/gateway"
+    )
+    assert mount.source == f"/host{env.root}/reports/gateway"
     assert container_spec.env["TRELLIS_REPORTS_DIR"] == "/app/workspace/reports/gateway"
 
 

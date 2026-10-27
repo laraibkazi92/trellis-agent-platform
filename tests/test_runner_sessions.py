@@ -171,6 +171,13 @@ def test_open_session_derives_a_read_only_session_spec(env):
     ]
     # A session gets no output dir: there is no rw mount at all.
     assert [mount.read_only for mount in container_spec.mounts] == [True, True]
+    # v0.7.2 R2: the agent name, so the server can attribute the session. No run id
+    # (a session outlives the run that opened it) and no dir, since nothing is
+    # writable here.
+    assert container_spec.env["TRELLIS_AGENT_NAME"] == "demo-assistant"
+    assert "TRELLIS_RUN_ID" not in container_spec.env
+    assert "TRELLIS_REPORTS_DIR" not in container_spec.env
+    assert "TRELLIS_OUTPUT_DIR" not in container_spec.env
     assert container_spec.mounts[0].source == f"/host{env.suite}"
     assert container_spec.mounts[1].source == f"/host{env.root}/shared"
 

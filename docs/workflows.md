@@ -162,7 +162,9 @@ The pipeline's environment is exactly what the workflow declares:
   `SESSION_SECRET`, `RUNNER_TOKEN`, provider keys and any operator variable in the worker's
   environment are absent.
 - They arrive through the `trellis-exec` stdin preamble, so `docker inspect` on the running
-  container shows none of them. The preamble is capped at 64 KiB total and 16 KiB per value.
+  container shows none of them — except the framework's own run-context names below, which
+  are public and live in the container configuration. The preamble is capped at 64 KiB
+  total and 16 KiB per value.
 - `TRELLIS_AGENT_NAME` carries the workflow name, so a tool the pipeline shells out to can
   find `reports/<name>/`. `TRELLIS_REPORTS_DIR` and `TRELLIS_OUTPUT_DIR` point at
   `/app/workspace/reports/<name>` and `/app/workspace/output/<name>` — the two read-write

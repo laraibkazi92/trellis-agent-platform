@@ -93,7 +93,11 @@ container created by the local `runner` service, from the manifest on disk:
 - **Only declared env is sent.** The request carries the manifest's declared keys
   (`secrets`, `optional_secrets`, `variables`, the `env:` block) plus
   `TRELLIS_USER_ID`/`TRELLIS_USER_EMAIL`. The runner rejects any other key with `400`, and
-  it builds `PATH` and the rest of the base environment itself.
+  it builds `PATH` and the rest of the base environment itself. It also sets
+  `TRELLIS_AGENT_NAME` from the verified run identity, so a server can attribute the
+  session. A session gets no `TRELLIS_RUN_ID` (it outlives the run that opened it) and no
+  `TRELLIS_REPORTS_DIR`/`TRELLIS_OUTPUT_DIR`: a session container has no writable
+  workspace mount.
 - **`mcp.yaml`'s `network:` is `egress` (default) or `none`.** `egress` is Docker's default
   bridge: the server reaches whatever the host reaches. `none` removes the network
   entirely. There is no bind mount of the workspace beyond the MCP's own directory

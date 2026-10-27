@@ -449,6 +449,50 @@ def test_a_caller_cannot_assert_the_run_context(workspace):
     assert "TRELLIS_AGENT_NAME" in excinfo.value.message
 
 
+def test_an_unattributed_call_gets_no_run_context_even_if_the_caller_sends_one(workspace):
+    """No identity, no announced dirs -- a declared name must not survive the merge.
+
+    The pop-then-set rule: without it, a manifest that declares one of these names
+    would let an anonymous caller announce ``TRELLIS_REPORTS_DIR=/etc`` in a
+    container that has no writable mount at all.
+    """
+    config = make_config(
+        output_dirs=["reports"], variables=["TRELLIS_REPORTS_DIR", "TRELLIS_RUN_ID"]
+    )
+
+    spec = build(
+        workspace,
+        config,
+        agent=None,
+        env={"TRELLIS_REPORTS_DIR": "/etc", "TRELLIS_RUN_ID": "forged"},
+    )
+
+    for name in ("TRELLIS_AGENT_NAME", "TRELLIS_RUN_ID", "TRELLIS_REPORTS_DIR"):
+        assert name not in spec.env, name
+        assert name not in spec.preamble_env, name
+    assert all(mount.read_only for mount in spec.mounts)
+
+
+def test_a_console_gets_no_run_context_from_its_env(workspace):
+    """A console mounts no workspace tree, so a dir/agent variable would be a lie."""
+    spec = build_console_spec(
+        "echo hi",
+        env={
+            "TRELLIS_REPORTS_DIR": "/etc",
+            "TRELLIS_AGENT_NAME": "someone",
+            "TRELLIS_RUN_ID": "forged",
+        },
+        user_id="u-1",
+        run_id="run-1",
+    )
+
+    for name in ("TRELLIS_AGENT_NAME", "TRELLIS_REPORTS_DIR", "TRELLIS_OUTPUT_DIR"):
+        assert name not in spec.env, name
+        assert name not in spec.preamble_env, name
+    # The runner's own run id is still announced; that one it knows.
+    assert spec.env["TRELLIS_RUN_ID"] == "run-1"
+
+
 # --------------------------------------------------------------------------- #
 # limits
 # --------------------------------------------------------------------------- #

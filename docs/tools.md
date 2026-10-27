@@ -141,8 +141,8 @@ The container also learns who it is and where it may write:
 
 | Variable | Value | Present when |
 | --- | --- | --- |
-| `TRELLIS_AGENT_NAME` | the agent this run acts as (`gateway` for a front-door MCP call) | always |
-| `TRELLIS_RUN_ID` | the id of this run | always |
+| `TRELLIS_AGENT_NAME` | the agent this run acts as (`gateway` for a front-door MCP call) | the call carries an agent identity |
+| `TRELLIS_RUN_ID` | the id of this run | the run has a run id |
 | `TRELLIS_REPORTS_DIR` | `/app/workspace/reports/<agent>` | `output_dirs:` lists `reports` |
 | `TRELLIS_OUTPUT_DIR` | `/app/workspace/output/<agent>` | `output_dirs:` lists `output` |
 
@@ -169,7 +169,8 @@ json.dump({"report": path}, sys.stdout)
 ```
 
 A `background_script` workflow container gets the same four: `TRELLIS_AGENT_NAME` is the
-workflow name, and both directories are always mounted read-write at
+workflow name (set by the runner from the validated pipeline directory, so a caller cannot
+rename it), and both directories are always mounted read-write at
 `/app/workspace/reports/<workflow>` and `/app/workspace/output/<workflow>` — see the
 [workflow guide](workflows.md#how-a-script-workflow-runs).
 
