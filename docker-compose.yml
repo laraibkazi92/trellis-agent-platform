@@ -44,8 +44,10 @@ services:
   # The control API is a Unix socket on the `runner-run` volume -- not a published port.
   # `network_mode: none` means no tool network can reach it, and only the containers
   # mounting that volume can drive it. Do not publish it.
-  # It has NO etcd dependency on purpose: tool execution must not stop when the
-  # registry does (the allowlist is resolved from the agent manifests on disk).
+  # It has NO etcd dependency and NO authorization role on purpose: it reads tool/MCP
+  # manifests from its workspace mount to build a container, and decides nothing. Tool
+  # execution must not stop when the registry does, and an allowlist is resolved by the
+  # hub and by the process that owns the agent runtime (core/tool_gate.py), never here.
   runner:
     build: *app-build
     image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.1}
@@ -264,7 +266,9 @@ services:
       ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
       # The ONE tool-authorization switch (v0.7.1): off | shadow | enforce. Group
       # rules come from workspace/policies/tool_access.yaml; the agent allowlist half
-      # is always enforced. Inert until an operator sets it in .env.
+      # is always enforced. Already `enforce` by default: the value below is the
+      # effective default, so an unset .env still enforces (a typo behaves as enforce
+      # too, since access must never widen by accident).
       TOOL_ACCESS_MODE: ${TOOL_ACCESS_MODE:-enforce}
       # How often the hub re-reads the tool registry so a newly connected edge's tools
       # become executable without a restart. 0 disables the watcher.

@@ -40,8 +40,10 @@ import json
 import hmac
 import logging
 import os
+import re
 import signal
 import struct
+import subprocess
 import sys
 import time
 import uuid
@@ -79,6 +81,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_WORKSPACE_ROOT = "/app/workspace"
 DEFAULT_RUNTIME = "runsc"
+# The gVisor release the v0.7.2 feature set is validated against (owner decision).
+# Compared by date, not by the trailing patch number; see ``_release_stamp``.
+MIN_RUNSC_RELEASE = "release-20261019.0"
 DEFAULT_MAX_CONTAINERS = 32
 DEFAULT_MAX_CONTAINERS_PER_TOOL = 8
 DEFAULT_REAP_INTERVAL_S = 300
@@ -547,6 +552,82 @@ async def _check_manifest_runtimes(backend: ContainerBackend) -> Check:
     )
 
 
+async def _check_runsc_version() -> Check:
+    """Warn (never fail) when the gVisor runtime is older than the validated release.
+
+    gVisor is host-level: the binary lives on the Docker host and is never installed in
+    this image, so the runner can only read a version when it is either on its own
+    ``PATH`` (an operator who mounted it) or the engine image ships it. When neither is
+    true the check is *informational*: it says the version must be confirmed on the host
+    (``runsc --version``, see docs/deploy.md) and passes, because refusing to serve over
+    something this process cannot observe would take a working stack down.
+
+    Non-fatal either way (owner decision, v0.7.2): a version mismatch is a warning, not
+    a gate. The minimum is the release the feature set is validated against; an older
+    ``runsc`` may start containers and still fail on the networking model.
+    """
+    version = _runsc_version()
+    if not version:
+        return Check(
+            "runsc_version",
+            True,
+            "skipped: `runsc` is not installed in this container (it is a host "
+            f"runtime); confirm it is {MIN_RUNSC_RELEASE} or newer on the host with "
+            "`runsc --version`",
+            skipped=True,
+        )
+    stamp = _release_stamp(version)
+    minimum = _release_stamp(MIN_RUNSC_RELEASE)
+    if stamp is not None and minimum is not None and stamp < minimum:
+        logger.warning(
+            "runner: runsc %s is older than the validated minimum %s; upgrade gVisor "
+            "on this host (docs/deploy.md -> Prerequisite: gVisor). Container isolation "
+            "stays on -- this is a warning, not a gate.",
+            version,
+            MIN_RUNSC_RELEASE,
+        )
+        return Check(
+            "runsc_version",
+            True,
+            f"runner: runsc {version} is older than the validated minimum "
+            f"{MIN_RUNSC_RELEASE}; upgrade gVisor on this host (isolation stays on)",
+        )
+    return Check("runsc_version", True, f"runsc {version}")
+
+
+def _runsc_version() -> str:
+    """The first non-empty line of ``runsc --version``, or ``""`` when unreadable."""
+    binary = (os.getenv("RUNSC_BIN") or "runsc").strip()
+    try:
+        result = subprocess.run(  # noqa: S603 - a fixed argv, resolved from PATH
+            [binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Not installed here (the normal case: runsc belongs to the host) or too slow
+        # to answer. Neither is worth failing a startup over.
+        return ""
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if line:
+            return line[:200]
+    return (result.stderr or "").strip().splitlines()[0][:200] if result.stderr else ""
+
+
+def _release_stamp(text: str) -> Optional[int]:
+    """``release-20261019.0`` / ``20261019.0`` -> ``20261019`` (or ``None``).
+
+    Compares by release *date*, which is how gVisor tags its releases and what makes
+    "older than ``release-YYYYMMDD.N``" a simple numeric comparison; the trailing
+    ``.N`` patch number is not orderable across dates.
+    """
+    match = re.search(r"(?:release-)?(\d{8})\.\d+", text or "")
+    return int(match.group(1)) if match else None
+
+
 async def run_preflight(backend: Optional[ContainerBackend] = None) -> list[Check]:
     """The startup gates, in order. The host-path canary runs afterwards."""
     backend = backend or get_backend()
@@ -555,6 +636,7 @@ async def run_preflight(backend: Optional[ContainerBackend] = None) -> list[Chec
         await _check_image(backend),
         await _check_tool_identity(),
         await _check_manifest_runtimes(backend),
+        await _check_runsc_version(),
     ]
 
 

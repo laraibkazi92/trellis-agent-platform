@@ -15,10 +15,11 @@ catalog verbatim and executes `tools/call` against a long-lived per-user session
 the server's credentials staying on the edge. Agents and workflows still run centrally.
 
 > **Status:** the tunnel, native tool registration, and MCP export are implemented
-> (wire protocol v2). Edges enroll from **Admin → Edges**, their tools appear in
-> `/registry/tools` as `<site>__<tool>` and their MCP tools as
-> `mcp__<site>__<mcp>__<tool>`, and the hub/gateway execute both like a central tool.
-> Edge-hosted agents are not part of this release.
+> (wire protocol `proto: 3`, see
+> [Protocol version and compatibility](#protocol-version-and-compatibility)). Edges enroll
+> from **Admin → Edges**, their tools appear in `/registry/tools` as `<site>__<tool>` and
+> their MCP tools as `mcp__<site>__<mcp>__<tool>`, and the hub/gateway execute both like a
+> central tool. Edge-hosted agents are not part of this release.
 
 ## Topology
 
@@ -291,16 +292,19 @@ are set from the frame's identity — the verified token's claims at the relay �
 caller only. A caller with no email claim gets no `TRELLIS_USER_EMAIL` at all (absent, not
 empty), so a tool can branch on presence.
 
-**The escape hatch.** A legacy tool that cannot declare every key it reads can set
-`env_passthrough: true` (or `TRELLIS_EDGE_ENV_PASSTHROUGH=true`), which restores the v0.4
-denylist behaviour — minus the token. It gives up the isolation between tools: every
-exported tool then sees the whole sanitized edge environment. It needs a restart to
-change.
+**The escape hatch.** `env_passthrough: true` (or `TRELLIS_EDGE_ENV_PASSTHROUGH=true`)
+still selects the whole sanitized edge environment instead of the allowlist — minus the
+token — but since `v0.7.1` it cannot widen what a *container* receives: both the tool path
+and the MCP-session path intersect the name set with the manifest's declared keys before
+the call is sent (and the runner answers `400` for anything undeclared that gets through
+anyway). A legacy tool whose keys are not all declared has to declare them; passthrough
+will not deliver them. It needs a restart to change.
 
 **CA bundle gap.** `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` and `SSL_CERT_DIR` are *not* in
 the allowlist. A corporate base image that sets only those will see TLS failures from an
-exported tool or MCP server until the keys are declared in `tool.yaml`/`mcp.yaml` (or
-passthrough is enabled). `SSL_CERT_FILE` is always present.
+exported tool or MCP server until the keys are declared in `tool.yaml`/`mcp.yaml`
+(passthrough does not bypass the declared-key rule either). `SSL_CERT_FILE` is always
+present.
 
 ## Edge credentials
 

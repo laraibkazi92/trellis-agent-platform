@@ -5,8 +5,8 @@
 
 Pins the contracts the hub still owns now that every tool call is a runner
 container (``core.tool_runtime``):
-- stamina re-invocation never mutates the caller's arguments, so `__user_id`
-  (and therefore scoped secret injection / execution tokens) survives retries.
+- caller identity comes only from the verified token, so it is the same on every
+  stamina retry, and a body `__user_id` is inert in every mode (v0.7.2).
 - the runner is the only execution path: a failure there is a sandbox failure,
   never a local subprocess.
 - per-tool `timeout_seconds` becomes the runner deadline, and a runner timeout is
@@ -235,14 +235,21 @@ def transient_result():
 # --------------------------------------------------------------------------- #
 
 
-def test_run_tool_preserves_user_id_across_retries(monkeypatch, tmp_path):
+def test_run_tool_keeps_the_token_identity_across_retries(monkeypatch, tmp_path):
+    """The claims are read once per invocation, so every retry acts for the same user."""
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", SECRET)
     monkeypatch.setenv("DEV_MODE", "false")
     fake_identity = install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
     runner = install_fake_runner(monkeypatch, transient_result(), ok_result())
+    token = agent_token.mint("agent-a", user_id="alice", user_email="alice@corp.example")
 
     result = asyncio.run(
-        _run_tool_scenario(make_config(secrets=["API_KEY"]), make_tool_dir(tmp_path), {"__user_id": "user-1"})
+        _run_tool_scenario(
+            make_config(secrets=["API_KEY"]),
+            make_tool_dir(tmp_path),
+            {"__user_id": "user-1", "__agent_token": token},
+        )
     )
 
     assert result == {"ok": True}
@@ -251,24 +258,30 @@ def test_run_tool_preserves_user_id_across_retries(monkeypatch, tmp_path):
     # framework loopback credential, so no execution token is minted.
     assert fake_identity.execution_token_calls == []
     resolved_user_ids = [call["identity"] for call in fake_identity.resolved_config_calls]
-    assert resolved_user_ids.count("user-1") >= 2
-    # No user-record read for identity: without a token there is no email to inject.
+    assert resolved_user_ids.count("alice") >= 2
+    # No user-record read for identity: the email rides the claims.
     assert fake_identity.get_user_calls == []
-    assert ("user-1", "tmpltool") in fake_identity.record_tool_usage_calls
+    assert fake_identity.record_tool_usage_calls == [("alice", "tmpltool")]
 
 
 def test_run_tool_records_usage_once_across_retries(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", SECRET)
     fake_identity = install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
     runner = install_fake_runner(monkeypatch, transient_result(), ok_result())
+    token = agent_token.mint("agent-a", user_id="alice", user_email="alice@corp.example")
 
     result = asyncio.run(
-        _run_tool_scenario(make_config(secrets=["API_KEY"]), make_tool_dir(tmp_path), {"__user_id": "user-1"})
+        _run_tool_scenario(
+            make_config(secrets=["API_KEY"]),
+            make_tool_dir(tmp_path),
+            {"__agent_token": token},
+        )
     )
 
     assert result == {"ok": True}
     assert len(runner.requests) == 2
-    assert fake_identity.record_tool_usage_calls == [("user-1", "tmpltool")]
+    assert fake_identity.record_tool_usage_calls == [("alice", "tmpltool")]
 
 
 def test_run_tool_does_not_mutate_caller_arguments(monkeypatch, tmp_path):
@@ -339,34 +352,54 @@ def test_tool_env_ignores_the_body_user_when_a_token_does_not_verify(monkeypatch
     assert fake_identity.record_tool_usage_calls == []
 
 
-def test_off_mode_falls_back_to_the_body_user_id(monkeypatch, tmp_path):
-    """The documented dev/rollout fallback: nothing is verified in ``off``."""
-    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "off")
+@pytest.mark.parametrize("mode", ["off", "log", "enforce"])
+def test_a_body_user_id_is_inert_in_every_mode(monkeypatch, tmp_path, mode):
+    """v0.7.2 R7.2: no ``__user_id`` fallback exists, in ``off``/``log`` either.
+
+    ``off`` and ``log`` verify nothing, so a body value there is an unverified
+    assertion: accepting it would resolve another user's scoped secrets and book usage
+    against their id. No token means no user identity -- and the reserved kwarg still
+    parses (inert, never an error).
+    """
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", mode)
     monkeypatch.setenv("DEV_MODE", "true")
     fake_identity = install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
     runner = install_fake_runner(monkeypatch, ok_result())
 
-    asyncio.run(
+    result = asyncio.run(
         _run_tool_scenario(
             make_config(secrets=["API_KEY"]), make_tool_dir(tmp_path), {"__user_id": "user-1"}
         )
     )
 
+    # No user-scoped secret resolution and no usage row for a body-asserted id.
+    assert fake_identity.resolved_config_calls == []
+    assert fake_identity.record_tool_usage_calls == []
+    if mode == "enforce":
+        # Only ``enforce`` refuses the tokenless call itself; the id is inert either way.
+        assert "access_denied" in result["error"]
+        assert runner.requests == []
+        return
+    assert result == {"ok": True}
     env = runner.requests[0].env
-    assert env["TRELLIS_USER_ID"] == "user-1"
-    # Identity is the token's alone, and this run has none: no email is invented from
-    # the user record (v0.7.1 Phase 4 dropped that fallback).
+    assert "TRELLIS_USER_ID" not in env
     assert "TRELLIS_USER_EMAIL" not in env
 
 
 def test_run_tool_args_carry_no_identity_fields_across_retries(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", SECRET)
     install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
     runner = install_fake_runner(monkeypatch, transient_result(), ok_result())
+    token = agent_token.mint("nightly", user_id="svc_agent_triage")
 
     result = asyncio.run(
-        _run_tool_scenario(make_config(secrets=["API_KEY"]), make_tool_dir(tmp_path), {"__user_id": "svc_agent_triage"})
+        _run_tool_scenario(
+            make_config(secrets=["API_KEY"]),
+            make_tool_dir(tmp_path),
+            {"__agent_token": token},
+        )
     )
 
     assert result == {"ok": True}
@@ -381,7 +414,8 @@ def test_run_tool_args_carry_no_identity_fields_across_retries(monkeypatch, tmp_
         dumped = request.model_dump()
         for field in ("agent", "user_id", "user_email", "run_id"):
             assert field not in dumped, field
-    # A background run's own identity still reaches the tool's environment.
+    # A background run's own identity still reaches the tool's environment -- via the
+    # claims, not via an argument.
     assert runner.requests[0].env["TRELLIS_USER_ID"] == "svc_agent_triage"
 
 
@@ -400,8 +434,10 @@ def test_run_tool_skips_retry_when_retry_on_transient_false(monkeypatch, tmp_pat
 def test_run_tool_handler_reports_retry_exhaustion_and_records_usage_once(monkeypatch, tmp_path):
     config = make_config()
     tool_dir = make_tool_dir(tmp_path)
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", SECRET)
     fake_identity = install_fake_identity(monkeypatch)
     install_fake_health(monkeypatch)
+    token = agent_token.mint("agent-a", user_id="alice", user_email="alice@corp.example")
 
     fake_mcp = FakeMCP()
     monkeypatch.setattr(hub, "load_tool_configs", lambda: {"tmpltool": (config, tool_dir)})
@@ -412,7 +448,8 @@ def test_run_tool_handler_reports_retry_exhaustion_and_records_usage_once(monkey
     handler = fake_mcp.handlers["tmpltool"]
 
     async def _scenario():
-        result = await handler(q="x", __user_id="user-1")
+        # A body `__user_id` alongside the token: only the token's user is booked.
+        result = await handler(q="x", __user_id="mallory", __agent_token=token)
         await asyncio.gather(*hub._background_tasks, return_exceptions=True)
         return result
 
@@ -420,7 +457,8 @@ def test_run_tool_handler_reports_retry_exhaustion_and_records_usage_once(monkey
 
     assert result["error"].startswith("Tool failed after retries:")
     assert len(runner.requests) == 3
-    assert fake_identity.record_tool_usage_calls == [("user-1", "tmpltool")]
+    # Once per invocation, not once per attempt -- and for the verified identity.
+    assert fake_identity.record_tool_usage_calls == [("alice", "tmpltool")]
 
 
 # --------------------------------------------------------------------------- #

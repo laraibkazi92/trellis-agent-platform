@@ -267,7 +267,7 @@ def test_runc_is_a_legitimate_runtime(env, monkeypatch):
 
 
 def test_preflight_checks_exactly_the_startup_gates(env):
-    """runtime, image, tool identity and manifest runtimes -- nothing network-bound."""
+    """runtime, image, tool identity, manifest runtimes, runsc version -- no network."""
     checks = asyncio.run(runner_module.run_preflight(env.backend))
 
     assert [check.name for check in checks] == [
@@ -275,8 +275,57 @@ def test_preflight_checks_exactly_the_startup_gates(env):
         "image",
         "tool_identity",
         "manifest_runtimes",
+        "runsc_version",
     ]
     assert runner_module.startup_ready(checks) is True
+
+
+def test_an_old_runsc_is_a_warning_not_a_gate(env, monkeypatch, caplog):
+    """v0.7.2: the validated minimum is a release tag, and a miss only warns."""
+    import subprocess
+
+    class _Result:
+        stdout = "runsc version release-20240101.0\nspec: 1.2.1\n"
+        stderr = ""
+
+    monkeypatch.setattr(
+        runner_module.subprocess, "run", lambda *a, **k: _Result()
+    )
+    with caplog.at_level("WARNING", logger=runner_module.logger.name):
+        checks = asyncio.run(runner_module.run_preflight(env.backend))
+
+    check = next(c for c in checks if c.name == "runsc_version")
+    assert check.ok is True
+    assert runner_module.startup_ready(checks) is True
+    assert "older than the validated minimum" in check.message
+    assert any("older than the validated minimum" in r.getMessage() for r in caplog.records)
+
+
+def test_a_current_runsc_passes_quietly(env, monkeypatch):
+    class _Result:
+        stdout = "runsc version release-20261019.0\nspec: 1.2.1\n"
+        stderr = ""
+
+    monkeypatch.setattr(runner_module.subprocess, "run", lambda *a, **k: _Result())
+    checks = asyncio.run(runner_module.run_preflight(env.backend))
+
+    check = next(c for c in checks if c.name == "runsc_version")
+    assert check.ok is True
+    assert "release-20261019.0" in check.message
+    assert "older" not in check.message
+
+
+def test_a_runner_without_runsc_binary_skips_the_version_check(env, monkeypatch):
+    def missing(*_args, **_kwargs):
+        raise FileNotFoundError("runsc")
+
+    monkeypatch.setattr(runner_module.subprocess, "run", missing)
+    checks = asyncio.run(runner_module.run_preflight(env.backend))
+
+    check = next(c for c in checks if c.name == "runsc_version")
+    assert check.ok is True
+    assert check.skipped is True
+    assert "host" in check.message
 
 
 @pytest.mark.parametrize(

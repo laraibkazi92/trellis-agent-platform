@@ -11,8 +11,9 @@ alike -- and it is also the front door when traffic arrives without going throug
 drives the call.
 
 Every test is hermetic: the policy registry is faked, the local/remote dispatch seams
-are recorded instead of executed, and ``__user_id`` is only ever the no-token dev
-fallback.
+are recorded instead of executed, and a body ``__user_id`` is inert here (v0.7.2: no
+mode turns it into identity, so it changes neither the verdict nor the execution
+identity).
 """
 
 import asyncio
@@ -326,12 +327,17 @@ def test_log_mode_still_applies_a_group_rule(executions, env, monkeypatch):
     assert "access_denied" in result["error"]
 
 
-def test_off_mode_keeps_the_user_id_as_the_dev_fallback(executions, monkeypatch):
+def test_off_mode_ignores_the_body_user_id(executions, monkeypatch):
+    """v0.7.2 R7.2: ``off`` is not an identity fallback -- nothing is verified there.
+
+    The call still runs (``off`` skips the gate), but the body's assertion is inert:
+    acting on it would resolve that user's scoped secrets without a token.
+    """
     monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "off")
     monkeypatch.setenv("DEV_MODE", "true")
 
     assert call({"__user_id": "dev-user", "__agent_token": "not-a-token"}) == {"ok": True}
-    assert executions[0]["user_id"] == "dev-user"
+    assert executions[0]["user_id"] is None
 
 
 # --- the FastMCP handler surface ---------------------------------------------

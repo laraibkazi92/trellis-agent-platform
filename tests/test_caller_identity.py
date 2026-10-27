@@ -18,6 +18,7 @@ from core import agent_token
 from core.caller_identity import (
     IDENTITY_INCOMPLETE,
     identity_incomplete_error,
+    lacks_credential_identity,
     resolve_mint_identity,
 )
 
@@ -71,6 +72,35 @@ def test_an_email_is_trimmed(monkeypatch):
     identity, _ = resolve(monkeypatch, {"email": "  ops@example.com  "})
 
     assert identity["user_email"] == "ops@example.com"
+
+
+def test_a_mixed_case_email_is_normalized_at_mint_time(monkeypatch):
+    """One spelling for the token, ``TRELLIS_USER_EMAIL``, the session key and the AAD.
+
+    An OIDC claim can carry ``User@Example.com`` for the same person who sealed under
+    ``user@example.com``; two spellings would be two identities (two MCP sessions, and
+    a sealed set that never opens).
+    """
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", "caller-identity-unit-secret-0123456789")
+    identity, _ = resolve(monkeypatch, {"email": "User@Example.com"})
+
+    assert identity["user_email"] == "user@example.com"
+    # What rides the token -- and therefore TRELLIS_USER_EMAIL on every call.
+    token = agent_token.mint(
+        "supervisor", user_id="user-1", user_email=identity["user_email"]
+    )
+    assert agent_token.verify(token).user_email == "user@example.com"
+
+
+def test_a_mixed_case_dev_email_is_normalized_too(monkeypatch):
+    """The DEV_MODE fallback is an identity like any other: same form, not a second one."""
+    monkeypatch.setenv("DEV_MODE", "true")
+    monkeypatch.setenv("DEV_USER_EMAIL", " Dev@Local.Host ")
+    fake = FakeIdentity(None)
+
+    identity = asyncio.run(resolve_mint_identity(fake, "user-1"))
+
+    assert identity["user_email"] == "dev@local.host"
 
 
 # --------------------------------------------------------------------------- #
@@ -185,3 +215,46 @@ def test_identity_incomplete_names_what_is_missing_and_is_not_a_credential_error
     assert "no email" in message
     # An operator must not be sent to re-seal a key that is not the problem.
     assert "credential_rejected" not in message
+
+
+# --------------------------------------------------------------------------- #
+# which identities can serve a per-user credential call
+# --------------------------------------------------------------------------- #
+
+
+class Claims:
+    """The two claim fields the decision reads."""
+
+    def __init__(self, user_id=None, user_email=None):
+        self.user_id = user_id
+        self.user_email = user_email
+
+
+def test_a_user_token_without_an_email_cannot_serve_a_per_user_set():
+    """Central cannot see the edge's credential_mode, so an emailless user is refused.
+
+    Letting it through would end in ``missing_credentials`` (a set the caller could
+    never seal) or ``credential_rejected`` (the blob opens with an email it does not
+    have) -- neither is fixable by re-sealing.
+    """
+    assert lacks_credential_identity(Claims("user-1")) is True
+
+
+def test_an_email_claim_makes_the_identity_complete():
+    assert lacks_credential_identity(Claims("user-1", "user@example.com")) is False
+
+
+def test_no_token_asserts_nothing_and_leaves_it_to_the_edge():
+    assert lacks_credential_identity(None) is False
+
+
+def test_a_service_identity_is_email_less_by_design():
+    """A background run never holds a seal: refusing it would break shared-mode calls."""
+    assert lacks_credential_identity(Claims("svc_agent_nightly")) is False
+    # A blob can only exist for a browser session's user, so a service id holding one
+    # is a contradiction -- refused rather than forwarded unattributable.
+    assert lacks_credential_identity(Claims("svc_agent_nightly"), sealed=True) is True
+
+
+def test_a_sealed_set_needs_the_email_even_for_a_service_identity():
+    assert lacks_credential_identity(Claims("user-1"), sealed=True) is True

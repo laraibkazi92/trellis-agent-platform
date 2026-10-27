@@ -26,6 +26,13 @@ A rebuild or upgrade replaces the engine only. The content mount and the `etcd-d
 > default bridge (`network: egress`) or no network (`none`). If you are upgrading an
 > existing install, read [upgrading.md → v0.7.1](upgrading.md#v071-2026-10-26) first: it
 > lists every removal with the action to take.
+>
+> **v0.7.2 breaking changes for edges.** An edge no longer holds a token-signing key
+> (`AGENT_TOKEN_SECRET`/`ENFORCE_AGENT_TOKENS` leave the proxy *and* the runner, and the
+> runner runs with `RUNNER_ROLE=edge`), and the edge/relay wire protocol moved to
+> `proto: 3`, so central and every edge are upgraded in the same window. A stack running
+> as `TRELLIS_UID`/`TRELLIS_GID` `0` no longer starts. Read
+> [upgrading.md → v0.7.2](upgrading.md#v072-2026-10-27) before you upgrade an edge.
 
 ## Prerequisites
 
@@ -38,8 +45,8 @@ verdict.
 
 - **Production:** register `runsc` on the host. gVisor is the isolation boundary between a
   tool container and the host kernel, so a production deployment must not run on `runc`.
-  The feature set is validated against a `runsc` that reports runtime-spec 1.2.1 in
-  `runsc --version`; run a current release and confirm that line before deploying.
+  The feature set is validated against the gVisor release **`release-20261019.0`**: run at
+  least that release and confirm it with `runsc --version` on the host before deploying.
 - **A dev machine (a laptop, WSL2, any Docker host without gVisor):** no gVisor needed,
   see [Dev machine](#dev-machine-runc).
 
@@ -390,10 +397,16 @@ image from this one and override the entrypoint, keep that contract.
 The runner refuses to start when its configured runtime is missing or cannot start a
 trivial container. There is no silent fallback to `runc`.
 
-**Minimum version.** This release is validated against a `runsc` whose `runsc --version`
-reports **runtime-spec 1.2.1**. Use a current gVisor release and confirm that line before
-you deploy; an older `runsc` may start containers and still fail on the networking model
-described in [Network policy](#network-policy).
+**Minimum version.** This release is validated against the gVisor release tag
+**`release-20261019.0`**. Run at least that release and confirm it with `runsc --version`
+before you deploy; an older `runsc` may start containers and still fail on the networking
+model described in [Network policy](#network-policy). The runner checks this itself but
+cannot act on it: `runsc` is a **host** runtime, so when the binary is not reachable from
+the runner's own container (the normal case) the preflight reports the check as *skipped*
+with an instruction to confirm on the host, and when it can read a version older than the
+minimum it logs a **non-fatal warning** and keeps serving. The version is a warning, not a
+gate, so a real incompatibility shows up later as a failed container start, not as a
+startup refusal.
 
 1. Install `runsc` on the **host** (not in a container) from the gVisor release you
    have tested, and pin that version in your own provisioning. Releases since

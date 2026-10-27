@@ -29,7 +29,7 @@ import httpx
 from core import agent_token as agent_token_module
 from core import edge_secrets_central
 from core.auth import get_identity_manager
-from core.caller_identity import identity_incomplete_error
+from core.caller_identity import identity_incomplete_error, lacks_credential_identity
 from core.tool_runtime import MAX_RESULT_CHARS
 
 logger = logging.getLogger(__name__)
@@ -145,7 +145,6 @@ async def call_edge_mcp(
     # registry for it, and a call without one has no identity at all (the assertion
     # in the body cannot stand in for it).
     claims = agent_token_module.verify_or_none(agent_token) if agent_token else None
-    user_email = claims.user_email if claims is not None else None
 
     # The caller's browser-sealed set for this (site, mcp, user). Central only ever
     # holds the ciphertext: it is forwarded verbatim and never logged. Sealing is
@@ -164,10 +163,13 @@ async def call_edge_mcp(
                 type(exc).__name__,
             )
 
-    if sealed is not None and (claims is None or not user_email):
+    if lacks_credential_identity(claims, sealed=sealed is not None):
         # Per-user credentials are sealed to the caller's email: refuse with the real
         # reason (missing identity) rather than let the edge call it
-        # credential_rejected, which would send an operator to re-seal a key.
+        # ``credential_rejected``/``missing_credentials``, which would send an operator
+        # to re-seal a key that cannot fix a caller with no email. Not gated on a blob
+        # already existing (v0.7.2): a caller who has not sealed one yet is exactly who
+        # ``per_user_required`` refuses.
         return identity_incomplete_error(f"MCP tool '{label}'", site)
 
     try:
