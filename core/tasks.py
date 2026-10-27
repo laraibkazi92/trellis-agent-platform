@@ -256,6 +256,14 @@ SLOT_WAIT_MAX_S = 30.0
 # fixed interval would wake all of them on the same tick. A step is the capped
 # backoff plus/minus this fraction, so the ceiling is SLOT_WAIT_MAX_S * (1 + jitter).
 SLOT_WAIT_JITTER = 0.25
+# Never re-attempt with an unusable budget: a retry carrying a second of deadline
+# makes the runner create a container only to kill it, and the run then fails as
+# `timeout` instead of `runner_capacity`. Half of a short deadline is accepted, so a
+# deliberately small WORKFLOW_RUN_TIMEOUT in a test or a demo still gets one retry.
+SLOT_WAIT_MIN_DEADLINE_S = 5.0
+# How long to let a detected cancel finish stopping its container before the worker
+# stops waiting for it. The stop is a small HTTP call with its own 30 s timeout.
+STOP_OUTCOME_WAIT_S = 30.0
 
 
 def _slot_wait_step(backoff: float) -> float:
@@ -266,6 +274,32 @@ def _slot_wait_step(backoff: float) -> float:
 async def _slot_wait_sleep(seconds: float) -> None:
     """The retry wait itself. Module-level so tests can drive it without real time."""
     await asyncio.sleep(seconds)
+
+
+async def _settle_cancel_monitor(monitor: "asyncio.Task", *, detected: bool = False) -> None:
+    """Tear the cancellation poller down without losing the stop it is performing.
+
+    The poller's stop call is what ends the container, and that container ending is
+    what makes the in-flight ``exec()`` return -- so the main coroutine routinely
+    resumes while the poller is still inside ``stop_run``. Cancelling it there would
+    discard the outcome the run event is about to report (``container_stopped`` and
+    the count). When a cancel was detected, the poller is therefore *awaited* (bounded
+    by the stop call's own 30 s timeout) instead of cancelled; in every other case
+    there is nothing to wait for and it is cancelled outright.
+    """
+    if detected and not monitor.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(monitor), timeout=STOP_OUTCOME_WAIT_S)
+        except (asyncio.TimeoutError, Exception):  # incl. the poller's own errors
+            pass
+        return
+    monitor.cancel()
+    try:
+        await monitor
+    except asyncio.CancelledError:
+        pass
+    except Exception:  # the poller swallows its own errors; a race can still leak one
+        pass
 
 
 class _RunCancelled(Exception):
@@ -295,11 +329,15 @@ async def _exec_with_slot_wait(
     the total wait once the run actually starts -- an operator must be able to tell
     "queued" from "slow". Any other error is re-raised untouched.
 
+    ``workflow_slot_wait=0`` disables the wait entirely: the first 429 is re-raised
+    untouched, exactly as before v0.7.2 (no event, same error code and message).
+
     ``cancelled`` is the poller's flag: a run cancelled while it was still queued must
     not start a container, so the wait ends with :class:`_RunCancelled` instead.
     """
-    deadline_ms = request.deadline_ms
+    deadline_s = request.deadline_ms / 1000.0
     slot_wait_s = max(0.0, float(resolve_tunable("workflow_slot_wait")))
+    min_deadline_s = min(SLOT_WAIT_MIN_DEADLINE_S, deadline_s / 2.0)
     waited = 0.0
     backoff = SLOT_WAIT_INITIAL_S
     announced = False
@@ -310,12 +348,17 @@ async def _exec_with_slot_wait(
         attempt = request
         if waited:
             attempt = request.model_copy(
-                update={"deadline_ms": max(1, deadline_ms - int(waited * 1000))}
+                update={
+                    "deadline_ms": max(1, request.deadline_ms - int(waited * 1000)),
+                    # A queued run outlives the token minted for it when the wait is
+                    # longer than the token's TTL, and every attempt re-verifies.
+                    "agent_token": refresh(agent_token_var.get()),
+                }
             )
         try:
             result = await runner.exec(attempt)
         except RunnerCallError as err:
-            if err.code != "capacity_exhausted":
+            if err.code != "capacity_exhausted" or slot_wait_s <= 0:
                 raise
             if not announced:
                 announced = True
@@ -332,18 +375,35 @@ async def _exec_with_slot_wait(
                         "deadline_ms": attempt.deadline_ms,
                     },
                 )
-            headroom = min(slot_wait_s - waited, deadline_ms / 1000.0 - waited)
+            headroom = min(slot_wait_s - waited, deadline_s - waited)
             if headroom <= 0:
+                # A cancel can land between the 429 and this check; it wins, so a run
+                # the operator cancelled is never recorded as a capacity failure.
+                if cancelled is not None and cancelled():
+                    raise _RunCancelled() from err
                 raise RuntimeError(
                     f"runner_capacity: no free runner container slot for workflow "
                     f"{agent_name!r} after waiting {waited:.1f}s "
                     f"(WORKFLOW_SLOT_WAIT_S={slot_wait_s:.1f}, "
-                    f"WORKFLOW_RUN_TIMEOUT={deadline_ms / 1000.0:.0f})"
+                    f"WORKFLOW_RUN_TIMEOUT={deadline_s:.0f})"
                 ) from err
             step = min(_slot_wait_step(backoff), headroom)
             await _slot_wait_sleep(step)
             waited += step
             backoff = min(backoff * 2, SLOT_WAIT_MAX_S)
+            # Checked before the next attempt, not after it: an attempt whose deadline
+            # is nearly spent starts a container the runner kills immediately, and the
+            # run would then fail as `timeout` rather than `runner_capacity`.
+            if deadline_s - waited < min_deadline_s:
+                if cancelled is not None and cancelled():
+                    raise _RunCancelled()
+                raise RuntimeError(
+                    f"runner_capacity: no free runner container slot for workflow "
+                    f"{agent_name!r} after waiting {waited:.1f}s: only "
+                    f"{max(0.0, deadline_s - waited):.1f}s of the run's "
+                    f"{deadline_s:.0f}s deadline would be left, not enough to run it "
+                    f"(WORKFLOW_SLOT_WAIT_S={slot_wait_s:.1f})"
+                ) from err
             continue
         if waited:
             await _append_run_event(
@@ -868,6 +928,10 @@ async def run_background_script(
         )
 
         cancelled_by_poller = False
+        # Why the poller stopped the run: a cancel while a container ran is
+        # `cancelled_mid_run`; a cancel while it was still queued for a slot never
+        # created one (`cancelled_while_waiting`).
+        cancellation_reason = "cancelled_mid_run"
         # What the stop attempt achieved, keyed exactly as the run event reports it.
         stop_outcome: Dict[str, Any] = {"container_stopped": False}
 
@@ -877,6 +941,11 @@ async def run_background_script(
             A stop failure must not mask the run's real outcome (a cancel, a timeout)
             and must not escape the poller task: the run record says the container
             could not be stopped, with the reason, and the run ends the normal way.
+
+            ``container_stopped`` follows the count the runner reports, not the call
+            succeeding: a run with no ``trellis.run`` label (token verification off) or
+            one whose container already exited reports 0, and claiming it was stopped
+            would be the one thing this event must not do.
             """
             if task_id == "unknown":
                 return {"container_stopped": False, "stop_error": "no run id"}
@@ -890,10 +959,20 @@ async def run_background_script(
                     f"container ({reason}): {err}"
                 )
                 return {"container_stopped": False, "stop_error": str(err)[:512]}
-            return {
-                "container_stopped": True,
-                "containers_stopped": int(getattr(stopped, "stopped", 0) or 0),
+            count = int(getattr(stopped, "stopped", 0) or 0)
+            detail = str(getattr(stopped, "detail", "") or "")
+            outcome: Dict[str, Any] = {
+                "container_stopped": count > 0,
+                "containers_stopped": count,
             }
+            if count == 0:
+                outcome["stop_detail"] = detail or (
+                    "no container was left for this run: it already exited, or it "
+                    "never carried a run label (token verification off)"
+                )
+            elif detail:
+                outcome["stop_detail"] = detail
+            return outcome
 
         async def _poll_for_cancellation(
             runner,
@@ -926,7 +1005,7 @@ async def run_background_script(
         async def _record_cancelled() -> str:
             await _append_run_event(
                 identity_mgr, agent_name, task_id, "run_cancelled",
-                {"reason": "cancelled_mid_run", **stop_outcome},
+                {"reason": cancellation_reason, **stop_outcome},
             )
             return "Cancelled."
 
@@ -947,13 +1026,16 @@ async def run_background_script(
             except _RunCancelled:
                 # Cancelled while it was still queued for a slot: no container ever
                 # ran, so the cancelled path below has nothing to stop.
+                cancellation_reason = "cancelled_while_waiting"
                 result = None
             except RunnerCallError as err:
                 if not cancelled_by_poller:
                     if err.code == "timeout":
                         # The worker's own wait ran out. Left alone the container
                         # would keep running to the runner's deadline, so end it here
-                        # and record why; the run still fails with the timeout.
+                        # and record why; the run still fails with the timeout. (The
+                        # poller may stop the same run concurrently -- /v1/stop is
+                        # idempotent, and the last writer's outcome is the truth.)
                         await _append_run_event(
                             identity_mgr, agent_name, task_id, "run_container_stopped",
                             {
@@ -970,11 +1052,9 @@ async def run_background_script(
                     raise RuntimeError(f"Runner is unreachable: {err}") from err
                 result = None
             finally:
-                cancel_monitor.cancel()
-                try:
-                    await cancel_monitor
-                except asyncio.CancelledError:
-                    pass
+                await _settle_cancel_monitor(
+                    cancel_monitor, detected=cancelled_by_poller
+                )
 
         if cancelled_by_poller:
             return await _record_cancelled()

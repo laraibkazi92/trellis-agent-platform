@@ -149,10 +149,23 @@ class FakeBackend:
         return self.containers[container_id].inspect()
 
     async def list_containers(self, labels: Mapping[str, str]) -> list[Mapping[str, Any]]:
+        """``GET /containers/json`` shape: top-level ``Labels``, no ``Config``.
+
+        Docker's list endpoint is what the runner's reaper and ``/v1/stop`` read, and
+        its label location differs from ``inspect`` (``Config.Labels``). Returning the
+        inspect shape here would make a label reader that only knows the list shape
+        pass in tests and find nothing in production.
+        """
         out = []
         for handle in self.containers.values():
             if all(handle.labels.get(k) == v for k, v in labels.items()):
-                out.append(handle.inspect())
+                out.append(
+                    {
+                        "Id": handle.id,
+                        "Labels": dict(handle.labels),
+                        "State": handle.state,
+                    }
+                )
         return out
 
     async def has_runtime(self, name: str) -> bool:

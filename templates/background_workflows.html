@@ -736,7 +736,12 @@
         failed: 'text-red-500 bg-red-50 dark:bg-red-900/20 border-red-500/30',
         cancelled: 'text-neutral-500 bg-neutral-100 dark:bg-neutral-800 border-neutral-500/30',
         orphaned: 'text-amber-500 bg-amber-50 dark:bg-amber-900/20 border-amber-500/30',
-        retried: 'text-amber-500 bg-amber-50 dark:bg-amber-900/20 border-amber-500/30'
+        retried: 'text-amber-500 bg-amber-50 dark:bg-amber-900/20 border-amber-500/30',
+        // v0.7.2: a run queued for a runner slot (R4) and the container a cancel or a
+        // deadline ended (R3). Amber = "not a failure, but not a plain success either".
+        waiting: 'text-amber-500 bg-amber-50 dark:bg-amber-900/20 border-amber-500/30',
+        slot_acquired: 'text-amber-500 bg-amber-50 dark:bg-amber-900/20 border-amber-500/30',
+        container_stopped: 'text-amber-500 bg-amber-50 dark:bg-amber-900/20 border-amber-500/30'
     };
     var RUN_EVENT_NEUTRAL_BADGE = 'text-neutral-500 bg-neutral-100 dark:bg-neutral-800 border-neutral-500/30';
 

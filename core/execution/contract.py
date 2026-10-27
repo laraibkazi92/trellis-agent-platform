@@ -267,7 +267,7 @@ class StopRequest(BaseModel):
     than by pydantic (422), because a caller bug should not read as a bad payload.
     """
 
-    run_id: str = ""
+    run_id: str = Field(default="", max_length=128)
 
 
 class StopResult(BaseModel):

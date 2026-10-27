@@ -1423,8 +1423,14 @@ async def stop_run(request: Request, payload: StopRequest):
         )
 
     backend = get_backend()
+    # Scoped to this install like the one-shot reaper: two runners sharing one daemon
+    # must not stop each other's containers on a colliding run id.
+    match = {
+        "trellis.run": run_id,
+        "trellis.install": os.getenv("TRELLIS_INSTALL_ID", "default"),
+    }
     try:
-        containers = await backend.list_containers({"trellis.run": run_id})
+        containers = await backend.list_containers(match)
     except Exception as exc:
         logger.warning("runner: cannot list the containers of run %r: %s", run_id, exc)
         return _error(
@@ -1437,8 +1443,13 @@ async def stop_run(request: Request, payload: StopRequest):
     stopped = 0
     skipped_sessions = 0
     for container in containers:
+        # `GET /containers/json` puts labels at the top level; `inspect` nests them
+        # under `Config`. Read both, and re-check the run id exactly: a filter is a
+        # request, not a guarantee.
         labels = (container.get("Config") or {}).get("Labels") or container.get("Labels") or {}
         if labels.get("trellis.run") != run_id:
+            continue
+        if labels.get("trellis.install") != match["trellis.install"]:
             continue
         if labels.get("trellis.kind") in SESSION_KINDS:
             skipped_sessions += 1

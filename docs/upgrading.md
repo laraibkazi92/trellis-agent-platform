@@ -524,10 +524,12 @@ Four behaviours to plan around:
    the workspace **read-only**; only `workspace/reports/` stays read-write, for a
    `background_agent`'s in-process file tools. A pipeline that wrote anywhere else in the
    workspace now fails, so write under `output/<name>/` or `reports/<name>/`.
-3. **Cancelling a run mid-flight does not stop the container.** The runner has no cancel
-   API, so the container runs to its deadline; the run is then recorded as cancelled
-   (`run_cancelled`, `container_stopped: false`) without the worker claiming execution
-   stopped. Cancel before the run starts, or shorten `WORKFLOW_RUN_TIMEOUT`
+3. **Cancelling a run mid-flight does not stop the container** *(superseded in `v0.7.2`,
+   which adds `POST /v1/stop`: the worker stops the container on cancel and on its own
+   deadline, recording `container_stopped` with the count).* As of `v0.7.1` the runner has
+   no cancel API, so the container runs to its deadline; the run is then recorded as
+   cancelled (`run_cancelled`, `container_stopped: false`) without the worker claiming
+   execution stopped. Cancel before the run starts, or shorten `WORKFLOW_RUN_TIMEOUT`
    (Admin → Limits & Tuning, default `3600` s) if a workflow must be bounded.
 4. **One container per run costs latency and a slot.** Each scripted run pays container
    create/start/teardown (roughly a second, more on a cold `runsc` image), and a run's

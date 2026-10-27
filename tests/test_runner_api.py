@@ -1038,3 +1038,57 @@ def test_stop_never_touches_a_session_container(env):
     assert response.json()["stopped"] == 0
     assert "session" in response.json()["detail"]
     assert session in env.backend.containers
+
+
+def test_stop_is_scoped_to_this_install(env):
+    """Two runners on one daemon must not stop each other's containers."""
+    from core.execution.spec import ContainerSpec
+
+    foreign = ContainerSpec(
+        image="trellis-agent-platform:test",
+        runtime="runsc",
+        cmd=["python3", "pipeline.py"],
+        working_dir="/app/workspace",
+        env={},
+        labels={
+            "trellis.install": "another-install",
+            "trellis.kind": "workflow",
+            "trellis.run": "run-1",
+        },
+        kind="workflow",
+    )
+
+    async def create() -> str:
+        return await env.backend.create(foreign)
+
+    foreign_id = asyncio.run(create())
+
+    response = asyncio.run(_call("POST", "/v1/stop", json_body={"run_id": "run-1"}))
+
+    assert response.status_code == 200
+    assert response.json()["stopped"] == 0
+    assert foreign_id in env.backend.containers
+
+
+def test_stop_reads_labels_from_the_list_shape(env, monkeypatch):
+    """`GET /containers/json` puts labels at the top level; `inspect` nests them."""
+    dead = _seed_container(env, kind="workflow", run_id="run-1")
+
+    async def list_shape(labels):
+        return [
+            {
+                "Id": container_id,
+                "Labels": {"trellis.install": "default", "trellis.kind": "workflow",
+                           "trellis.run": "run-1"},
+                "State": "running",
+            }
+            for container_id in list(env.backend.containers)
+        ]
+
+    monkeypatch.setattr(env.backend, "list_containers", list_shape)
+
+    response = asyncio.run(_call("POST", "/v1/stop", json_body={"run_id": "run-1"}))
+
+    assert response.status_code == 200
+    assert response.json()["stopped"] == 1
+    assert dead not in env.backend.containers

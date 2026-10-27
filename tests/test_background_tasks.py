@@ -965,8 +965,13 @@ def test_a_cancelled_run_whose_stop_fails_says_so_and_still_ends_cancelled(monke
     assert mgr.runs["run-script"]["state"] == "cancelled"
 
 
-def test_a_run_that_already_ended_before_the_stop_still_counts_as_stopped(monkeypatch):
-    """`stopped == 0` means nothing was left running -- the goal, not a failure."""
+def test_a_run_that_already_ended_reports_nothing_stopped_with_a_reason(monkeypatch):
+    """`stopped == 0` is success for the caller, but the event must not claim a stop.
+
+    Nothing was left running, so there is nothing to stop -- and the record says so
+    (``container_stopped: false`` plus the reason) instead of reading like a failure
+    with no explanation.
+    """
     from core.execution.contract import StopResult
     from fixtures.fake_runner import FakeRunnerClient
 
@@ -987,9 +992,94 @@ def test_a_run_that_already_ended_before_the_stop_still_counts_as_stopped(monkey
 
     assert _run_script_workflow(mgr) == "Cancelled."
     cancelled = [payload for event, payload in mgr.events if event == "run_cancelled"]
-    assert cancelled[0]["container_stopped"] is True
+    assert cancelled[0]["container_stopped"] is False
     assert cancelled[0]["containers_stopped"] == 0
+    assert "already exited" in cancelled[0]["stop_detail"]
 
+
+
+def test_a_cancel_whose_exec_returns_first_still_records_the_stop(monkeypatch):
+    """The container exiting is what makes ``exec`` return, so the poller's stop is
+    still in flight when the worker resumes. Its outcome must not be discarded.
+
+    Regression for the R3 blocker: the teardown used to cancel the monitor inside
+    ``stop_run``, leaving the run event at ``container_stopped: false`` with no reason
+    even though the container had just been stopped.
+    """
+    from fixtures.fake_runner import FakeRunnerClient
+
+    mgr = FakeScriptIdentityManager(_script_workflow())
+    mgr.runs["run-script"] = {"state": "processing", "metadata": {}}
+    runner = FakeRunnerClient()
+    monkeypatch.setattr(tasks, "CANCELLATION_POLL_INTERVAL_S", 0.01)
+    real_sleep = asyncio.sleep
+
+    async def exec_while_cancelled(request):
+        mgr.runs["run-script"]["state"] = "cancelled"
+        # Long enough for the poller to notice and enter stop_run, short enough that
+        # the exec returns while the stop is still sleeping.
+        await real_sleep(0.05)
+        return runner.result
+
+    async def slow_stop(run_id):
+        runner.stops.append(run_id)
+        await real_sleep(0.15)
+        return runner.stop_result or __import__(
+            "core.execution.contract", fromlist=["StopResult"]
+        ).StopResult(run_id=run_id, stopped=1)
+
+    runner.exec = exec_while_cancelled
+    runner.stop_run = slow_stop
+    _patch_script_path(monkeypatch, mgr, runner)
+
+    assert _run_script_workflow(mgr) == "Cancelled."
+    cancelled = [payload for event, payload in mgr.events if event == "run_cancelled"]
+    assert cancelled[0]["container_stopped"] is True
+    assert cancelled[0]["containers_stopped"] == 1
+    assert "stop_detail" not in cancelled[0]
+
+
+def test_a_cancel_while_queued_is_not_recorded_as_a_mid_run_cancel(monkeypatch):
+    """A run cancelled before it ever got a slot says so; nothing was stopped."""
+    from fixtures.fake_runner import FakeRunnerClient
+
+    from core.execution.contract import StopResult
+
+    mgr = FakeScriptIdentityManager(_script_workflow())
+    mgr.runs["run-script"] = {"state": "processing", "metadata": {}}
+    # Nothing was created yet, so the stop finds nothing -- the poller may still call
+    # it, and that call is harmless by design.
+    runner = FakeRunnerClient(
+        capacity_until_call=1000, stop_result=StopResult(run_id="run-script", stopped=0)
+    )
+    monkeypatch.setattr(tasks, "CANCELLATION_POLL_INTERVAL_S", 0.01)
+    _patch_slot_waits(monkeypatch, lambda seconds: _mark_cancelled(mgr, seconds))
+    _patch_script_path(monkeypatch, mgr, runner, slot_wait=60.0)
+
+    assert _run_script_workflow(mgr) == "Cancelled."
+    cancelled = [payload for event, payload in mgr.events if event == "run_cancelled"]
+    assert cancelled[0]["reason"] == "cancelled_while_waiting"
+    assert cancelled[0]["container_stopped"] is False
+    # The poller still asks the runner to stop (it cannot know whether a container
+    # appeared in the last instant); nothing was there, so nothing was stopped.
+    assert runner.stops == ["run-script"]
+    assert cancelled[0]["containers_stopped"] == 0
+    # No container was ever asked for after the cancel.
+    assert len(runner.requests) == 1
+
+
+def _mark_cancelled(mgr, _seconds):
+    mgr.runs["run-script"]["state"] = "cancelled"
+
+
+def _patch_slot_waits(monkeypatch, sleeper):
+    async def fake_sleep(seconds):
+        sleeper(seconds)
+        # Real (short) sleep so the cancellation poller gets scheduled and its
+        # thread-pooled run-record read actually completes during the wait.
+        await asyncio.sleep(0.02)
+
+    monkeypatch.setattr(tasks, "_slot_wait_sleep", fake_sleep)
 
 
 def test_a_worker_deadline_stops_the_container_before_failing(monkeypatch):
@@ -1117,7 +1207,10 @@ def test_a_zero_window_fails_the_first_saturation_immediately(monkeypatch):
     with pytest.raises(RuntimeError) as excinfo:
         _run_script_workflow(mgr)
 
-    assert "runner_capacity" in str(excinfo.value)
+    # The 429 is re-raised untouched: no wait, no event, the same error the worker
+    # produced before the slot wait existed.
+    assert "capacity_exhausted" in str(excinfo.value)
+    assert "runner_capacity" not in str(excinfo.value)
     assert waits == []
 
 
@@ -1182,7 +1275,8 @@ def test_the_slot_wait_never_outlives_the_run_timeout(monkeypatch):
     assert "runner_capacity" in str(excinfo.value)
     # It waited the whole run timeout and not a second of the larger slot window.
     assert sum(waits) == pytest.approx(100.0)
-    assert "WORKFLOW_RUN_TIMEOUT=100" in str(excinfo.value)
+    # The message names the budget that ran out, not just the window.
+    assert "of the run's 100s deadline" in str(excinfo.value)
 
 
 def test_a_run_cancelled_while_queued_never_starts_a_container(monkeypatch):

@@ -182,9 +182,24 @@ Two costs to plan for: each run pays container create/start/teardown (about a se
 on a cold `runsc` image), and it holds one of the runner's global container slots
 (`RUNNER_MAX_CONTAINERS`, default 32) until it finishes. A pipeline that hangs holds that
 slot until its deadline (`WORKFLOW_RUN_TIMEOUT`, default 3600 s), and enough of them push
-ordinary tool calls into `429 capacity_exhausted`. Cancelling a run does not stop the
-container: the runner has no cancel call, so the run is recorded as cancelled with
-`container_stopped: false` when the result comes back.
+ordinary tool calls into `429 capacity_exhausted`.
+
+A saturated pool no longer fails a workflow run outright. The worker retries the call with
+a capped, jittered backoff inside a window of `WORKFLOW_SLOT_WAIT_S` (default `300`,
+`0` disables the wait) and records `run_waiting` once, then `run_slot_acquired` with how
+long it queued. Every waited second is charged against the run's own deadline, so a run that
+queued for four minutes does not also get its full `WORKFLOW_RUN_TIMEOUT` on top; if no slot
+frees in time it fails with reason `runner_capacity` naming the wait. Tool calls are
+unchanged: a saturated pool is still an immediate `429` there.
+
+Cancelling a run now stops its container. The worker's poller calls the runner's
+`POST /v1/stop`, which kills and removes every container labelled with the run id, and the
+run is recorded as `run_cancelled` with `container_stopped: true` and the count (or `false`
+plus a reason when the stop genuinely failed). The same stop runs when the worker's own wait
+expires, so a timed-out run does not leave a container running to the runner's deadline.
+One caveat: the label is the run id from the verified agent token, so a stack running with
+`ENFORCE_AGENT_TOKENS=off` (development only) has no run id to match and cannot stop a
+container.
 
 `db-sync` validates a workflow's `runtime`, `entrypoint`, `network`, `limits`,
 `allowed_tools` and declared env names before publishing it. A runtime outside
