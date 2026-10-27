@@ -9,314 +9,468 @@ pointed at by `TRELLIS_WORKSPACE_DIR` (see `.env.example` → *Deployment Layout
 run with the default `./workspace` inside this clone, the same steps apply, but be aware
 that your content is then inside the tree you check out tags into.
 
+The current release, `v0.7.1`, is breaking. Read [its section](#v071-2026-10-26) before
+you upgrade.
+
 ---
 
-## v0.7.1 — in development (breaking)
+## v0.7.1 (2026-10-26)
 
-`v0.7.1` removes the legacy in-process sandbox backends and all of the network-profile
-machinery. Tools and MCP sessions run **only** in runner containers, and tool containers
-get plain Docker egress. This section is being written as the changes land: the entries
-below cover the sandbox/network removals, and further v0.7.1 removals (token identity,
-tool access policy, workflow containers, secret handling) are appended here before the
-tag.
+Changes since `v0.7.0`: this release **removes** machinery rather than adding it. The
+in-process sandbox backends (`bwrap`, Landlock, the AppArmor profile), the network
+profiles and the opt-in egress proxy are gone, so a `runner` container is the only place
+a tool, an MCP session or a script workflow executes. Caller identity comes only from the
+verified agent token. The three-switch tool-authorization stack is replaced by one
+evaluator whose group rules live in `workspace/policies/tool_access.yaml`. Secrets reach a
+container through its stdin instead of its configuration. A `background_script` workflow
+runs as one container per run.
 
-#### Sandbox backends removed — every call runs in a runner container
+There are no compatibility shims beyond accepting an old manifest value with a warning:
+each removal below names what replaces it. The resulting posture is described in
+[deploy.md](deploy.md#execution-isolation), [tools.md](tools.md#container-execution-contract),
+[workflows.md](workflows.md#how-a-script-workflow-runs) and [proxy.md](proxy.md).
 
-`bwrap`, Landlock, the `auto` selector and the AppArmor profile are gone, together with
-`sandbox/trellis-sandbox.c`, `core/sandbox_preflight.py`, `deploy/apparmor/` and the
-`SANDBOX_BACKEND` selector. Tools have run in the runner container-per-call path since
-v0.6, so for the shipped compose stack this changes nothing at runtime.
+**Runtime prerequisite.** `runsc` is still the isolation boundary. The feature set in this
+release is validated against a `runsc` that reports **runtime-spec 1.2.1** in
+`runsc --version`; run a current gVisor release and confirm that line, as described in
+[deploy.md → Prerequisite: gVisor](deploy.md#prerequisite-gvisor-runsc). `runc` remains a
+dev-machine and per-tool escape hatch.
+
+#### Upgrade order
+
+1. **Read this whole section first.** Two changes can bite silently: the `network:`
+   default flip and the tool-access widening (an agent's allowlist, not the old policy
+   document, is now what grants a call).
+2. **Copy the rules you want to keep** out of `/registry/tool_policies` into
+   `workspace/policies/tool_access.yaml` (format in the tool-access section below).
+   Nothing migrates from the old document, and a malformed new file stops the whole
+   stack.
+3. **Rebuild or pull the images**, including `RUNNER_IMAGE` and every edge's
+   `TRELLIS_IMAGE`: tool containers start through a shim that only v0.7.1 images carry.
+4. **Keep `AGENT_TOKEN_SECRET` on every component that verifies a token**, including each
+   edge **runner**. Tokens are now enforced by default.
+5. **Deploy**: `docker compose pull && docker compose up -d`, or
+   `docker compose up -d --build` when you build from source.
+6. **Approve each edge key** in Admin → Edges. Every existing edge becomes pending until
+   you do, and sealing is blocked until then.
+7. **Audit each agent's `allowed_tools`/`allowed_mcps`**, then set `TOOL_ACCESS_MODE` if
+   you do not want `enforce`.
+8. **Exercise the three paths once**: a bound tool call, a script workflow, and one edge
+   call.
+
+#### Sandbox backends removed: a runner container is the only execution path
+
+`SANDBOX_BACKEND` is gone, and with it every value it accepted: `auto`, `bwrap`,
+`landlock` and `container`. The Landlock helper and its source (`sandbox/trellis-sandbox.c`),
+`core/sandbox_preflight.py`, the in-process path in `core/sandbox.py`, `deploy/apparmor/`
+and the bwrap/AppArmor CI legs were deleted. The hub no longer relaxes its own LSM
+profile, because no tool process runs inside it.
+
+Tools have executed in runner containers since v0.6, so the change is mostly deletions:
+
+- The hub's `/healthz` is now a liveness probe (`{ok, backend}`). Runner readiness is the
+  runner's own `GET /v1/healthz`; nothing reports it through the hub any more.
+- Tool result dicts still carry the legacy `sandbox` key when the runner refuses a call.
 
 **What to do instead**
 
-- Nothing to configure, and nothing to install. Tool/MCP execution is the `runner`
-  service; there is no backend to select or pin.
-- Delete the legacy keys from `.env` if you carry them: `SANDBOX_BACKEND`,
-  `SANDBOX_SECCOMP`, `SANDBOX_NET_DEFAULT`, `SANDBOX_UID`, `SANDBOX_GID`,
-  `SANDBOX_TMP_ROOT`, `SANDBOX_RLIMIT_AS_MB`, `SANDBOX_RLIMIT_CPU_S`,
-  `SANDBOX_RLIMIT_NPROC`, `SANDBOX_RLIMIT_FSIZE_MB`. They are ignored.
-- Remove any `systempaths=unconfined` / `seccomp=unconfined` / `apparmor=unconfined`
-  lines from your own compose overrides: the hub now keeps `cap_drop: [ALL]` and
-  `no-new-privileges` and needs no LSM exception. Unload a host-installed
-  `trellis-hub` AppArmor profile if you added one.
-- **Dev machines without gVisor** run the same runner: set
-  `CONTAINER_DEFAULT_RUNTIME=runc` (default stays `runsc`, which is the only isolation
-  boundary in production). A per-tool `container_runtime: runc` still works.
+- Nothing to configure or install: tool and MCP execution is the `runner` service, and
+  there is no backend to select or pin.
+- Delete these keys from `.env` if you carry them: `SANDBOX_BACKEND`, `SANDBOX_SECCOMP`,
+  `SANDBOX_NET_DEFAULT`, `SANDBOX_UID`, `SANDBOX_GID`, `SANDBOX_TMP_ROOT`,
+  `SANDBOX_RLIMIT_AS_MB`, `SANDBOX_RLIMIT_CPU_S`, `SANDBOX_RLIMIT_NPROC` and
+  `SANDBOX_RLIMIT_FSIZE_MB`. Nothing reads them.
+- Remove any `systempaths=unconfined`, `seccomp=unconfined` or `apparmor=unconfined` line
+  from your own compose overrides. The hub keeps `cap_drop: [ALL]` and
+  `no-new-privileges` and needs no exception. Unload a host-installed `trellis-hub`
+  AppArmor profile if you added one.
+- **Dev machines without gVisor** run the same runner with
+  `CONTAINER_DEFAULT_RUNTIME=runc` (the default stays `runsc`). A per-tool
+  `container_runtime: runc` still works. See
+  [deploy.md → Dev machine](deploy.md#dev-machine-docker-desktop).
 
-#### Network profiles and the egress proxy removed — tools use normal Docker egress
+#### Network: `network:` is `egress` or `none`, and the default changes
 
 The two tool networks (`trellis-tools-internal`, `trellis-tools-internet`), the
 `DOCKER-USER` rules, the generated `resolv.conf` mounts and the CONNECT allowlist proxy
-are all gone, with the files that built them: `core/execution/netprofiles.py`,
+are gone, with the files that built them: `core/execution/netprofiles.py`,
 `scripts/setup-network-profiles.sh`, `scripts/egress_proxy.py`,
 `scripts/generate_egress_acl.py`, `docker-compose.egress.yml`,
 `docker-compose.egress-ci.yml`, `docker-compose.ci-bwrap.yml` and
-`docker-compose.ci-apparmor.yml`.
+`docker-compose.ci-apparmor.yml`. The runner's network-profile check went with them; its
+startup gates are now the runtime, the image, the tool identity and the manifest
+runtimes.
 
-**What to do instead**
+A manifest's `network:` accepts exactly two values:
 
-- Delete the removed keys from `.env`: `TRELLIS_INTERNAL_CIDRS`, `TRELLIS_ENGINE_SUBNETS`,
-  `TOOLS_INTERNAL_DNS`, `TOOLS_INTERNET_DNS`, `TOOLS_NET_INTERNAL_SUBNET`,
-  `TOOLS_NET_INTERNET_SUBNET`, and any `EGRESS_*` value. Nothing reads them.
-- Drop `COMPOSE_FILE=...docker-compose.egress.yml` (and the `--build`/`-f` form) from your
-  upgrade commands — the file no longer exists.
-- Tool containers now run on **Docker's default bridge**, so names resolve the same way
-  they do for any container on that bridge (this is also what makes DNS work under
-  `runsc`). If you need no network at all, declare `network: none` in the manifest.
-- Tear down leftovers on the host once: `docker network rm trellis-tools-internal
-  trellis-tools-internet` (they are no longer created) and remove any `DOCKER-USER`
-  rules you added for the profiles.
-- **Accepted risk (unchanged in spirit, wider in reach):** with no profiles, a tool can
-  reach anything the Docker host can reach, including cloud metadata endpoints. Engine
-  services stay off the default bridge (compose keeps them on the project network), so a
-  tool cannot address them by service name — but containers on the default bridge can
-  reach each other by IP. Use `network: none` for tools that need no network.
+| Value | Where the container runs |
+| --- | --- |
+| `egress` (default) | Docker's **default bridge**, with whatever route and resolvers the host has |
+| `none` | No network at all: no route, no loopback, no resolver |
 
-#### `network:` collapses to `none | egress`, and the default changes
+The v0.6 profile names `allow`, `internet` and `internal` still load as `egress` and log
+**one deprecation warning per distinct value per process** (the hub, the runner and
+`db-sync` each log their own). `deny`/`off` load as `none`. An unrecognized value falls
+back to `none` with a warning, so a typo can never hand a tool the network; `db-sync`
+refuses an unknown `network:` in a workflow `config.yaml` outright.
 
-Manifest `network:` values are now `egress` (Docker default bridge) and `none`.
-The old `allow`, `internet` and `internal` values are accepted and treated as `egress`,
-with **one deprecation warning per value** per process; they will be rejected in a later
-release. `deny`/`off` still mean `none`, and any unrecognized value still falls back to
-`none` with a warning.
+**The default flipped.** A tool, an MCP session or a workflow that declares no `network:`
+used to get no network and now gets `egress`. The interactive `execute` path is
+unaffected: it is always `none`.
+
+**Accepted risk, stated plainly.** With no profiles and no host firewall rules, `egress`
+means what it says: a tool container can reach anything the Docker host can reach,
+including private networks, internal services on the host's routing table, and the cloud
+metadata endpoint (`169.254.169.254`). There is no per-destination allowlist in this
+release. `network: none` is the only containment option, so set it on every manifest that
+does not call an external API.
+
+**Why the default bridge.** Under `runsc`, Docker's embedded DNS (`127.0.0.11`) on a
+user-defined network is unreachable: both container-name and external resolution time out
+(UDP), while the same lookup on the default bridge resolves because Docker copies the
+host's real upstream resolvers into the container's `resolv.conf`. Tool, MCP and workflow
+containers therefore ride the **default bridge**, and no `trellis-tools` network is
+created. Two consequences, both deliberate:
+
+- Containers on the default bridge can reach **each other** by IP, so one tool container
+  is not isolated from another at layer 3.
+- Engine services are not on the default bridge: compose puts them on the project network,
+  so a tool cannot resolve `host`, `hub`, `relay`, `etcd` or `redis` by service name.
+  Published front-door ports stay reachable through the host's bridge gateway, which is
+  the same exposure any container on that bridge has. The runner itself runs with no
+  network at all, so its control socket is never reachable from a tool container.
 
 **What to do instead**
 
 - Rewrite every `network: allow` / `internet` / `internal` in `tool.yaml`, `mcp.yaml` and
   workflow `config.yaml` to `egress` (or `none`). A `grep -rn "network:" workspace/` is
   usually enough.
-- Note the **default change**: tools and MCP sessions that declare no `network:` used to
-  run with no network (`none`) and now run with `egress`. Set `network: none` explicitly
-  on any manifest that must stay offline. The interactive `execute` path is unaffected —
-  it is always `none`.
+- Set `network: none` explicitly on any manifest that must stay offline, including MCP
+  servers that only touch a local socket.
+- Delete these keys from `.env`: `TRELLIS_INTERNAL_CIDRS`, `TRELLIS_ENGINE_SUBNETS`,
+  `TOOLS_INTERNAL_DNS`, `TOOLS_INTERNET_DNS`, `TOOLS_NET_INTERNAL_SUBNET`,
+  `TOOLS_NET_INTERNET_SUBNET` and any `EGRESS_*` value.
+- Drop `COMPOSE_FILE=...docker-compose.egress.yml` (and the `-f` form) from your upgrade
+  commands; the file no longer exists.
+- Tear down leftovers once on each host: `docker network rm trellis-tools-internal
+  trellis-tools-internet` (nothing creates them any more) and delete any `DOCKER-USER`
+  rules you added for the profiles.
+- An `egress:` list in `tool.yaml` is now inert: the proxy that read it is gone. The field
+  is still accepted so old manifests parse, and nothing enforces it.
 
-#### Caller identity comes only from the agent token — body fields are gone
+#### Caller identity comes only from the agent token; body fields are gone
 
 The verified agent token is the single source of caller identity. `user` and `user_email`
-were removed from every request body (relay `CallBody`, hub `ExecRequest`, the runner exec
-payload); the relay now derives the edge frame's identity from the token's claims (`u`
-user id, `e` email) and the rest of the stack reads the claims instead of a body.
+were removed from every request body (the relay's `CallBody`, the hub's `ExecRequest`, the
+runner exec payload, stdio session creation and the console transport). The relay derives
+the edge frame's identity from the token's claims (`u` user id, `e` email); the hub, the
+runner and the edge read the same claims instead of a body. A background run carries a
+service identity: `svc_agent_<name>` with no email and no groups.
 
 **What to do instead**
 
-- Nothing, for the shipped components — they all ship in one image and were changed
-  together. A custom caller that posts to the relay's `/v1/sites/{site}/call` must send
-  `agent_token` and stop sending `user`/`user_email`; the relay logs one warning if it
-  still sees them and ignores them (a body can never assert an identity).
+- Nothing, for the shipped components: they all ship in one image and changed together. A
+  custom caller that posts to the relay's `/v1/sites/{site}/call` must send `agent_token`
+  and stop sending `user`/`user_email`; the relay logs one warning if it still sees them
+  and ignores them, because a body can never assert an identity.
 - A token minted without an email claim has no `TRELLIS_USER_EMAIL` at the edge, and a
-  per-user-credential call from it fails with `identity_incomplete` (not
-  `credential_rejected`) instead of guessing an address from the user id.
+  per-user-credential call from it now fails with **`identity_incomplete`** (a new code,
+  deliberately not `credential_rejected`) instead of guessing an address from the user id.
+  Tools can still branch on whether the variable is present at all: it is absent, not
+  empty.
 - Per-user sealed edge credentials need a **mintable** token. A deployment with no
-  `AGENT_TOKEN_SECRET` mints nothing, so such a call carries no claims at all: there is
-  no verified identity to seal a credential set to, central does not look one up, and the
-  edge's `credential_mode` refuses the call instead of opening a set it cannot attribute.
-  A token that carries a user id but no email fails with `identity_incomplete`. Configure
-  the signing key, or use the shared edge credential file instead of sealing.
+  `AGENT_TOKEN_SECRET` mints nothing, so the call carries no claims at all: there is no
+  verified identity to seal a set to, central looks none up, and the edge's
+  `credential_mode` refuses the call rather than opening a set it cannot attribute.
+  Configure the signing key, or use the shared edge credential file instead of sealing.
 
 #### The edge proxy no longer verifies agent tokens
 
-`trellis-proxy` verifies nothing: the relay authenticated the caller, verified the token
-and built the frame identity from its claims, and the edge trusts that identity over the
-authenticated tunnel (the same trust it already placed in the relay's authorization
-decision). The signing key is still part of an edge install, but only for the **runner**:
-it verifies the forwarded token's signature and expiry and derives the agent and the
-output dir from that token's claims. It makes no authorization decision of its own —
-`RUNNER_AUTHORIZATION` and the runner's manifest allowlist check are gone.
+`trellis-proxy` verifies nothing. The relay authenticated the caller, verified the token
+and built the frame identity from its claims; the edge trusts that identity over the
+authenticated tunnel, the same trust it already placed in the relay's authorization
+decision. **`AGENT_TOKEN_SECRET` leaves the edge proxy entirely.** The edge **runner**
+keeps it: it verifies the forwarded token's signature and expiry and derives the agent and
+the output directory from the claims. It makes no authorization decision of its own,
+because the relay already made it for the call it forwarded. `RUNNER_AUTHORIZATION` and
+the runner's own manifest allowlist check are gone.
+
+Catalog publishing is per entry on both sides, so one bad manifest no longer costs the
+tunnel:
+
+- The edge validates every export before `hello`: a declared key that does not match
+  `^[A-Za-z_][A-Za-z0-9_]*$`, an unpublished tool name or an unsupported transport skips
+  **that export** with a warning, and the rest stay online.
+- The relay's `hello` validation drops a single unusable tool, MCP or credential target
+  and logs `edge hello site=...: not publishing '<name>': <reason>` instead of closing the
+  tunnel. Only frame-level violations (wrong `proto`, unknown caps, a key whose
+  fingerprint does not match, an oversized frame) still refuse the handshake.
+- A credential-file line whose key is not a valid environment identifier is now logged
+  with its line number and path instead of being silently skipped.
 
 **What to do instead**
 
 - Keep `AGENT_TOKEN_SECRET` in the edge's `.env`: the sample
-  `deploy/proxy/docker-compose.yml` requires it on the runner service (`:?` — compose
-  refuses to start without it) and does not set it on `trellis-proxy`. It must be the
+  `deploy/proxy/docker-compose.yml` sets it on the **runner** service with `:?`, so compose
+  refuses to start without it, and it is not set on `trellis-proxy` at all. It must be the
   same value central signs with, or every forwarded token fails verification.
-- The **central** install still needs it on host/hub/gateway/relay/taskiq/runner — that is
-  where verification happens today.
-- Upgrade the edge to the same image tag as central in the same change. The frame carries
-  the same `user`/`user_email` field names, now sourced from the token's claims, so the
-  wire stays compatible — but the trust model does not: an edge on the new build verifies
-  nothing, and an edge on the old build still expects the proxy to verify.
-
-#### Declared secrets come from the shared file only
-
-The process-environment fallback for a declared **secret** is removed. `edge-secrets/
-<tool-or-mcp>.env` is the only non-sealed source for a secret; a caller's sealed set still
-wins whole. Declared **variables** (endpoints, non-secret configuration) keep their
-`shared file -> process env` order.
-
-**What to do instead**
-
-- Move any credential that today lives only in the edge container's `.env` into
-  `edge-secrets/<tool-or-mcp>.env` (mode 0600) or seal it per user in the central UI. A
-  key left only in the environment now resolves to unset.
-- `env_passthrough: true` still hands a tool the whole sanitized environment (that is its
-  documented cost), so do not rely on it as a credential path either.
-
-#### One bad manifest no longer takes an edge offline
-
-Both sides validate a catalog entry by entry before publishing it:
-
-- The edge checks every exported tool/MCP's declared credential names against
-  `^[A-Za-z_][A-Za-z0-9_]*$` (and re-checks catalog entries the relay would refuse) and
-  **skips** the offending export with a warning; the rest stay online.
-- The relay's `hello` validation drops a single unusable tool/MCP/credential target and
-  logs it (`edge hello site=…: not publishing '<name>': <reason>`) instead of closing the
-  tunnel. Only frame-level violations (wrong `proto`, unknown caps, mismatched key
-  fingerprint, oversized frame) still refuse the handshake.
-- A credential-file line whose key is not a valid environment identifier is now logged
-  with its line number and path instead of being silently ignored.
-
-**What to do instead**
-
+- Create the edge and the central install from the same release. Relay frames and edge
+  trust changed together; an edge on the new build verifies nothing, an edge on the old
+  build still expects its proxy to verify.
 - Rename a declared key that contains `-` or starts with a digit (for example
-  `my-api-key` -> `MY_API_KEY`) in `tool.yaml`/`mcp.yaml` and in the matching dotenv file.
-  Until then that export is simply absent from central's catalog, with a warning in the
-  edge log explaining why.
+  `my-api-key` becomes `MY_API_KEY`) in `tool.yaml`/`mcp.yaml` and in the matching dotenv
+  file. Until then that export is simply absent from central's catalog, with an edge log
+  line explaining why.
 
-#### Edge credential keys need admin approval before sealing
+#### Edge credentials: one shared file, sealed sets, and an admin-approved key
 
-Sealing a per-user edge credential set is now gated on an admin approving the edge's key
-fingerprint. A newly published key — a site's first hello, or the new half of
-`edge-keygen --rotate` — stays **pending** in `/registry/edges/<site>/config`
-(`edge_key_approved: false`), and the seal endpoint refuses to serve its public key
-(`409 key_pending_approval`). Configuration → Edge credentials shows the waiting
-fingerprint and keeps the form disabled.
+There are exactly two credential sources, and neither is a plaintext per-user file: the
+shared `edge-secrets/<tool-or-mcp>.env` on the edge, and a browser-sealed set stored
+centrally as ciphertext. The process-environment fallback for a declared **secret** is
+removed: a key that lives only in the edge container's `.env` now resolves to unset.
+Declared **variables** (endpoints, non-secret configuration) keep their `shared file`,
+then process environment order. `env_passthrough: true` still hands a tool the whole
+sanitized environment, which is its documented cost and not a credential path.
 
-**What to do instead**
+The last traces of the v0.5 plaintext store are gone too: `edge-user-secrets/`,
+`proxy.yaml`'s `user_secrets_dir`, `TRELLIS_EDGE_USER_SECRETS_DIR`, the `user-secrets`
+CLI and even the startup warning about a leftover directory. A directory or a config key
+from that era is simply ignored now, so delete both.
 
-- After upgrading **and after every key rotation**, open **Admin → Edges**, check the
-  fingerprint, and click **Approve key**. Existing edges need this once: their current
-  key is pending until approved, and until then users cannot seal new credential sets
-  (sets already stored keep working).
-- During a rotation overlap the previously approved fingerprint stays approved, so blobs
-  sealed to the old key keep opening. Approving the new fingerprint is what re-enables
-  sealing; `--drop-old-key` still ends the overlap.
-
-#### Tool authorization: one evaluator, one mode, rules in the workspace
-
-The three-switch etcd policy stack is gone. Admin → **Tool Authorization** (`/admin/tool-authz`)
-is now a **read-only** page: it shows the loaded group rules and policy version, the current
-`TOOL_ACCESS_MODE`, every agent's effective allowlist and recent shadow denials. Removed from
-the page (and from the routing table): the policy editor, the three per-surface mode switches
-(`tool_authz_mode`, `bound_tools_mode`, `hub_call_mode`), **Bootstrap**, **Clear log** and the
-principal-groups editor. The matching etcd keys are gone too: `/registry/tool_policies`,
-`/config/framework/{tool_authz_mode,bound_tools_mode,hub_call_mode,principal_groups}` and the
-`/registry/tool_authz_denies` ring (shadow denials now live in a bounded, shared ring owned by
-the evaluator). One evaluator (`core/tool_access.py`) now decides every call — hub, relay,
-host-before-runner and bound tools — and a policy read that fails **fails closed**.
+Sealing is gated on an admin approving the key fingerprint. A newly published key (a
+site's first hello, or the new half of `edge-keygen --rotate`) stays **pending** in
+`/registry/edges/<site>/config` with `edge_key_approved: false`, and the seal endpoint
+refuses to serve its public key (`409 key_pending_approval`) while Configuration → Edge
+credentials shows the waiting fingerprint and keeps the form disabled. Only sealing is
+gated: hello, catalog publishing, tool calls and sets already stored keep working.
 
 **What to do instead**
 
-- Put group rules in `workspace/policies/tool_access.yaml` (synced to the registry on every
-  rebuild, watched by every enforcing process, so an edit lands in a couple of seconds). The
-  format is `rules: [{name, targets, groups}]`; a target matched by a rule is usable only by a
-  caller whose token groups intersect that rule's groups.
-- Set the one switch in the deployment environment: `TOOL_ACCESS_MODE=off|shadow|enforce`
-  (default `enforce`; an unrecognized value behaves as `enforce`).
-- Leftover policy keys in an upgraded etcd (`/registry/tool_policies`,
-  `/config/framework/tool_authz_mode`, … `/bound_tools_mode`, … `/hub_call_mode`,
-  `/config/framework/principal_groups`, `/registry/tool_authz_denies`) are simply never read
-  again; delete them or leave them, nothing migrates from them. Copy any hand-tuned rules out
-  of the old document into `workspace/policies/tool_access.yaml` first — the new format is one
-  rule per target pattern with a group list, not principal/scope rules.
-- Group membership now reaches the decision only through the agent token's `g` claim (minted
-  per run from the user record). The `principal_groups` mapping and the middleware's
-  stored-group publication are gone, so a user whose groups exist only in that mapping has no
-  groups for tool access.
+- Move any credential that today lives only in the edge container's environment into
+  `edge-secrets/<tool-or-mcp>.env` (mode `0600`) or seal it per user in the central UI.
+- Delete a leftover `edge-user-secrets/` directory, its compose mount and its
+  `proxy.yaml` key.
+- After upgrading, and after every key rotation, open **Admin → Edges**, check the
+  fingerprint and click **Approve key**. Every existing edge is pending until you do;
+  during a rotation overlap the previously approved fingerprint stays approved, so blobs
+  sealed to the old key keep opening, and `--drop-old-key` still ends the overlap.
+
+#### Tool access rules: one evaluator, one mode, rules in the workspace
+
+The three-switch etcd policy stack is gone. One evaluator (`core/tool_access.py`) decides
+every call at every enforcement point: the hub (local and edge tools), the edge relay
+(edge tool calls and MCP sessions), the host before it asks the runner for an `execute` or
+MCP session call, and the bound-tool wrappers an agent gets from its own allowlist.
+
+Two halves decide one call:
+
+1. **The agent's allowlist**, resolved from its record (`allowed_tools`, `allowed_mcps`,
+   `<site>__*` wildcards, console names). This half is enforced in every mode. A caller
+   with **no agent record** is decided by the target's own `public`/`public_tools` flag.
+2. **Group rules** from `workspace/policies/tool_access.yaml`. A target matched by at
+   least one rule is usable only by a caller whose token groups intersect one of those
+   rules; a target no rule matches is governed by the allowlist alone. Rules are
+   allow-lists of groups with no priorities, no deny-overrides and no "everyone" group.
+
+Removed with the old stack: the three per-surface switches (`tool_authz_mode`,
+`bound_tools_mode`, `hub_call_mode`), the policy editor, **Bootstrap** and **Clear log**,
+the principal-groups editor, `/registry/tool_policies`, `/registry/tool_authz_denies`, the
+`principal_groups` mapping, the hub's stored-group lookup with its 30 s cache, and the
+public-tool special case that used to live in `tool_search`. Admin → Tool Authorization
+(`/admin/tool-authz`) is now **read-only**: it shows the loaded rules with their groups and
+policy version, the current `TOOL_ACCESS_MODE`, every agent's effective allowlist and the
+bounded shadow-denial ring (agent, target, reason, rule, groups, surface, timestamp).
+
+One switch replaces the three: **`TOOL_ACCESS_MODE=off|shadow|enforce`**, default
+`enforce`, and an unrecognized value behaves as `enforce` (a typo must never widen
+access).
+
+| Mode | What it does |
+| --- | --- |
+| `enforce` | Decisions are final. |
+| `shadow` | A group-rule denial is logged and pushed onto the ring, then allowed. |
+| `off` | The group-rule half is skipped. The allowlist half still applies. |
+
+Neither relaxed mode touches the allowlist half, so a shadow window can never execute a
+call outside the agent's manifest. Policy and registry reads **fail closed**: an
+unreadable document, a failed registry read or an expired snapshot denies every call the
+group rules could have decided, and the watch is installed in every enforcing process at
+startup, so an edit lands everywhere within a second or two without a restart.
+
+Four behaviours to plan around:
+
+**(a) `default_action: deny` is gone, which widens access.** The new file has no
+`default_action` key (it is a validation error if present): a target no rule matches is
+governed by the agent's own allowlist. A call the old document denied for lack of a
+matching rule can therefore be **allowed** now. **Audit every agent's
+`allowed_tools`/`allowed_mcps` during the upgrade**, because the allowlist, not the policy
+file, is what grants. A rule can only narrow a call, never widen one.
+
+**(b) Service and workflow identities carry no groups.** A `background_agent` or
+`background_script` run mints `svc_agent_<name>` with no group claim, so any rule matching
+its tools denies that run (the caller holds no group, and a rule admits only holders). The
+same applies to a delegated sub-agent minted from a service identity. There is no
+group-less "everyone" rule: an empty `groups` list is a validation error.
+
+**(c) A malformed policy file stops the whole stack.** The sync is strict on purpose: an
+unparseable file, an unknown key, an empty `groups`, a duplicate rule or a duplicate name
+makes `scripts/sync_to_db.py` print the errors and exit **2** without writing anything.
+Because host, hub, gateway, the UI and the worker wait on `db-sync` with
+`condition: service_completed_successfully`, a non-zero exit keeps the stack from coming
+up. Fix the file and run `docker compose up -d` (or `trellis sync`); the registry keeps the
+last valid policy, so a running stack keeps its previous rules. Deleting the file is safe
+but silent: the sync warns and the registry keeps the old rules.
+
+**(d) Only `execute` is covered among the console tools.** `read_file`, `write_file`,
+`edit_file`, `ls`, `glob` and `grep` never pass through the evaluator. A rule naming one
+is accepted, warns at sync and on the admin page, and decides nothing; those tools stay
+constrained by the agent's console allowlist. `describe_tool` and the discovery catalog
+reads are ungated for the same reason: they return schemas and execute nothing.
+
+**What to do instead**
+
+- Put group rules in `workspace/policies/tool_access.yaml`: a `rules:` list of
+  `{name, targets, groups}`, where `targets` are shell globs matched against the reference
+  the enforcement point uses (`text_stats`, `mcp__coralogix__list_alerts`, `dc1__node_ssh`,
+  `mcp__dc1__devops-cli__kubectl`, `coralogix`, `execute`). `name` is an optional unique
+  label; `groups` needs at least one name. The file ships with `rules: []` and commented
+  examples; the format is documented in [tools.md → Tool access rules](tools.md#tool-access-rules).
+- Set `TOOL_ACCESS_MODE` in the deployment environment. Start with `shadow` if you are
+  adding rules to a live install, and check the ring on Admin → Tool Authorization before
+  switching to `enforce`.
+- Copy any hand-tuned rules out of `/registry/tool_policies` before you delete it; nothing
+  migrates. The new format is one rule per target pattern with a group list, not
+  principal/scope rules.
+- Group membership reaches the decision only through the agent token's `g` claim (minted
+  per run from the user record). A user whose groups exist only in the retired
+  `principal_groups` mapping now has no groups for tool access; put them in the identity
+  provider, or accept that a rule-guarded tool is closed to them.
+- Re-bootstrap nothing: there is no bootstrap step any more, and a rule that matches a
+  workflow's tool denies that workflow unless you relax the mode or drop the rule.
+
+#### No principal exemptions: the supervisor and the gateway are ordinary agents
+
+`principal="system"` and the `SYSTEM_PRINCIPALS` set are gone, together with every
+exemption that honoured them: the hub's `gateway` bypass, the relay's supervisor and
+gateway bypass, and the runner's. The supervisor mints an ordinary token and is checked
+against **its own** manifest allowlist (the shipped `supervisor` asset binds `text_stats`
+for exactly that reason); the gateway mints for the external caller's user identity, and a
+caller with no agent record is authorized by the tool's own `public` flag.
+
+Two consequences are intended:
+
+- A supervisor or gateway call outside its manifest is denied, including a tool that used
+  to reach through the framework's own identity.
+- A supervisor or gateway **console or MCP session** is refused by design: the runner
+  authorizes those two kinds from an on-disk agent manifest, and neither identity has one.
+  No working path is lost, but do not route `execute` or an MCP session through the
+  gateway.
+
+Delegation now mints a child token at the `agent_factory` seam (both the supervisor's
+sub-agent toolset and the A2A capability), carrying the parent run id in its `p` claim and
+restoring the parent token when the child run ends. A sub-agent is therefore checked
+against **its** allowlist, not its parent's. In `ENFORCE_AGENT_TOKENS=log` or `off` a mint
+failure falls back to the parent token with a warning; in `enforce` it fails the call.
+
+**Bare `allowed_tools` names no longer grant MCP tools.** A bare name matches only that
+exact registered tool. An MCP tool needs `allowed_mcps` (whole server) or its full
+`mcp__<server>__<tool>` reference, and an edge MCP tool needs the 4-part
+`mcp__<site>__<mcp>__<tool>` form. The build-time MCP registration and
+`permits_mcp_session` apply the same rule, so the runtime and the compiled toolset agree.
+
+**What to do instead**
+
+- Add `allowed_mcps` (or the full `mcp__...` names) to any agent that relied on a
+  same-named MCP tool through `allowed_tools`.
+- Give the supervisor and gateway agents the tools they actually need in their own
+  manifests. A missing binding now fails that call instead of falling back to a framework
+  identity.
 - The `principal` claim (`k`) and the `principal=` argument on `agent_token.mint` /
-  `mint_for_run` are **removed**. No enforcement point honoured them after the exemptions
-  went, so a token minted for `gateway`/`system` is now an ordinary token: it gets no elevated
-  identity and no extra grant (its only possible grant is the target's own public exposure).
-  If a script of yours passes `principal=`, delete the argument; existing tokens still verify
-  and the extra claim is ignored.
+  `mint_for_run` are **removed**. Existing tokens still verify and the extra claim is
+  ignored; delete the argument from your own scripts.
+- A token minted for a service identity is an ordinary token: it gets no elevated identity
+  and no extra grant beyond the target's own public exposure.
 
-##### Three behaviours that surprise people in the new evaluator
+#### Secrets reach a container through stdin, never through its configuration
 
-**(a) Service and workflow identities carry NO groups.** A `background_agent` or
-`background_script` run mints `svc_agent_<name>` with an empty group claim (there is no IdP
-login behind it), so **any rule that matches one of its tools denies that run** — the caller
-holds no group, and a rule admits only holders. The same is true of a delegated sub-agent
-whose token was minted from a service identity. If a workflow must reach a rule-guarded tool,
-either run with `TOOL_ACCESS_MODE=off`/`shadow` (a deliberate trade: `off` drops the group
-half for *everyone* in that process) or do not put that tool under a rule. There is no
-group-less "everyone" rule by design — an empty `groups` list is a validation error.
+Every tool, MCP-session, console and workflow container is started through a small
+entrypoint shim, `trellis-exec`, installed in the engine image at
+`/usr/local/bin/trellis-exec` (images derived from the engine image inherit it). Resolved
+secrets therefore never reach the container's environment, where `docker inspect`, a
+support dump or a debugging session would show them. The runner writes one JSON line to the
+container's stdin first, `{"env": {"NAME": "value", ...}}`; the shim merges those values
+into the process environment (the preamble wins) and `exec`s the real command in place, so
+the process still reads them with `os.getenv()`.
 
-**(b) `default_action: deny` is gone: the allowlist decides unless a rule matches.** v0.7's
-policy document could deny a call for lack of a matching rule. The new file has no
-`default_action` key (it is a validation error if present); a target **no rule matches** is
-governed by the **agent's own allowlist alone**. So a call the old policy denied for lack of a
-matching rule can now be **allowed** if the agent's `allowed_tools`/`allowed_mcps` grants it.
-That is an explicit widening: audit each agent's allowlist during the upgrade, because the
-allowlist — not the policy file — is now the grant. A rule can only narrow a call, never widen
-one.
+- Everything after the preamble newline is the call's own stdin, byte for byte: the
+  stdin/stdout tool protocol and MCP stdio framing are unchanged.
+- A missing, oversized or malformed preamble makes the shim exit **78** without running
+  anything, and it never logs a key or a value. The caps are **64 KiB for the whole line**
+  and **16 KiB for one value**, sized against what `execve` accepts.
+- `docker inspect` on a running container now shows only a fixed non-secret allowlist of
+  18 names (`HOME`, `PATH`, `TMPDIR`, `TMP`, `TEMP`, `LANG`, `LANGUAGE`, `LC_ALL`,
+  `LC_CTYPE`, `TZ`, `TERM`, `PYTHONUNBUFFERED`, `SSL_CERT_FILE`, `SSL_CERT_DIR`,
+  `REQUESTS_CA_BUNDLE`, `TRELLIS_USER_ID`, `TRELLIS_USER_EMAIL`, `TRELLIS_RUN_ID`) plus
+  whatever your own compose `environment:` adds. A name that looks like a credential is
+  refused by the allowlist even if someone adds it there by mistake.
+- A declared secret or variable whose name cannot be an environment variable (`my-secret`,
+  or one starting with a digit) is now a **sync error**: `db-sync` prints the name and
+  exits **2** instead of publishing a manifest that would lose the credential at the last
+  mile. The runner rejects the same name with a `400`, and the shim would otherwise have
+  refused the whole line and taken the tool's other credentials with it.
+- One-shot containers are removed as soon as the result is collected, and session
+  containers on close or eviction.
 
-**(c) A malformed `workspace/policies/tool_access.yaml` stops the whole stack.** The sync is
-strict on purpose: an unparseable file, an unknown key, a rule with an empty `groups`, a
-duplicate rule or a duplicate name makes `scripts/sync_to_db.py` print the errors and exit
-**2**, writing nothing. Because every app service declares
-`depends_on: db-sync: condition: service_completed_successfully`, a non-zero exit keeps host,
-UI, gateway and the worker from starting at all — the intended fail-closed posture, and why the
-policy ships as a reviewed file rather than an admin form. Fix the file and re-run
-`docker compose up -d` (or `trellis sync`); the registry still holds the last valid policy, so
-the running stack keeps its previous rules until the new document validates.
+**What to do instead**
 
-A rule naming a console tool other than `execute` (`read_file`, `write_file`, `edit_file`,
-`ls`, `glob`, `grep`) is **not** an error — it is a warning printed by the sync and shown on
-Admin → Tool Authorization, because those tools never pass through the evaluator. Only the
-console `execute` tool is covered by rules; the file tools stay constrained by the agent's
-console allowlist.
+- Set `RUNNER_IMAGE` (and each edge's `TRELLIS_IMAGE`) to **v0.7.1 or newer**. An older
+  image does not degrade gracefully: no tool container can start (the entrypoint is
+  missing, so containers exit `126`/`127` or the daemon refuses the start), and the
+  runner's startup canary refuses to serve calls. The canary names the image when the shim
+  is what is missing. The runner never pulls an image itself, so it must already be
+  present locally.
+- Keep `/usr/local/bin/trellis-exec` as the entrypoint of any tool image you build. A
+  manifest `image:` that points somewhere else must provide the shim or an equivalent that
+  reads the same one-line preamble.
+- Do not debug by reading a container's environment; that is the point of the split. A
+  value you need to see belongs in the tool's own output or the run log.
+- Rename invalid declared keys in `tool.yaml`/`mcp.yaml`/`config.yaml` and in the matching
+  dotenv file: `my-secret` becomes `MY_SECRET`.
 
-#### Secrets no longer travel in container configuration — the `trellis-exec` stdin preamble
+#### Runner and token enforcement defaults
 
-Tool and MCP-session containers are now started through a small entrypoint shim,
-`trellis-exec`, installed in the engine image at `/usr/local/bin/trellis-exec` (derived
-images inherit it). Instead of carrying resolved secrets in the container's environment —
-where `docker inspect`, a support dump or a `docker compose` debugging session shows them —
-the runner writes one JSON line to the container's stdin first,
-`{"env": {"NAME": "value", ...}}`, and the shim merges it into the process environment
-(preamble wins) before `exec`-ing the real command. Everything after that newline is the
-tool's own stdin, byte for byte, so the stdin/stdout tool protocol and MCP stdio framing are
-unchanged; a missing, oversized or malformed preamble line makes the shim exit `78` without
-running anything, and no key or value is ever logged. There is nothing to configure:
-`docker inspect` on a running tool or MCP-session container now shows only fixed non-secret
-variables (`HOME`, `PATH`, `LANG`, `TZ`, `TRELLIS_USER_*`, ...) plus whatever your own
-compose `environment:` adds. A declared secret/variable name must be a valid environment
-name (`^[A-Za-z_][A-Za-z0-9_]*$`); one that is not (`my-secret`) is dropped from the
-preamble with a warning naming it, because it would otherwise make the shim reject the whole
-line and take the tool's other credentials down with it. Two consequences: a tool image you
-build from the engine image inherits the shim, and any workflow that replaced the entrypoint
-to read secrets out of the container's `Env` for debugging no longer can — that is the point.
+`RUNNER_AUTHORIZATION` is gone, and so is the runner's own manifest allowlist check. The
+runner still verifies `RUNNER_TOKEN` on the socket, verifies a forwarded token's signature
+and expiry, derives the agent and the output directory from its claims, and keeps the
+`kind: "discovery"` read (socket-token gated, engine internal). It makes no authorization
+decision: every decision belongs to `core/tool_access.py` at the enforcement point that
+owns the caller.
 
-##### `RUNNER_IMAGE` and edge images must be v0.7.1 or newer
+**`ENFORCE_AGENT_TOKENS` now defaults to `enforce` in code**, not in compose. An unset or
+unrecognized value enforces. `off` is a local-development posture that requires
+`DEV_MODE=true`; without it the value is refused with an error and `enforce` applies. `log`
+remains the one intentional rollout window: it records the would-be denial and lets the
+call through. Tokens also carry the caller's groups (`g`, read once at mint from the user
+record) and a parent run id (`p`) used by delegation.
 
-Because every tool / MCP-session container is now started through
-`/usr/local/bin/trellis-exec`, the **runner image** has to be an image that contains it —
-i.e. built from this release or newer. The same holds for an edge's `TRELLIS_IMAGE`: the
-edge runs its own tool containers through the same shim.
+**What to do instead**
 
-An older image does not degrade gracefully: every tool container fails to start (the
-entrypoint is missing, so the container exits `126`/`127`, or the daemon refuses the start
-with `exec: "/usr/local/bin/trellis-exec": ... no such file or directory`), and the
-runner's startup canary refuses to serve calls. Rebuild or re-pull `RUNNER_IMAGE` (and
-recreate each edge from a matching tag) in the same step as the rest of the upgrade:
+- Set `AGENT_TOKEN_SECRET` (32+ bytes, `openssl rand -hex 32`) on every service that
+  verifies a token, on central and on each edge runner. With the default `enforce`, a
+  `DEV_MODE=true` stack that has no secret now **exits at startup**.
+- For a throwaway local stack you may set `ENFORCE_AGENT_TOKENS=off` together with
+  `DEV_MODE=true`. Do not use it on anything shared.
+- If you carry `RUNNER_AUTHORIZATION` in `.env` or an edge config, delete it: nothing
+  reads it.
 
-```bash
-docker pull ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.1
-# .env
-RUNNER_IMAGE=ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.1
-```
-
-The runner never pulls an image itself, so it must already be present locally
-(`docker image inspect "$RUNNER_IMAGE"`). When the shim is what is missing, the canary's
-failure message names the image instead of blaming `TRELLIS_HOST_WORKSPACE`.
-
-#### `background_script` workflows run in one sandboxed container per run
+#### `background_script` workflows run in one container per run
 
 A script workflow used to be an ordinary subprocess of the `taskiq-worker`: it inherited
 the worker's environment, saw the whole workspace read-write and could reach the engine's
 own services by name. It is now **one runner container per run**, created from the same
-image and runtime as a tool (`runsc` by default). Nothing about the pipeline's contract
-changes — it is still a plain process reading its event payload on stdin and printing to
-stdout — but what surrounds it does:
+image and runtime as a tool (`runsc` by default). The pipeline's own contract does not
+change: it is still a plain process reading its event payload on stdin and writing to
+stdout. What surrounds it does:
 
 | Mount | Container path | Mode |
 | --- | --- | --- |
@@ -328,73 +482,92 @@ stdout — but what surrounds it does:
 | scratch space | `/tmp` | tmpfs (`limits.tmpfs_mb`) |
 
 Everything else is absent: no other workflow, no suite the workflow did not declare, no
-`agents/`, `mcps/`, `.env` or registry state. That *is* the enforcement — a workflow
-container carries no agent token and makes no hub round trip. Enforcement is per
-**suite**, not per tool: a suite holding none of the workflow's `allowed_tools` is not
-mounted at all, while a tool that shares a suite with an allowed one is still on the
-filesystem and still runnable — `allowed_tools` decides which directories appear, not
-which executables inside them may be started. A workflow that declares an edge tool or
-an MCP tool is legal (that list is also the run's allowlist), it just has no files to
-mount.
+`agents/`, `mcps/`, `.env` or registry state. That *is* the enforcement: a workflow
+container carries no agent token and makes no hub round trip, so a tool it did not declare
+is simply not on the filesystem. Enforcement is per **suite**, not per tool: a suite
+holding none of the workflow's `allowed_tools` is not mounted at all, while a tool that
+shares a suite with an allowed one is present and runnable. `allowed_tools` decides which
+directories appear, not which executables inside them may be started. A workflow that
+declares an edge tool or an MCP tool is legal (that list is also the run's allowlist), it
+just has no files to mount.
 
-**Four behaviours that surprise people**
+Four behaviours to plan around:
 
 1. **Only declared secrets and variables exist.** The container does not inherit the
    worker's environment any more. `SESSION_SECRET`, `ENCRYPTION_KEY`, `RUNNER_TOKEN`,
    provider keys and every operator-defined variable in the worker's own environment are
-   gone; the pipeline sees exactly the keys its `secrets`/`variables` blocks declare
-   (plus whatever the tools it declares require), passed in through the `trellis-exec`
-   preamble so they never appear in `docker inspect`. A pipeline that quietly relied on
-   an undeclared variable now reads nothing.
-2. **The worker no longer writes the workspace, except `reports/`.** `taskiq-worker`
-   mounts the workspace **read-only**; only `workspace/reports/` stays read-write, for a
+   gone; the pipeline sees exactly the keys its `secrets`/`variables` blocks declare (plus
+   whatever the tools it declares require), delivered through the `trellis-exec` preamble
+   so they never appear in `docker inspect`. A pipeline that quietly relied on an
+   undeclared variable now reads nothing.
+2. **The worker no longer writes the workspace, except `reports/`.** `taskiq-worker` mounts
+   the workspace **read-only**; only `workspace/reports/` stays read-write, for a
    `background_agent`'s in-process file tools. A pipeline that wrote anywhere else in the
-   workspace now fails — write under `output/<name>/` or `reports/<name>/`.
+   workspace now fails, so write under `output/<name>/` or `reports/<name>/`.
 3. **Cancelling a run mid-flight does not stop the container.** The runner has no cancel
    API, so the container runs to its deadline; the run is then recorded as cancelled
    (`run_cancelled`, `container_stopped: false`) without the worker claiming execution
-   stopped. Cancel *before* the run starts, or shorten
-   `WORKFLOW_RUN_TIMEOUT` (Admin → Limits & Tuning, default `3600` s) if a workflow must
-   be bounded.
-4. **One container per run costs latency.** Each scripted run now pays container
+   stopped. Cancel before the run starts, or shorten `WORKFLOW_RUN_TIMEOUT`
+   (Admin → Limits & Tuning, default `3600` s) if a workflow must be bounded.
+4. **One container per run costs latency and a slot.** Each scripted run pays container
    create/start/teardown (roughly a second, more on a cold `runsc` image), and a run's
-   steps share that one container — so they share its files, its `/tmp` and the single
-   secret set. Nothing is isolated *between* the steps of one pipeline. It also holds
-   one of the runner's **global** container slots (`RUNNER_MAX_CONTAINERS`, default
-   `32`) for the whole run: a pipeline that gets stuck and sits until its deadline keeps
-   that slot, and enough of them push ordinary tool calls into
-   `429 capacity_exhausted`. Keep `WORKFLOW_RUN_TIMEOUT` realistic, and size
-   `RUNNER_MAX_CONTAINERS` for workflows + interactive calls together.
+   steps share that container, so they share its files, its `/tmp` and the one secret set:
+   nothing is isolated between the steps of one pipeline. The run also holds one of the
+   runner's **global** container slots (`RUNNER_MAX_CONTAINERS`, default `32`) until it
+   finishes, so a pipeline that sits until its deadline keeps that slot, and enough of them
+   push ordinary tool calls into `429 capacity_exhausted`. Size the global cap for
+   workflows and interactive calls together.
 
 **What to do instead**
 
-- Run each pipeline once by hand after upgrading (Workflows → Run) and check its output
-  and `workspace/reports/<name>/` — a missing declared secret or a write outside
-  `output/`/`reports/` is the failure mode this change introduced.
+- Run each pipeline once by hand after upgrading (Workflows → Run) and check its output and
+  `workspace/reports/<name>/`. A missing declared secret or a write outside
+  `output/`/`reports/` is the failure mode this change introduces.
 - Add every credential and endpoint the pipeline reads to its `config.yaml`
-  (`secrets:`/`variables:`, or via the tools it declares) and set the values in
+  (`secrets:`/`variables:`, or through the tools it declares) and set the values in
   Workflows → Secrets. Undeclared values no longer leak in from the worker.
 - Remove any pipeline dependency on engine hostnames (`HOST_URL`, `HUB_URL`,
-  `http://host:8000`, `http://hub:8001`): a workflow container gets normal Docker egress,
+  `http://host:8000`, `http://hub:8001`): a workflow container gets ordinary Docker egress,
   not the compose project network. Call the API with an explicit URL (`PUBLIC_HOST_URL`)
   and a declared token, or do the work through a declared tool.
-- A tool a pipeline shells out to can read `TRELLIS_AGENT_NAME` (the workflow name) to
-  find where it should write `reports/<name>/`. A workflow container has no agent token,
-  so this environment variable is how a pipeline — and any tool it launches with its own
-  environment — learns which workflow it is running for.
-- `db-sync` validates a `background_script`'s `runtime`, `entrypoint`, `network`,
-  `limits` and `allowed_tools` before publishing it: an unknown `limits` knob, a value
-  outside the four runtimes, an `entrypoint` that is not a plain relative path or is not
-  there, or an unknown `network` stops the sync with exit 2 and writes nothing. Those
-  used to sync and fail one scheduled run at a time.
-- `runtime:` accepts `python`, `node`, `bash` and `exec`. A value outside that list stops
-  `db-sync` (exit 2) before the workflow can be published; a config that is already in the
-  registry yet names something else still runs its entrypoint directly (`exec`, the v0.7
-  behaviour) with a warning — pin one of the four.
+- Read `TRELLIS_AGENT_NAME` (the workflow name) inside a tool the pipeline shells out to,
+  to find where it should write `reports/<name>/`. A workflow container has no agent token,
+  so this variable is how a pipeline, and any tool it launches with its own environment,
+  learns which workflow it is running for.
+- `db-sync` validates a `background_script`'s `runtime`, `entrypoint`, `network`, `limits`,
+  `allowed_tools` and declared env names before publishing it: an unknown `limits` knob, a
+  runtime outside the four supported values, an `entrypoint` that is not a plain relative
+  path or is not present, an unknown `network`, or an invalid env name stops the sync with
+  exit 2 and writes nothing. Those used to sync and then fail one scheduled run at a time.
+- `runtime:` accepts `python` (the default), `node`, `bash` and `exec`. `exec` runs the
+  entrypoint as given (a shebang script or a binary). A config already in the registry that
+  names something else still runs its entrypoint directly with a warning; pin one of the
+  four.
 - A workflow `limits:` block overrides only the knobs it names; the rest stay at the
-  workflow defaults (4 GiB / 2 CPUs / 1024 pids / 1 GiB tmpfs), never a tool's 512 MiB.
+  workflow defaults (4 GiB memory, 2 CPUs, 1024 pids, 1 GiB tmpfs), never a tool's 512 MiB.
 
-<!-- v0.7.1: further removals are appended below this marker before the tag. -->
+#### Changes to declare
+
+- **Compose services:** none added or removed. `hub` loses the LSM exceptions it carried
+  for the in-process sandbox, and `taskiq-worker` mounts the workspace read-only with
+  `workspace/reports/` read-write.
+- **`.env` keys:** added `TOOL_ACCESS_MODE` (default `enforce`). Removed and now ignored:
+  `SANDBOX_*`, `TRELLIS_INTERNAL_CIDRS`, `TRELLIS_ENGINE_SUBNETS`, `TOOLS_INTERNAL_DNS`,
+  `TOOLS_INTERNET_DNS`, `TOOLS_NET_INTERNAL_SUBNET`, `TOOLS_NET_INTERNET_SUBNET`,
+  `EGRESS_*`, `RUNNER_AUTHORIZATION`. `AGENT_TOKEN_SECRET` is required on central and on
+  each edge runner, and `RUNNER_IMAGE` must be v0.7.1 or newer.
+- **Registry sync:** new `workspace/policies/tool_access.yaml` (published to
+  `/registry/tool_access`); an invalid policy file or an invalid workflow config now
+  aborts the sync with exit 2. `/registry/tool_policies`, `/registry/tool_authz_denies` and
+  `/config/framework/{tool_authz_mode,bound_tools_mode,hub_call_mode,principal_groups}` are
+  never read again.
+- **Tool protocol / `workspace/` layout:** the stdin/stdout protocol is unchanged; add
+  `workspace/policies/`. The visible filesystem inside a tool is unchanged. A tool container
+  can no longer see the engine's services by name, and `network:` means `egress` or `none`.
+- **Data migrations:** none. Existing users, API keys, run history and sealed credential
+  sets are unaffected; each edge key needs one approval in the UI.
+- **Image pins:** `TRELLIS_IMAGE` and `RUNNER_IMAGE` must both be v0.7.1 or newer, on
+  central and on every edge.
 
 ---
 
@@ -404,7 +577,7 @@ Releases are tagged `vMAJOR.MINOR.PATCH`. `v0.2.0` is the first release.
 
 | Surface | Status |
 | --- | --- |
-| `workspace/` layout — `agents/`, `tools/`, `workflows/`, `mcps/`, `shared/` | Public API |
+| `workspace/` layout — `agents/`, `tools/`, `workflows/`, `mcps/`, `shared/`, `policies/` | Public API |
 | Tool protocol — JSON arguments on `stdin`, JSON results on `stdout` | Public API |
 | Agent `config.yaml` / `skills.md`, `tool.yaml`, `mcp.yaml` manifests | Public API |
 | `docker-compose.yml` services, `.env` keys, registry sync behavior | Stable, but changes are announced per release below |
@@ -709,8 +882,9 @@ is the hub's own uid.
 
 Rollback to the root-hub posture (removing the hub's `user:` line and restoring the old
 capabilities) is only justified when a host cannot run bwrap as a non-root user at all — it
-reintroduces the privilege-separation problem this migration removed. See
-[deploy.md](deploy.md#sandbox-settings-and-rollback).
+reintroduces the privilege-separation problem this migration removed. That rollback path
+was deleted in `v0.7.1` along with the backend itself: see
+[v0.7.1](#v071-2026-10-26).
 
 #### Per-tool network policy
 
@@ -728,9 +902,9 @@ a seccomp rule refuses UDP/raw sockets. Loopback is blocked as well.
 
 `docker-compose.egress.yml` moves the hub onto an internal-only network whose only route out
 is a CONNECT proxy that connects to domains declared in `tool.yaml` `egress:`. It is off by
-default. Enable it with `COMPOSE_FILE` in `.env`; see
-[deploy.md](deploy.md#egress-mode-opt-in) for enabling, rollback, and the v1 limits (union
-allowlist, Node clients ignoring proxy variables, etcd still reachable from tools).
+default. Enable it with `COMPOSE_FILE` in `.env`. The whole mechanism (the compose files,
+`scripts/egress_proxy.py`, the ACL generator and the `egress:` list) was removed in
+`v0.7.1`: see [v0.7.1](#v071-2026-10-26).
 
 #### Probe lifecycle
 
@@ -1044,8 +1218,8 @@ hello frame over the 10 MiB cap (the largest catalogs are dropped, tools stay on
 Set `SANDBOX_RLIMIT_AS_MB=8192` for stdio MCP servers written in Node — the `4096`
 default is tight and an allocation failure looks like a crash. `SANDBOX_RLIMIT_CPU_S`
 counts **consumed** CPU, so the 600 s default does not retire an idle long-lived session.
-Both apply to the Landlock backend only; see
-[deploy.md → Sandbox settings and rollback](deploy.md#sandbox-settings-and-rollback).
+Both variables were removed in `v0.7.1`; size a session container with the manifest's
+`limits:` block instead ([mcp.md → Memory sizing](mcp.md#memory-sizing-sessions--limitsmemory_mb--60--of-host-ram)).
 
 #### Rollback
 
@@ -1232,8 +1406,9 @@ firewall reload, or a Docker upgrade — Docker recreates `DOCKER-USER` empty.
 tools. That profile is what makes **SSH** work: SSH is L3 traffic, so adding the
 destination CIDR is enough. Cloud-metadata addresses are dropped from *every* profile,
 and `TRELLIS_ENGINE_SUBNETS` lists the compose network CIDRs that are dropped too (set it
-when your compose subnet is not the default). Profile table and sizing: [deploy.md →
-Network profiles](deploy.md#network-profiles).
+when your compose subnet is not the default). The profiles, both variables and the setup
+script were removed in `v0.7.1`: see [v0.7.1](#v071-2026-10-26) and
+[deploy.md → Network policy](deploy.md#network-policy).
 
 #### Breaking: `network` default flips to `none`
 

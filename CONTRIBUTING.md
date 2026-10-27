@@ -1,9 +1,9 @@
 # Contributing to Trellis
 
-This repository is the **framework engine** — the services in `core/`, the sandboxed
-tool runner, the registry, and the dashboard. Organizations consume it by pinning a
-release tag and supplying their own content (agents, tools, workflows, MCP servers)
-in a separate repo, mounted via `TRELLIS_WORKSPACE_DIR`. See
+This repository is the **framework engine** — the services in `core/`, the tool runner that
+executes every call in its own container, the registry, and the dashboard. Organizations
+consume it by pinning a release tag and supplying their own content (agents, tools,
+workflows, MCP servers) in a separate repo, mounted via `TRELLIS_WORKSPACE_DIR`. See
 [docs/deploy.md](docs/deploy.md) for that side of it.
 
 This guide covers working on the engine itself. For the framework internals — service
@@ -29,9 +29,15 @@ stack.
 ```bash
 git clone https://github.com/laraibkazi92/trellis-agent-platform.git
 cd trellis-agent-platform
-cp .env.example .env    # set SESSION_SECRET, then set DEV_MODE=true
+cp .env.example .env    # then set the four required values below
 docker compose up -d --build
 ```
+
+Compose refuses to start until `.env` carries `RUNNER_TOKEN` (`openssl rand -hex 32`),
+`AGENT_TOKEN_SECRET` (also 32+ random bytes), `TRELLIS_HOST_WORKSPACE` (the **host** path of
+the workspace directory) and `SESSION_SECRET`. For a local stack, set `DEV_MODE=true` and
+`CONTAINER_DEFAULT_RUNTIME=runc` as well; see
+[docs/deploy.md → Dev machine](docs/deploy.md#dev-machine-docker-desktop).
 
 Set `DEV_MODE=true` in `.env` to run without authentication — it disables all auth
 across host, hub, gateway, and UI. Development only: never expose a `DEV_MODE`

@@ -153,7 +153,7 @@ def test_a_missing_shim_is_reported_as_an_image_problem_not_a_workspace_problem(
             _Exits(exit_code, b'exec: "/usr/local/bin/trellis-exec": not found'),
             host_workspace=str(tmp_path),
             workspace_root=str(tmp_path),
-            image="trellis-agent-platform:v0.7.0",
+            image="trellis-agent-platform:v0.7.1",
             runtime="runsc",
         )
     )
@@ -162,7 +162,7 @@ def test_a_missing_shim_is_reported_as_an_image_problem_not_a_workspace_problem(
     assert "no /usr/local/bin/trellis-exec" in result.detail
     assert "RUNNER_IMAGE" in result.detail and "v0.7.1" in result.detail
     # The image, not the workspace, is named -- and the workspace hint is gone.
-    assert "trellis-agent-platform:v0.7.0" in result.detail
+    assert "trellis-agent-platform:v0.7.1" in result.detail
     assert "TRELLIS_HOST_WORKSPACE" not in result.detail
 
 

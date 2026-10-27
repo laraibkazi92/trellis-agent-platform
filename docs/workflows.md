@@ -2,17 +2,12 @@
 
 Background Workflows are asynchronous tasks that run without direct human interaction. They are triggered by cron schedules or inbound webhooks and can be either procedural scripts or LLM-powered agents.
 
-> **v0.7.1 removed the sandbox-backend and network-profile model.** Every tool call is a
-> `runner` container, and a workflow's per-manifest `network:` is only `egress` (the
-> default: Docker's default bridge) or `none` — the `internal`/`internet`/`allow` profile
-> names load as `egress` with one deprecation warning per value, and
-> `SANDBOX_BACKEND`/`TRELLIS_INTERNAL_CIDRS` no longer exist. A `background_script` run is
-> now ONE sandboxed `runner` container (the workflow dir, `shared/` and only the tool
-> suites its `allowed_tools` names, read-only; `output/<name>` and `reports/<name>`
-> read-write; a `/tmp` tmpfs), and it sees only the secrets/variables it declares. See
-> [upgrading.md → v0.7.1](upgrading.md#background_script-workflows-run-in-one-sandboxed-container-per-run).
-> A full rewrite of this page is tracked for the same release. Cross-check with
-> [upgrading.md → v0.7.1](upgrading.md#v071--in-development-breaking).
+> **Execution model.** A `background_script` pipeline runs as **one runner container per
+> run** (mounts and environment in [How a script workflow runs](#how-a-script-workflow-runs)),
+> and a `background_agent` is an ordinary agent run. A workflow's per-manifest `network:` is
+> `egress` (the default, Docker's default bridge) or `none`. Tools a workflow declares still
+> pass the [tool access rules](tools.md#tool-access-rules), and a workflow identity carries
+> no groups.
 
 ---
 
@@ -75,12 +70,18 @@ trigger:
   expression: "0 18 * * *"   # Daily at 6:00 PM UTC
 ```
 
-The `pipeline.py` is a **standard Python script** — not an agent, not stdin/stdout JSON. It runs as a normal process inside ONE sandboxed `runner` container per run, with access to exactly the secrets and variables it declares (nothing is inherited from the worker).
+The `pipeline.py` is a **standard Python script**, not an agent and not the stdin/stdout
+JSON protocol. It runs as a normal process inside one `runner` container per run, with
+access to exactly the secrets and variables it declares (nothing is inherited from the
+worker). What the container looks like is in
+[How a script workflow runs](#how-a-script-workflow-runs).
 
 `allowed_tools` is optional here and it is a **mount list**, not a per-call gate: only the
 suites holding the tools it names are mounted (read-only). A suite with none of them is
 absent from the container; a tool that shares a suite with a listed one is still present
-and still runnable.
+and still runnable. The list is also the run's allowlist for the tool-access rules, so a
+workflow that declares an edge tool or an MCP tool is legal even though there are no files
+to mount for it.
 
 The rendered trigger payload is evaluated against the workflow's `guardrails` before the script
 starts, exactly like a `background_agent`'s input: a blocking rule marks the run `failed`
@@ -131,6 +132,61 @@ trigger:
 
 Provide a `skills.md` alongside the config. The system prompt follows the same conventions as user-facing agents — see the [Agent Guide](agents.md) for best practices.
 
+### How a script workflow runs
+
+One `background_script` run is **one runner container**, created from the engine image and
+the deployment runtime (`runsc` by default; a dev machine sets
+`CONTAINER_DEFAULT_RUNTIME=runc`). The worker still owns the run record, the heartbeat,
+cancellation polling and the guardrail check on the input; the pipeline process runs in the
+container.
+
+| Mount | Container path | Mode |
+| --- | --- | --- |
+| the workflow's own directory | `/app/workspace/workflows/<name>` | read-only, and the **working directory** |
+| shared code | `/app/workspace/shared` | read-only (when it exists) |
+| the tool suites its `allowed_tools` names | `/app/workspace/tools/<suite>` | read-only |
+| the workflow's output dir | `/app/workspace/output/<name>` | read-write |
+| the workflow's report dir | `/app/workspace/reports/<name>` | read-write |
+| scratch space | `/tmp` | tmpfs, sized by `limits.tmpfs_mb` |
+
+Everything else is absent: no other workflow, no suite the workflow did not declare, no
+`agents/`, `mcps/`, `.env` or registry state. That is the enforcement, because the container
+carries no agent token and makes no hub round trip. It is per **suite**, not per tool: a
+suite holding none of the allowed tools is not mounted at all, while a tool that shares a
+suite with an allowed one is present and runnable.
+
+The pipeline's environment is exactly what the workflow declares:
+
+- `secrets:` and `variables:` on the workflow itself, plus the keys the tools it declares
+  require, resolved from the workflow's stored secrets. Nothing else is inherited, so
+  `SESSION_SECRET`, `RUNNER_TOKEN`, provider keys and any operator variable in the worker's
+  environment are absent.
+- They arrive through the `trellis-exec` stdin preamble, so `docker inspect` on the running
+  container shows none of them. The preamble is capped at 64 KiB total and 16 KiB per value.
+- `TRELLIS_AGENT_NAME` carries the workflow name, so a tool the pipeline shells out to can
+  find `reports/<name>/`. `TRELLIS_USER_ID`, `TRELLIS_USER_EMAIL` and `TRELLIS_RUN_ID` are
+  present as container variables when the run has them.
+- `network:` is `egress` (default) or `none`. `egress` is Docker's default bridge, so the
+  pipeline reaches whatever the host reaches, and **not** the compose project network:
+  `http://hub:8001` or `http://etcd:2379` does not resolve. Call the framework API with an
+  explicit URL and a declared token, or do the work through a declared tool.
+- `limits:` overrides only the knobs it names. The defaults are sized for a whole pipeline
+  (4096 MiB memory, 2 CPUs, 1024 pids, 1024 MiB tmpfs), never a single tool's 512 MiB.
+
+Two costs to plan for: each run pays container create/start/teardown (about a second, more
+on a cold `runsc` image), and it holds one of the runner's global container slots
+(`RUNNER_MAX_CONTAINERS`, default 32) until it finishes. A pipeline that hangs holds that
+slot until its deadline (`WORKFLOW_RUN_TIMEOUT`, default 3600 s), and enough of them push
+ordinary tool calls into `429 capacity_exhausted`. Cancelling a run does not stop the
+container: the runner has no cancel call, so the run is recorded as cancelled with
+`container_stopped: false` when the result comes back.
+
+`db-sync` validates a workflow's `runtime`, `entrypoint`, `network`, `limits`,
+`allowed_tools` and declared env names before publishing it. A runtime outside
+`python`/`node`/`bash`/`exec`, an entrypoint that is not a plain relative path inside the
+workflow directory or is missing, an unknown `limits` knob or `network`, or an env name that
+cannot be a process variable stops the sync with exit 2 and writes nothing.
+
 ---
 
 ### `config.yaml` — All Fields
@@ -146,7 +202,13 @@ entrypoint: pipeline.py          # Required for background_script. Main file to 
 model: gemini-3-flash-preview    # Required for background_agent. LLM model identifier.
 thinking_level: low              # Required for background_agent. One of: none, low, medium, high.
 allowed_tools:                   # Required for background_agent. Tool names the agent may call.
-  - get_system_time
+  - get_system_time              #   For background_script it is the mount list (optional).
+allowed_mcps:                    # Optional, background_agent only. MCP servers the agent may use.
+  - coralogix
+network: egress                  # Optional, background_script only. egress (default) | none.
+limits:                          # Optional, background_script only. Only the knobs you name.
+  memory_mb: 4096                #   Defaults: 4096 MiB, 2 CPUs, 1024 pids, 1024 MiB tmpfs.
+  cpus: 2.0
 tags:                            # Optional. Labels for UI filtering.
   - reporting
 trigger:
@@ -247,6 +309,26 @@ This lets the same tool authenticate differently depending on whether it's calle
 
 ---
 
+### Tool access rules
+
+A workflow's tool calls go through the same evaluator as an agent's
+(`core/tool_access.py`, documented in [tools.md → Tool access rules](tools.md#tool-access-rules)).
+Two halves decide a call: the workflow's own `allowed_tools`/`allowed_mcps` (always
+enforced) and the group rules in `workspace/policies/tool_access.yaml`.
+
+The one thing to know about workflows is that their identity carries **no groups**. A run
+mints `svc_agent_<name>` with no group claim, so a rule that matches a tool the workflow
+uses denies that run no matter who triggered it. If a workflow must reach a rule-guarded
+tool, either leave that tool out of the rules or relax the mode for the deployment:
+`TOOL_ACCESS_MODE` is `off`, `shadow` or `enforce` (default `enforce`), and `off`/`shadow`
+relax only the group-rule half, never the allowlist.
+
+For a `background_script`, the same `allowed_tools` list is also the container's mount list,
+so declaring a tool there both grants it and puts its suite on the filesystem. A tool that
+is not declared is not mounted at all.
+
+---
+
 ### Sync to Registry
 
 After creating or editing workflow files, push to etcd:
@@ -273,4 +355,6 @@ The scheduler picks up new cron triggers automatically after sync. No restart re
 - [ ] Cron expression tested at [crontab.guru](https://crontab.guru) — or, for webhooks, a signed `POST` to `/webhooks/<name>` returns `{"status": "accepted", ...}`
 - [ ] Required secrets declared in the relevant tool's `tool.yaml` under `background` context (`general` if the workflow also fires via webhook)
 - [ ] Background-scoped secrets populated in the Dashboard UI
+- [ ] A `background_script` declares every credential and endpoint it reads (`secrets:`/`variables:`) and writes only under `output/<name>/` or `reports/<name>/`
+- [ ] A `background_script`'s `runtime` is one of `python`, `node`, `bash`, `exec`, and its `entrypoint` exists inside the workflow directory
 - [ ] `docker compose up -d --build` run after changes

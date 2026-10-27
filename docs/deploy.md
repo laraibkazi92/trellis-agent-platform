@@ -23,24 +23,32 @@ A rebuild or upgrade replaces the engine only. The content mount and the `etcd-d
 > **v0.7.1 breaking changes.** The legacy in-process sandbox backends (bwrap, Landlock,
 > the shipped AppArmor profile), the network profiles and the opt-in egress proxy were
 > removed: every tool/MCP call is a runner container, and tool containers use Docker's
-> default bridge (`network: egress`) or no network (`none`). Sections below that still
-> describe the v0.6 machinery — *Sandbox settings and rollback*, *Hardened Landlock-only
-> variant*, *Network profiles*, *Egress mode* — carry a **Removed in v0.7.1** note and are
-> kept as history until the v0.7.1 docs pass rewrites them. Follow
-> [upgrading.md → v0.7.1](upgrading.md#v071--in-development-breaking) instead.
+> default bridge (`network: egress`) or no network (`none`). If you are upgrading an
+> existing install, read [upgrading.md → v0.7.1](upgrading.md#v071-2026-10-26) first: it
+> lists every removal with the action to take.
 
 ## Prerequisites
 
-Docker Engine with the Compose v2 plugin is the only host dependency — the prebuilt image bundles the full toolchain (Python, Node, Go), so no language runtimes are needed on the host. Every tool call is a container started by the `runner` service, so the only host-side question is which OCI runtime is registered: `runsc` (gVisor) where it is installed, `runc` otherwise (`CONTAINER_DEFAULT_RUNTIME`). `GET /v1/healthz` over the runner's socket reports the verdict.
+Docker Engine with the Compose v2 plugin is the only host dependency. The prebuilt image
+bundles the full toolchain (Python, Node, Go), so no language runtimes are needed on the
+host. Every tool call is a container started by the `runner` service, so the only host-side
+question is which OCI runtime is registered: `runsc` (gVisor) where it is installed, `runc`
+otherwise (`CONTAINER_DEFAULT_RUNTIME`). The runner's own `GET /v1/healthz` reports the
+verdict.
 
-> The v0.6 backend matrix (bwrap / Landlock per host kernel and LSM) no longer applies: since
-> v0.7.1 the container runner is the only execution path, so the host only needs Docker plus
-> the runtime the runner uses — `runsc` (gVisor) in production, `runc` on a dev machine
-> (`CONTAINER_DEFAULT_RUNTIME`). What a tool container can see is proven by the runsc
-> isolation harness (`docker-compose.ci-isolation.yml`, self-hosted with runsc registered)
-> and, on `runc`, by the `Sandbox smoke` workflow.
+- **Production:** register `runsc` on the host. gVisor is the isolation boundary between a
+  tool container and the host kernel, so a production deployment must not run on `runc`.
+  The feature set is validated against a `runsc` that reports runtime-spec 1.2.1 in
+  `runsc --version`; run a current release and confirm that line before deploying.
+- **A dev machine (Docker Desktop, WSL2, a laptop):** no gVisor needed, see
+  [Dev machine](#dev-machine-docker-desktop).
 
-In every supported case the hub container runs as `${TRELLIS_UID:-1000}` — the operator uid that owns the workspace — not root, and tool containers run as that same uid.
+What a tool container can see is proven by the runsc isolation harness
+(`docker-compose.ci-isolation.yml`, self-hosted with `runsc` registered) and, on `runc`, by
+the `Sandbox smoke` workflow.
+
+The hub container runs as `${TRELLIS_UID:-1000}`, the operator uid that owns the workspace,
+not root, and tool containers run as that same uid.
 
 ## Install path A: pull prebuilt images (recommended)
 
@@ -55,7 +63,7 @@ docker compose up -d
 
 ### Pinning and verifying a release
 
-`TRELLIS_IMAGE` in `.env` pins a **tag** (`:v0.4.0`) because a tag stays readable in a diff. Tags are mutable, so if you need the image to be byte-identical forever, pin the **digest** published in that release's workflow summary instead:
+`TRELLIS_IMAGE` in `.env` pins a **tag** (`:v0.7.1`) because a tag stays readable in a diff. Tags are mutable, so if you need the image to be byte-identical forever, pin the **digest** published in that release's workflow summary instead:
 
 ```bash
 TRELLIS_IMAGE=ghcr.io/laraibkazi92/trellis-agent-platform@sha256:<digest>
@@ -64,7 +72,7 @@ TRELLIS_IMAGE=ghcr.io/laraibkazi92/trellis-agent-platform@sha256:<digest>
 Every release published after provenance was wired up is attested by GitHub's keyless signer, which proves the image was built by `.github/workflows/publish-images.yml` from the commit its tag points at. Verify a pulled image with the GitHub CLI (no signing key, no registry login — the attestation is stored next to the image):
 
 ```bash
-gh attestation verify oci://ghcr.io/laraibkazi92/trellis-agent-platform:v0.4.0 \
+gh attestation verify oci://ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.1 \
   -R laraibkazi92/trellis-agent-platform
 ```
 
@@ -97,7 +105,7 @@ If the host has no access to GHCR, export the images from a connected machine an
 # connected machine
 docker compose pull
 docker save -o trellis-images.tar \
-  ghcr.io/laraibkazi92/trellis-agent-platform:v0.4.0 \
+  ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.1 \
   ghcr.io/vectorize-io/hindsight:0.9.1-slim \
   gcr.io/etcd-development/etcd:v3.6.15 \
   redis:alpine \
@@ -111,7 +119,7 @@ docker load -i trellis-images.tar
 Alternatively push the same images to a private registry mirror and point the stack at it with `TRELLIS_IMAGE` in `.env`:
 
 ```bash
-TRELLIS_IMAGE=registry.internal.example.com/trellis-agent-platform:v0.4.0
+TRELLIS_IMAGE=registry.internal.example.com/trellis-agent-platform:v0.7.1
 ```
 
 ## Install path B: build from source
@@ -129,11 +137,44 @@ TRELLIS_UID=$(id -u)
 TRELLIS_GID=$(id -g)
 ```
 
+## Dev machine (Docker Desktop)
+
+You do not need gVisor to run the whole stack locally. Docker Desktop does not ship or
+support a `runsc` runtime, so run every container on `runc` there:
+
+```bash
+# .env
+DEV_MODE=true                            # no login while you iterate; never expose this
+CONTAINER_DEFAULT_RUNTIME=runc           # the only runtime Docker Desktop can start
+RUNNER_TOKEN=$(openssl rand -hex 32)     # required by the runner and every caller
+AGENT_TOKEN_SECRET=$(openssl rand -hex 32)   # required: tokens are enforced by default
+TRELLIS_HOST_WORKSPACE=/absolute/path/to/workspace   # HOST path, not /app/workspace
+```
+
+- **`runc` gives up kernel-syscall isolation.** That is fine for a laptop and not fine for
+  anything shared, which is why the compose default stays `runsc`. Do not promote a dev
+  `.env` to a server.
+- **`TRELLIS_HOST_WORKSPACE` must be a path the Docker daemon can see.** On Docker Desktop
+  that means a directory under the file-sharing roots (for example `/Users/you/...` on
+  macOS, or `/home/you/...` inside WSL2 on Windows). A path outside them makes every tool
+  bind mount resolve to nothing and the runner's startup canary refuses to serve.
+- **`AGENT_TOKEN_SECRET` is not optional, even in `DEV_MODE`.** Tokens default to
+  `ENFORCE_AGENT_TOKENS=enforce`, and a stack that enforces with no signing key exits at
+  startup. Setting `ENFORCE_AGENT_TOKENS=off` alongside `DEV_MODE=true` also works; it is
+  refused on a stack that is not in `DEV_MODE`.
+- **What you cannot reproduce locally.** Every container runs on `runc`, so a failure that
+  only happens under gVisor (a syscall gVisor does not implement, for instance) will not
+  reproduce here; use a `runsc` host for that.
+- **Tool access rules still apply.** The shipped `workspace/policies/tool_access.yaml` has
+  no rules, so the agent allowlist alone decides; if you add a rule, remember that a local
+  dev login usually carries no identity-provider groups and will be denied in `enforce`
+  mode.
+
 ## First-run setup
 
 ```bash
 # 1. Clone the engine at a release tag
-git clone --branch v0.4.0 https://github.com/laraibkazi92/trellis-agent-platform.git
+git clone --branch v0.7.1 https://github.com/laraibkazi92/trellis-agent-platform.git
 cd trellis-agent-platform
 
 # 2. Seed your environment file
@@ -152,7 +193,7 @@ The variables below are the ones you must touch for a first deployment. Everythi
 | `SESSION_SECRET` | Yes | Signs sessions and seeds the Fernet encryption key (`ENCRYPTION_KEY` falls back to it). |
 | `ADMIN_USERS` | Yes | Comma-separated admin identities (e.g. `ops@example.com`). |
 | `TRELLIS_WORKSPACE_DIR` | Recommended | Workspace bind-mount source. Defaults to `./workspace` inside the clone. Point it at your content repo to keep the engine pristine. |
-| `TRELLIS_IMAGE` | Optional | Pins the engine image tag or digest, e.g. `ghcr.io/laraibkazi92/trellis-agent-platform:v0.4.0`. |
+| `TRELLIS_IMAGE` | Optional | Pins the engine image tag or digest, e.g. `ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.1`. |
 | `TRELLIS_UID` / `TRELLIS_GID` | Optional | Container uid:gid for workspace file ownership. Defaults to `1000:1000`. |
 | `DEV_MODE` | No | Keep `false` for anything shared. `true` disables **all** authentication. |
 | `OIDC_GROUPS_CLAIM` | Optional | Identity-provider claim holding group membership for the tool-access group rules (default `groups`). Accepted as a list or a comma-separated string. |
@@ -205,8 +246,14 @@ It creates the standard layout under `PATH` (never overwriting existing files, s
     ├── tools/
     ├── mcps/
     ├── workflows/
+    ├── policies/          # tool_access.yaml (group rules); add it yourself
     └── shared/
 ```
+
+`trellis init` does not create `policies/`: copy the shipped
+`workspace/policies/tool_access.yaml` (it ships with `rules: []`) or start from the format
+in [tools.md → Tool access rules](tools.md#tool-access-rules). The sync warns when the file
+is missing and keeps whatever policy the registry already holds.
 
 Because the scaffold nests a `workspace/` directory, mount **that** subdirectory — `TRELLIS_WORKSPACE_DIR=../my-org-workspace/workspace`. If no `.env` exists in `PATH`, `init` also copies `.env.example` there as a reference; the running stack reads the engine clone's `.env`, not that copy.
 
@@ -306,100 +353,45 @@ The clone ships three samples: `workspace/agents/demo-assistant/`, `workspace/to
 - **Front door.** `nginx-gateway` publishes ports 80 and 443 and is the single entry point for the stack. Set `SSL_ENABLED=True` and `SSL_DNS_NAME=<your-domain>` in `.env` to serve HTTPS; certificates are read from `SSL_CERT_DIR` (default `./gateway/ssl`, expecting `cert.pem` and `key.pem`). The cert-directory volume mount is commented out in `docker-compose.yml` — enable it by uncommenting that block, or via a local `docker-compose.override.yml`, which keeps the engine clone pristine.
 - **Bind address.** `HOST_BIND` defaults to `0.0.0.0`, so published ports are reachable from anywhere. Set `HOST_BIND=127.0.0.1` to keep them loopback-only — this also covers the Hindsight ports (8888 API, 9999 Control Plane UI). etcd and Redis are never published regardless.
 - **Authentication.** Keep `DEV_MODE=false` for anything shared: `true` disables API-key auth, UI login, and MCP auth across `host`, `hub`, `gateway`, and `ui`, and only logs a startup warning — it does not restrict the bind host. Optional SSO is configured with `GITHUB_CLIENT_ID`/`GITHUB_CLIENT_SECRET` or the `OIDC_*` variables, plus `ALLOWED_DOMAINS` to restrict by email domain.
-- **Tool sandbox.** Every tool invocation is its own container, started by the `runner`
-  service (`runsc` in production, `runc` on a dev machine — see
-  [Execution isolation](#execution-isolation-v06)). The hub container runs as
-  `${TRELLIS_UID:-1000}` — the operator uid that owns the bind-mounted workspace — and drops
-  all capabilities (`cap_drop: [ALL]`, empty `cap_add`, `no-new-privileges`), because no tool
-  process runs inside it any more. A tool container gets only the mounts its manifest
-  declares, `network: egress` (Docker's default bridge) or `none`, and the cgroup limits from
-  `limits:`. **`runsc` is the isolation boundary**: it is the only thing between a tool and
-  the host kernel, so a production deployment must not run on `runc`.
+- **Tool containers.** Every tool invocation is its own container, started by the `runner`
+  service (`runsc` in production, `runc` on a dev machine). The hub drops all capabilities
+  (`cap_drop: [ALL]`, empty `cap_add`, `no-new-privileges`) because no tool process runs
+  inside it. See [Security notes](#security-notes) and
+  [Execution isolation](#execution-isolation).
 
-**v0.7.1:** the in-process backends (`bwrap`, `Landlock`, the `trellis-sandbox` helper) and
-the shipped `deploy/apparmor/trellis-hub` profile were deleted. The hub needs no relaxed LSM
-profile — nothing executes in it — and the v0.6 `smoke`/`apparmor`/`egress` CI jobs are gone
-with the backends they proved. The proofs that a tool container is real are now:
+## Execution isolation
 
-| Proof | Covers |
-| --- | --- |
-| `docker-compose.ci-isolation.yml` (self-hosted host with `runsc` registered) | What a real gVisor tool container can see, write and reach — `tests/live -m runsc`, including "no egress under `network: none`". |
-| `.github/workflows/sandbox-smoke.yml` → job `Sandbox smoke` | The same container contract end to end on the container runtime every dev machine has (`runc`): build the stack, run `scripts/sandbox_smoke.py --tool text_stats`. |
-
-### Sandbox settings and rollback
-
-> **Removed in v0.7.1.** Every variable in the table below is gone — nothing in the code
-> reads `SANDBOX_*` any more (setting one is ignored, not honoured) — and there is no
-> backend to roll back to: the container runner is the only execution path. Per-tool
-> `container_runtime: runsc | runc` is the only sandbox-related manifest knob left, and
-> `CONTAINER_DEFAULT_RUNTIME` the only deployment-wide one.
-
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `SANDBOX_BACKEND` | `auto` | `auto` (bwrap, then Landlock), `bwrap`, or `landlock`. An invalid value warns and behaves as `auto`. |
-| `SANDBOX_SECCOMP` | `on` | Landlock helper's syscall deny-list. `off` passes `--no-seccomp`; use it if the filter breaks a runtime. The same filter is what refuses UDP/raw IP sockets under `network: none`, so with `off` that policy denies TCP connect/bind only and a tool can still reach the network over UDP (documented warning at startup). |
-| `SANDBOX_NET_DEFAULT` | `allow` | Deployment-wide network policy for tools: `allow` or `none`. A tool's own `network:` in `tool.yaml` overrides it. `none` gives the tool no network at all (loopback included) — bwrap via `--unshare-net`, Landlock via `--deny-net` on ABI 4+. An invalid value warns and falls back to `allow`. |
-| `SANDBOX_UID` / `SANDBOX_GID` | the hub's own uid (compose: `${SANDBOX_UID:-${TRELLIS_UID}}`, default `1000`) | uid/gid Landlock tools run as (and own the per-run `TMPDIR`). `0` is rejected. **This uid must own the `/app/workspace` tree**, otherwise Landlock tools cannot write there. On a non-root hub it must equal the hub's uid — there is no privileged helper to drop to a different one. bwrap is unaffected: it maps the hub uid 1:1 inside its namespaces. |
-| `SANDBOX_TMP_ROOT` | `/tmp/trellis` | Parent for per-run tmpdirs; created `0711`. Point it at a larger filesystem if `/tmp` is small. Compose forwards it to the hub; empty means the default. |
-| `SANDBOX_RLIMIT_AS_MB` | `4096` (4 GiB) | Address-space cap for each tool, **Landlock backend only**. `0` disables the limit. |
-| `SANDBOX_RLIMIT_CPU_S` | `600` | CPU-seconds cap for each tool, **Landlock backend only**. `0` disables the limit. |
-| `SANDBOX_RLIMIT_NPROC` | disabled | Process/thread cap for the tool's uid, **Landlock backend only**. Off by default because it counts every process of that uid on the host (containers share the kernel uid table), so a shared operator uid sits near the limit; set it only when the sandbox uid is dedicated. The container's `pids_limit` is the per-container backstop. |
-| `SANDBOX_RLIMIT_FSIZE_MB` | `64` | Largest file a tool may write (MiB), **Landlock backend only**. `0` disables the limit. |
-
-These limits are `setrlimit(2)` calls made by the Landlock helper (`sandbox/trellis-sandbox.c`) just before `exec`, so they are inherited by everything the tool spawns and are much harder to raise after the sandbox drop. **They apply to the Landlock backend only**: the helper is not in bwrap's argv and the hub passes no rlimit flags to bwrap, so under bwrap nothing is capped per tool. The container's own limits are the backstop on that path — `pids_limit`, plus `mem_limit` or `deploy.resources` if you need a hard memory bound. A tool that exceeds `SANDBOX_RLIMIT_FSIZE_MB` is killed by `SIGXFSZ`; one that exceeds `SANDBOX_RLIMIT_AS_MB` fails the allocation with `ENOMEM`.
-
-The backend and probe results are cached at startup, so apply any change with `docker compose up -d hub` (no rebuild needed). `SANDBOX_SECCOMP=off` must be set **before** the hub starts for the same reason: the preflight caches its verdict, including the helper argv it probes with.
-
-Rollback levers, cheapest first: `SANDBOX_BACKEND=bwrap` (one env var, no rebuild), `SANDBOX_SECCOMP=off` (disables the syscall filter but keeps filesystem confinement), and re-adding only `SYS_ADMIN` to the hub's `cap_add` if a host needs it for bwrap.
-
-To return to the old root-hub posture (for example, a host where bwrap can only set up its user namespace as root), delete the hub's `user:` line and restore the capabilities the root helper expects — `cap_add: [SYS_ADMIN, SETFCAP, SETUID, SETGID, CHOWN]` — then `docker compose up -d hub`. That is only needed when bwrap cannot start as the operator uid; it brings back the privilege-separation wart this migration removed (bwrap tools are uid 0 inside their namespaces, owned by root on the host, and Landlock relies on a setuid drop), so exhaust `SYS_ADMIN` alone and `SANDBOX_BACKEND=landlock` first.
-
-### Hardened Landlock-only variant
-
-> **Removed in v0.7.1.** There is no Landlock backend (and no `trellis-sandbox` helper) to
-> pin any more. Hardening a deployment now means the runtime: `runsc` (the default), nobody
-> else's data in the workspace, and `network: none` on tools that do not need egress.
-
-If you never want bwrap's container-level exceptions, pin the Landlock backend. The helper only *adds* restrictions (it runs unprivileged, applies Landlock, and installs seccomp), so Docker's default seccomp and AppArmor profiles are **expected** to be fine — this variant is not exercised in CI yet, so validate it against your Docker version before standardising on it:
-
-```yaml
-    cap_drop: [ALL]
-    security_opt:
-      - "no-new-privileges:true"
-    environment:
-      SANDBOX_BACKEND: landlock
-```
-
-The base hub already runs as `${TRELLIS_UID}` with `cap_drop: [ALL]` and an empty `cap_add`, so this only removes the three `*=unconfined` options (`systempaths=unconfined`, `seccomp=unconfined`, `apparmor=unconfined`) that exist for bwrap. No capability is needed: the helper runs as the workspace owner, so keep `SANDBOX_UID` at its default (the hub's own uid) — a non-root hub cannot drop to a different uid. `security_opt` is a list, so a plain `docker-compose.override.yml` appends to the base values instead of replacing them — edit the hub block directly, or replace that list with Compose's `!override` tag (Compose 2.24+).
-
-One caveat: `docker compose up --wait` fails when `/healthz` returns 503 — that is the intended signal, not a broken deploy. `host` depends on `hub` with `condition: service_started`, not `service_healthy`, so chat-only agents still start.
-
-## Execution isolation (v0.6)
-
-Since v0.6 every local tool call runs in its **own gVisor container**, created by a
-dedicated `runner` service. The hub no longer forks tool subprocesses and no longer
-needs a sandbox of its own: the compose default is `SANDBOX_BACKEND=container`, and the
-in-process `auto`/`bwrap`/`landlock` backends are **local-development only**. Each
-container sees its own toolkit directory read-only, `shared/` read-only, a sized tmpfs
+Every local tool call runs in its **own container**, created by a dedicated `runner`
+service; the hub no longer forks tool subprocesses and no longer needs a sandbox of its
+own. A container sees its toolkit directory read-only, `shared/` read-only, a sized tmpfs
 for `/tmp`, and (only when the tool declares `output_dirs`) the calling agent's output
-directory. The network is a deny-by-default profile.
+directory. Nothing else from the workspace is visible.
+
+`trellis-proxy` gives an edge the same model: the edge's own `runner` service creates the
+containers, and the proxy forwards calls over a shared socket volume.
 
 ### Secrets never in container configuration
 
-Resolved secrets reach a tool only through a one-line stdin preamble
-(`{"env": {...}}`) applied by `trellis-exec`, the shim the engine image installs at
-`/usr/local/bin/trellis-exec` (derived images inherit it). `docker inspect` on a running
-tool or MCP-session container therefore shows no declared secret — only fixed variables
-such as `HOME`, `PATH`, `LANG` and `TRELLIS_USER_*` — while the process inside still reads
-them from its environment. Everything after the preamble newline is the tool's own stdin,
-so the JSON stdin/stdout protocol and MCP stdio framing are unchanged; a malformed
-preamble makes the shim exit `78` before anything runs, and it never logs a key or value.
-If you build a tool image from this one and override the entrypoint, keep that contract.
+Resolved secrets reach a tool only through a one-line stdin preamble (`{"env": {...}}`)
+applied by `trellis-exec`, the shim the engine image installs at
+`/usr/local/bin/trellis-exec` (images derived from the engine image inherit it).
+`docker inspect` on a running tool or MCP-session container therefore shows no declared
+secret, only fixed variables such as `HOME`, `PATH`, `LANG` and `TRELLIS_USER_*`, while the
+process inside still reads the values from its environment. Everything after the preamble
+newline is the tool's own stdin, so the JSON stdin/stdout protocol and MCP stdio framing
+are unchanged. A malformed or oversized preamble (64 KiB total, 16 KiB per value) makes the
+shim exit `78` before anything runs, and it never logs a key or a value. If you build a tool
+image from this one and override the entrypoint, keep that contract.
 
 ### Prerequisite: gVisor (`runsc`)
 
 The runner refuses to start when its configured runtime is missing or cannot start a
-trivial container — there is no silent fallback to `runc`.
+trivial container. There is no silent fallback to `runc`.
+
+**Minimum version.** This release is validated against a `runsc` whose `runsc --version`
+reports **runtime-spec 1.2.1**. Use a current gVisor release and confirm that line before
+you deploy; an older `runsc` may start containers and still fail on the networking model
+described in [Network policy](#network-policy).
 
 1. Install `runsc` on the **host** (not in a container) from the gVisor release you
    have tested, and pin that version in your own provisioning. Releases since
@@ -433,10 +425,10 @@ trivial container — there is no silent fallback to `runc`.
    }
    ```
 
-   `--network=sandbox` keeps networking in gVisor's netstack so the `DOCKER-USER`
-   profile rules apply to the traffic that leaves the container. Do **not** add
-   `--ignore-cgroups=true`: per-container `--memory`/`--cpus`/`--pids-limit` come from
-   the manifest `limits:` block and need cgroups.
+   `--network=sandbox` keeps networking inside gVisor's netstack, which is the mode this
+   release is validated in. Do **not** add `--ignore-cgroups=true`: per-container
+   `--memory`/`--cpus`/`--pids-limit` come from the manifest `limits:` block and need
+   cgroups.
 
    Registering a runtime is one of the few daemon settings Docker reloads in place:
    after editing `daemon.json`, `sudo systemctl reload docker` is enough
@@ -447,10 +439,11 @@ trivial container — there is no silent fallback to `runc`.
 
    ```bash
    docker info --format '{{json .Runtimes}}' | grep runsc
+   runsc --version
    docker run --rm --runtime=runsc hello-world
    ```
 
-   Both must succeed. A per-tool `container_runtime: runc` in `tool.yaml` is the escape
+   All three must succeed. A per-tool `container_runtime: runc` in `tool.yaml` is the escape
    hatch for a tool that cannot run under gVisor; it forfeits the kernel-syscall
    isolation and must be justified per tool.
 
@@ -479,11 +472,12 @@ that socket as root on the host, and do not mount it anywhere else — not into 
 - **No etcd dependency:** it starts independently of the registry and reads manifests
   from its workspace mount.
 
-Startup gates (logged, fail closed) are: the runtime is present *and* starts a trivial
-container, `RUNNER_IMAGE` exists locally (the runner never pulls), the network-profile
-rules verify, the socket is `0660` for the app gid, and the host-path canary passes. Use
-`python scripts/runner_preflight.py` with the runner's environment to see each gate
-without fighting a restart loop.
+Startup gates (logged, fail closed) are: the configured runtime is registered, and if it
+is `runsc` a trivial container starts under it; `RUNNER_IMAGE` exists locally (the runner
+never pulls); the socket is `0660` for the app gid; `TRELLIS_UID`/`TRELLIS_GID` name a
+non-root user; every runtime a manifest declares is registered; and the host-path canary
+passes. Use `python scripts/runner_preflight.py` with the runner's environment to see each
+gate without fighting a restart loop.
 
 ### `TRELLIS_HOST_WORKSPACE` must be the host path
 
@@ -510,64 +504,44 @@ The check re-runs on `SIGHUP` and every `RUNNER_REAP_INTERVAL_S` seconds (defaul
 A failed re-check stops new calls (`runner_path_mismatch`) rather than running a tool
 against the wrong tree.
 
-### Network profiles
+### Network policy
 
-> **Removed in v0.7.1.** There are no profiles and no host firewall rules. `network:` is
-> `egress` (the default: Docker's default bridge — the container reaches whatever the host
-> can, cloud metadata included) or `none`. The `internal`/`internet`/`allow` values load as
-> `egress` with one deprecation warning per value; `deny`/`off` load as `none`. The table
-> and scripts below describe the v0.6 deployment and are kept as history until the v0.7.1
-> docs pass rewrites this section.
+A manifest's `network:` has exactly two values:
 
-| Profile | Docker network | Subnet (default) | Egress policy |
-| --- | --- | --- | --- |
-| `none` | — (`network_mode: none`) | — | loopback only |
-| `internal` | `trellis-tools-internal` | `172.31.241.0/24` | ACCEPT `TRELLIS_INTERNAL_CIDRS` + the resolver in `TOOLS_INTERNAL_DNS`; DROP everything else |
-| `internet` | `trellis-tools-internet` | `172.31.240.0/24` | ACCEPT public; DROP RFC1918, CGNAT, link-local, multicast, metadata, engine subnets |
+| Value | Container network |
+| --- | --- |
+| `egress` (default) | Docker's **default bridge**: whatever route and resolvers the host has |
+| `none` | No network at all: no route, no loopback, no resolver |
 
-`tool.yaml`'s `network:` defaults to `none`; legacy `allow` maps to `internet`. On top
-of the per-profile policy, `DOCKER-USER` drops — for every profile — cloud metadata
-(`169.254.169.254`, `fd00:ec2::254`, `100.100.100.200`, `169.254.169.123`), the host
-bridge gateway, and every compose network in `TRELLIS_ENGINE_SUBNETS` (etcd, redis,
-hub, relay, host). The rules are matched on the profile networks' CIDRs so they also
-cover gVisor netstack traffic exiting through the Docker bridge.
+There are no network profiles, no host firewall rules, no CONNECT proxy and no generated
+`resolv.conf`. `core/execution/netprofiles.py`, `scripts/setup-network-profiles.sh`,
+`scripts/egress_proxy.py`, `scripts/generate_egress_acl.py`,
+`docker-compose.egress*.yml` and the `DOCKER-USER` rules they installed were removed in
+v0.7.1, together with `TRELLIS_INTERNAL_CIDRS`, `TRELLIS_ENGINE_SUBNETS`,
+`TOOLS_INTERNAL_DNS` and the `TOOLS_NET_*_SUBNET` pair. The v0.6 profile names `allow`,
+`internet` and `internal` still load as `egress` with one deprecation warning per distinct
+value per process; `deny`/`off` load as `none`, and an unrecognized value falls back to
+`none`. A workflow's `config.yaml` is validated at sync time, so an unknown value there
+stops `db-sync` instead.
 
-Create the networks and rules once per host, as root:
+The console `execute` container is always `none`, and the `runner` itself runs with
+`network_mode: "none"`; neither has an option to change that.
 
-```bash
-sudo scripts/setup-network-profiles.sh            # networks + rules (idempotent)
-sudo scripts/setup-network-profiles.sh --verify   # exit non-zero if anything is missing
-```
+**Why the default bridge.** Under `runsc`, Docker's embedded resolver (`127.0.0.11`) on a
+user-defined network is unreachable: container-name and external lookups both time out. The
+default bridge works because Docker copies the host's real upstream resolvers into the
+container's `resolv.conf`, and that is the only reason tool, MCP and workflow containers
+ride it. Two consequences:
 
-The two tool networks are created by this script, not by `docker compose`, because they
-need pinned subnets and `enable_icc=false`; they are deliberately absent from the
-compose `networks:` block. Re-run `--verify` after a reboot, a firewall reload, or a
-Docker upgrade (Docker recreates `DOCKER-USER` empty), and from provisioning before
-`docker compose up -d`. The runner performs the same check at startup. `--teardown`
-removes only the rules, which is useful for tests.
+- Containers on the default bridge can reach **each other** by IP, so one tool container is
+  not isolated from another at layer 3.
+- Engine services are not on the default bridge (compose puts them on the project network),
+  so a tool cannot resolve `host`, `hub`, `relay`, `etcd` or `redis` by service name.
+  Published front-door ports remain reachable through the host's bridge gateway, which is
+  the same exposure any container on that bridge has.
 
-For a tool that needs to reach an internal API or SSH, add the destination to
-`TRELLIS_INTERNAL_CIDRS` (comma-separated) and give it `network: internal`. SSH is L3
-traffic, so a CIDR is enough — hostname allowlists still need the opt-in CONNECT proxy
-from [Egress mode](#egress-mode-opt-in).
-
-**Name resolution.** gVisor cannot reach Docker's embedded resolver (`127.0.0.11`),
-which Docker writes into the resolv.conf of every container on a user-defined network,
-so `getaddrinfo` fails inside every network profile by default. The runner therefore
-generates a resolv.conf per profile and bind-mounts it read-only over the container's:
-
-| Profile | Variable | Default |
-| --- | --- | --- |
-| `internet` | `TOOLS_INTERNET_DNS` | `1.1.1.1,8.8.8.8` |
-| `internal` | `TOOLS_INTERNAL_DNS` | empty (no resolver) |
-
-The file lives at `<workspace>/.runner-dns/<profile>.conf` (the workspace is the only
-path both the runner and the Docker daemon can see) and contains resolver addresses
-only. Set the variable to an empty string to keep Docker's file, or to a comma-separated
-list of IPs to override it; entries that are not IP addresses are ignored with a warning.
-An `internal` resolver must itself be inside an allowlisted `TRELLIS_INTERNAL_CIDRS`
-entry, otherwise the profile's blanket deny drops the queries. Tools on `none` have no
-network and therefore no DNS.
+The accepted risk that follows from this is stated in [Security notes](#security-notes);
+`network: none` is the only per-tool containment this release offers.
 
 ### Sizing
 
@@ -585,126 +559,62 @@ raise `RUNNER_MAX_CONTAINERS`; lower the global or per-tool caps on a small host
 `tmpfs_mb` counts against its `memory_mb` (validators keep `tmpfs_mb ≤ memory_mb / 2`).
 Image layers are shared, so the first pull dominates disk, not per-call cost.
 
-Rolling back to the in-process sandbox is `SANDBOX_BACKEND=auto` plus uncommenting the
-hub's legacy `security_opt` lines; the runner service stays in the compose file, idle.
-That path is for development hosts only — see [Sandbox settings and
-rollback](#sandbox-settings-and-rollback).
+A workflow run holds one of those global slots for its whole duration
+(`WORKFLOW_RUN_TIMEOUT`, default `3600` s), so size the cap for scripted workflows and
+interactive calls together.
 
-## Egress mode (opt-in)
+## Security notes
 
-> **Removed in v0.7.1.** `docker-compose.egress.yml`, `docker-compose.egress-ci.yml`,
-> `scripts/egress_proxy.py` and `scripts/generate_egress_acl.py` were deleted with the
-> network profiles: tool containers get Docker's default bridge (`network: egress`) or no
-> network at all (`none`), and no proxy, ACL or allowlist is involved. The commands below
-> — including `sandbox_smoke.py --check-egress`, a flag that no longer exists — describe
-> the v0.6 deployment and are kept only as history until the v0.7.1 docs pass rewrites this
-> section. `network: none` is the only containment option now.
+- **Accepted network risk.** With `network: egress`, a tool container can reach anything the
+  Docker host can reach: the internet, the host's private networks and internal services on
+  its routing table, and the cloud metadata endpoint (`169.254.169.254`). There is no
+  per-destination allowlist or egress filter in this release. Treat every tool manifest as a
+  statement about what that tool may reach, set `network: none` on anything that does not
+  call an external API, and review tool code the way you review a service account.
+- **`runsc` is the isolation boundary.** It is the only thing between a tool container and
+  the host kernel. A production deployment must not run on `runc`.
+- **Secrets are not container configuration.** They arrive through the `trellis-exec` stdin
+  preamble, so `docker inspect` shows none of them. See
+  [Secrets never in container configuration](#secrets-never-in-container-configuration).
+- **Tool access rules gate tools; the console is separate.** `workspace/policies/tool_access.yaml`
+  narrows who may call a hub, edge or MCP tool, and it can only narrow what an agent's
+  allowlist already grants. Of the console tools, only `execute` passes through it; the file
+  tools (`ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`) stay in the host
+  process, rooted at `reports/<agent>`, and are constrained by the agent's console
+  allowlist alone. `execute` itself runs in a throwaway container with no network and an
+  empty `/workspace`.
+- **Identity comes from the token.** No request body carries a caller identity, and a token
+  is enforced by default (`ENFORCE_AGENT_TOKENS=enforce`). Keep `DEV_MODE=false` on anything
+  shared.
+- **Workspace ownership.** Tool containers run as `${TRELLIS_UID}:${TRELLIS_GID}` with all
+  capabilities dropped, a read-only root filesystem and `no-new-privileges`. That uid must
+  own the workspace tree, or a tool cannot write under `output/` or `reports/`.
 
-By default the hub — and therefore every tool it spawns — has the same unrestricted outbound access as any other container on `trellis-network`. Egress mode removes that: the hub gets a route to **one** CONNECT proxy and nothing else, and that proxy only connects to domains some tool declared in its `tool.yaml`. LLM providers are unaffected: those calls are made by `host`, which keeps its default-network route.
+The infrastructure checks behind these statements:
 
-### Enable and disable
+| Proof | Covers |
+| --- | --- |
+| `docker-compose.ci-isolation.yml` (self-hosted host with `runsc` registered) | What a real gVisor tool container can see, write and reach: `tests/live -m runsc`, including "no egress under `network: none`". |
+| `.github/workflows/sandbox-smoke.yml` → job `Sandbox smoke` | The same container contract end to end on the runtime every dev machine has (`runc`): build the stack, run `scripts/sandbox_smoke.py --tool text_stats`. |
 
-Egress mode is a compose override, and a committed override file is **not** auto-loaded. Enable it in `.env`:
-
-```bash
-COMPOSE_FILE=docker-compose.yml:docker-compose.egress.yml
-```
-
-or pass the files explicitly:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.egress.yml up -d
-```
-
-> **The override is not sticky.** Any later plain `docker compose up -d` (with `COMPOSE_FILE` no longer set) silently drops it and puts the hub back on `trellis-network` with full outbound access. Keep `COMPOSE_FILE` in `.env` for as long as you want egress mode, and check `docker inspect tool-hub --format '{{json .NetworkSettings.Networks}}'` after every deploy.
-
-> **Image requirement.** The proxy runs `scripts/egress_proxy.py` from the app image. `v0.3.0` is the first release that ships it; if you pin an older `TRELLIS_IMAGE` (or build from a pre-`v0.3.0` checkout), add `--build`.
-
-What the override adds:
-
-- `toolnet`, an `internal: true` network with no default route;
-- the hub on `toolnet` **only** (`networks: !override`; Compose otherwise merges and keeps `default`);
-- `host`, `gateway`, `taskiq-worker`, `etcd`, and `redis` on both networks — they still need to reach the hub, or be reached by it, by service name;
-- `egress-proxy`, the only container on both `toolnet` and `default`, running `scripts/egress_proxy.py`;
-- `HTTP_PROXY`/`HTTPS_PROXY` (and lowercase forms) plus `NO_PROXY` on the hub, which tools inherit.
-
-`NO_PROXY` is load-bearing: the hub talks to etcd and the runner socket path must never be proxied. Those names must bypass the proxy, which is why the override lists `etcd,redis,host,hub,gateway,taskiq-worker,localhost,127.0.0.1,::1`.
-
-### The allowlist
-
-Each tool entry may declare the external domains it needs:
-
-```yaml
-- name: issues_fetch
-  runtime: python
-  entrypoint: fetch_issues.py
-  egress:
-    - api.example.com
-    - "*.vendor.example"
-```
-
-The proxy container generates its allowlist at startup from the **union** of every `workspace/tools/**/tool.yaml`:
-
-```bash
-python scripts/generate_egress_acl.py                 # union on stdout
-python scripts/generate_egress_acl.py --out FILE      # write it
-python scripts/generate_egress_acl.py --check         # CI: validate only
-```
-
-Entries are stored as plain lowercase DNS suffixes; `example.com` covers the name itself and every `*.example.com`. Wildcards are accepted as input and normalized, parents are dropped (`api.example.com` disappears once `example.com` is present), and an invalid entry is fatal — the proxy container does not start, which fails closed. An empty union writes an empty file and prints a warning; the proxy then denies everything. There is no allow-all mode.
-
-Restart the proxy after editing tool manifests: `docker compose restart egress-proxy`. A tool that needs a new domain is a content change plus that restart, not a rebuild.
-
-### Guarantees
-
-- **No direct route.** The hub is attached only to `toolnet` (`internal: true`), so a tool cannot open a TCP connection to the internet. `sandbox_smoke.py --check-egress` asserts this from inside the sandbox.
-- **CONNECT allowlist.** The proxy accepts only `CONNECT host:port`; the port must be in `EGRESS_PORTS` (default `443`) and the host must match the generated suffix list. Anything else is `405`/`403`.
-- **No IP literals, no private destinations.** A CONNECT to `1.2.3.4:443` is rejected before any lookup. Every resolved address is checked, and if any is private, loopback, link-local, reserved, unspecified, or multicast the tunnel is refused. Set `EGRESS_ALLOW_PRIVATE_DESTINATIONS=true` only for a CI mock or an on-prem API that genuinely lives on a private network.
-- **DNS is a residual channel.** `internal: true` removes the default route, so TCP/UDP cannot leave. The embedded Docker resolver still forwards external name lookups from the host stack (the query carries the container's source address; there is no route check), so a compromised tool can encode data in query names if the host resolver reaches the internet. `network: none` closes this channel; otherwise treat external DNS as egress.
-- **Bounded tunnels.** Connect timeout (10 s), idle timeout (60 s), absolute tunnel lifetime (600 s), and a concurrent-tunnel cap (64) are enforced; the cap answers `503`.
-
-### Non-guarantees (v1)
-
-- **The allowlist is a union, not per-tool.** Any tool can reach any domain any tool declared. A compromised tool cannot invent an endpoint, but it can talk to another tool's vendor. Per-tool enforcement needs proxy authentication and is the v2 refinement.
-- **Tools still reach etcd and redis.** The hub shares `toolnet` with them (they must, for the registry and secrets), and tools share the hub's network namespace. `network: none` is the mitigation for tools that need no network at all; treat etcd/redis isolation as a separate platform concern.
-- **Non-HTTP egress is blocked.** SSH, arbitrary TCP, and anything that is not `CONNECT` on an allowlisted port cannot work in egress mode. Raw sockets and UDP have no route either, because the only attached network is `toolnet` and it has no default route. That is intended.
-- **Node `fetch`/`undici` ignore `HTTP_PROXY`** (and fail closed, because there is no direct route). Go tools built in the hub honour the proxy, so `proxy.golang.org` and any module host must be in the union if a tool imports third-party packages at build time. Python `requests`/`httpx` honour the env vars.
-- **No TLS interception.** The proxy tunnels bytes; it cannot inspect or filter HTTP, and it does not cache.
-
-### Rollback
-
-Egress mode is one `-f` away from off, and no data is involved:
-
-```bash
-# 1. Remove COMPOSE_FILE from .env (or omit the -f flags).
-# 2. Recreate the stack on the default network. --remove-orphans also deletes
-#    egress-proxy, which is no longer part of the config and would otherwise
-#    keep toolnet attached (and block step 3).
-docker compose --remove-orphans up -d
-# 3. toolnet has no members now; remove the leftover network by name.
-docker network ls | grep toolnet
-docker network rm <project>_toolnet
-```
-
-Order matters: `docker network rm` fails while the orphaned proxy container is still attached. A full `docker compose down` (without `-v`) also removes both, but stops the stack. Never use `down -v`: it deletes the `etcd-data` volume.
-
-### Troubleshooting
-
-- **`ENETUNREACH` / `EHOSTUNREACH` inside a tool** means it tried a direct connection: either the proxy is down (`docker compose logs egress-proxy`), or the domain is not in the union. The proxy log has one line per decision with `decision=deny reason=...`.
-- **`403` from a client that sets `HTTPS_PROXY`** is the proxy refusing the target: `reason=not-allowlisted`, `port-not-allowed`, `ip-literal`, or `private-destination`. Regenerate the ACL (`docker compose restart egress-proxy`) after adding the domain.
-- **`502`** means the name was allowlisted and public, but the upstream connect failed (timeout, refused).
-- **Failures are fast, not timeouts.** If `NO_PROXY` was overridden, calls to `http://host:8000` fail immediately with `405` (plain HTTP through a CONNECT-only proxy) or `403 port-not-allowed` (if the client CONNECTs); nothing hangs. Compare `docker compose exec hub printenv NO_PROXY` with the value in `docker-compose.egress.yml`.
-- **The hub lost its network after a deploy** means the override was dropped. Re-apply it and re-check the membership above.
+## Smoke checks after a deploy
 
 ```bash
 docker compose ps                       # every service up; db-sync exited 0
 curl -sI localhost                      # front door answers through nginx
 docker compose exec host curl -sf http://127.0.0.1:8000/health
-docker compose exec hub curl -s localhost:8001/healthz | python -m json.tool
+docker compose exec hub curl -s http://127.0.0.1:8001/healthz   # liveness only
+docker compose exec runner python -m core.execution.runner --healthcheck
+#   ^ probes /v1/healthz over the socket with RUNNER_TOKEN: runtime, image, canary
+docker compose logs db-sync             # sync counts, tool-access policy line
 # The container execution contract, end to end (needs the runner + Docker).
 docker compose exec hub python scripts/sandbox_smoke.py --tool text_stats
-docker compose logs db-sync             # sync counts
 docker compose exec host python scripts/trellis logs --limit 5
 ```
 
-`/healthz` returning 503 is a real sandbox diagnosis (`code` + `remediation`), not a dead deployment: the hub is up, chat-only agents keep working, and only local tool calls fail until the cause is fixed. The verdict is cached at startup and re-probed after a classified tool failure marks it stale (one probe set at a time, at most once per minute), so a host fixed under a running hub is re-checked on the next health check or tool call. The limit is one-directional: a hub that started with a failing verdict keeps it until restarted, because nothing invalidates a verdict that never let a tool run. Fix the host, then restart the hub (`docker compose up -d hub`) to re-probe.
+The runner's `/v1/healthz` is the place to look when tool calls fail: it reports the
+runtime, the image and the host-path canary separately, and a failing gate refuses new
+calls with a specific code instead of running a tool against the wrong tree. The hub's own
+`/healthz` is only a liveness probe; chat-only agents keep working while the runner is
+down.
+

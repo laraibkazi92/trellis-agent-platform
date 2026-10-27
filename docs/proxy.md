@@ -32,7 +32,7 @@ INTERNAL VM -- outbound 443 only, no public IP
 │                       export_mcps)               │
 │  edge-secrets/       (shared credentials)        │
 │  edge-key            (0400 private seal key)     │
-│  sandbox (bwrap | Landlock)                      │
+│  forwards calls to the edge runner (v0.6)        │
 └──────────────────┬───────────────────────────────┘
                    │ wss://central/edge/v1/connect
                    ▼
@@ -55,20 +55,19 @@ The relay is a tunnel terminator, not an MCP server: it speaks plain internal HT
 hub and one WebSocket per site to the edges. It runs as a single replica because the
 site → connection map lives in process memory.
 
-## Edge runner (v0.6)
+## Edge runner
 
-Since v0.6 an edge executes tool calls in a **local `runner` service**, not as a child
-process of `trellis-proxy`. The sample `deploy/proxy/docker-compose.yml` ships both
-services:
+An edge executes tool calls in a **local `runner` service**, never as a child process of
+`trellis-proxy`. The sample `deploy/proxy/docker-compose.yml` ships both services:
 
-- **`runner`** — the only container on the edge with `/var/run/docker.sock`. It creates
-  one gVisor (`runsc`) container per tool call, gives it a read-only suite mount plus
-  `shared/`, a sized tmpfs, and the deny-by-default network profile from the tool's
-  manifest. It has `network_mode: "none"` and serves a Unix socket at
-  `/run/trellis/runner.sock`, never a port.
-- **`trellis-proxy`** — unchanged in role (dial out over WSS, one tunnel per edge), but
-  it forwards every tool call and stdio MCP session over the shared `proxy-runner`
-  volume to the runner service instead of forking tools.
+- **`runner`** — the only container on the edge with `/var/run/docker.sock`. It creates one
+  container per tool call (gVisor `runsc` where it is registered, `runc` on a dev machine),
+  gives it a read-only suite mount plus `shared/`, a sized tmpfs, and whichever network the
+  manifest asks for (`egress` or `none`). It has `network_mode: "none"` and serves a Unix
+  socket at `/run/trellis/runner.sock`, never a port.
+- **`trellis-proxy`** — unchanged in role (dial out over WSS, one tunnel per edge), but it
+  forwards every tool call and stdio MCP session over the shared `proxy-runner` volume to
+  the runner service instead of forking tools.
 
 Set in `proxy.yaml`:
 
@@ -91,38 +90,29 @@ runner's startup canary and it refuses to serve. The `runner` also mounts the wo
 read-write (it writes the canary and creates output directories) while tool containers
 still see only their read-only mounts.
 
-> **v0.7.1: the edge proxy never verifies an agent token.** `trellis-proxy` uses the
-> identity the relay derived over the authenticated tunnel — see
-> [Edge credentials](#edge-credentials) — and takes no `AGENT_TOKEN_SECRET`. The edge
-> **runner** keeps the key (the sample compose sets it there only): it verifies the
-> forwarded token's signature and expiry, then derives the agent and the output dir from
-> that token's claims. It makes no authorization decision — the relay already made it for
-> the call it forwarded. The edge `.env` must carry a valid `AGENT_TOKEN_SECRET` (the
-> same value as central); the runner refuses to start without one.
+> **The edge proxy never verifies an agent token.** `trellis-proxy` uses the identity the
+> relay derived over the authenticated tunnel (see [Edge credentials](#edge-credentials)) and
+> takes **no `AGENT_TOKEN_SECRET`**. The edge **runner** keeps the key, and the sample
+> compose sets it there only: it verifies the forwarded token's signature and expiry, then
+> derives the agent and the output dir from that token's claims. It makes no authorization
+> decision, because the relay already made it for the call it forwarded. The edge `.env`
+> must still carry a valid `AGENT_TOKEN_SECRET` (the same value as central), or the runner
+> refuses to start. `ENFORCE_AGENT_TOKENS` defaults to `enforce` there too.
 
-Prerequisites on the edge host are the same as central: `runsc` registered with Docker
-(proved with `docker run --runtime=runsc hello-world`) and the network profiles created
-by `sudo scripts/setup-network-profiles.sh`. Both are covered in
-[deploy.md → Execution isolation](deploy.md#execution-isolation-v06).
+Prerequisites on the edge host are the same as central: Docker, plus `runsc` registered
+with it (proved with `docker run --runtime=runsc hello-world`). A dev machine without
+gVisor sets `CONTAINER_DEFAULT_RUNTIME=runc` for the edge runner as well. See
+[deploy.md → Execution isolation](deploy.md#execution-isolation) and
+[deploy.md → Dev machine](deploy.md#dev-machine-docker-desktop).
 
-> **v0.7.1:** the network profiles (and `scripts/setup-network-profiles.sh`) are
-> removed, and the legacy `sandbox: auto | bwrap | landlock` values below no longer
-> select anything -- the edge runner is the only execution path. Set
-> `CONTAINER_DEFAULT_RUNTIME=runc` on a host without gVisor. See
-> [upgrading.md → v0.7.1](upgrading.md#v071--in-development-breaking).
-
-Legacy note: `sandbox: auto | bwrap | landlock` (and `sandbox: container`) is gone as of
-v0.7.1. An existing `proxy.yaml` that still carries a `sandbox:` key **loads normally** —
-the key is ignored with a single deprecation warning, because the edge always runs tools
-through the runner — but nothing selects an in-process backend any more, so an edge needs
-a working runner even on a laptop (set `CONTAINER_DEFAULT_RUNTIME=runc` there).
-`edge-secrets/` (the shared
-service account) is unchanged by phase 4; the plaintext `edge-user-secrets/` directory and
-its `user-secrets` CLI were **removed** -- per-user credentials are now browser-sealed
-ciphertext opened with `edge-key` (see [Per-user credentials and the edge
-key](#per-user-credentials-and-the-edge-key)). **MCP sessions and `execute` console calls
-also run as runner containers** (phase 2), so an edge's session state is never on its host
-disk.
+`proxy.yaml` no longer has a sandbox selector. An existing config that still carries a
+`sandbox:` key **loads normally**: the key is ignored, because the edge always runs tools
+through the runner and there is no in-process backend any more. `edge-secrets/` (the shared
+service account) is unchanged, while the plaintext `edge-user-secrets/` directory and its
+`user-secrets` CLI are gone: per-user credentials are browser-sealed ciphertext opened with
+`edge-key` (see [Per-user credentials and the edge key](#per-user-credentials-and-the-edge-key)).
+MCP sessions and `execute` console calls also run as runner containers, so an edge keeps no
+session state on its host disk.
 
 ## Enrollment
 
@@ -155,8 +145,9 @@ mistake, only one of them serves calls.
 ## Authoring tools
 
 An edge tool is authored like a local one: `workspace/tools/<tool>/tool.yaml` plus its
-script, same fields, same sandbox. There is no remote-specific marker to add and no
-`mcp__` naming — the relay does the translation from catalog to registry.
+script, same fields, same execution model (a runner container on that VM). There is no
+remote-specific marker to add and no `mcp__` naming: the relay does the translation from
+catalog to registry.
 
 What differs on an edge:
 
@@ -170,8 +161,8 @@ What differs on an edge:
   else in the edge container's `.env` is invisible. See
   [Environment scoping](#environment-scoping).
 - **Credentials are resolved per call from edge-local files**, with an optional per-user
-  store, so the v0.4 limitation that every edge tool ran as one service account no longer
-  applies. See [Edge-local credentials](#edge-local-credentials).
+  sealed set, so the v0.4 limitation that every edge tool ran as one service account no
+  longer applies. See [Edge credentials](#edge-credentials).
 - **`retry_on_transient` defaults to `false`** for remote tools: a dropped tunnel must not
   silently replay a call that already had a side effect.
 
@@ -324,10 +315,10 @@ Nothing a user types ever crosses the tunnel or reaches etcd in the clear, and t
 |---|---|---|---|
 | `secrets_dir` | `edge-secrets` | `TRELLIS_EDGE_SECRETS_DIR` | `<tool-or-mcp>.env`, one service account per exported item |
 
-It must live **outside** the sandbox-writable workspace: the workspace is the only path a
-tool can write, so a credential store inside it would be readable (and writable) by every
-exported tool. The sample compose mounts it at `/etc/trellis/edge-secrets`; if you maintain
-your own compose file, add the mount
+It must live **outside** the workspace: a tool container mounts only its suite, `shared/`
+and a declared output directory, so a credential store inside the workspace would be inside
+the tree a tool can read. The sample compose mounts it at `/etc/trellis/edge-secrets`; if
+you maintain your own compose file, add the mount
 ([upgrading.md](upgrading.md#compose-and-volume-changes)). The *path* needs a restart; the
 *contents* do not (tool calls re-read them, MCP sessions re-read them at creation or on
 `SIGHUP`).
@@ -528,11 +519,11 @@ gets `credential_rejected`.
 must be re-entered in the UI. There is no recovery path, by design: central never has the
 private key. Keep `/etc/trellis/keys/edge-key` in the host backup.
 
-### Removals in v0.6.0
+### Removals: plaintext per-user credentials
 
-- `edge-user-secrets/` and `proxy.yaml`'s `user_secrets_dir` are gone. A leftover directory
-  is ignored and logs one startup warning; delete it after users have re-entered their
-  sets.
+- `edge-user-secrets/` and `proxy.yaml`'s `user_secrets_dir` are gone, and so is the
+  startup warning about a leftover directory. A leftover directory is ignored: delete it
+  after users have re-entered their sets.
 - `trellis-proxy user-secrets` is gone (`set`, `list`, `delete`). The command is unknown,
   not deprecated.
 - A per-user credential cannot be a `variable`; the write endpoint rejects the blob and the
@@ -572,7 +563,7 @@ credentials.
   share the tunnel-wide in-flight semaphore (`MAX_INFLIGHT`) with tool calls.
 
 stdio servers run in a runner session container built from `mcp.yaml`: the server directory
-is mounted read-only, `network:` selects the profile (`none` by default), and the
+is mounted read-only, `network:` is `egress` (the default) or `none`, and the
 `credential_mode` env is resolved once at session creation. `http`/`streamable-http`/`sse`
 servers spawn no container; the declared credentials are sent as headers only.
 
@@ -582,20 +573,22 @@ A server with no static `tools:` catalog is discovered by opening a throwaway se
 `kind="discovery"` and a 60 s deadline, listing its tools, and tearing the container down.
 The result is cached per export signature (dropped on `SIGHUP`), so a reload does not
 re-spawn for an unchanged server. Discovery leaves no container and no directory behind.
+That path is the one engine-internal read that still bypasses the tool-access evaluator:
+it is gated by `RUNNER_TOKEN` on the socket, not by a caller principal, and it executes
+nothing.
 
-### Sandbox limits for Node MCP servers
+### Limits for Node MCP servers
 
 A stdio MCP server lives for the whole session rather than one call, so size the limits
-for a long-lived Node process. Under the container backend these are `limits:` in
-`mcp.yaml` (defaults: `memory_mb: 2048`, `cpus: 2.0`, `pids: 512`, `tmpfs_mb: 512`) — a
-`tmpfs_mb` at or near `memory_mb` OOM-kills the session, and the manifest validator
-requires `tmpfs_mb * 2 <= memory_mb`. See
+for a long-lived Node process. They come from `limits:` in `mcp.yaml` (defaults:
+`memory_mb: 2048`, `cpus: 2.0`, `pids: 512`, `tmpfs_mb: 512`); a `tmpfs_mb` at or near
+`memory_mb` OOM-kills the session, and the manifest validator requires
+`tmpfs_mb * 2 <= memory_mb`. See
 [mcp.md → Memory sizing](mcp.md#memory-sizing-sessions--limitsmemory_mb--60--of-host-ram).
 
-The legacy bwrap/Landlock path (`sandbox: auto | bwrap | landlock`, and the
-`SANDBOX_RLIMIT_AS_MB` / `SANDBOX_RLIMIT_CPU_S` knobs it read) was removed in v0.7.1;
-container limits come from the manifest's `limits:` block only. See
-[upgrading.md → v0.7.1](upgrading.md#v071--in-development-breaking).
+There is no other limit mechanism: the in-process backends and the `SANDBOX_RLIMIT_*`
+variables they read were removed in v0.7.1 (see
+[upgrading.md → v0.7.1](upgrading.md#v071-2026-10-26)).
 
 ## Protocol v2 and compatibility
 
@@ -605,7 +598,8 @@ container limits come from the manifest's `limits:` block only. See
   `lazy_catalog: true` is set) and `mcps` (the
   catalogs). A proto-1 hello has neither and is read as tools-only.
 - Calls carry `kind: "tool" | "mcp"` (absent means `"tool"`, so v0.4 frames are
-  unchanged), plus `mcp` for MCP calls and the optional `user_email`.
+  unchanged) plus `mcp` for MCP calls. The frame's `user`/`user_email` are **derived from
+  the verified token's claims** at the relay; a request body cannot set them (v0.7.1).
 - **Upgrade central before edges.** A v0.5 edge dialing a v0.4 relay is refused at the
   handshake with `CLOSE_VERSION` (close code `4001`); the edge logs one terminal
   "version mismatch — upgrade central first" line and retries only at the maximum backoff
@@ -626,7 +620,7 @@ container limits come from the manifest's `limits:` block only. See
 | Edge drops mid-call | In-flight calls fail with `edge_disconnected`; they are never replayed |
 | Token revoked | Handshake `401`; a live socket is closed with `4403` |
 | Relay restart | Edges reconnect with jittered backoff (1 s → 60 s); catalogs are republished |
-| Tool timeout | The edge kills the process tree (existing sandbox logic) and returns an error result |
+| Tool timeout | The edge kills the container (process tree included) and returns an error result |
 | MCP server not exported | Relay answers `404 unknown_mcp`; central reports that the site does not export the MCP tool |
 | MCP deadline (`edge_timeout`) | The call fails; the session is **kept** (login state intact) and nothing is replayed |
 | MCP server crashed / session evicted | That call returns `mcp_session_lost`; the next call starts a fresh session |
@@ -666,26 +660,25 @@ container limits come from the manifest's `limits:` block only. See
   encryption is not part of this release.
 - Site compromise is bounded to that site's catalogs. Central/relay compromise is bounded
   to the union of exported tools — not the customer's network.
-- **Exported tools are trusted code on that VM.** They run unsandboxed from the proxy's
-  point of view in the sense that they share its uid: they can read the workspace, the
-  edge's `env_file` (a file on disk is readable to the uid even though its keys are no
-  longer *inherited* into the child env), and the credential stores, and (if they are
-  malicious) the token file or the proxy's memory. The token cannot cross to another
-  site — it is site-scoped and the relay derives identity from its hash — but a malicious
-  *tool author* on a trusted edge can impersonate that edge. Review tool code the way you
-  review a service account.
-  The token is read from a file and the file is unlinked, so it is not inherited through
-  the process environment; a read-only secret mount cannot be unlinked, which is a
-  residual (same-uid) exposure.
-- **The edge trusts central's identity assertion.** Per-user credentials are selected by
-  the `user_email` central puts in the call frame, over the authenticated tunnel; the
-  edge cannot verify it independently. See
-  [Edge-local credentials](#edge-local-credentials).
+- **Exported tools are trusted code on that VM, not code that shares the proxy's uid.** A
+  tool runs as the workspace owner (`TRELLIS_UID`) in its own runner container, with only
+  its suite, `shared/` and a declared output directory mounted, so it cannot read the
+  proxy's environment, the unlinked token file or the credential stores; the edge key is
+  mounted into `trellis-proxy` only. What it can still do is act as that uid on that host
+  and reach whatever its `network:` allows (`egress` reaches whatever the host reaches).
+  A malicious *tool author* on a trusted edge can therefore originate calls that look like
+  that edge's, and the tunnel token cannot cross to another site because it is site-scoped
+  and the relay derives identity from its hash. Review tool code the way you review a
+  service account.
+- **The edge trusts the relay's identity assertion.** Per-user credentials are selected by
+  the identity the relay derived from the verified token's claims (`u`/`e`) and put in the
+  call frame over the authenticated tunnel; the edge proxy verifies no token and cannot
+  check that identity independently. See [Edge credentials](#edge-credentials).
 - Edge payloads are capped (10 MB frame, 1 MB arguments, 200 tools per site, 50 MCP
   servers × 256 tools × 128 KiB schema, 16 in flight) and the relay logs site, tool, call
-  id, duration, and outcome — never arguments or results. MCP calls log the same fields
-  plus `mcp` under the `mcp_call` event. The user id travels in the call frame for
-  attribution and is not logged with the payload.
+  id, duration, and outcome, never arguments or results. MCP calls log the same fields
+  plus `mcp` under the `mcp_call` event. The frame's identity is used for attribution and
+  a sealed credential's AAD, and is not logged with the payload.
 
 ## Operating an edge fleet
 
@@ -783,7 +776,7 @@ its own container tmpfs `HOME`/`TMPDIR`. The edge's workspace mount is therefore
 in every supported setup.
 
 `WORKSPACE_ROOT` (default `/app/workspace`) is read for one thing only: the startup warning
-when a v0.5 `mcp-sessions/` directory is still lying around (dead state — delete it).
+when a v0.5 `mcp-sessions/` directory is still lying around (dead state, delete it).
 
 ### Reloading without a restart
 
@@ -807,9 +800,12 @@ Live (applied on the next publish):
 Restart-required (the proxy logs a warning and keeps the current value if you try):
 
 - `site`, `server_url`, the token (`token_env`/`token_file`), the `tls_*` files;
-- `sandbox` (backend selection) and `env_passthrough`;
+- `env_passthrough`;
 - the `secrets_dir` **path**. The edge key is re-read on `SIGHUP`, so a rotation takes
   effect on the next hello without a restart.
+
+An old `sandbox:` key is ignored entirely: there is no backend to select, and every call
+runs in the edge runner.
 
 ### Relay shutdown
 

@@ -2,14 +2,11 @@
 
 Tools are standalone executables that agents call to interact with external systems — APIs, databases, CLIs, or any process. They are language-agnostic and communicate via JSON over stdin/stdout.
 
-> **v0.7.1 removed the sandbox-backend and network-profile model.** There is exactly one
-> execution path — the `runner` starts one container per call (`runsc` in production,
-> `runc` on dev machines) — and per-manifest `network:` is now only `egress` (the default:
-> Docker's default bridge) or `none`. `SANDBOX_BACKEND`, the bwrap/Landlock backends, the
-> AppArmor profile, `TRELLIS_INTERNAL_CIDRS` and the opt-in egress proxy are gone. This
-> page is corrected where the change is security-relevant; the full rewrite is tracked for
-> the v0.7.1 docs pass, so prefer [upgrading.md → v0.7.1](upgrading.md#v071--in-development-breaking)
-> when the two disagree.
+> **Execution model.** There is exactly one path: the `runner` service starts one container
+> per call (`runsc` in production, `runc` on a dev machine), and a manifest's `network:` is
+> `egress` (the default, Docker's default bridge) or `none`. See
+> [Container execution contract](#container-execution-contract) for what a tool container
+> sees, and [Tool access rules](#tool-access-rules) for who may call it.
 
 ---
 
@@ -59,15 +56,10 @@ Check the tool's `tool.yaml` for required `inputs`, `secrets`, and `variables` b
 
 ## Building Tools
 
-### Sandbox Model
+### Execution model
 
-There is one execution model since v0.7.1: every local tool call is its own **runner
-container** (see the [container execution contract](#container-execution-contract-v06)
-below). The in-process `bwrap` and `Landlock` backends, the `trellis-sandbox` helper, the
-shipped AppArmor profile and the `SANDBOX_BACKEND` selector were removed — a deployment that
-still sets `SANDBOX_BACKEND` is ignored rather than honoured.
-
-What that means for tool code:
+There is no in-process path: the hub, the gateway and an edge proxy all hand a tool call to
+a `runner`, which creates the container from your manifest. What that means for tool code:
 
 - The container's `$HOME` and `$TMPDIR` are a disposable tmpfs: scratch space only, gone
   with the container.
@@ -80,12 +72,12 @@ What that means for tool code:
 - POSIX shared memory and PTY allocation work as they do in any container started from the
   image; size `limits:` around a tool that needs more than the defaults.
 
-### Container execution contract (v0.6)
+### Container execution contract
 
-Since v0.6 every local tool call is its **own gVisor container**, created by the `runner`
-service from your manifest. Container paths are the same ones tools already use, so the
-JSON stdin/stdout protocol, `TRELLIS_USER_ID`/`TRELLIS_USER_EMAIL`, and wrapper scripts do
-not change; what changes is what exists around the process.
+Every local tool call is its **own container**, created by the `runner` service from your
+manifest. Container paths are the same ones tools already use, so the JSON stdin/stdout
+protocol, `TRELLIS_USER_ID`/`TRELLIS_USER_EMAIL`, and wrapper scripts do not change; what
+changes is what exists around the process.
 
 | Mount | Container path | Mode |
 | --- | --- | --- |
@@ -124,7 +116,11 @@ the way results reach the agent.
   declares (secrets, `variables`, a literal `env:` block) arrives through the preamble. If
   your manifest pins `image:` to something that is *not* derived from the engine image, that
   image must provide `/usr/local/bin/trellis-exec` (or your own equivalent that reads the
-  same one-line preamble); a container started without it never runs its command.
+  same one-line preamble); a container started without it never runs its command. The
+  preamble is capped at **64 KiB total and 16 KiB per value**: past either limit the shim
+  exits `78` before your script runs, so keep large blobs (a service-account JSON, say) out
+  of a single variable. A declared name that cannot be an environment variable
+  (`my-secret`) is refused by `db-sync` at sync time rather than dropped at call time.
 - **Identity and rootfs:** the tool runs as `TRELLIS_UID:TRELLIS_GID` with all
   capabilities dropped, a read-only root filesystem and `no-new-privileges`.
 - **Runtime:** `container_runtime` selects `runsc` (default), `runsc-variant`, or `runc`
@@ -310,7 +306,7 @@ network, because that is now the only real control.
 
 > **Author guidance:** `retry_on_transient` defaults to `true`. If your tool creates, posts, updates, deletes, sends, comments, or otherwise has a non-idempotent side effect against a 3rd-party system (ticketing systems, Slack, support systems, SSH/infra operations, local writes, etc.), you must explicitly set `retry_on_transient: false` in that tool's `tool.yaml` entry — do not rely on the default. Read-only/query tools can safely leave it unset.
 
-**Timeouts** — every subprocess execution is bounded by `TOOL_EXECUTION_TIMEOUT` (default **300 s**; change it in the Admin Dashboard -> Limits & Tuning, or set the env var as a deployment default). Override the default for a single tool with `timeout_seconds`. Timeouts are **immediately fatal — never retried**: a tool that hung for the full timeout is almost certainly stuck, and retrying would only multiply wall-clock time and side-effect risk. The failure is still recorded as a health event for the circuit breaker.
+**Timeouts** — every tool call is bounded by `TOOL_EXECUTION_TIMEOUT` (default **300 s**; change it in the Admin Dashboard -> Limits & Tuning, or set the env var as a deployment default). Override the default for a single tool with `timeout_seconds`. Timeouts are **immediately fatal — never retried**: a tool that hung for the full timeout is almost certainly stuck, and retrying would only multiply wall-clock time and side-effect risk. The failure is still recorded as a health event for the circuit breaker.
 
 ```yaml
 - name: issues_create_ticket
@@ -330,10 +326,13 @@ network, because that is now the only real control.
 
 | Runtime | `entrypoint` | Notes |
 |---------|-------------|-------|
-| `python` | `.py` file | Runs with the hub's Python 3.12 interpreter |
+| `python` | `.py` file | Runs with the image's Python 3.12 interpreter (`python3`) |
 | `ts` | `.ts` file | Executed with `npx tsx`; install deps in the tool directory |
-| `go` | compiled binary | Build and commit the binary to `<tool-dir>/.bin/<tool-name>` — the hub executes it from there |
+| `go` | compiled binary | Build and commit the binary to `<tool-dir>/.bin/<tool-name>`; the container runs it from there |
 | `bash` | `.sh` file | Runs with `bash` |
+
+All four run inside the tool container, from the read-only suite mount, with the working
+directory set to the suite.
 
 ---
 
@@ -403,7 +402,7 @@ The hub reloads tool configs dynamically, so no restart is needed for most chang
 
 ---
 
-## Tool Authorization
+## Tool access rules
 
 Every tool call the framework dispatches passes **one** decision, made in
 `core/tool_access.py`. Admin → **Tool Authorization** (`/admin/tool-authz`) shows what that
@@ -447,9 +446,23 @@ and execute nothing, so neither the allowlist nor the group rules apply to them.
 
 The file is part of the workspace: `scripts/sync_to_db.py` validates it and writes it to the
 registry on every rebuild, and each enforcing process watches that key, so an edit lands
-everywhere within a second or two — no restart. An invalid file is refused by the sync (the
-previous document stays) and, at runtime, an unreadable or invalid document **fails closed**:
+everywhere within a second or two without a restart. The shipped file is `rules: []` with
+commented examples. A malformed file (unparseable, an unknown key, an empty `groups`, a
+duplicate rule or name) makes the sync print the errors and exit **2** without writing
+anything, and because host, hub, gateway, the UI and the worker wait on `db-sync`
+completing successfully, the stack does not come up: that is deliberate, since a silently
+ignored policy would widen access. A *missing* file only warns and leaves the registry's
+current rules in place. At runtime, an unreadable or invalid document **fails closed**:
 every call a group rule could have decided is denied until the read succeeds.
+
+Two operational details:
+
+- `*` is a plain glob, so it matches every reference (console names, hub tools, edge tools,
+  MCP tools and MCP session names) and hides every `search_tools` card from a caller whose
+  token carries no groups.
+- Service identities carry no groups. A `background_agent` or `background_script` run mints
+  `svc_agent_<name>` without a group claim, so a rule matching one of its tools denies that
+  run. Add no rule for workflow-only tools, or relax the mode for that process.
 
 The mode is the deployment variable `TOOL_ACCESS_MODE` (valid: `off`, `shadow`, `enforce`;
 default `enforce`, and an unrecognized value behaves as `enforce`):

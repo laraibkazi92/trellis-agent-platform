@@ -38,7 +38,7 @@ https://github.com/user-attachments/assets/4e36c961-5bc2-459f-9597-68330fe54d97
 - **Agents as two files.** A `config.yaml` (model, tools, metadata) and a `skills.md` (the system prompt) in `workspace/agents/` is a live agent. Nothing to rewrite or containerize.
 - **One endpoint, any client.** Call the fleet over `POST /v1/chat/completions`, which is OpenAI-compatible, or over a single MCP connection. Register once and every agent is reachable.
 - **Predictable routing.** Plain-language `use_when` rules lock a request onto the right agent before any embedding is computed. Semantic search is the fallback, and agents can delegate to peers when a task spans specialists.
-- **Shared, sandboxed tools.** A tool is a standalone script in Python, Go, TypeScript, or Bash that reads JSON on stdin and writes JSON on stdout. Build it once and reference it from any agent. Every run is wrapped in a bubblewrap sandbox.
+- **Shared, sandboxed tools.** A tool is a standalone script in Python, Go, TypeScript, or Bash that reads JSON on stdin and writes JSON on stdout. Build it once and reference it from any agent. Every call runs in its own container, cut off from the host kernel by gVisor in production.
 - **Credentials injected per caller.** The same tool uses a personal token in a user session and a service-account key in a scheduled job. Scope is declared once in `tool.yaml`, so tools carry no credential logic.
 - **Background work built in.** A `background_script` runs deterministic pipelines and a `background_agent` runs unattended LLM work, both triggered by cron or a signed webhook.
 - **Memory that persists.** Through Hindsight, agents remember across sessions, per agent and optionally per user, behind an admin gate.
@@ -56,10 +56,15 @@ Docker is the only prerequisite. If you are deploying Trellis for an organizatio
 The fastest path is the prebuilt multi-arch image, published publicly on GHCR as `ghcr.io/laraibkazi92/trellis-agent-platform` (anonymous pulls once its package visibility is public):
 
 ```bash
-cp .env.example .env    # set SESSION_SECRET
+cp .env.example .env
+# then set SESSION_SECRET, RUNNER_TOKEN, AGENT_TOKEN_SECRET (each: openssl rand -hex 32)
+# and TRELLIS_HOST_WORKSPACE (the host path of ./workspace)
 docker compose pull && docker compose up -d      # prebuilt image
 # or: docker compose up -d --build               # build from source
 ```
+
+A laptop has no gVisor: set `CONTAINER_DEFAULT_RUNTIME=runc` (and `DEV_MODE=true` if you
+want to skip login) and see [docs/deploy.md → Dev machine](docs/deploy.md#dev-machine-docker-desktop).
 
 Orgs pin the engine to a release tag, starting with `v0.2.0` (set `TRELLIS_IMAGE` in `.env`), while `main` tracks upstream development.
 
@@ -98,6 +103,7 @@ The gateway exposes four tools no matter how many agents you register: `search_a
 - `workspace/tools/` - standalone scripts in any language with a `tool.yaml` manifest. JSON in on stdin, JSON out on stdout.
 - `workspace/workflows/` - background agents and scripts triggered by schedules or webhooks.
 - `workspace/mcps/` - registrations for external MCP servers.
+- `workspace/policies/` - `tool_access.yaml`, the group rules that narrow who may call which tool.
 - `workspace/shared/` - helpers shared across separate tool suites.
 
 Scaffold the layout with `python scripts/trellis init`. To run Trellis for an organization with your own content repo, point `TRELLIS_WORKSPACE_DIR` at that checkout instead of `./workspace`; see [docs/deploy.md](docs/deploy.md).
@@ -107,7 +113,7 @@ Scaffold the layout with `python scripts/trellis init`. To run Trellis for an or
 | Service | Port | What it does |
 | --- | --- | --- |
 | Agent host (`core/host.py`) | 8000 | FastAPI + PydanticAI. Serves `/v1/chat/completions`, routes to agents, runs them. |
-| Tool hub (`core/hub.py`) | 8001 | FastMCP server. Discovers tools in `workspace/tools/` and runs each in a bubblewrap sandbox. |
+| Tool hub (`core/hub.py`) | 8001 | FastMCP server. Discovers tools in `workspace/tools/` and dispatches each call to the runner, which executes it in its own container. |
 | MCP gateway (`core/gateway.py`) | 8002 | Exposes the agent fleet to external MCP clients at `/mcp`. |
 | Dashboard UI (`core/ui.py`) | 8080 | Manage agents, tools, workflows, API keys, and tool secrets. |
 | nginx gateway | 80/443 | Single front door for the stack, with optional TLS. |

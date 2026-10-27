@@ -32,7 +32,7 @@ The `mcp.yaml` defines how the Universal Agent Host (`core/host.py`) connects to
 - `public` (Optional): Expose **all** tools from this MCP server directly to external MCP clients via the Gateway's `search_tools`/`use_tool` tools (no agent hop required).
 - `public_tools` (Optional): A whitelist of specific tool names to expose publicly when `public` is not set server-wide.
 - `tools` (Optional): A static list of tool definitions (`name`, `description`, `inputSchema`) exposed by the server. You normally don't write this by hand: when it's absent, the registry sync live-connects to the server (opening a discovery session in a runner container for `stdio`, or connecting to the HTTP URL, with a ~20s budget), discovers its tools, and persists the discovered list into the registry config automatically. That list then feeds the runtime's discovery fast-path and the semantic tool-search index (`mcp__{server}__{tool}` embeddings). Hand-listing `tools` in `mcp.yaml` skips discovery entirely — useful when the server can't be reached from the sync environment; if discovery fails, the config is still saved and the runtime falls back to live discovery.
-- `network` (Optional): `none` (default) | `internal` | `internet`; the legacy `allow` maps to `internet`. Only applies to `stdio` servers, and it is enforced on the runner's container (see [How stdio MCP servers run](#how-stdio-mcp-servers-run)). `http`/`sse` transports ignore it.
+- `network` (Optional): `egress` (default: ordinary Docker egress on the default bridge) or `none` (no network at all). Only applies to `stdio` servers, and it is enforced on the runner's container (see [How stdio MCP servers run](#how-stdio-mcp-servers-run)). `http`/`sse` transports ignore it. Legacy `allow`/`internet`/`internal` load as `egress` with one deprecation warning per value; `deny`/`off` load as `none`.
 - `remote` (Optional): **written by the edge relay only, never authored in a file.** A `{site, mcp}` block marks the server as edge-hosted: central never connects to it and never resolves central secrets for it. See [Edge-hosted MCP servers](#edge-hosted-mcp-servers).
 
 ## Secure Secret Management
@@ -94,8 +94,10 @@ container created by the local `runner` service, from the manifest on disk:
   (`secrets`, `optional_secrets`, `variables`, the `env:` block) plus
   `TRELLIS_USER_ID`/`TRELLIS_USER_EMAIL`. The runner rejects any other key with `400`, and
   it builds `PATH` and the rest of the base environment itself.
-- **`mcp.yaml`'s `network:` selects the profile** (`none` by default). There is no bind
-  mount of the workspace beyond the MCP's own directory (read-only) plus `shared/`.
+- **`mcp.yaml`'s `network:` is `egress` (default) or `none`.** `egress` is Docker's default
+  bridge: the server reaches whatever the host reaches. `none` removes the network
+  entirely. There is no bind mount of the workspace beyond the MCP's own directory
+  (read-only) plus `shared/`.
 - **A lost session is reported, not retried.** If the runner no longer has the session
   (restart, reaper, deleted container), that call returns `mcp_session_lost`; the next
   call starts a fresh container. No MCP call is ever replayed automatically.
