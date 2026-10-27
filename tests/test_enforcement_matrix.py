@@ -13,8 +13,9 @@ Every surface is driven directly, with no container backend and no live relay:
 The property under test is the plan's acceptance gate: the group-rule combinations
 (no rule / matching group / non-matching group / shadow) decide identically at every
 surface, ``shadow`` records without denying, ``enforce`` denies, and an unreadable
-registry or policy fails closed. The runner no longer decides anything (it only
-verifies the token), which is pinned at the end.
+registry or policy fails closed. The runner no longer decides anything -- it verifies
+the token (central) or serves the identity the edge proxy verified (edge) -- which is
+pinned at the end.
 """
 
 import asyncio
@@ -26,7 +27,7 @@ import pytest
 from core import agent_token, hub, tool_access
 from core import auth as core_auth
 from core.execution import runner as runner_module
-from core.execution.contract import ExecRequest, SessionCreateRequest
+from core.execution.contract import ExecRequest, RunIdentity, SessionCreateRequest
 from core.models import ToolConfig
 from services.edge_relay import app as relay_app
 
@@ -518,6 +519,7 @@ def _assert_runner_denied(denial) -> None:
 
 @pytest.fixture
 def runner_env(monkeypatch):
+    monkeypatch.delenv("RUNNER_ROLE", raising=False)
     monkeypatch.setenv("AGENT_TOKEN_SECRET", SECRET)
     monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
     monkeypatch.delenv("DEV_MODE", raising=False)
@@ -589,6 +591,143 @@ def test_runner_log_mode_runs_a_bad_token(runner_env, monkeypatch):
     monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "log")
 
     assert runner_module._authorize(_session(_bad_token("expired"))) is None
+
+
+# --------------------------------------------------------------------------- #
+# v0.7.2 R1: the edge role -- no key, no verification, identity from the body
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def edge_runner_env(monkeypatch):
+    """An edge runner: no signing key on this host, and `enforce` set to prove it."""
+    monkeypatch.setenv("RUNNER_ROLE", "edge")
+    monkeypatch.delenv("AGENT_TOKEN_SECRET", raising=False)
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+    monkeypatch.delenv("DEV_MODE", raising=False)
+    runner_module.reset_for_tests()
+    try:
+        yield
+    finally:
+        runner_module.reset_for_tests()
+
+
+def _identity(agent="agent-a", **overrides) -> RunIdentity:
+    payload = {
+        "agent": agent,
+        "user_id": "user-1",
+        "user_email": "user@example.test",
+        "groups": [GROUP],
+        "run_id": "run-edge",
+    }
+    payload.update(overrides)
+    return RunIdentity(**payload)
+
+
+@pytest.mark.parametrize("kind", ["tool", "console", "mcp_session", "discovery"])
+def test_the_edge_role_authorizes_every_kind_without_a_token(edge_runner_env, kind):
+    """`enforce` + no key: a central runner would refuse all four; the edge has
+    nothing to verify with, so it authorizes on the socket + proxy identity."""
+    payload = {
+        "tool": _tool(None),
+        "console": _console(None),
+        "mcp_session": _session(None),
+        "discovery": _session(None, kind="discovery"),
+    }[kind]
+
+    assert runner_module._authorize(payload) is None
+
+
+@pytest.mark.parametrize("case", ["missing", "bad_sig", "expired"])
+def test_the_edge_role_ignores_an_agent_token(edge_runner_env, monkeypatch, case):
+    """A token in the body is never verified: nothing is loaded, nothing is read."""
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", SECRET)  # mint the bait...
+    token = _bad_token(case)
+    monkeypatch.delenv("AGENT_TOKEN_SECRET", raising=False)  # ...then drop the key
+
+    def never(*_args, **_kwargs):
+        raise AssertionError("the edge runner must never verify a token")
+
+    monkeypatch.setattr(runner_module.agent_token_module, "verify", never)
+    payload = _tool(token, target=TOOL)
+
+    assert runner_module._authorize(payload) is None
+
+
+def test_the_edge_role_takes_identity_from_the_body(edge_runner_env):
+    payload = _tool(None).model_copy(
+        update={"identity": _identity("agent-a", run_id="run-edge")}
+    )
+
+    identity = runner_module._request_identity(payload)
+
+    assert identity is payload.identity
+    assert (identity.agent, identity.user_id, identity.run_id) == (
+        "agent-a",
+        "user-1",
+        "run-edge",
+    )
+    assert identity.groups == [GROUP]
+
+
+def test_a_central_runner_takes_identity_from_the_token(runner_env):
+    payload = _tool(_token("agent-a"))
+
+    identity = runner_module._request_identity(payload)
+
+    assert identity.agent == "agent-a"
+    assert identity.user_id == "user-1"
+
+
+@pytest.mark.parametrize("kind", ["tool", "console", "workflow"])
+def test_the_edge_role_needs_body_identity(edge_runner_env, kind):
+    """No key to fall back on: a run with no identity cannot be served."""
+    payload = (
+        ExecRequest(kind="workflow", target="demo-inventory", entrypoint="pipeline.py")
+        if kind == "workflow"
+        else ExecRequest(
+            kind=kind,
+            target="console" if kind == "console" else TOOL,
+            command="echo hi" if kind == "console" else None,
+        )
+    )
+
+    denial = runner_module._identity_denial(payload)
+
+    assert denial is not None
+    assert denial.status_code == 400
+    detail = json.loads(denial.body)["detail"]
+    assert detail["code"] == "invalid_request"
+    assert "RUNNER_ROLE=edge" in detail["message"]
+
+
+def test_the_edge_role_leaves_discovery_unidentified(edge_runner_env):
+    """The agent-free catalog read is the one kind that may arrive bare."""
+    assert runner_module._identity_denial(_session(None, kind="discovery")) is None
+    # A session is not a top-level run either: identity is optional there too.
+    assert runner_module._identity_denial(_session(None)) is None
+
+
+@pytest.mark.parametrize("payload_kind", ["exec", "session"])
+def test_a_central_runner_refuses_body_identity(runner_env, payload_kind):
+    """Identity on the verifying role comes from the token, never from the body."""
+    identity = _identity()
+    payload = (
+        ExecRequest(kind="tool", target=TOOL, identity=identity)
+        if payload_kind == "exec"
+        else SessionCreateRequest(
+            kind="mcp_session", target="coralogix", session_key=SESSION_KEY,
+            identity=identity,
+        )
+    )
+
+    denial = runner_module._identity_denial(payload)
+
+    assert denial is not None
+    assert denial.status_code == 400
+    detail = json.loads(denial.body)["detail"]
+    assert detail["code"] == "invalid_request"
+    assert "central runner refuses body identity" in detail["message"]
 
 
 def test_the_shipped_supervisor_manifest_is_an_image_asset():

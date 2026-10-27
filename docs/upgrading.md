@@ -47,8 +47,10 @@ dev-machine and per-tool escape hatch.
    stack.
 3. **Rebuild or pull the images**, including `RUNNER_IMAGE` and every edge's
    `TRELLIS_IMAGE`: tool containers start through a shim that only v0.7.1 images carry.
-4. **Keep `AGENT_TOKEN_SECRET` on every component that verifies a token**, including each
-   edge **runner**. Tokens are now enforced by default.
+4. **Keep `AGENT_TOKEN_SECRET` on every central component that verifies a token.** Tokens
+   are now enforced by default. This item also named each edge **runner** in `v0.7.1`; a
+   `v0.7.2` edge needs no signing key (see
+   [the edge proxy no longer verifies agent tokens](#the-edge-proxy-no-longer-verifies-agent-tokens)).
 5. **Deploy**: `docker compose pull && docker compose up -d`, or
    `docker compose up -d --build` when you build from source.
 6. **Approve each edge key** in Admin → Edges. Every existing edge becomes pending until
@@ -195,6 +197,15 @@ the output directory from the claims. It makes no authorization decision of its 
 because the relay already made it for the call it forwarded. `RUNNER_AUTHORIZATION` and
 the runner's own manifest allowlist check are gone.
 
+> **Superseded in `v0.7.2`: the edge holds no signing key at all.** The relay stopped
+> sending `agent_token` in call frames, and the edge runner now takes the relay-derived
+> identity (`agent`, `user`, `user_email`, `groups`, `run_id`, `parent_run_id`) from
+> `trellis-proxy` over the `RUNNER_TOKEN`-authenticated Unix socket under
+> `RUNNER_ROLE=edge`, whose default is the central posture. `AGENT_TOKEN_SECRET` and
+> `ENFORCE_AGENT_TOKENS` are read by no edge service, including the runner; the v0.7.1
+> instructions below that put the key on an edge runner no longer apply. Central still
+> needs the key on `host`, `hub`, `gateway`, `edge-relay`, `taskiq-worker` and `runner`.
+
 Catalog publishing is per entry on both sides, so one bad manifest no longer costs the
 tunnel:
 
@@ -213,7 +224,8 @@ tunnel:
 - Keep `AGENT_TOKEN_SECRET` in the edge's `.env`: the sample
   `deploy/proxy/docker-compose.yml` sets it on the **runner** service with `:?`, so compose
   refuses to start without it, and it is not set on `trellis-proxy` at all. It must be the
-  same value central signs with, or every forwarded token fails verification.
+  same value central signs with, or every forwarded token fails verification. *(v0.7.1
+  only: `v0.7.2` removes the key from the edge entirely — see the note above.)*
 - Create the edge and the central install from the same release. Relay frames and edge
   trust changed together; an edge on the new build verifies nothing, an edge on the old
   build still expects its proxy to verify.
@@ -461,8 +473,11 @@ record) and a parent run id (`p`) used by delegation.
 **What to do instead**
 
 - Set `AGENT_TOKEN_SECRET` (32+ bytes, `openssl rand -hex 32`) on every service that
-  verifies a token, on central and on each edge runner. With the default `enforce`, a
-  `DEV_MODE=true` stack that has no secret now **exits at startup**.
+  verifies a token, on central and on each edge runner. *(The edge half of that ended in
+  `v0.7.2`, which leaves no signing key on an edge: see the note under
+  [the edge proxy no longer verifies agent tokens](#the-edge-proxy-no-longer-verifies-agent-tokens).)*
+  With the default `enforce`, a `DEV_MODE=true` stack that has no secret now **exits at
+  startup**.
 - For a throwaway local stack you may set `ENFORCE_AGENT_TOKENS=off` together with
   `DEV_MODE=true`. Do not use it on anything shared.
 - If you carry `RUNNER_AUTHORIZATION` in `.env` or an edge config, delete it: nothing
@@ -560,7 +575,8 @@ Four behaviours to plan around:
   `SANDBOX_*`, `TRELLIS_INTERNAL_CIDRS`, `TRELLIS_ENGINE_SUBNETS`, `TOOLS_INTERNAL_DNS`,
   `TOOLS_INTERNET_DNS`, `TOOLS_NET_INTERNAL_SUBNET`, `TOOLS_NET_INTERNET_SUBNET`,
   `EGRESS_*`, `RUNNER_AUTHORIZATION`. `AGENT_TOKEN_SECRET` is required on central and on
-  each edge runner, and `RUNNER_IMAGE` must be v0.7.1 or newer.
+  each edge runner (the edge half ends in `v0.7.2` — an edge then needs neither that nor
+  `ENFORCE_AGENT_TOKENS`), and `RUNNER_IMAGE` must be v0.7.1 or newer.
 - **Registry sync:** new `workspace/policies/tool_access.yaml` (published to
   `/registry/tool_access`); an invalid policy file, an invalid workflow config or an agent
   directory named `gateway` (the reserved front-door identity) now aborts the sync with

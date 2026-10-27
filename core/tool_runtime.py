@@ -23,9 +23,12 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Mapping, Optional, TYPE_CHECKING
 
 from core.models import ToolConfig
+
+if TYPE_CHECKING:
+    from core.execution.contract import RunIdentity
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +50,19 @@ class TransientToolError(Exception):
     """A failure worth retrying (stamina owns the retry budget)."""
 
 
+def _edge_identity(identity: Optional[Mapping[str, Any]]) -> Optional["RunIdentity"]:
+    """The frame identity as the runner's ``RunIdentity`` (``None`` when absent).
+
+    The frame->model translation is shared with the MCP stdio transport
+    (``RunIdentity.from_frame``): one mapping, two consumers.
+    """
+    if not identity:
+        return None
+    from core.execution.contract import RunIdentity
+
+    return RunIdentity.from_frame(identity)
+
+
 async def _execute_in_container(
     config: ToolConfig,
     arguments: Dict[str, Any],
@@ -54,14 +70,20 @@ async def _execute_in_container(
     env: Dict[str, str],
     timeout: float,
     agent_token: Optional[str] = None,
+    identity: Optional[Mapping[str, Any]] = None,
     record_health,
 ) -> Dict[str, Any]:
     """Run the tool as its own container via the runner.
 
     Only declared env keys cross the socket; the runner re-sanitizes the base
-    environment and rejects anything the manifest does not declare. Identity travels
-    in ``agent_token`` only: the runner derives the caller's user id, email, groups,
-    agent and run id from the verified claims, so the request body carries none.
+    environment and rejects anything the manifest does not declare.
+
+    Identity has two carriers, one per runner role, never both on one request:
+    the **central** hub sends ``agent_token`` and the runner derives the caller's
+    user id, email, groups, agent and run id from the verified claims, so the body
+    carries none; the **edge** has no signing key, so the proxy forwards the relay-
+    derived ``identity`` (the claims the relay verified on its side of the tunnel)
+    and the edge runner takes it from this authenticated request instead.
     """
     from core.execution.client import RunnerCallError, RunnerClient, RunnerUnavailable
     from core.execution.contract import ExecRequest
@@ -76,6 +98,7 @@ async def _execute_in_container(
             manifest_digest=manifest_digest(config),
             env={k: v for k, v in env.items() if k in declared},
             agent_token=agent_token,
+            identity=_edge_identity(identity),
             input=input_json,
             deadline_ms=max(1, int(timeout * 1000)),
         )
@@ -184,6 +207,7 @@ async def execute_tool(
     env: Dict[str, str],
     on_health: Optional[HealthCallback] = None,
     agent_token: Optional[str] = None,
+    identity: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run one tool invocation and normalize its outcome into a result dict.
 
@@ -192,6 +216,10 @@ async def execute_tool(
     declared keys are forwarded. ``on_health`` replaces the hub's
     ``health_monitor.record_event`` calls; it is invoked in a worker thread so a
     slow store cannot stall concurrent tool I/O.
+
+    ``agent_token`` is the hub's carrier (a central runner verifies it); ``identity``
+    is the edge's, because the edge has no token to send and the relay already
+    verified the caller. Exactly one of them is set by any given caller.
 
     Execution always happens in the runner's container for this call; the
     in-process sandbox backends are gone. ``tool_dir`` is validated here so a
@@ -225,6 +253,7 @@ async def execute_tool(
             env=env,
             timeout=timeout,
             agent_token=agent_token,
+            identity=identity,
             record_health=record_health,
         )
     except TransientToolError:

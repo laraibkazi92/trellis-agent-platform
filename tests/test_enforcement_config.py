@@ -107,25 +107,25 @@ def test_compose_passes_the_tool_access_switch_to_every_enforcing_process():
         assert env.get("TOOL_ACCESS_MODE", "").endswith("enforce}"), name
 
 
-def test_the_edge_proxy_never_verifies_an_agent_token():
-    """v0.7.1: the edge trusts the relay's frame identity; the proxy has no key.
+def test_no_edge_service_holds_an_agent_token_signing_key():
+    """v0.7.2 R1: no service on the edge holds a signing key.
 
-    The **runner** keeps the key: it verifies signature and expiry, derives the agent
-    and the output dir from the token's claims, and (since Phase 4) makes no allowlist
-    decision at all -- the relay already made it for the call it forwarded.
+    The relay is the only token verifier on the edge path: it forwards relay-derived
+    identity in the call frame (agent, user, user_email, groups, run_id) and the proxy
+    hands it to the runner over the ``RUNNER_TOKEN``-authenticated socket. The runner
+    role is explicit, never inferred from key presence, and still resolves no agent
+    allowlist (the relay already decided the call it forwarded).
     """
     services = _services(ROOT / "deploy" / "proxy" / "docker-compose.yml")
 
-    proxy_env = services["trellis-proxy"]["environment"]
-    assert "AGENT_TOKEN_SECRET" not in proxy_env
-    assert "ENFORCE_AGENT_TOKENS" not in proxy_env
+    for name in ("trellis-proxy", "runner"):
+        env = services[name].get("environment") or {}
+        assert "AGENT_TOKEN_SECRET" not in env, name
+        assert "ENFORCE_AGENT_TOKENS" not in env, name
 
     runner_env = services["runner"]["environment"]
-    assert "AGENT_TOKEN_SECRET" in runner_env
-    assert "set AGENT_TOKEN_SECRET" in runner_env["AGENT_TOKEN_SECRET"]
-    # Enforcing by default: the edge runner verifies the token the relay forwarded.
-    assert "off" not in runner_env["ENFORCE_AGENT_TOKENS"]
-    # Gone in Phase 4 with the runner's own allowlist check.
+    assert runner_env["RUNNER_ROLE"] == "edge"
+    # Gone in Phase 4 of v0.7.1 with the runner's own allowlist check.
     assert "RUNNER_AUTHORIZATION" not in runner_env
 
 

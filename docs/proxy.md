@@ -80,7 +80,6 @@ and in the edge's `.env`:
 ```bash
 RUNNER_TOKEN=<openssl rand -hex 32>            # identical on proxy and runner
 TRELLIS_HOST_WORKSPACE=/srv/trellis/workspace  # HOST path of ./workspace on this VM
-AGENT_TOKEN_SECRET=<same value as central>     # runner only (proxy never verifies)
 MAX_SESSIONS_EDGE=4                            # warm MCP session containers (default 32)
 ```
 
@@ -90,14 +89,23 @@ runner's startup canary and it refuses to serve. The `runner` also mounts the wo
 read-write (it writes the canary and creates output directories) while tool containers
 still see only their read-only mounts.
 
-> **The edge proxy never verifies an agent token.** `trellis-proxy` uses the identity the
-> relay derived over the authenticated tunnel (see [Edge credentials](#edge-credentials)) and
-> takes **no `AGENT_TOKEN_SECRET`**. The edge **runner** keeps the key, and the sample
-> compose sets it there only: it verifies the forwarded token's signature and expiry, then
-> derives the agent and the output dir from that token's claims. It makes no authorization
-> decision, because the relay already made it for the call it forwarded. The edge `.env`
-> must still carry a valid `AGENT_TOKEN_SECRET` (the same value as central), or the runner
-> refuses to start. `ENFORCE_AGENT_TOKENS` defaults to `enforce` there too.
+> **The edge holds no signing key.** `trellis-proxy` verifies no agent token: the relay
+> authenticated the caller, verified the token and derived the frame identity, and the edge
+> trusts that identity over the authenticated tunnel (see
+> [Edge credentials](#edge-credentials)). The edge **runner** verifies nothing either:
+> with `RUNNER_ROLE=edge` it takes the caller's identity (`agent`, `user`, `user_email`,
+> `groups`, `run_id`, `parent_run_id`) from `trellis-proxy` over the
+> `RUNNER_TOKEN`-authenticated Unix socket and never loads `AGENT_TOKEN_SECRET`. The role
+> is explicit; it is never inferred from whether a key happens to be present. Its default
+> is `central`, which expects a verified token instead.
+>
+> The sample compose sets `RUNNER_ROLE: edge` on the runner and passes no signing key to
+> either service. If you maintain your own edge compose file, add that variable — a runner
+> left in the central posture refuses body-supplied identity and expects a verified token
+> instead. An older edge `.env` that still lists `AGENT_TOKEN_SECRET` or
+> `ENFORCE_AGENT_TOKENS` keeps working: the runner logs one warning naming them at startup
+> and reads neither. Delete both lines. `RUNNER_TOKEN` is still required: it authenticates
+> the socket, and an unauthenticated socket can create containers.
 
 Prerequisites on the edge host are the same as central: Docker, plus `runsc` registered
 with it (proved with `docker run --runtime=runsc hello-world`). A dev machine without
@@ -301,9 +309,10 @@ Nothing a user types ever crosses the tunnel or reaches etcd in the clear, and t
 > **Trust boundary.** The edge trusts the relay's identity assertion. The `user` /
 > `user_email` in a call frame are derived **only** from the verified agent token's
 > claims (`u` / `e`) at the relay — the relay is the single verification point — and they
-> arrive over the authenticated tunnel. The edge proxy verifies no token of its own and
-> needs no `AGENT_TOKEN_SECRET`; it uses that identity unchanged for the MCP session key,
-> the sealed envelope's AAD and `TRELLIS_USER_ID`/`TRELLIS_USER_EMAIL`. Because the
+> arrive over the authenticated tunnel. No service on the edge verifies a token of its own
+> or holds a signing key: the proxy hands the identity to the runner over the
+> `RUNNER_TOKEN`-authenticated socket, and uses it unchanged for the MCP session key, the
+> sealed envelope's AAD and `TRELLIS_USER_ID`/`TRELLIS_USER_EMAIL`. Because the
 > identity is part of the AAD, a blob stored for one person cannot be replayed for
 > another, for a different tool/MCP, or for another site: the GCM tag fails and the call
 > returns `credential_rejected` without running. Keep the tunnel token and the relay's internal
@@ -600,6 +609,8 @@ variables they read were removed in v0.7.1 (see
 - Calls carry `kind: "tool" | "mcp"` (absent means `"tool"`, so v0.4 frames are
   unchanged) plus `mcp` for MCP calls. The frame's `user`/`user_email` are **derived from
   the verified token's claims** at the relay; a request body cannot set them (v0.7.1).
+  Since v0.7.2 the frame carries no `agent_token` at all: identity is relay-derived and
+  the edge needs no signing key to read it (see [Edge runner](#edge-runner)).
 - **Upgrade central before edges.** A v0.5 edge dialing a v0.4 relay is refused at the
   handshake with `CLOSE_VERSION` (close code `4001`); the edge logs one terminal
   "version mismatch — upgrade central first" line and retries only at the maximum backoff

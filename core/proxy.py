@@ -981,6 +981,27 @@ def _elapsed_ms(started: float) -> int:
     return max(0, int((time.monotonic() - started) * 1000))
 
 
+def _frame_identity(call: Mapping[str, Any]) -> Dict[str, Any]:
+    """The caller identity a validated call frame carries, keyed the edge's way.
+
+    The relay is the only verifier on this path (v0.7.2 R1): it derived every field
+    from the verified token's claims and no longer sends the token, because the edge
+    holds no key that could check one. The keys stay as ``user``/``user_email`` --
+    what ``build_env``, ``_server_env`` and the sealed-blob owner check already read
+    -- so one mapping feeds the env, the sealed envelope and the runner request.
+    Only the frame is a source: nothing here merges a body, a config or the process
+    environment into it.
+    """
+    return {
+        "user": call.get("user"),
+        "user_email": call.get("user_email"),
+        "agent": call.get("agent"),
+        "groups": call.get("groups") or [],
+        "run_id": call.get("run_id"),
+        "parent_run_id": call.get("parent_run_id"),
+    }
+
+
 def _timeout_frame(frame: Dict[str, Any], deadline_ms: int, started: float) -> Dict[str, Any]:
     """The frame the edge sends when it loses the race with the relay's deadline."""
     call_id = frame.get("id")
@@ -1027,9 +1048,11 @@ async def handle_call(
     becomes ``credential_rejected`` and the tool never runs.
 
     The frame's caller identity is **trusted**: the relay built it from the verified
-    agent token's claims and nothing on the edge re-checks a token (v0.7.1). The
-    ``agent_token`` is forwarded unchanged to the runner, which owns the remaining
-    verification.
+    agent token's claims and nothing on the edge re-checks a token (v0.7.1). As of
+    v0.7.2 the frame carries no token at all -- the relay is the only verifier and
+    sends the claims it derived. That identity is what travels to the runner (over
+    the ``RUNNER_TOKEN``-authenticated socket), which is also why the edge runner
+    takes it from the body instead of verifying anything itself.
     """
     started = time.monotonic()
     raw_id = message.get("id")
@@ -1039,8 +1062,6 @@ async def handle_call(
         call = protocol.validate_call(message)
     except protocol.ProtocolError as exc:
         return _result_frame(fallback_id, _elapsed_ms(started), error=("invalid_arguments", str(exc)))
-
-    agent_token = call.get("agent_token")
 
     entry = config_map.get(call["tool"])
     if entry is None:
@@ -1058,7 +1079,7 @@ async def handle_call(
 
     if credential_modes is None:
         credential_modes = proxy_config.export_modes if proxy_config else {}
-    identity = {"user": call.get("user"), "user_email": call.get("user_email")}
+    identity = _frame_identity(call)
     site = proxy_config.site if proxy_config else None
     if call.get("sealed") is not None and (edge_key is None or prev_edge_key is None):
         edge_key, prev_edge_key = _resolve_edge_keys(edge_key, prev_edge_key)
@@ -1102,16 +1123,15 @@ async def handle_call(
 
     try:
         # The tool's own timeout (core.tool_runtime) governs; the relay's
-        # deadline_ms only bounds its wait for this result. The token is omitted
-        # when absent so a pre-v0.6 frame keeps the exact call shape.
-        token_kwargs = {"agent_token": agent_token} if agent_token else {}
+        # deadline_ms only bounds its wait for this result. The caller's identity
+        # rides the request as data: an edge runner has no token to verify.
         result = await tool_runtime.execute_tool(
             config,
             tool_dir,
             arguments,
             env=env,
             on_health=None,
-            **token_kwargs,
+            identity=identity,
         )
     except Exception as exc:
         logger.exception("Tool %r failed on the edge", call["tool"])
@@ -1140,7 +1160,8 @@ async def handle_mcp_call(
     A sealed blob is opened here (kind ``mcp``, the server's name, the caller's
     identity) and the decrypted mapping is handed to the session manager, which uses
     it only when it opens (or reopens) the session. The identity is the frame's, i.e.
-    the verified token's claims on the relay; no token is verified here (v0.7.1).
+    the claims the relay derived from the token it verified; no token is verified --
+    or even sent -- here (v0.7.2 R1).
     """
     started = time.monotonic()
     raw_id = message.get("id")
@@ -1175,9 +1196,8 @@ async def handle_mcp_call(
             call["mcp"],
             call["tool"],
             call["args"],
-            {"user": call.get("user"), "user_email": call.get("user_email")},
+            _frame_identity(call),
             call["deadline_ms"],
-            agent_token=call.get("agent_token"),
             sealed=sealed,
         )
     except proxy_mcp.McpCallError as exc:

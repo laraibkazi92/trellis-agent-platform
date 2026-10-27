@@ -44,10 +44,13 @@ services:
       # "Per-user credentials and the edge key"); `trellis-proxy edge-keygen --show`
       # prints the public fingerprint.
       EDGE_PRIVATE_KEY_PATH: ${EDGE_PRIVATE_KEY_PATH:-/etc/trellis/keys/edge-key}
-      # The edge PROXY never verifies an agent token (v0.7.1): the relay
-      # authenticated the caller and derived the call's identity from the token's
-      # claims, and the edge trusts that identity over the authenticated tunnel. The
-      # signing key therefore lives on the RUNNER only (see below).
+      # The edge PROXY never verifies an agent token: the relay authenticated the
+      # caller and derived the call's identity from the token's claims, and the edge
+      # trusts that identity over the authenticated tunnel. Since v0.7.2 no service on
+      # this host holds a signing key either -- the runner below takes the identity
+      # from this proxy over the shared socket (RUNNER_ROLE=edge). An
+      # AGENT_TOKEN_SECRET or ENFORCE_AGENT_TOKENS left in .env is loaded and read by
+      # nothing; the runner logs one warning naming it so the line can be deleted.
     volumes:
       # Tool suites and write targets live under the workspace. Tool containers get
       # their own read-only suite/shared mounts and, when asked for, one rw output
@@ -135,13 +138,16 @@ services:
       # manifest says `network: none`.
       TRELLIS_UID: ${TRELLIS_UID:-1000}
       TRELLIS_GID: ${TRELLIS_GID:-1000}
-      # The edge runner verifies the token's signature and expiry; the authorization
-      # decision was already made centrally (the relay) before the call was forwarded.
-      ENFORCE_AGENT_TOKENS: ${ENFORCE_AGENT_TOKENS:-enforce}
-      # Kept (and required) on the RUNNER ONLY: it derives the agent and the output dir
-      # from the token's claims. The proxy service above never sets it -- the proxy
-      # verifies no agent token at all.
-      AGENT_TOKEN_SECRET: ${AGENT_TOKEN_SECRET:?set AGENT_TOKEN_SECRET}
+      # This runner is the EDGE half of the pair. `edge` tells it to take the caller's
+      # identity (agent, user, user_email, groups, run_id, parent_run_id) from
+      # trellis-proxy over the RUNNER_TOKEN-authenticated socket -- the proxy got it
+      # from the relay's call frame, and the relay is the only token verifier on this
+      # path. So no edge service loads a signing key: AGENT_TOKEN_SECRET and
+      # ENFORCE_AGENT_TOKENS are not set here and are never read (the runner logs one
+      # warning if they are). The role is explicit and is never inferred from whether
+      # a key happens to be present; the default is `central`, which expects a verified
+      # agent token.
+      RUNNER_ROLE: edge
       PYTHONDONTWRITEBYTECODE: "1"
     healthcheck:
       test: ["CMD-SHELL", "python -m core.execution.runner --healthcheck"]

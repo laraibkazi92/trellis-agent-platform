@@ -164,20 +164,36 @@ class EdgeConn:
         deadline_ms: int = DEFAULT_DEADLINE_MS,
         user: Optional[str] = None,
         user_email: Optional[str] = None,
-        agent_token: Optional[str] = None,
+        agent: Optional[str] = None,
+        groups: Optional[List[str]] = None,
+        run_id: Optional[str] = None,
+        parent_run_id: Optional[str] = None,
         sealed: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forward one tool call and await its validated result frame.
 
-        ``user``/``user_email`` are the verified token's claims (``_claims_identity``),
-        never a request body; the routes are the only production callers.
+        Every identity argument is derived from the verified token's claims
+        (``_claims_identity`` / ``_claims_run_identity``), never from a request body;
+        the routes are the only production callers. No credential crosses the tunnel
+        (R1): the relay is the only verifier, so the frame carries what it resolved.
         """
         if self.closed:
             raise EdgeDisconnected(f"edge '{self.site}' is closed")
         if tool not in self.tools:
             raise EdgeUnknownTool(f"tool '{tool}' is not exported by edge '{self.site}'")
         return await self._forward(
-            self._call_frame(tool, args, deadline_ms, user, user_email, agent_token, sealed),
+            self._call_frame(
+                tool,
+                args,
+                deadline_ms,
+                user,
+                user_email,
+                agent,
+                groups,
+                run_id,
+                parent_run_id,
+                sealed,
+            ),
             tool,
         )
 
@@ -189,20 +205,35 @@ class EdgeConn:
         deadline_ms: int = DEFAULT_DEADLINE_MS,
         user: Optional[str] = None,
         user_email: Optional[str] = None,
-        agent_token: Optional[str] = None,
+        agent: Optional[str] = None,
+        groups: Optional[List[str]] = None,
+        run_id: Optional[str] = None,
+        parent_run_id: Optional[str] = None,
         sealed: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forward one MCP ``tools/call`` through the same tunnel.
 
         The tool name is *not* checked here: the edge owns that authority (it refuses
         a name it did not publish), and its refusal arrives as an ordinary error
-        result rather than a relay-side 404.
+        result rather than a relay-side 404. Identity arguments are the same
+        claims-derived ones as :meth:`request`; nothing is re-verified downstream.
         """
         if self.closed:
             raise EdgeDisconnected(f"edge '{self.site}' is closed")
         if mcp not in self.mcps:
             raise EdgeUnknownMcp(f"mcp '{mcp}' is not exported by edge '{self.site}'")
-        frame = self._call_frame(tool, args, deadline_ms, user, user_email, agent_token, sealed)
+        frame = self._call_frame(
+            tool,
+            args,
+            deadline_ms,
+            user,
+            user_email,
+            agent,
+            groups,
+            run_id,
+            parent_run_id,
+            sealed,
+        )
         frame["kind"] = "mcp"
         frame["mcp"] = mcp
         return await self._forward(frame, tool, mcp=mcp)
@@ -291,14 +322,21 @@ class EdgeConn:
         deadline_ms: int,
         user: Optional[str],
         user_email: Optional[str],
-        agent_token: Optional[str] = None,
+        agent: Optional[str] = None,
+        groups: Optional[List[str]] = None,
+        run_id: Optional[str] = None,
+        parent_run_id: Optional[str] = None,
         sealed: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build one ``call`` frame with the deadline clamped to the wire cap.
 
-        ``user``/``user_email`` are the claims-derived identity: the edge uses them
-        unchanged (MCP session key, sealed AAD, ``TRELLIS_USER_*``) and does not
-        verify anything of its own.
+        The identity keys (``user``/``user_email``/``agent``/``groups``/``run_id``/
+        ``parent_run_id``) are the relay-derived claims identity: the edge forwards
+        them unchanged (MCP session key, sealed AAD, ``TRELLIS_USER_*``, run
+        attribution) and verifies nothing of its own. R1 removed the agent token from
+        this frame: it signed the caller's identity, and whoever holds it can mint
+        runs, so the edge never holds one -- the relay verified it and only the
+        resolved identity travels.
         """
         frame: Dict[str, Any] = {
             "t": "call",
@@ -311,10 +349,16 @@ class EdgeConn:
         # Omitted when absent so a v0.4 edge sees the exact same bytes.
         if user_email is not None:
             frame["user_email"] = user_email
-        # Forwarded verbatim for the edge's runner, which verifies signature/expiry
-        # when it opens a container; the authorization decision was already made here.
-        if agent_token is not None:
-            frame["agent_token"] = agent_token
+        # Run attribution, also claims-only. Absent keys stay absent rather than
+        # riding as nulls: an older edge ignores them and the shape stays minimal.
+        if agent is not None:
+            frame["agent"] = agent
+        if groups:
+            frame["groups"] = list(groups)
+        if run_id is not None:
+            frame["run_id"] = run_id
+        if parent_run_id is not None:
+            frame["parent_run_id"] = parent_run_id
         # Opaque ciphertext: the relay cannot open it, so it forwards the bytes and
         # never stores, logs or audits them.
         if sealed is not None:
@@ -622,7 +666,8 @@ class CallBody(BaseModel):
     # Strict: pydantic would otherwise accept ``true`` as ``1``.
     deadline_ms: Annotated[int, Field(strict=True)] = DEFAULT_DEADLINE_MS
     # Minted by the agent runtime; verified here -- the relay is the only verifier on
-    # this path -- and forwarded verbatim to the edge for the runner.
+    # this path -- and never forwarded (R1): the edge receives the identity it resolved,
+    # not a credential it would have to hold and verify.
     agent_token: Optional[str] = None
     # Browser-sealed per-user credentials: opaque to the relay, forwarded verbatim and
     # never logged or audited (only ``has_sealed`` reaches the audit line). Typed as
@@ -678,6 +723,25 @@ def _claims_identity(
     return user, email
 
 
+def _claims_run_identity(claims: Optional[agent_token_module.Claims]) -> Dict[str, Any]:
+    """The rest of the frame identity, from the same verified claims.
+
+    Returns ``agent``/``groups``/``run_id``/``parent_run_id`` -- the run attribution
+    the edge needs now that it no longer receives an agent token (R1) -- or ``{}``
+    when there is no verified caller, so a body can never assert one. Key names match
+    ``RunIdentity`` in ``core/execution/contract.py``; ``parent_run_id`` is ``None``
+    for a root run.
+    """
+    if claims is None:
+        return {}
+    return {
+        "agent": claims.agent,
+        "groups": list(claims.groups),
+        "run_id": claims.run_id,
+        "parent_run_id": claims.parent_run_id,
+    }
+
+
 async def _export_public(
     site: str, tool: str, mcp: Optional[str], conn: Optional[EdgeConn] = None
 ) -> bool:
@@ -717,8 +781,9 @@ async def _authorize_agent(
     caller's groups come from its token (claim ``"g"``) and never from a record.
 
     This is the **only** token verification on the edge path: the identity in the
-    forwarded frame is built from these claims (``_claims_identity``) and the edge
-    trusts it over the authenticated tunnel.
+    forwarded frame is built from these claims (``_claims_identity`` /
+    ``_claims_run_identity``) and the edge trusts it over the authenticated tunnel --
+    the token itself stops here (R1), so the edge never needs a signing key to read it.
 
     No caller is exempt. A token whose agent has no record (the gateway front door
     mints for the external client it serves) is left with the export's own published
@@ -1077,13 +1142,20 @@ async def edge_connect(ws: WebSocket) -> None:
 
 @app.post("/v1/sites/{site}/call")
 async def call_site_tool(site: str, body: CallBody) -> JSONResponse:
-    """Internal-only: hub routes a remote tool here and waits for the edge."""
+    """Internal-only: hub routes a remote tool here and waits for the edge.
+
+    The relay is the only token verifier on this path (R1): the frame it builds
+    carries the identity resolved from the verified claims, never the token.
+    """
     started = time.monotonic()
     args_bytes = len(protocol.encode(body.args))
     call_id = uuid.uuid4().hex
     # Filled in after the token is verified; the frame identity (and the audit line)
     # come from the claims, never from the body.
     identity: Dict[str, Optional[str]] = {"user": None, "user_email": None}
+    # agent/groups/run_id/parent_run_id: the rest of the claims-derived identity, empty
+    # when no token verified. Spread into the frame rather than filled in per field.
+    run_identity: Dict[str, Any] = {}
 
     def audit_call(outcome: str, **extra: Any) -> None:
         audit.record(
@@ -1134,6 +1206,11 @@ async def call_site_tool(site: str, body: CallBody) -> JSONResponse:
         identity["user"], identity["user_email"] = protocol.validate_identity(
             *_claims_identity(claims)
         )
+        # Run attribution from the same claims, checked with the edge's own rules: the
+        # edge closes the tunnel on a bad call frame, so a malformed claim must be a 400
+        # here, not a dropped connection. ``{}`` when nothing verified, so an
+        # unauthenticated caller's frame carries no agent/run keys at all.
+        run_identity = protocol.validate_run_identity(**_claims_run_identity(claims))
     except ProtocolError as exc:
         audit_call("invalid_arguments")
         return _error(400, "invalid_arguments", str(exc))
@@ -1150,6 +1227,8 @@ async def call_site_tool(site: str, body: CallBody) -> JSONResponse:
                 "tool": body.tool,
                 "args": body.args,
                 "deadline_ms": body.deadline_ms,
+                # Still a body field (the relay's auth input), so a malformed one is a
+                # 400 here rather than a token verdict -- but R1 never sends it onward.
                 "agent_token": body.agent_token,
                 "sealed": body.sealed,
             }
@@ -1176,8 +1255,8 @@ async def call_site_tool(site: str, body: CallBody) -> JSONResponse:
             body.deadline_ms,
             identity["user"],
             identity["user_email"],
-            agent_token=body.agent_token,
             sealed=body.sealed,
+            **run_identity,
         )
     except EdgeOverloaded as exc:
         audit_call("edge_overloaded")
@@ -1215,12 +1294,15 @@ async def call_site_mcp(site: str, mcp: str, body: McpCallBody) -> JSONResponse:
     checked as an object within the size cap and forwarded un-coerced. An MCP
     server's schemas are discriminated unions, so the *server* validates them; the
     edge refuses a tool name it did not publish, and that refusal arrives as a
-    normal ``200`` with ``error``.
+    normal ``200`` with ``error``. The relay is the only token verifier here too (R1),
+    so the frame carries the resolved identity and never the token.
     """
     started = time.monotonic()
     args_bytes = len(protocol.encode(body.args))
     call_id = uuid.uuid4().hex
     identity: Dict[str, Optional[str]] = {"user": None, "user_email": None}
+    # agent/groups/run_id/parent_run_id, filled in from the same verified claims.
+    run_identity: Dict[str, Any] = {}
 
     def audit_call(outcome: str, **extra: Any) -> None:
         audit.record(
@@ -1277,6 +1359,8 @@ async def call_site_mcp(site: str, mcp: str, body: McpCallBody) -> JSONResponse:
                 "tool": body.tool,
                 "args": body.args,
                 "deadline_ms": body.deadline_ms,
+                # Body-shape check only (see the tool route): the token is the relay's
+                # auth input and is never put on the wire.
                 "agent_token": body.agent_token,
                 "sealed": body.sealed,
             }
@@ -1296,6 +1380,8 @@ async def call_site_mcp(site: str, mcp: str, body: McpCallBody) -> JSONResponse:
         audit_call("access_denied", agent=claims.agent if claims else None)
         return _error(403, code, message)
     try:
+        # Claims-derived run attribution; ``{}`` when nothing verified.
+        run_identity = protocol.validate_run_identity(**_claims_run_identity(claims))
         identity["user"], identity["user_email"] = protocol.validate_identity(
             *_claims_identity(claims)
         )
@@ -1311,8 +1397,8 @@ async def call_site_mcp(site: str, mcp: str, body: McpCallBody) -> JSONResponse:
             body.deadline_ms,
             identity["user"],
             identity["user_email"],
-            agent_token=body.agent_token,
             sealed=body.sealed,
+            **run_identity,
         )
     except EdgeOverloaded as exc:
         audit_call("edge_overloaded")

@@ -492,10 +492,26 @@ def test_the_frame_identity_comes_from_the_claims_only(enforcing):
     seen = {}
 
     async def _record(
-        tool, args, deadline_ms, user=None, user_email=None, agent_token=None, sealed=None
+        tool,
+        args,
+        deadline_ms,
+        user=None,
+        user_email=None,
+        agent=None,
+        groups=None,
+        run_id=None,
+        parent_run_id=None,
+        sealed=None,
     ):
         seen.update(
-            tool=tool, user=user, user_email=user_email, agent_token=agent_token, sealed=sealed
+            tool=tool,
+            user=user,
+            user_email=user_email,
+            agent=agent,
+            groups=groups,
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+            sealed=sealed,
         )
         return {"id": "x", "ok": True, "result": {"echoed": args}}
 
@@ -516,11 +532,17 @@ def test_the_frame_identity_comes_from_the_claims_only(enforcing):
     )
 
     assert response.status_code == 200
+    # The run id is minted fresh per token, so compare it to the claims itself.
+    claims = agent_token_module.verify(token)
     assert seen == {
         "tool": "echo",
         "user": "claim-user",
         "user_email": "claims@example.com",
-        "agent_token": token,
+        # Run attribution comes from the same claims, never the body.
+        "agent": "agent-a",
+        "groups": None,
+        "run_id": claims.run_id,
+        "parent_run_id": None,
         "sealed": None,
     }
 
@@ -532,9 +554,7 @@ def test_a_body_identity_is_logged_once_and_ignored(caplog):
 
     # The warning is emitted before dispatch; answer the call so the test does not
     # wait out the real deadline.
-    async def _answer(
-        tool, args, deadline_ms, user=None, user_email=None, agent_token=None, sealed=None
-    ):
+    async def _answer(*args, **kwargs):
         return {"id": "x", "ok": True, "result": {}}
 
     conn.request = _answer
@@ -549,14 +569,19 @@ def test_a_body_identity_is_logged_once_and_ignored(caplog):
 
 
 def test_a_call_without_a_token_has_no_identity(in_log_mode):
-    """No verified token: the frame carries no identity, and none is invented."""
+    """No verified token: no identity travels, and none is invented."""
     conn = _install_conn()
     seen = {}
 
-    async def _record(
-        tool, args, deadline_ms, user=None, user_email=None, agent_token=None, sealed=None
-    ):
-        seen.update(user=user, user_email=user_email)
+    async def _record(*args, **kwargs):
+        seen.update(
+            user=kwargs.get("user"),
+            user_email=kwargs.get("user_email"),
+            agent=kwargs.get("agent"),
+            groups=kwargs.get("groups"),
+            run_id=kwargs.get("run_id"),
+            parent_run_id=kwargs.get("parent_run_id"),
+        )
         return {"id": "x", "ok": True, "result": {}}
 
     conn.request = _record
@@ -566,7 +591,14 @@ def test_a_call_without_a_token_has_no_identity(in_log_mode):
     )
 
     assert response.status_code == 200
-    assert seen == {"user": None, "user_email": None}
+    assert seen == {
+        "user": None,
+        "user_email": None,
+        "agent": None,
+        "groups": None,
+        "run_id": None,
+        "parent_run_id": None,
+    }
 
 
 def test_a_malformed_claims_email_is_rejected_before_forwarding(enforcing):
@@ -580,6 +612,29 @@ def test_a_malformed_claims_email_is_rejected_before_forwarding(enforcing):
             "tool": "echo",
             "args": {"q": "x"},
             "agent_token": _mint(user_email="ann@example.com\n"),
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_arguments"
+    assert conn.ws.sent == []
+
+
+def test_a_malformed_claims_group_is_rejected_before_forwarding(enforcing):
+    """Same rule for the run identity: a claim the edge would refuse never leaves here.
+
+    A bad value on arrival closes the tunnel, so the relay validates with the edge's own
+    rules first (R1: this is the only place a malformed claim can be caught).
+    """
+    conn = _install_conn()
+    conn.request = pytest.fail
+
+    response = TestClient(app_module.app).post(
+        "/v1/sites/site-a/call",
+        json={
+            "tool": "echo",
+            "args": {"q": "x"},
+            "agent_token": _mint(groups=("ops\nprod",)),
         },
     )
 
@@ -738,11 +793,22 @@ def test_mcp_endpoint_routes_to_the_edge_connection(enforcing):
     result = {"content": [{"type": "text", "text": "ok"}], "isError": False}
 
     async def _record(
-        mcp, tool, args, deadline_ms, user=None, user_email=None, agent_token=None, sealed=None
+        mcp,
+        tool,
+        args,
+        deadline_ms,
+        user=None,
+        user_email=None,
+        agent=None,
+        groups=None,
+        run_id=None,
+        parent_run_id=None,
+        sealed=None,
     ):
         seen.update(
             mcp=mcp, tool=tool, args=args, deadline_ms=deadline_ms, user=user,
-            user_email=user_email, agent_token=agent_token, sealed=sealed,
+            user_email=user_email, agent=agent, groups=groups, run_id=run_id,
+            parent_run_id=parent_run_id, sealed=sealed,
         )
         return {"id": "x", "ok": True, "result": result}
 
@@ -764,6 +830,7 @@ def test_mcp_endpoint_routes_to_the_edge_connection(enforcing):
 
     assert response.status_code == 200
     assert response.json() == {"tool": "tenant_account_tools", "result": result}
+    claims = agent_token_module.verify(token)
     assert seen == {
         "mcp": "devops-cli",
         "tool": "tenant_account_tools",
@@ -772,7 +839,11 @@ def test_mcp_endpoint_routes_to_the_edge_connection(enforcing):
         "deadline_ms": protocol.DEFAULT_DEADLINE_MS,
         "user": "claim-user",
         "user_email": "claims@example.com",
-        "agent_token": token,
+        # The token itself never crosses (R1): the MCP route forwards identity too.
+        "agent": "agent-a",
+        "groups": None,
+        "run_id": claims.run_id,
+        "parent_run_id": None,
         "sealed": None,
     }
 
@@ -2211,7 +2282,9 @@ def test_an_admin_edit_is_allowed_to_empty_the_mcp_catalog(monkeypatch):
 # The relay is the authority for edge calls: it verifies the token, resolves the
 # agent's effective allowlist from the registry itself, and only then forwards a
 # frame. These tests pin the denial paths (none of which may reach the edge) and
-# the one thing that must survive: the token rides the forwarded frame verbatim.
+# what crosses instead of the token: the claims-derived identity (R1 -- the edge
+# holds no signing key, so a token on the wire would be the only thing it could
+# verify, and whoever holds one can mint a run).
 
 
 def _agent(tools=None, mcps=None):
@@ -2237,46 +2310,123 @@ def _mint(agent="agent-a", **kwargs):
 
 
 def _capture(seen):
+    """Record the identity arguments the relay hands to the edge connection.
+
+    R1: what crosses is a resolved identity, never the agent token -- so there is no
+    ``agent_token`` kwarg left to capture.
+    """
+
     async def _record(*args, **kwargs):
-        seen.update(agent_token=kwargs.get("agent_token"), call=args)
+        seen.update(
+            agent=kwargs.get("agent"),
+            groups=kwargs.get("groups"),
+            run_id=kwargs.get("run_id"),
+            parent_run_id=kwargs.get("parent_run_id"),
+            call=args,
+        )
         return {"id": "x", "ok": True, "result": {}}
 
     return _record
 
 
-def test_a_permitted_call_forwards_the_agent_token(enforcing):
+def test_a_permitted_call_forwards_the_claims_identity(enforcing):
     conn = _install_conn()
     seen = {}
     conn.request = _capture(seen)
-    token = _mint()
 
     response = TestClient(app_module.app).post(
         "/v1/sites/site-a/call",
-        json={"tool": "echo", "args": {"q": "x"}, "agent_token": token},
+        json={
+            "tool": "echo",
+            "args": {"q": "x"},
+            "agent_token": _mint(run_id="run-1", groups=("ops",)),
+        },
     )
 
     assert response.status_code == 200
-    assert seen["agent_token"] == token
+    assert seen["agent"] == "agent-a"
+    assert seen["groups"] == ["ops"]
+    assert seen["run_id"] == "run-1"
+    assert seen["parent_run_id"] is None
 
 
-def test_the_forwarded_frame_carries_the_agent_token():
-    """Not just the HTTP body: the wire frame the edge verifies must carry it too."""
+def test_the_forwarded_frame_carries_the_claims_identity_and_no_token():
+    """R1: the wire frame carries the resolved identity, never the agent token."""
 
     async def _scenario():
         ws = FakeWebSocket()
         conn = EdgeConn(ws, "site-a", {"echo": _tool()})
         task = asyncio.create_task(
-            conn.request("echo", {"q": "hi"}, 5000, "u1", agent_token="t1.payload.sig")
+            conn.request(
+                "echo",
+                {"q": "hi"},
+                5000,
+                "u1",
+                agent="agent-a",
+                groups=["ops"],
+                run_id="run-1",
+                parent_run_id="run-0",
+            )
         )
         await _wait_for_frames(ws)
 
         frame = ws.sent[0]
-        assert frame["agent_token"] == "t1.payload.sig"
+        assert frame["agent"] == "agent-a"
+        assert frame["groups"] == ["ops"]
+        assert frame["run_id"] == "run-1"
+        assert frame["parent_run_id"] == "run-0"
+        # The signing material stops at the relay: whoever holds it can mint a run.
+        assert "agent_token" not in frame
 
         conn.resolve(frame["id"], {"id": frame["id"], "ok": True, "result": {}})
         await task
 
     asyncio.run(_scenario())
+
+
+def test_a_frame_without_a_verified_caller_carries_no_run_identity():
+    """No token, no identity: the keys are absent, not present-and-null."""
+    conn = EdgeConn(FakeWebSocket(), "site-a", {"echo": _tool()})
+
+    frame = conn._call_frame("echo", {"q": "hi"}, 5000, None, None)
+
+    assert frame == {
+        "t": "call",
+        "id": frame["id"],
+        "tool": "echo",
+        "args": {"q": "hi"},
+        "deadline_ms": 5000,
+        "user": None,
+    }
+
+
+def test_validate_call_returns_the_run_identity_and_tolerates_an_old_token():
+    """The edge-side half of R1: new keys are validated and returned, the token is not.
+
+    An older relay still sends ``agent_token``; the frame must parse (wire tolerance),
+    even though nothing on the edge consumes it any more.
+    """
+    parsed = protocol.validate_call(
+        {
+            "id": "c1",
+            "tool": "echo",
+            "agent": "agent-a",
+            "groups": ["ops"],
+            "run_id": "run-1",
+            "agent_token": "t1.payload.sig",
+        }
+    )
+
+    assert parsed["agent"] == "agent-a"
+    assert parsed["groups"] == ["ops"]
+    assert parsed["run_id"] == "run-1"
+    # Absent, not null: a root run and a token-less caller add no keys.
+    assert "parent_run_id" not in parsed
+    assert parsed["agent_token"] == "t1.payload.sig"
+
+    # An older edge's own shape checks still apply to what crosses the tunnel.
+    with pytest.raises(protocol.ProtocolError):
+        protocol.validate_call({"id": "c1", "tool": "echo", "groups": "ops"})
 
 
 @pytest.mark.parametrize(
@@ -2395,6 +2545,9 @@ def test_the_forwarded_frame_carries_the_token_identity_not_a_record_read(enforc
     # The frame's positional identity arguments came from the verified claims.
     assert seen["call"][3] == "u-1"
     assert seen["call"][4] == "u@example.test"
+    # ...and so did the run attribution the edge sees instead of the token.
+    assert seen["agent"] == "agent-a"
+    assert seen["groups"] == ["ops"]
 
 
 def test_a_public_export_is_the_front_doors_grant(enforcing):
@@ -2474,13 +2627,12 @@ def test_an_mcp_call_accepts_a_server_grant_or_a_per_tool_grant(enforcing):
 
     # Granted as an edge MCP: permits_mcp and permits_tool both hold.
     enforcing.agents["agent-a"] = _agent(mcps=["site-a__devops-cli"])
-    token = _mint()
     permitted = client.post(
         "/v1/sites/site-a/mcps/devops-cli/call",
-        json={**body, "agent_token": token},
+        json={**body, "agent_token": _mint()},
     )
     assert permitted.status_code == 200
-    assert seen["agent_token"] == token
+    assert seen["agent"] == "agent-a"
 
     # Documented narrowing: the tool's full `mcp__...` reference grants just that tool,
     # which is enough to open the session it needs.

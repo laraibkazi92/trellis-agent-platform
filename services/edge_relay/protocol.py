@@ -64,8 +64,16 @@ MAX_MCP_DESC_CHARS = 8_192
 # RFC 5321 caps a forward path at 256 bytes including the angle brackets.
 MAX_USER_EMAIL_CHARS = 254
 # A t1 token is a few hundred bytes; the cap only bounds what the relay will
-# validate and forward to the edge.
+# validate and forward to the edge. R1 keeps this check for wire tolerance (an older
+# relay still sends the token) but nothing on the edge consumes it any more.
 MAX_AGENT_TOKEN_CHARS = 4096
+# The claims-derived run attribution a call frame carries. Every value is signed into
+# the token, so these only bound what the edge will accept and parse; a longer one is a
+# malformed claim, not something to accommodate.
+MAX_AGENT_NAME_CHARS = 128
+MAX_RUN_ID_CHARS = 128
+MAX_GROUPS = 256
+MAX_GROUP_NAME_CHARS = 254
 # Slightly above the hub's default tool timeout (300 s) so the edge's own,
 # structured timeout wins the race and the caller gets the tool's error instead
 # of a bare relay 504.
@@ -825,6 +833,78 @@ def validate_identity(
     return user, user_email
 
 
+def _identity_string(value: Any, field: str, limit: int) -> Optional[str]:
+    """One optional identity string: type, length and control-character rules.
+
+    Shared by the identity validators so the relay's pre-send check and the edge's
+    on-arrival check cannot drift (a mismatch costs the tunnel: the edge closes it).
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ProtocolError(f"call.{field} must be a string or null")
+    if len(value) > limit:
+        raise ProtocolError(f"call.{field} exceeds {limit} characters")
+    if any(ord(char) < 32 for char in value):
+        raise ProtocolError(f"call.{field} must not contain control characters")
+    return value
+
+
+def _identity_groups(value: Any) -> List[str]:
+    """The caller's groups: a bounded list of non-empty, control-character-free names."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ProtocolError("call.groups must be a list of strings or null")
+    if len(value) > MAX_GROUPS:
+        raise ProtocolError(f"call.groups exceeds {MAX_GROUPS} entries")
+    names: List[str] = []
+    for name in value:
+        if not isinstance(name, str) or not name:
+            raise ProtocolError("call.groups must contain non-empty strings")
+        if len(name) > MAX_GROUP_NAME_CHARS:
+            raise ProtocolError(f"call.groups entry exceeds {MAX_GROUP_NAME_CHARS} characters")
+        if any(ord(char) < 32 for char in name):
+            raise ProtocolError("call.groups entries must not contain control characters")
+        names.append(name)
+    return names
+
+
+def validate_run_identity(
+    agent: Any = None,
+    groups: Any = None,
+    run_id: Any = None,
+    parent_run_id: Any = None,
+) -> Dict[str, Any]:
+    """Validate one frame's run attribution, returning only the keys to send.
+
+    R1 removed the agent token from the call frame, so these four keys (named as in
+    ``core.execution.contract.RunIdentity``) are the whole of what the edge learns
+    about the run behind a call. Every one is derived by the relay from the verified
+    token's claims, never from a request body, and the edge trusts them over the
+    authenticated tunnel.
+
+    Absent values are dropped rather than sent as nulls: a token-less caller produces
+    ``{}``, and an older edge then sees a frame shaped exactly as before. Called by the
+    relay *before* sending (so a malformed claim is a ``400``, not a closed tunnel) and
+    by :func:`validate_call` on arrival.
+    """
+    out: Dict[str, Any] = {}
+    agent = _identity_string(agent, "agent", MAX_AGENT_NAME_CHARS)
+    if agent is not None:
+        out["agent"] = agent
+    names = _identity_groups(groups)
+    if names:
+        out["groups"] = names
+    run_id = _identity_string(run_id, "run_id", MAX_RUN_ID_CHARS)
+    if run_id is not None:
+        out["run_id"] = run_id
+    parent_run_id = _identity_string(parent_run_id, "parent_run_id", MAX_RUN_ID_CHARS)
+    if parent_run_id is not None:
+        out["parent_run_id"] = parent_run_id
+    return out
+
+
 def validate_call(frame: Dict[str, Any]) -> Dict[str, Any]:
     call_id = frame.get("id")
     if not isinstance(call_id, str) or not call_id or len(call_id) > 128:
@@ -865,9 +945,11 @@ def validate_call(frame: Dict[str, Any]) -> Dict[str, Any]:
     # authenticated tunnel and does not re-verify any token.
     user, user_email = validate_identity(frame.get("user"), frame.get("user_email"))
 
-    # The agent token is opaque to this module and to the edge: the relay verifies it
-    # (the only verifier in this path) and forwards it for the runner. Only its shape
-    # is checked, because it crosses the tunnel verbatim.
+    # The agent token is no longer sent (R1): the relay is the only verifier, so the
+    # edge receives the identity it resolved instead of a credential it would have to
+    # hold a signing key for. Accepted here only for wire tolerance with an older relay
+    # -- nothing on the edge consumes it, and only its shape is checked because it would
+    # cross the tunnel verbatim.
     agent_token = frame.get("agent_token")
     if agent_token is not None:
         if not isinstance(agent_token, str):
@@ -880,6 +962,14 @@ def validate_call(frame: Dict[str, Any]) -> Dict[str, Any]:
             raise ProtocolError(
                 "call.agent_token must not contain control characters"
             )
+
+    # Run attribution, from the same claims-derived identity as ``user``/``user_email``.
+    run_identity = validate_run_identity(
+        frame.get("agent"),
+        frame.get("groups"),
+        frame.get("run_id"),
+        frame.get("parent_run_id"),
+    )
 
     # The sealed per-user credential envelope is opaque to the relay: shape and size
     # only (``edge_crypto.validate_blob``), never decryptability. Central may have
@@ -902,6 +992,8 @@ def validate_call(frame: Dict[str, Any]) -> Dict[str, Any]:
         "user": user,
         "user_email": user_email,
         "agent_token": agent_token,
+        # agent/groups/run_id/parent_run_id: only the ones the relay resolved.
+        **run_identity,
         "sealed": sealed,
     }
 

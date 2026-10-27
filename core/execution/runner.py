@@ -21,6 +21,17 @@ is raw bytes, stdout is re-framed as ``tag(1) + length(4, big-endian) + payload`
 so one stream carries both stdout and stderr. The registry is in-process on purpose
 -- a restart kills every session, which is cheaper and safer than trying to
 re-adopt containers whose stdin socket the old process owned.
+
+Identity has two possible sources, selected by ``RUNNER_ROLE`` (never inferred):
+
+* ``central`` (default) -- the request carries an ``agent_token``; the runner verifies
+  its signature and expiry and takes agent/user/groups/run from its claims. A body
+  that asserts ``identity`` is refused: on this role a forged body must not be able
+  to name another caller.
+* ``edge`` -- this process holds no signing key, so it verifies nothing. Identity comes
+  in the body, relayed by the edge proxy from the relay's verified-claims frame; the
+  proxy authenticated through the Unix socket plus ``RUNNER_TOKEN`` and the relay
+  already authorized the call. A token in the body is ignored, not checked.
 """
 
 import argparse
@@ -56,6 +67,7 @@ from core.execution.contract import (
     ExecRequest,
     ExecResult,
     HealthInfo,
+    RunIdentity,
     SessionCreateRequest,
     SessionInfo,
 )
@@ -143,6 +155,74 @@ def _default_runtime() -> str:
 
 def _runner_image() -> str:
     return (os.getenv("RUNNER_IMAGE") or os.getenv("TRELLIS_IMAGE") or "").strip()
+
+
+# --------------------------------------------------------------------------- #
+# runner role
+# --------------------------------------------------------------------------- #
+
+# ``RUNNER_ROLE`` names which half of the edge split this process is. It is a
+# deployment fact and is NEVER inferred from key presence: a central runner that lost
+# its key would otherwise silently downgrade to trusting body identity, which is the
+# one thing this split exists to prevent.
+DEFAULT_RUNNER_ROLE = "central"
+RUNNER_ROLES = frozenset({"central", "edge"})
+# One line per message per process: the per-request paths would otherwise repeat the
+# same warning on every call.
+_warned: set[str] = set()
+
+
+def _log_once(key: str, level: int, message: str, *args: Any) -> None:
+    if key in _warned:
+        return
+    _warned.add(key)
+    logger.log(level, message, *args)
+
+
+def runner_role() -> str:
+    """``central`` (default) or ``edge`` -- what this process may trust.
+
+    A **central** runner verifies the ``agent_token`` and takes identity from its
+    claims. An **edge** runner holds no signing key at all: it serves the ``identity``
+    the edge proxy puts in the body, having authenticated that proxy with the Unix
+    socket and ``RUNNER_TOKEN``. An unrecognized value falls back to ``central`` --
+    the fail-closed side, which verifies instead of trusting -- and is logged once.
+    """
+    raw = (os.getenv("RUNNER_ROLE") or "").strip().lower()
+    if not raw:
+        return DEFAULT_RUNNER_ROLE
+    if raw in RUNNER_ROLES:
+        return raw
+    _log_once(
+        "role:unrecognized",
+        logging.ERROR,
+        "runner: unrecognized RUNNER_ROLE %r; falling back to %r (expected one of: %s)",
+        raw,
+        DEFAULT_RUNNER_ROLE,
+        ", ".join(sorted(RUNNER_ROLES)),
+    )
+    return DEFAULT_RUNNER_ROLE
+
+
+def _warn_unused_edge_key() -> None:
+    """An edge runner is handed key settings it must not use: say so, exactly once."""
+    configured = [
+        name
+        for name in ("AGENT_TOKEN_SECRET", "ENFORCE_AGENT_TOKENS")
+        if (os.getenv(name) or "").strip()
+    ]
+    if not configured:
+        return
+    _log_once(
+        "role:edge-token-settings",
+        logging.WARNING,
+        "runner: RUNNER_ROLE=edge -- %s %s set but unused on an edge runner: it holds "
+        "no signing key and never verifies a token (identity comes from the edge proxy "
+        "over the runner-token-authenticated socket). Remove %s from this host.",
+        " and ".join(configured),
+        "are" if len(configured) > 1 else "is",
+        "them" if len(configured) > 1 else "it",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -587,7 +667,23 @@ async def reap_one_shot(backend: Optional[ContainerBackend] = None) -> int:
 
 async def startup(backend: Optional[ContainerBackend] = None) -> list[Check]:
     """Fail closed: log every failed gate, then refuse to serve."""
-    agent_token_module.require_secret("runner")
+    role = runner_role()
+    if role == "central":
+        # Only a central runner mints/verifies: it needs the key, and an enforcing
+        # deployment without one must not start.
+        agent_token_module.require_secret("runner")
+        logger.info(
+            "runner: role=central -- identity comes from the verified agent token"
+        )
+    else:
+        # An edge runner never loads a signing key (no require_secret, no
+        # signing_keys): identity arrives from the edge proxy over the
+        # runner-token-authenticated socket.
+        logger.info(
+            "runner: role=edge -- identity comes from the edge proxy over the "
+            "runner-token-authenticated socket; this process holds no signing key"
+        )
+        _warn_unused_edge_key()
     checks = await full_preflight(backend)
     failed = [check for check in checks if not check.ok]
     for check in failed:
@@ -605,12 +701,13 @@ async def startup(backend: Optional[ContainerBackend] = None) -> list[Check]:
 
 
 def _verified_claims(payload: Any) -> Optional[agent_token_module.Claims]:
-    """The caller's verified claims, or ``None`` when the request carries no verified token.
+    """A **central** runner's identity: the caller's verified claims, or ``None``.
 
-    Identity in the runner comes from here and nowhere else -- the wire bodies have no
-    identity fields. ``None`` is the rollout/dev posture (``ENFORCE_AGENT_TOKENS=off``,
-    or ``log`` without a minting secret): the container then runs with no identity
-    attribution rather than an asserted one.
+    Central only. Identity there comes from the token and nowhere else -- the wire
+    body carries no identity fields (``_identity_denial`` refuses a body that asserts
+    one). ``None`` is the rollout/dev posture (``ENFORCE_AGENT_TOKENS=off``, or ``log``
+    without a minting secret): the container then runs with no identity attribution
+    rather than an asserted one. An edge runner never calls this: it has no key.
     """
     if agent_token_module.mode() == "off":
         return None
@@ -620,10 +717,66 @@ def _verified_claims(payload: Any) -> Optional[agent_token_module.Claims]:
         return None
 
 
+def _request_identity(
+    payload: Any,
+) -> Optional[agent_token_module.Claims | RunIdentity]:
+    """The run's identity from whichever source this role owns, or ``None``.
+
+    ``central`` -> the verified token's claims. ``edge`` -> the body's ``identity``,
+    which the edge proxy relayed from the relay's verified-claims frame; a token in
+    that body is silently ignored (there is no key here to check it with, and the
+    proxy has already authenticated). Both objects expose the same attribute names,
+    so every caller below reads ``identity.agent`` / ``.user_id`` / ``.run_id``
+    without caring which one it got.
+    """
+    if runner_role() == "edge":
+        return getattr(payload, "identity", None)
+    return _verified_claims(payload)
+
+
+# Kinds that always run *as somebody*. An edge runner cannot serve one without the
+# identity the edge proxy carries; ``discovery`` is exempt (agent-free catalog read).
+IDENTITY_REQUIRED_KINDS = frozenset({"tool", "console", "workflow"})
+
+
+def _identity_denial(payload: Any) -> Optional[JSONResponse]:
+    """Refuse the other role's identity form, and a missing one, before dispatch.
+
+    Neither deployment may be talked into trusting a body it does not verify: central
+    verifies the token, so a body that asserts identity is a forgery attempt; edge
+    trusts the proxy, so it must actually receive what the proxy verified.
+    """
+    role = runner_role()
+    identity = getattr(payload, "identity", None)
+    if role == "central":
+        if identity is None:
+            return None
+        return _error(
+            400,
+            "invalid_request",
+            "central runner refuses body identity: identity comes from the verified "
+            "agent token only",
+        )
+    if payload.kind in IDENTITY_REQUIRED_KINDS and identity is None:
+        return _error(
+            400,
+            "invalid_request",
+            f"RUNNER_ROLE=edge: a {payload.kind} run needs the caller's identity in "
+            "the request body; the edge proxy must send it (this host holds no "
+            "token-signing key)",
+        )
+    return None
+
+
 def _authorize(payload: Any) -> Optional[JSONResponse]:
     """Verify the agent token: signature, expiry and shape -- nothing else.
 
-    The runner has no registry and no agent manifests, so it cannot resolve an
+    A **central** runner's gate. An **edge** runner has no key to verify with, so it
+    returns ``None`` for every kind and verifies nothing: the Unix socket plus the
+    ``RUNNER_TOKEN`` bearer authenticate the edge proxy, the relay already authorized
+    the call, and identity arrives in the body (``_request_identity``).
+
+    The central runner has no registry and no agent manifests, so it cannot resolve an
     allowlist. Every authorization decision is made *before* the request reaches this
     process: the hub authorizes tool calls, the process that owns the agent runtime
     authorizes the sessions and console containers it asks for (``core.tool_gate``,
@@ -640,6 +793,8 @@ def _authorize(payload: Any) -> Optional[JSONResponse]:
     The one non-agent path is a ``kind: "discovery"`` catalog read, which carries no
     agent run at all and is gated by the runner bearer token on the control socket.
     """
+    if runner_role() == "edge":
+        return None
     mode = agent_token_module.mode()
     if mode == "off":
         return None
@@ -1072,9 +1227,14 @@ async def exec_tool(request: Request, payload: ExecRequest):
     if denial is not None:
         return denial
 
-    # Identity for the container: the verified claims, and nothing else. A request
-    # with no verified token (off/log rollout) runs unattributed.
-    claims = _verified_claims(payload)
+    denial = _identity_denial(payload)
+    if denial is not None:
+        return denial
+
+    # Identity for the container: the verified claims on a central runner, the edge
+    # proxy's relay-derived identity on an edge runner -- and nothing else. A request
+    # with no identity at all (central off/log rollout) runs unattributed.
+    identity = _request_identity(payload)
 
     if payload.kind == "console":
         return await _execute_one_shot(
@@ -1083,9 +1243,9 @@ async def exec_tool(request: Request, payload: ExecRequest):
             lambda: spec.build_console_spec(
                 payload.command or "",
                 env=payload.env,
-                user_id=claims.user_id if claims else None,
-                user_email=claims.user_email if claims else None,
-                run_id=claims.run_id if claims else None,
+                user_id=identity.user_id if identity else None,
+                user_email=identity.user_email if identity else None,
+                run_id=identity.run_id if identity else None,
             ),
         )
 
@@ -1107,9 +1267,9 @@ async def exec_tool(request: Request, payload: ExecRequest):
                 env=payload.env,
                 host_workspace=_host_workspace(),
                 workspace_root=_workspace_root(),
-                run_id=claims.run_id if claims else None,
-                user_id=claims.user_id if claims else None,
-                user_email=claims.user_email if claims else None,
+                run_id=identity.run_id if identity else None,
+                user_id=identity.user_id if identity else None,
+                user_email=identity.user_email if identity else None,
                 network=payload.network,
                 limits=payload.limits,
             ),
@@ -1152,10 +1312,10 @@ async def exec_tool(request: Request, payload: ExecRequest):
             env=payload.env,
             host_workspace=_host_workspace(),
             workspace_root=_workspace_root(),
-            # Output-directory ownership follows the token's agent, so a tool can
+            # Output-directory ownership follows the caller's agent, so a tool can
             # only be handed `output|reports|data/<its own agent>`.
-            agent=claims.agent if claims else None,
-            run_id=claims.run_id if claims else None,
+            agent=identity.agent if identity else None,
+            run_id=identity.run_id if identity else None,
         ),
     )
 
@@ -1243,6 +1403,12 @@ async def open_session(request: Request, payload: SessionCreateRequest):
     # Authorization before target/digest lookups: an unauthenticated caller must
     # not be able to enumerate targets or probe manifest digests.
     denial = _authorize(payload)
+    if denial is not None:
+        return denial
+
+    # Same identity rule as /v1/exec. A session takes its container env from the
+    # request's ``env``, so there is nothing else to resolve here.
+    denial = _identity_denial(payload)
     if denial is not None:
         return denial
 

@@ -340,7 +340,7 @@ def test_backend_timeout_maps_to_504(env):
     assert detail["retryable"] is False
 
 
-# --- authorization: the token, and nothing else ------------------------------
+# --- authorization: the token, and nothing else (central role) ----------------
 #
 # v0.7.1 Phase 4: the runner verifies signature and expiry and then runs. It has no
 # registry and no agent manifests, so it cannot resolve an allowlist, and every
@@ -348,6 +348,8 @@ def test_backend_timeout_maps_to_504(env):
 # process that owns the agent runtime authorizes console/MCP sessions
 # (`core.tool_gate`, checked in tests/test_enforcement_matrix.py). The one agent-free
 # kind remains a throwaway discovery read, gated by the control socket's bearer token.
+# The edge role (`RUNNER_ROLE=edge`, v0.7.2 R1) holds no key and verifies nothing: its
+# cases are at the bottom of this file.
 
 
 def _console_body(token):
@@ -516,6 +518,211 @@ def test_a_discovery_read_is_gated_by_the_socket_token_alone(env, monkeypatch):
         _call("POST", "/v1/sessions", json_body=body, headers={})
     )
     assert unauthenticated.status_code == 401
+
+
+# --- roles: central verifies a token, edge trusts the proxy -------------------
+#
+# v0.7.2 R1: the edge runner stops holding a signing key. It serves whatever the
+# edge proxy proves through the runner-token-authenticated socket (the relay already
+# verified the token), and a central runner refuses a body that asserts identity.
+
+
+def _identity(**overrides) -> dict:
+    identity = {
+        "agent": "demo-assistant",
+        "user_id": "u-edge",
+        "user_email": "edge@example.test",
+        "groups": ["ops"],
+        "run_id": "run-edge",
+    }
+    identity.update(overrides)
+    return identity
+
+
+def _edge(monkeypatch) -> None:
+    monkeypatch.setenv("RUNNER_ROLE", "edge")
+
+
+def _tokenless_body(root, **overrides) -> dict:
+    """The edge role's wire shape: identity, and no token at all."""
+    body = _body(root, **overrides)
+    body.pop("agent_token", None)
+    return body
+
+
+def test_the_edge_role_takes_identity_from_the_body(env, monkeypatch):
+    """A tool run mounts the body identity's output dir and labels its run."""
+    body = _tokenless_body(env.root, identity=_identity())
+    _edge(monkeypatch)
+    monkeypatch.delenv("AGENT_TOKEN_SECRET", raising=False)
+    env.backend.queue(RawExec(exit_code=0, stdout=b'{"ok": true}\n'))
+
+    response = asyncio.run(_call("POST", "/v1/exec", json_body=body))
+
+    assert response.status_code == 200, response.json()
+    container_spec = env.backend.specs[0]
+    assert container_spec.mounts[2].target == "/app/workspace/reports/demo-assistant"
+    assert container_spec.mounts[2].source == f"/host{env.root}/reports/demo-assistant"
+    assert container_spec.labels["trellis.run"] == "run-edge"
+    # No token was needed and none was consulted: agent, run and user all came from
+    # the body the edge proxy wrote.
+    assert container_spec.labels["trellis.target"] == "echo"
+
+
+def test_the_edge_role_puts_identity_in_the_console_env(env, monkeypatch):
+    _edge(monkeypatch)
+    monkeypatch.delenv("AGENT_TOKEN_SECRET", raising=False)
+    env.backend.queue(RawExec(exit_code=0, stdout=b"hi\n"))
+
+    body = {"kind": "console", "target": "console", "command": "echo hi",
+            "identity": _identity()}
+    response = asyncio.run(_call("POST", "/v1/exec", json_body=body))
+
+    assert response.status_code == 200, response.json()
+    container_spec = env.backend.specs[0]
+    assert container_spec.env["TRELLIS_USER_ID"] == "u-edge"
+    assert container_spec.env["TRELLIS_USER_EMAIL"] == "edge@example.test"
+    assert container_spec.env["TRELLIS_RUN_ID"] == "run-edge"
+    assert container_spec.labels["trellis.run"] == "run-edge"
+
+
+@pytest.mark.parametrize("kind", ["tool", "console", "workflow"])
+def test_the_edge_role_refuses_a_run_without_identity(env, monkeypatch, kind):
+    """The edge has no key to fall back on: a bare body cannot run as anybody."""
+    _edge(monkeypatch)
+    body = {"kind": kind, "target": "echo"}
+    if kind == "console":
+        body["command"] = "echo hi"
+    if kind == "workflow":
+        body["entrypoint"] = "pipeline.py"
+
+    response = asyncio.run(_call("POST", "/v1/exec", json_body=body))
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert detail["code"] == "invalid_request"
+    assert "RUNNER_ROLE=edge" in detail["message"]
+    assert "identity" in detail["message"]
+    assert env.backend.specs == []
+
+
+def test_the_edge_role_ignores_an_agent_token(env, monkeypatch):
+    """A token in the body is neither verified nor needed (there is no key here)."""
+    body = _body(
+        env.root, agent_token=_token("gateway"), identity=_identity()
+    )  # signed with the fixture secret...
+    _edge(monkeypatch)
+    monkeypatch.delenv("AGENT_TOKEN_SECRET", raising=False)  # ...which is now gone
+    env.backend.queue(RawExec(exit_code=0, stdout=b'{"ok": true}\n'))
+
+    response = asyncio.run(_call("POST", "/v1/exec", json_body=body))
+
+    assert response.status_code == 200, response.json()
+    # The body identity wins: the token names another agent and does not mount it.
+    assert env.backend.specs[0].mounts[2].target == (
+        "/app/workspace/reports/demo-assistant"
+    )
+
+
+def test_a_central_runner_refuses_body_identity(env):
+    """On the verifying role a body-asserted identity is a forgery attempt."""
+    response = asyncio.run(
+        _call("POST", "/v1/exec", json_body=_body(env.root, identity=_identity()))
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert detail["code"] == "invalid_request"
+    assert "central runner refuses body identity" in detail["message"]
+    assert env.backend.specs == []
+
+
+def test_a_central_session_refuses_body_identity(env):
+    body = {
+        "kind": "mcp_session",
+        "target": "coralogix",
+        "session_key": "a" * 32,
+        "agent_token": _token("supervisor"),
+        "identity": _identity(),
+    }
+
+    response = asyncio.run(_call("POST", "/v1/sessions", json_body=body))
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "invalid_request"
+
+
+def test_the_edge_role_still_serves_a_tokenless_discovery_read(env, monkeypatch):
+    """`discovery` is the agent-free kind: no identity, and the socket token gates it."""
+    _edge(monkeypatch)
+    body = {"kind": "discovery", "target": "catalog", "session_key": "a" * 32}
+
+    response = asyncio.run(_call("POST", "/v1/sessions", json_body=body))
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "unknown_target"
+
+
+def test_edge_startup_needs_no_signing_key(env, monkeypatch):
+    """`startup()` on the edge role never asks for a key -- even under `enforce`."""
+    _edge(monkeypatch)
+    monkeypatch.delenv("AGENT_TOKEN_SECRET", raising=False)
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+
+    def never(*_args, **_kwargs):
+        raise AssertionError("an edge runner must never load a signing key")
+
+    monkeypatch.setattr(runner_module.agent_token_module, "require_secret", never)
+    monkeypatch.setattr(runner_module.agent_token_module, "signing_keys", never)
+    monkeypatch.setattr(canary_module.secrets, "token_bytes", lambda _n: b"canary-payload")
+    env.backend.queue(RawExec(exit_code=0, stdout=b"canary-payload"))
+
+    checks = asyncio.run(runner_module.startup(env.backend))
+
+    assert runner_module.startup_ready(checks) is True
+
+
+def test_edge_startup_warns_once_about_unused_token_settings(env, monkeypatch, caplog):
+    """A key on an edge runner is dead configuration: say it once, then stop."""
+    _edge(monkeypatch)
+    monkeypatch.setenv("AGENT_TOKEN_SECRET", SECRET)
+    monkeypatch.setenv("ENFORCE_AGENT_TOKENS", "enforce")
+    monkeypatch.setattr(canary_module.secrets, "token_bytes", lambda _n: b"canary-payload")
+    # The once-per-process guard is module state; give this test a clean one so the
+    # assertion does not depend on which edge test ran first.
+    monkeypatch.setattr(runner_module, "_warned", set())
+    env.backend.queue(RawExec(exit_code=0, stdout=b"canary-payload"))
+
+    with caplog.at_level("INFO", logger=runner_module.logger.name):
+        asyncio.run(runner_module.startup(env.backend))
+        warnings = [
+            record
+            for record in caplog.records
+            if "unused on an edge runner" in record.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert "AGENT_TOKEN_SECRET" in warnings[0].getMessage()
+        assert "ENFORCE_AGENT_TOKENS" in warnings[0].getMessage()
+
+        # The guard is per process, not per call.
+        runner_module._warn_unused_edge_key()
+        assert len(
+            [r for r in caplog.records if "unused on an edge runner" in r.getMessage()]
+        ) == 1
+
+    assert any(
+        "role=edge" in record.getMessage() for record in caplog.records
+    )
+
+
+def test_an_unrecognized_runner_role_falls_back_to_central(monkeypatch, caplog):
+    monkeypatch.setenv("RUNNER_ROLE", "worker")
+    monkeypatch.setattr(runner_module, "_warned", set())
+
+    with caplog.at_level("ERROR", logger=runner_module.logger.name):
+        assert runner_module.runner_role() == "central"
+
+    assert any("unrecognized RUNNER_ROLE" in r.getMessage() for r in caplog.records)
 
 
 def test_preflight_endpoint_reports_ok_health(env, monkeypatch):

@@ -461,7 +461,7 @@ def serve(config_map, frames, *, ws_class=FakeWebSocket, ws_kwargs=None, drain_g
 
 
 def test_serve_publishes_then_answers_calls(tmp_path, monkeypatch):
-    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None):
+    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None, identity=None):
         return {"ok": True}
 
     monkeypatch.setattr(proxy.tool_runtime, "execute_tool", fake_execute)
@@ -585,7 +585,7 @@ def test_next_backoff_resets_only_after_a_stable_session():
 def test_serve_rejects_calls_beyond_max_inflight(tmp_path, monkeypatch):
     monkeypatch.setattr(proxy, "MAX_INFLIGHT", 1)
 
-    async def slow_execute(config, tool_dir, arguments, *, env, on_health=None):
+    async def slow_execute(config, tool_dir, arguments, *, env, on_health=None, identity=None):
         await asyncio.sleep(0.2)
         return {"ok": True}
 
@@ -664,9 +664,42 @@ def test_call_is_cancelled_at_the_caller_deadline(tmp_path, monkeypatch):
     assert results[1]["ok"] is True
 
 
+def test_frame_identity_keeps_the_frame_names_and_nothing_else():
+    """The mapping is the one shape the env, the sealed owner and the runner share."""
+    call = {
+        "user": "u1",
+        "user_email": "u1@example.com",
+        "agent": "a1",
+        "groups": ["g1"],
+        "run_id": "r1",
+        "parent_run_id": "p1",
+        "tool": "demo",
+        "args": {"secret": "x"},
+        "agent_token": "t1.payload.signature",
+    }
+
+    assert proxy._frame_identity(call) == {
+        "user": "u1",
+        "user_email": "u1@example.com",
+        "agent": "a1",
+        "groups": ["g1"],
+        "run_id": "r1",
+        "parent_run_id": "p1",
+    }
+    # Absent fields are empty, never a stale value carried over from anywhere else.
+    assert proxy._frame_identity({}) == {
+        "user": None,
+        "user_email": None,
+        "agent": None,
+        "groups": [],
+        "run_id": None,
+        "parent_run_id": None,
+    }
+
+
 def test_handle_call_returns_result(tmp_path, monkeypatch):
 
-    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None):
+    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None, identity=None):
         assert config.name == "demo"
         assert arguments == {"q": "1"}  # string inputs are coerced like the hub
         assert "PATH" in env
@@ -687,7 +720,7 @@ def test_handle_call_returns_result(tmp_path, monkeypatch):
 def test_handle_call_exports_the_caller_identity_to_the_tool(tmp_path, monkeypatch):
     seen = {}
 
-    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None):
+    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None, identity=None):
         seen.update(env)
         return {"ok": True}
 
@@ -709,7 +742,7 @@ def test_handle_call_exports_the_caller_identity_to_the_tool(tmp_path, monkeypat
 def test_handle_call_without_identity_exports_no_identity_vars(tmp_path, monkeypatch):
     seen = {}
 
-    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None):
+    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None, identity=None):
         seen.update(env)
         return {"ok": True}
 
@@ -768,7 +801,7 @@ def test_handle_call_reports_tool_exceptions(tmp_path, monkeypatch):
 def test_slow_call_does_not_block_a_second_call(tmp_path, monkeypatch):
     finished = []
 
-    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None):
+    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None, identity=None):
         if config.name == "slow":
             await asyncio.sleep(0.2)
         finished.append(config.name)
@@ -1179,14 +1212,25 @@ def _install_fake_connect(monkeypatch, close_code):
     monkeypatch.setattr(proxy, "_connect_factory", lambda: _fake_connect)
 
 
-# ---------------------------------------------------------------- agent tokens
+# ------------------------------------------------------------- caller identity
 #
-# v0.7.1: the edge verifies **nothing**. The relay authenticated the caller, verified
-# the token and built the frame identity from its claims; the edge trusts that identity
-# over the authenticated tunnel. A bad, missing or expired token is therefore not the
-# edge's refusal to make -- it is forwarded unchanged so the runner can act on it.
+# v0.7.2 R1: the edge holds no token-signing key and verifies nothing. The relay
+# authenticated the caller, verified the token and sends the claims it derived (agent,
+# user, email, groups, run ids); the edge trusts that identity over the authenticated
+# tunnel and forwards it to its own runner, which takes it from the request body. No
+# token travels on this path any more, so nothing here could check one.
 
 TOKEN_SECRET = "test-agent-token-secret-0123456789abcdef"
+
+# A frame as the relay builds it after R1: relay-derived identity, no token.
+FRAME_IDENTITY = {
+    "user": "user-1",
+    "user_email": "user-1@corp.example",
+    "agent": "demo",
+    "groups": ["sre", "ops"],
+    "run_id": "run-1",
+    "parent_run_id": "run-parent",
+}
 
 
 @pytest.fixture
@@ -1200,29 +1244,42 @@ def enforcing_tokens(monkeypatch):
     [None, "t1.forged.signature", ""],
     ids=["missing", "bad_sig", "empty"],
 )
-def test_handle_call_never_verifies_a_token(tmp_path, monkeypatch, enforcing_tokens, token):
-    """Even in enforce mode the edge runs the call: verification is the relay's job."""
+def test_handle_call_serves_a_frame_from_a_relay_that_still_sends_a_token(
+    tmp_path, monkeypatch, enforcing_tokens, token
+):
+    """Even in enforce mode the edge runs the call: verification is the relay's job.
+
+    A rolling upgrade can pair a v0.7.1 relay with a v0.7.2 edge. Such a frame still
+    carries a token -- and it must neither be checked here nor reach the runner, which
+    has nothing to check it with either (R1).
+    """
     ran = {}
 
-    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None, agent_token=None):
-        ran["agent_token"] = agent_token
+    async def fake_execute(
+        config, tool_dir, arguments, *, env, on_health=None, identity=None
+    ):
+        ran["identity"] = identity
         return {"ok": True}
 
     monkeypatch.setattr(proxy.tool_runtime, "execute_tool", fake_execute)
 
     frame = asyncio.run(
         proxy.handle_call(
-            {"demo": (make_config(), tmp_path)}, call_frame(agent_token=token)
+            {"demo": (make_config(), tmp_path)},
+            call_frame(agent_token=token, user="user-1"),
         )
     )
 
     assert frame["ok"] is True
-    # An empty token is not forwarded (the frame keeps its pre-v0.6 shape).
-    assert ran.get("agent_token") == (token or None)
+    assert ran["identity"]["user"] == "user-1"
+    # The frame's token is not part of the identity, so nothing forwards it.
+    assert "agent_token" not in ran["identity"]
 
 
 def test_handle_call_never_verifies_an_expired_token(tmp_path, monkeypatch, enforcing_tokens):
-    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None, agent_token=None):
+    async def fake_execute(
+        config, tool_dir, arguments, *, env, on_health=None, identity=None
+    ):
         return {"ok": True}
 
     monkeypatch.setattr(proxy.tool_runtime, "execute_tool", fake_execute)
@@ -1254,39 +1311,124 @@ def test_the_edge_starts_without_an_agent_token_secret(tmp_path, monkeypatch):
     asyncio.run(proxy.run(_once_config(), once=True))
 
 
-def test_handle_call_passes_the_agent_token_to_the_tool(
-    tmp_path, monkeypatch, enforcing_tokens
-):
+def test_handle_call_forwards_the_frame_identity_to_the_tool(tmp_path, monkeypatch):
     seen = {}
 
-    async def fake_execute(config, tool_dir, arguments, *, env, on_health=None, agent_token=None):
-        seen["agent_token"] = agent_token
+    async def fake_execute(
+        config, tool_dir, arguments, *, env, on_health=None, identity=None
+    ):
+        seen["identity"] = identity
+        seen["env"] = env
         return {"ok": True}
 
     monkeypatch.setattr(proxy.tool_runtime, "execute_tool", fake_execute)
-    token = agent_token.mint("demo")
 
     frame = asyncio.run(
         proxy.handle_call(
-            {"demo": (make_config(), tmp_path)}, call_frame(agent_token=token)
+            {"demo": (make_config(), tmp_path)}, call_frame(**FRAME_IDENTITY)
         )
     )
 
     assert frame["ok"] is True
-    assert seen["agent_token"] == token
+    identity = seen["identity"]
+    assert identity["user"] == "user-1"
+    assert identity["user_email"] == "user-1@corp.example"
+    # The relay-derived fields (R1) -- one mapping feeds the env and the runner.
+    assert identity["agent"] == "demo"
+    assert identity["groups"] == ["sre", "ops"]
+    assert identity["run_id"] == "run-1"
+    assert identity["parent_run_id"] == "run-parent"
+    # No token key at all: the frame has none to carry, and none is forwarded.
+    assert "agent_token" not in identity
+    # The tool still sees the caller through its env, from that same frame identity.
+    assert seen["env"]["TRELLIS_USER_ID"] == "user-1"
+    assert seen["env"]["TRELLIS_USER_EMAIL"] == "user-1@corp.example"
 
 
-def test_handle_mcp_call_never_verifies_a_token(monkeypatch, enforcing_tokens):
-    """Same rule on the MCP path: the manager is reached with the frame as-is."""
+def _install_fake_runner(monkeypatch):
+    """A ``RunnerClient`` stand-in sitting exactly where the socket would be."""
+    from core.execution import client as client_module
+    from core.execution.contract import ExecResult
+
+    requests = []
+
+    class FakeRunnerClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+        async def exec(self, request):
+            requests.append(request)
+            return ExecResult(exit_code=0, stdout='{"ok": true}', stderr="")
+
+    monkeypatch.setattr(client_module, "RunnerClient", lambda *a, **k: FakeRunnerClient())
+    # An edge has no etcd; keeps the tunable lookup off the network.
+    monkeypatch.setenv("TRELLIS_EDGE_MODE", "1")
+    monkeypatch.setenv("TOOL_EXECUTION_TIMEOUT", "30")
+    return requests
+
+
+def _runnable_tool(tmp_path):
+    """A config_map for one tool whose entrypoint exists on disk."""
+    tool_dir = tmp_path / "demo"
+    tool_dir.mkdir()
+    (tool_dir / "main.py").write_text("print('{}')\n", encoding="utf-8")
+    return {"demo": (make_config(), tool_dir)}
+
+
+def test_handle_call_sends_the_frame_identity_to_the_runner_and_no_token(
+    tmp_path, monkeypatch
+):
+    """The whole tool path, up to the socket: identity in, no token out.
+
+    The fake runner client stands where the socket would be, so this pins what an edge
+    runner actually receives: the relay's claims in ``identity`` and nothing it could
+    verify -- the edge has no signing key and sends none.
+    """
+    requests = _install_fake_runner(monkeypatch)
+
+    frame = asyncio.run(
+        proxy.handle_call(_runnable_tool(tmp_path), call_frame(**FRAME_IDENTITY))
+    )
+
+    assert frame["ok"] is True, frame.get("error")
+    request = requests[0]
+    assert request.identity is not None
+    assert request.identity.agent == "demo"
+    assert request.identity.user_id == "user-1"
+    assert request.identity.user_email == "user-1@corp.example"
+    assert request.identity.groups == ["sre", "ops"]
+    assert request.identity.run_id == "run-1"
+    assert request.identity.parent_run_id == "run-parent"
+    assert request.agent_token is None
+
+
+def test_an_identity_less_frame_sends_no_identity_at_all(tmp_path, monkeypatch):
+    """No agent in the frame (tokens off, or a pre-R1 relay) means no identity claim.
+
+    The edge runner refuses an identity-less tool run itself; this side must not
+    fabricate a nameless identity, which would hide that refusal behind a 422.
+    """
+    requests = _install_fake_runner(monkeypatch)
+
+    frame = asyncio.run(proxy.handle_call(_runnable_tool(tmp_path), call_frame()))
+
+    assert frame["ok"] is True, frame.get("error")
+    assert requests[0].identity is None
+    assert requests[0].agent_token is None
+
+
+def test_handle_mcp_call_forwards_the_frame_identity(monkeypatch, enforcing_tokens):
+    """The MCP path gets the same identity and, likewise, no token (R1)."""
     seen = {}
 
     class Manager:
         site = "plant-floor"
 
-        async def call(
-            self, mcp, tool, args, identity, deadline_ms, *, agent_token=None, sealed=None
-        ):
-            seen["agent_token"] = agent_token
+        async def call(self, mcp, tool, args, identity, deadline_ms, *, sealed=None):
+            seen["identity"] = identity
             return {"content": [], "isError": False}
 
     frame = asyncio.run(
@@ -1299,16 +1441,23 @@ def test_handle_mcp_call_never_verifies_a_token(monkeypatch, enforcing_tokens):
                 "mcp": "devops-cli",
                 "tool": "stateful",
                 "args": {},
-                "agent_token": "t1.forged.signature",
+                **FRAME_IDENTITY,
             },
         )
     )
 
     assert frame["ok"] is True
-    assert seen["agent_token"] == "t1.forged.signature"
+    identity = seen["identity"]
+    assert identity["user"] == "user-1"
+    assert identity["user_email"] == "user-1@corp.example"
+    assert identity["agent"] == "demo"
+    assert identity["groups"] == ["sre", "ops"]
+    assert identity["run_id"] == "run-1"
+    assert identity["parent_run_id"] == "run-parent"
+    assert "agent_token" not in identity
 
 
-def test_handle_mcp_call_passes_the_agent_token_to_the_manager(
+def test_handle_mcp_call_forwards_the_sealed_set_and_no_token(
     monkeypatch, enforcing_tokens
 ):
     seen = {}
@@ -1316,14 +1465,12 @@ def test_handle_mcp_call_passes_the_agent_token_to_the_manager(
     class Manager:
         site = "plant-floor"
 
-        async def call(
-            self, mcp, tool, args, identity, deadline_ms, *, agent_token=None, sealed=None
-        ):
-            seen["agent_token"] = agent_token
+        async def call(self, mcp, tool, args, identity, deadline_ms, *, sealed=None):
             seen["sealed"] = sealed
+            seen["identity"] = identity
             return {"content": [], "isError": False}
 
-    token = agent_token.mint("demo")
+    # A v0.7.1 relay's frame still carries this; it must not reach the manager.
     frame = asyncio.run(
         proxy.handle_mcp_call(
             Manager(),
@@ -1334,18 +1481,22 @@ def test_handle_mcp_call_passes_the_agent_token_to_the_manager(
                 "mcp": "devops-cli",
                 "tool": "stateful",
                 "args": {},
-                "agent_token": token,
+                "agent_token": agent_token.mint("demo"),
+                "user": "user-1",
             },
         )
     )
 
     assert frame["ok"] is True
-    assert seen["agent_token"] == token
     assert seen["sealed"] is None
+    assert seen["identity"]["user"] == "user-1"
+    assert "agent_token" not in seen["identity"]
 
 
-def test_the_session_manager_opens_the_transport_with_the_token(tmp_path, monkeypatch):
-    """The token is used at open time only: a warm session keeps what it has."""
+def test_the_session_manager_opens_the_transport_with_the_frame_identity(
+    tmp_path, monkeypatch
+):
+    """The identity is used at open time only: a warm session keeps what it has."""
     from core import proxy_mcp
 
     seen = {}
@@ -1368,9 +1519,8 @@ def test_the_session_manager_opens_the_transport_with_the_token(tmp_path, monkey
         kind="mcp_session",
         deadline_ms=0,
         identity=None,
-        agent_token=None,
     ):
-        seen["agent_token"] = agent_token
+        seen["identity"] = identity
         return FakeClient()
 
     monkeypatch.setattr(proxy_mcp, "_transport", fake_transport)
@@ -1391,21 +1541,14 @@ def test_the_session_manager_opens_the_transport_with_the_token(tmp_path, monkey
     )
 
     result = asyncio.run(
-        manager.call(
-            "devops-cli",
-            "stateful",
-            {},
-            {"user_email": "ops@example.com"},
-            5000,
-            agent_token="t1.payload.signature",
-        )
+        manager.call("devops-cli", "stateful", {}, dict(FRAME_IDENTITY), 5000)
     )
 
     assert result["isError"] is False
-    assert seen["agent_token"] == "t1.payload.signature"
+    assert seen["identity"] == FRAME_IDENTITY
 
 
-def test_the_runner_stdio_transport_receives_the_agent_token(tmp_path, monkeypatch):
+def test_the_runner_stdio_transport_receives_the_frame_identity(tmp_path, monkeypatch):
     from core import proxy_mcp
     from core.execution import stdio_transport
 
@@ -1422,9 +1565,51 @@ def test_the_runner_stdio_transport_receives_the_agent_token(tmp_path, monkeypat
         directory=tmp_path,
     )
 
-    proxy_mcp._runner_transport(entry, {}, agent_token="t1.payload.signature")
+    proxy_mcp._runner_transport(entry, {}, identity=dict(FRAME_IDENTITY))
 
-    assert seen["agent_token"] == "t1.payload.signature"
+    assert seen["identity"] == FRAME_IDENTITY
+    # R1: the session is created with the identity and no token.
+    assert "agent_token" not in seen
+
+
+def test_the_runner_stdio_transport_puts_the_identity_on_the_session_request(
+    tmp_path, monkeypatch
+):
+    """What actually crosses the socket: ``SessionCreateRequest.identity``, no token."""
+    from core.execution import stdio_transport
+
+    opened = []
+
+    class FakeRunnerClient:
+        async def open_session(self, request):
+            opened.append(request)
+            raise RuntimeError("stop after the request is built")
+
+    transport = stdio_transport.RunnerStdioTransport(
+        target="devops-cli",
+        session_key="0" * 32,
+        env={},
+        identity=dict(FRAME_IDENTITY),
+        client_factory=FakeRunnerClient,
+    )
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(_open_and_ignore(transport))
+
+    request = opened[0]
+    assert request.agent_token is None
+    assert request.identity is not None
+    assert request.identity.agent == "demo"
+    assert request.identity.user_id == "user-1"
+    assert request.identity.user_email == "user-1@corp.example"
+    assert request.identity.groups == ["sre", "ops"]
+    assert request.identity.run_id == "run-1"
+    assert request.identity.parent_run_id == "run-parent"
+
+
+async def _open_and_ignore(transport):
+    async with transport.connect_session():
+        pass
 
 
 # --- sealed credential ownership ---------------------------------------------

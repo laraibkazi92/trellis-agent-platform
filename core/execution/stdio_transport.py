@@ -18,7 +18,7 @@ incremental and never assume a read boundary.
 import contextlib
 import logging
 import struct
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Mapping, Optional
 
 import anyio
 import mcp_types as types
@@ -31,7 +31,7 @@ from mcp.shared.message import SessionMessage
 from typing_extensions import Unpack
 
 from core.execution.client import RunnerClient
-from core.execution.contract import SessionCreateRequest, SessionInfo
+from core.execution.contract import RunIdentity, SessionCreateRequest, SessionInfo
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +87,15 @@ async def _close_client(client: Any) -> None:
         await close()
 
 
+def _run_identity(identity: Optional[Mapping[str, Any]]) -> Optional[RunIdentity]:
+    """The edge frame's identity as the wire model, or ``None`` for a central client.
+
+    The frame->model translation is shared with the tool runtime
+    (``RunIdentity.from_frame``): one mapping, two consumers.
+    """
+    return RunIdentity.from_frame(identity)
+
+
 class RunnerStdioTransport(ClientTransport):
     """MCP over a runner session container instead of a local subprocess."""
 
@@ -98,15 +107,18 @@ class RunnerStdioTransport(ClientTransport):
         manifest_digest: str = "",
         agent_token: Optional[str] = None,
         token_resolver: Any = None,
+        identity: Optional[Mapping[str, Any]] = None,
         deadline_ms: int = 3_600_000,
         kind: str = "mcp_session",
         client_factory: Any = RunnerClient,
     ) -> None:
-        """The session's identity is the verified token's claims, nothing else.
+        """Identity has two carriers, one per runner role -- never both.
 
-        v0.7.1 Phase 2 removed identity from the runner request body: the runner
-        derives the agent, user, email and groups from the token, so this transport
-        takes no identity arguments at all.
+        A **central** client carries the run's token (``agent_token`` for an explicit
+        one, ``token_resolver`` or the run contextvar otherwise) and the runner derives
+        the agent, user, email and groups from its claims. An **edge** client has no
+        signing key: the relay verified the caller and the proxy passes those claims as
+        ``identity``, which the edge runner takes from this authenticated request.
         """
         self.target = target
         self.session_key = session_key
@@ -115,9 +127,9 @@ class RunnerStdioTransport(ClientTransport):
         self.agent_token = agent_token
         # Central clients live in a process-wide cache, so a token captured at
         # construction belongs to whichever run created the cache entry. Resolve
-        # per session-open instead (the contextvar is per run); an explicit token
-        # (the edge frame) wins.
+        # per session-open instead (the contextvar is per run).
         self._token_resolver = token_resolver
+        self.identity = dict(identity) if identity else None
         self.deadline_ms = deadline_ms
         self.kind = kind
         self._client_factory = client_factory
@@ -148,6 +160,7 @@ class RunnerStdioTransport(ClientTransport):
             session_key=self.session_key,
             env=self.env,
             agent_token=self._current_token(),
+            identity=_run_identity(self.identity),
             deadline_ms=self.deadline_ms,
         )
 

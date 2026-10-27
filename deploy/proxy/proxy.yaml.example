@@ -215,6 +215,16 @@ lazy_catalog: false
 # Env equivalent: RUNNER_SOCKET.
 runner_socket: /run/trellis/runner.sock
 #
+# IDENTITY: the relay is the only token verifier on this path. It authenticates the
+# caller, verifies the agent token and derives the frame identity from its claims; the
+# proxy passes that identity (agent, user, user_email, groups, run_id, parent_run_id) to
+# the edge runner over the RUNNER_TOKEN-authenticated socket. Nothing here configures
+# identity, and no service on this host holds a signing key: the sample compose sets
+# `RUNNER_ROLE: edge` on the runner, which is what tells it to take identity from the
+# proxy instead of verifying a token of its own. The role is explicit -- a runner started
+# without it runs in the central posture, which refuses body-supplied identity and expects
+# a verified agent token instead.
+#
 # Session/tool resource use is sized by the manifest's `limits:` block (cgroup v2 on
 # the runner container), not by environment variables.
 

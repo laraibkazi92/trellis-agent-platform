@@ -486,15 +486,17 @@ def _runner_transport(
     *,
     kind: str = "mcp_session",
     deadline_ms: int = DEFAULT_SESSION_DEADLINE_MS,
-    agent_token: Optional[str] = None,
+    identity: Optional[Mapping[str, Any]] = None,
 ) -> Any:
     """The stdio transport seam: one runner session container per session.
 
     Module-level so tests can substitute an in-memory transport without a runner
     or Docker. ``session_key`` is random per transport: it indexes the runner's
     session registry and is never derived from the caller (two identities must
-    never collide, and a respawn must not reuse a dead container's key). Identity is
-    not a transport input: the runner reads it from the verified token.
+    never collide, and a respawn must not reuse a dead container's key).
+    ``identity`` is the frame's relay-derived caller: the edge holds no signing key,
+    so the session is created with it in the body and the runner role decides what
+    to do -- there is no token to verify on this path (v0.7.2 R1).
     """
     from core.execution.stdio_transport import RunnerStdioTransport
 
@@ -503,10 +505,9 @@ def _runner_transport(
         session_key=secrets.token_hex(16),
         env=dict(env),
         manifest_digest=manifest_digest(entry.config),
-        # Verified by the runner when the session opens; a warm session keeps the
-        # token it was created with (no re-mint, plan §3.4(c)). The session's
-        # identity (agent/user/email/groups) is derived from it, never from the frame.
-        agent_token=agent_token,
+        # Sent at open time only; a warm session keeps the identity it was created
+        # with, like a warm session keeps its env (plan §3.4(c)).
+        identity=identity,
         deadline_ms=deadline_ms,
         kind=kind,
     )
@@ -587,13 +588,15 @@ def _transport(
     *,
     kind: str = "mcp_session",
     deadline_ms: int = DEFAULT_SESSION_DEADLINE_MS,
-    agent_token: Optional[str] = None,
+    identity: Optional[Mapping[str, Any]] = None,
 ):
     """A client for one server. Only stdio runs code, and it runs in a container.
 
     A session enters its client once and holds it for the session's whole lifetime,
     so closing the client must tear the runner session down -- that is the only
-    lifecycle a warm session has. Nothing here spawns a host process.
+    lifecycle a warm session has. Nothing here spawns a host process. ``identity``
+    only reaches the runner: an http/sse server sees the env, never the caller's
+    claims.
     """
     Client, StreamableHttpTransport, SSETransport = _fastmcp()
     if entry.config.transport == "stdio":
@@ -603,7 +606,7 @@ def _transport(
                 env,
                 kind=kind,
                 deadline_ms=deadline_ms,
-                agent_token=agent_token,
+                identity=identity,
             )
         )
     headers = _http_headers(entry, env, token_env)
@@ -978,14 +981,14 @@ class McpSessionManager:
         identity: Dict[str, Any],
         deadline_ms: int,
         *,
-        agent_token: Optional[str] = None,
         sealed: Optional[Mapping[str, str]] = None,
     ) -> Dict[str, Any]:
         """Execute one MCP ``tools/call`` and return the mapped payload.
 
         Refusals and crashes raise ``McpCallError``; the caller turns that into a
-        ``result`` frame. Nothing here ever retries a call. ``agent_token`` is used
-        only when a session opens; a warm session keeps the one it was created with.
+        ``result`` frame. Nothing here ever retries a call. ``identity`` is the
+        frame's relay-derived caller: it keys the session and reaches the runner when
+        a session opens -- a warm session keeps the one it was created with.
 
         ``sealed`` is this call's decrypted per-user mapping, used only if the session
         has to open (a warm session already fixed its env, including credentials).
@@ -1028,7 +1031,7 @@ class McpSessionManager:
                     self._evict_for(entry)
                     await self.reap()
                     session = await self._open(
-                        entry, key, identity, credential_env, agent_token, sealed
+                        entry, key, identity, credential_env, sealed
                     )
 
         async with session.lock:
@@ -1147,7 +1150,6 @@ class McpSessionManager:
         session_key: Tuple[str, str],
         identity: Mapping[str, Any],
         credential_env: Mapping[str, str],
-        agent_token: Optional[str] = None,
         sealed: Optional[Mapping[str, str]] = None,
     ) -> _ServerSession:
         env = _server_env(
@@ -1165,7 +1167,7 @@ class McpSessionManager:
                 env,
                 self.token_env,
                 deadline_ms=_session_deadline_ms(entry),
-                agent_token=agent_token,
+                identity=identity,
             )
             await client.__aenter__()
         except Exception as exc:

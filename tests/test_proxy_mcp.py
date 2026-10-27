@@ -1465,7 +1465,7 @@ def test_small_results_are_untouched():
 def test_the_session_identity_and_key_come_from_the_frame_never_the_token(
     tmp_path, fake_sessions
 ):
-    """v0.7.1: no token-derived identity on the edge. The frame is the only source."""
+    """v0.7.1/v0.7.2: no token-derived identity on the edge. The frame is the only source."""
     write_mcp(tmp_path / "mcps", tools=SERVER_TOOLS + [ENV_DUMP_TOOL])
     entries = load_one(tmp_path / "mcps")
     manager = proxy_mcp.McpSessionManager()
@@ -1474,14 +1474,14 @@ def test_the_session_identity_and_key_come_from_the_frame_never_the_token(
     async def scenario():
         try:
             manager.set_entries(entries, await catalogs_for(entries))
+            # R1: the call takes no token at all -- the frame's identity is the whole
+            # of what the session and the runner see.
             result = await manager.call(
                 "stateful",
                 "env_dump",
                 {},
                 identity,
                 DEADLINE_MS,
-                # A token for somebody else changes nothing: the edge never reads it.
-                agent_token="t1.forged.signature",
             )
             return result, list(manager._sessions)
         finally:
