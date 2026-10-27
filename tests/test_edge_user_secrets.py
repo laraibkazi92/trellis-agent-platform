@@ -471,31 +471,37 @@ def test_per_user_required_refuses_a_missing_identity_before_missing_credentials
     assert SECRET_VALUE not in caught.value.message
 
 
-def test_per_user_required_refuses_a_missing_identity_even_with_a_sealed_set(tmp_path):
-    """A blob is bound to the email: with none, it cannot be opened either (R7.1)."""
+def test_per_user_required_serves_a_sealed_set_without_an_email(tmp_path):
+    """A blob that arrived is bound to this caller: email, else user id (R7.1).
+
+    The refusal is about a caller with *nothing sealed*, not about a missing address:
+    ``sealed_identity`` falls back to the user id, so an email-less identity can hold a
+    set legitimately (a webhook run's identity is the literal ``webhook``). Refusing it
+    would reject the one credential that is provably theirs.
+    """
     store = make_store(tmp_path)
 
-    with pytest.raises(secrets.MissingCredentials) as caught:
-        store.resolve(
-            tool_config(secrets=["DEVOPS_PASSWORD"]),
-            name="devops",
-            email=None,
-            site="dc1",
-            mode="per_user_required",
-            sealed={"DEVOPS_PASSWORD": "mine"},
-        )
+    resolved = store.resolve(
+        tool_config(secrets=["DEVOPS_PASSWORD"]),
+        name="devops",
+        email=None,
+        site="dc1",
+        mode="per_user_required",
+        sealed={"DEVOPS_PASSWORD": "mine"},
+    )
 
-    assert caught.value.code == "identity_incomplete"
+    assert resolved["DEVOPS_PASSWORD"] == "mine"
 
 
 @pytest.mark.parametrize("mode", ["shared", "per_user"])
 def test_a_sealed_set_still_resolves_without_an_email(tmp_path, mode):
     """A blob is sealed to the email *or* the user id, so no address is needed for it.
 
-    Only ``per_user_required`` has an email requirement (nothing is sealed for a caller
-    without one, and the caller is sent to the identity provider, not the seal form).
-    Refusing a decrypted blob here would break an identity that is legitimately
-    email-less -- a webhook run's ``webhook`` user id, for one.
+    Only ``per_user_required`` **without a blob** has an email requirement (nothing is
+    sealed for a caller without one, and the caller is sent to the identity provider,
+    not to the seal form). A decrypted blob is served in every mode: refusing it would
+    break an identity that is legitimately email-less -- a webhook run's ``webhook``
+    user id, for one.
     """
     store = make_store(tmp_path)
     write_shared(store, DEVOPS_PASSWORD=SECRET_VALUE)
@@ -513,7 +519,7 @@ def test_a_sealed_set_still_resolves_without_an_email(tmp_path, mode):
 
 
 def test_a_blank_email_counts_as_no_email(tmp_path):
-    """Whitespace must not become a filename-less "identity" that seals to nothing."""
+    """Whitespace is not an address, so it must not pass for one in the refusal."""
     store = make_store(tmp_path)
 
     with pytest.raises(secrets.MissingCredentials) as caught:

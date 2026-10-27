@@ -13,8 +13,8 @@ Covered contracts:
 - ``core.remote_mcp.call_edge_mcp`` maps every relay status onto the same
   ``{"content", "isError", "structuredContent"}`` / ``{"error": ...}`` dict shape
   ``core.hub::_run_remote`` returns, takes identity from the verified token's claims
-  only, refuses a per-user-credential call whose token has no email with
-  ``identity_incomplete``, and caps oversized results.
+  only, leaves the per-user credential decision to the edge (it knows the export's
+  ``credential_mode``), and caps oversized results.
 - ``discover_external_mcps`` takes an edge MCP's catalog from its static ``tools``.
 - ``build_agent`` registers the 4-part ``mcp__<site>__<mcp>__<tool>`` name.
 - The gateway ``use_tool`` seam dispatches 4-part names to the relay caller.
@@ -340,13 +340,14 @@ def test_call_edge_mcp_service_token_carries_no_email(monkeypatch):
     assert result == {"content": []}
 
 
-def test_call_edge_mcp_per_user_credentials_need_an_email_claim(monkeypatch):
-    """A token with no email cannot serve a sealed per-user set.
+def test_call_edge_mcp_leaves_the_per_user_decision_to_the_edge(monkeypatch):
+    """An email-less token holding a set is dispatched: central has nothing to judge.
 
     A blob is sealed to the email *or the user id*, so an email-less identity that
     holds one is a legitimate caller (a webhook run mints the literal id ``webhook``).
-    Only a blob with nothing to attribute it to is refused, and never as
-    ``credential_rejected``: re-sealing cannot fix a missing subject.
+    ``per_user_required`` without a set is the edge's refusal -- it is the only side
+    that knows its ``credential_mode`` -- and its ``identity_incomplete`` comes back as
+    the call's error, never as a central short-circuit.
     """
     requests, _ = install_transport(monkeypatch, json_response(200, {"result": {"content": []}}))
     monkeypatch.setattr(

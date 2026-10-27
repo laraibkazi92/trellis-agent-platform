@@ -27,12 +27,11 @@ statement and the edge never second-guesses it:
 * ``per_user_required``: the sealed set **only**; nothing sealed for this caller is
   a hard refusal (``missing_credentials``) -- the call must not run at all.
 
-One refusal is about *identity*, not credentials: ``per_user_required`` for a caller
-whose identity has **no email** is refused with ``identity_incomplete`` before the
-credentials are even looked at -- with or without a blob -- because nothing is sealed
-for an identity that has never had an address to seal to. A blob that *did* arrive is
-not refused for that reason: it was sealed to the email, or to the user id when the
-identity has none, so it still opens.
+One refusal is about *identity*, not credentials: ``per_user_required`` for an
+email-less caller with **no blob** is refused with ``identity_incomplete`` before the
+shared file is even looked at, because re-sealing cannot fix an identity. A blob that
+*did* arrive is never refused for that reason: it was sealed to the caller's email, or
+to their user id when they have none, so it is provably theirs and still opens.
 
 The per-user set is all-or-nothing (plan §5 Phase 4 R8): once a blob is present, a
 declared secret it omits stays missing and is never filled from the shared file.
@@ -99,8 +98,8 @@ class MissingCredentials(Exception):
 
     Raised for two different problems, and the code says which: ``missing_credentials``
     when ``per_user_required`` has no sealed set for this caller (sealing one fixes it),
-    ``identity_incomplete`` when the call needs per-user material the identity cannot
-    carry because it has no email (nothing the caller seals fixes it). The message is
+    ``identity_incomplete`` when an email-less caller has no set at all, so there is
+    nothing to seal to (nothing the caller seals fixes it). The message is
     the exact string central surfaces to the agent: it names the identity and the site
     or export, never a value.
     """
@@ -229,11 +228,11 @@ def _caller_email(email: Optional[str]) -> str:
 
 
 def _identity_incomplete(name: str, site: Optional[str]) -> MissingCredentials:
-    """The refusal for a per-user call whose identity carries no email (v0.7.2 R7.1).
+    """The refusal for ``per_user_required`` with no set and no email (v0.7.2 R7.1).
 
-    The code and the wording come from ``core.caller_identity`` so an operator sees the
-    same explanation from the edge, the hub and the gateway, and is sent to the identity
-    provider rather than to the seal form (which cannot help).
+    The code and the wording come from ``core.caller_identity`` so the code stays one
+    wire contract, and the caller is sent to their identity provider rather than to the
+    seal form (which cannot help).
     """
     return MissingCredentials(
         identity_incomplete_error(f"export '{name}'", site or "unknown")["error"],
@@ -331,27 +330,34 @@ class CredentialStore:
         (v0.7.1): it is visible to every tool in the container and to any operator
         inspecting it, so a declared secret comes from ``secrets_dir`` or is absent.
 
-        Either way ``per_user_required`` needs the caller's **email**: nothing is sealed
-        for an identity without one, and a mixed-up caller is sent to their identity
-        provider rather than to the seal form. That refusal comes first -- see
-        :func:`_identity_incomplete`. A blob that *did* arrive needs no email (it was
-        also sealed under the user id), so it still opens. Side-effect free and
-        synchronous: no directory is created, and the only log lines name files and keys.
+        Either way ``per_user_required`` **without a blob** needs the caller's email:
+        nothing is sealed for an identity that never had one, and a mixed-up caller is
+        sent to their identity provider rather than to the seal form. That refusal comes
+        first -- see :func:`_identity_incomplete`. A blob that *did* arrive is not gated
+        on the email: it is bound to this caller's email *or* their user id
+        (``edge_secrets_central.sealed_identity``), so it opens either way. Side-effect
+        free and synchronous: no directory is created, and the only log lines name files
+        and keys.
         """
         declared = edge_env.declared_keys_for(config)
         resolved_mode = _mode(mode)
         variables = declared_variable_keys(config)
 
-        # Identity before credentials (v0.7.2 R7.1). ``per_user_required`` can only be
-        # satisfied by a set sealed for this caller, and sealing happens against the
-        # caller's email; an identity without one has nothing sealed and nothing to
-        # match, so that IS the refusal -- with or without a blob. Answered before the
+        # Identity before credentials (v0.7.2 R7.1). ``per_user_required`` with no blob
+        # can only be satisfied by a set sealed for this caller, and nothing is sealed
+        # for an identity with no subject -- so that IS the refusal, answered before the
         # ``missing_credentials`` path below, which would send the operator to re-seal a
         # key that cannot fix a missing address.
         #
-        # A *blob that arrived* is not gated on the email: ``sealed_identity`` falls back
-        # to the user id, so an identity with no address can legitimately hold one.
-        if resolved_mode == "per_user_required" and not _caller_email(email):
+        # A blob that arrived is the opposite case: it was decrypted above, so it is
+        # bound to this very caller -- their email, else their user id. Gating it on the
+        # email would refuse the one path that is provably theirs (a webhook run's
+        # identity is the literal user id ``webhook`` and has no address by design).
+        if (
+            resolved_mode == "per_user_required"
+            and sealed is None
+            and not _caller_email(email)
+        ):
             raise _identity_incomplete(name, site)
 
         if sealed is not None:

@@ -305,6 +305,7 @@ catalog itself, and a non-google agent sees the discriminated union.
 | Tool error reported by the edge | `200` with `error` → `MCP tool '…' failed on edge '<site>': <reason>`. A server that answers `isError: true` is a normal result and is passed through as such |
 | Session lost (`mcp_session_lost`) | In-call result: the server crashed, or the session hit its TTL/LRU cap. **Recoverable — retry manually**; the next call starts a fresh session (login state is gone) |
 | Missing credentials (`missing_credentials`) | In-call result with exactly `no credentials for <email> on edge <site>` under `per_user_required` (`anonymous` in place of an address when the call carries no identity). **Recoverable** once the user seals the declared secret keys in Configuration → Edge credentials |
+| Missing identity (`identity_incomplete`) | Under `per_user_required`, the caller's identity has **no email claim** and holds no sealed set, so there is nothing to seal to. **Not recoverable** by sealing: fix the email claim at the identity provider, or supply a set sealed to the user id |
 | Credential rejected (`credential_rejected`) | The sealed blob is bound to another target/user/site or to a retired edge key. **Recoverable** after reloading the credential form and re-entering the set; the call never ran |
 
 All of these reach the model as an error string for that one call. Central has no retry

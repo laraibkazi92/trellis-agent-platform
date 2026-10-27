@@ -21,7 +21,7 @@ from core import edge_secrets_central
 from core import tool_access
 from core.models import ToolConfig
 from core.auth import get_identity_manager
-from core.caller_identity import identity_incomplete_error, lacks_credential_identity
+from core.caller_identity import is_service_identity
 from core.env_sanitize import sanitized_env
 from core.devmode import enforce_dev_mode_safety
 # The execution core lives in core.tool_runtime so the edge proxy
@@ -295,7 +295,7 @@ async def _build_tool_env(
 
     if user_id:
         from core.discovery import _resolve_requirements
-        is_background = user_id.startswith("svc_agent_")
+        is_background = is_service_identity(user_id)
 
         # Scoped Secret Injection
         secret_keys = _resolve_requirements(config.secrets, is_background)
@@ -444,6 +444,12 @@ async def _run_remote(
     # nothing is re-read from the registry for it, and the caller cannot assert a
     # different user through the call -- so only a token has an identity to seal to: a
     # no-token call has nothing to look up (and the edge's credential_mode decides).
+    #
+    # Central makes no identity decision of its own (v0.7.2 R7.1): a blob is sealed to
+    # the caller's email *or* their user id, so an email-less identity is not a
+    # contradiction, and ``per_user_required`` is the edge's call -- it is the only side
+    # that knows the export's ``credential_mode``. The refusal code travels back from
+    # there (``identity_incomplete``).
     sealed: Optional[Dict[str, Any]] = None
     if claims is not None and claims.user_id:
         try:
@@ -459,17 +465,6 @@ async def _run_remote(
                 site,
                 type(exc).__name__,
             )
-
-    if lacks_credential_identity(claims, sealed=sealed is not None):
-        # A sealed set with nothing to attribute it to (no token, or a token that is
-        # neither an email nor a user id). Refusing here names the real problem
-        # (identity, not credentials) instead of letting the edge report
-        # ``credential_rejected``. Whether an email-less caller may use a per-user
-        # *mode* is the edge's call: it knows the ``credential_mode`` and answers with
-        # the same code (v0.7.2 R7.1).
-        error = identity_incomplete_error(f"tool '{config.name}'", site)["error"]
-        await record_health(False, error)
-        return {"error": error}
 
     try:
         async with _remote_client(timeout_seconds + 35) as client:

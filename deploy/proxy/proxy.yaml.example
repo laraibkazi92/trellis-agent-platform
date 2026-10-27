@@ -115,7 +115,8 @@ export_mcps:
   # HOME. Its mcp.yaml declares an explicit `tools:` catalog (8 category meta-tools with
   # top-level oneOf schemas), so publishing needs no live discovery.
   # per_user_required: no sealed set for the caller = fail closed with
-  # `no credentials for <email> on edge dc1`, nothing is spawned.
+  # `no credentials for <email> on edge dc1` (or `identity_incomplete` when the
+  # identity has no email to seal to), nothing is spawned.
   - name: devops-cli
     include_tools:
       - tenant_account_tools
@@ -160,7 +161,9 @@ secrets_dir: /etc/trellis/edge-secrets
 #                      variables: edge-secrets/<name>.env, then process env.
 #   per_user           the caller's sealed set if present; else the shared mode above.
 #   per_user_required  the caller's sealed set ONLY; nothing sealed for them refuses
-#                      the call (`missing_credentials`) before anything runs.
+#                      the call before anything runs (`missing_credentials`, or
+#                      `identity_incomplete` when their identity has no email claim
+#                      and there is nothing to seal to).
 # A sealed set is ALL-OR-NOTHING for secrets: a declared secret it omits stays missing
 # and is never filled from the shared file. The process environment is NOT a source for
 # a declared secret (it is visible to every tool in the container and to anyone who

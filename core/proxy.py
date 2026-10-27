@@ -694,8 +694,10 @@ def build_env(
     dropped in both modes, even if something re-adds it to the process environment.
 
     ``credential_mode`` is the operator's policy for this tool and may raise
-    ``MissingCredentials`` (``per_user_required``): callers must turn that into a
-    ``missing_credentials`` error result **without** running the tool.
+    ``MissingCredentials`` (``per_user_required``): callers must turn that into an
+    error result carrying its own ``code`` -- ``missing_credentials``, or
+    ``identity_incomplete`` when the caller has no email to seal to -- **without**
+    running the tool.
 
     ``sealed`` is the decrypted per-user mapping (``None`` = no blob). When it is not
     None the per-user branch is all-or-nothing: only the secret names it carries reach
@@ -1042,7 +1044,9 @@ async def handle_call(
     serve loop does -- therefore cannot silently downgrade a ``per_user_required`` tool
     to ``shared``; with no ``proxy_config`` at all there is nothing to read and the
     default mode applies. Under ``per_user_required`` a caller with no sealed blob
-    short-circuits to a ``missing_credentials`` result: the tool is never executed.
+    short-circuits to an error result -- ``missing_credentials``, or
+    ``identity_incomplete`` when their identity has no email claim, since there is
+    nothing to seal a set to: the tool is never executed.
 
     ``message["sealed"]`` is the caller's ciphertext for exactly this
     ``(site, tool, identity)``. It is opened here (current key, then the rotation

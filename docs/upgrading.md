@@ -287,13 +287,15 @@ one, at sync time and at parse time:
 Three ordering fixes, all fail-closed:
 
 - **`identity_incomplete` is reported before `missing_credentials`.** A
-  `per_user_required` edge export called by an identity with no email is refused with
-  `identity_incomplete` — with or without a sealed set — instead of `missing_credentials`,
-  which would tell an operator to re-seal a set nobody could have sealed. The edge owns
-  that decision because it is the only side that knows the export's `credential_mode`.
-  A sealed set that *did* arrive is still opened: it is sealed to the caller's email, or
-  to their user id when the identity has no email, so an email-less identity can
-  legitimately hold one (`webhook` runs are the shipped example).
+  `per_user_required` edge export called by an identity with no email **and no sealed
+  set** is refused with `identity_incomplete` instead of `missing_credentials`, which
+  would tell an operator to re-seal a set nobody could have sealed. The edge owns that
+  decision because it is the only side that knows the export's `credential_mode`; central
+  makes no identity decision of its own. A sealed set that *did* arrive is still served:
+  it is sealed to the caller's email, or to their user id when the identity has no email,
+  so an email-less identity can legitimately hold one (`webhook` runs are the shipped
+  example). A set sealed to an address the caller no longer carries is
+  `credential_rejected` — re-seal it as that identity.
 - **The body `__user_id` fallback is gone in every mode**, `off` and `log` included. Caller
   identity comes only from a verified token; a call with no token has no user identity, so
   it has no user-scoped secrets, no `TRELLIS_USER_*` and no usage row. A custom caller that
@@ -309,8 +311,9 @@ Three ordering fixes, all fail-closed:
 
 - Send an agent token from any custom caller into the relay, the hub or `/mcp`; a body is
   never an identity.
-- If a per-user tool now answers `identity_incomplete`, the token has no email claim: look
-  at the identity provider's email claim and at the user record, not at the credential set.
+- If a per-user tool now answers `identity_incomplete`, the caller has no email claim and
+  no sealed set: look at the identity provider's email claim and at the user record, not at
+  the credential set.
 - Check any user record or IdP that stores a mixed-case address (`User@Example.com`). It now
   normalizes to `user@example.com` everywhere, which is also what a sealed set is keyed
   under.
@@ -500,8 +503,9 @@ service identity: `svc_agent_<name>` with no email and no groups.
   and stop sending `user`/`user_email`; the relay logs one warning if it still sees them
   and ignores them, because a body can never assert an identity.
 - A token minted without an email claim has no `TRELLIS_USER_EMAIL` at the edge, and a
-  per-user-credential call from it now fails with **`identity_incomplete`** (a new code,
-  deliberately not `credential_rejected`) instead of guessing an address from the user id.
+  `per_user_required` call from an identity with no sealed set now fails with
+  **`identity_incomplete`** (a new code, deliberately not `credential_rejected`) instead
+  of guessing an address from the user id. A set sealed to the user id still serves it.
   Tools can still branch on whether the variable is present at all: it is absent, not
   empty.
 - Per-user sealed edge credentials need a **mintable** token. A deployment with no

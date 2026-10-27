@@ -353,7 +353,7 @@ you maintain your own compose file, add the mount
 |---|---|
 | `shared` (default) | the caller's sealed set when one exists (it always wins); otherwise the shared file for secrets, and the shared file → process environment for variables |
 | `per_user` | the caller's sealed set if they have one; otherwise the same as `shared` |
-| `per_user_required` | the caller's sealed set **only**; with no blob for them the call fails closed with `missing_credentials` and **nothing executes** |
+| `per_user_required` | the caller's sealed set **only**; with no blob for them the call fails closed — `identity_incomplete` if their identity has no email, otherwise `missing_credentials` — and **nothing executes** |
 
 A sealed set is **all-or-nothing** for secrets. Once it exists for
 `(site, kind, target, identity)`, only the declared secret names it carries reach the
@@ -372,9 +372,12 @@ then the process environment in every mode. The write endpoint rejects a blob th
 one, and the edge ignores it anyway because it is not in the declared secret set.
 
 Only keys the manifest declares are read out of any source, so an extra key in a file
-cannot reach a child process. An anonymous caller (no `user_email`) has no sealed setup,
-so `per_user` falls back to the shared file and `per_user_required` fails closed. For MCP
-sessions, credentials are resolved once at session creation (see
+cannot reach a child process. An anonymous caller (no `user_email`) with no sealed set
+falls back to the shared file under `per_user`, and is refused under `per_user_required`
+with `identity_incomplete` — there is no address to seal a new set to, and nothing an
+operator seals fixes that. A set is keyed by the caller's email *or*, when they have none,
+their user id, so an email-less identity that already sealed one is served normally. For
+MCP sessions, credentials are resolved once at session creation (see
 [MCP sessions](#mcp-sessions)).
 
 ### Shared file format
@@ -649,7 +652,7 @@ variables they read were removed in v0.7.1 (see
 | MCP server not exported | Relay answers `404 unknown_mcp`; central reports that the site does not export the MCP tool |
 | MCP deadline (`edge_timeout`) | The call fails; the session is **kept** (login state intact) and nothing is replayed |
 | MCP server crashed / session evicted | That call returns `mcp_session_lost`; the next call starts a fresh session |
-| MCP credentials missing (`per_user_required`) | The call returns `missing_credentials` (`no credentials for <email> on edge <site>`); nothing is spawned |
+| MCP credentials missing (`per_user_required`) | The call returns `missing_credentials` (`no credentials for <email> on edge <site>`) or `identity_incomplete` (no email claim and no sealed set); nothing is spawned |
 | Hub → relay timeout | `504` → tool error |
 | Invalid catalog entry | That tool is rejected and logged; the site's other tools still register |
 | Name collision with a local tool | Registration is refused for the colliding tool only, and logged |

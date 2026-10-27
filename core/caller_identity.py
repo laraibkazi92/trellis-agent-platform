@@ -21,8 +21,9 @@ from core.agent_token import normalize_groups
 
 logger = logging.getLogger(__name__)
 
-# Stable refusal code for a per-user-credential call it cannot serve: the edge seals
-# credentials per user and needs the caller's email, but the verified token has none.
+# Stable refusal code for a per-user-credential call the edge cannot serve: its
+# ``credential_mode`` is ``per_user_required``, which is satisfied only by a set sealed
+# for the caller, and the caller's identity has no email to seal to.
 IDENTITY_INCOMPLETE = "identity_incomplete"
 
 # Background runs act as a service identity (``svc_agent_<agent>``) and are email-less
@@ -35,33 +36,6 @@ SERVICE_IDENTITY_PREFIX = "svc_agent_"
 def is_service_identity(user_id: Any) -> bool:
     """Whether ``user_id`` is a background run's service identity."""
     return str(user_id or "").startswith(SERVICE_IDENTITY_PREFIX)
-
-
-def lacks_credential_identity(claims: Any, *, sealed: bool = False) -> bool:
-    """Whether a *sealed* credential set cannot be attributed to this identity.
-
-    A blob is sealed to ``edge_secrets_central.sealed_identity``: the caller's
-    lowercased email, **else their user id**. So the identity a blob needs is "an email
-    or a user id", not "an email" -- that fallback is what lets an identity with no
-    email address still use per-user credentials, and refusing it would break a working
-    path (a webhook-triggered run mints the literal user id ``webhook`` and has no email
-    by design).
-
-    Central cannot see an edge export's ``credential_mode``, so this only answers the
-    question it *can*: a blob arrived and there is nothing to attribute it to. Whether a
-    per-user *mode* may run for an email-less caller is the edge's decision -- it knows
-    the mode, and ``core.edge_user_secrets.resolve`` refuses it with the same
-    ``identity_incomplete`` code.
-    """
-    if not sealed:
-        return False
-    if claims is None:
-        # A blob with no token: nothing was verified, so there is no subject at all.
-        return True
-    if getattr(claims, "user_email", None):
-        return False
-    # The seal's own fallback: a user id is a usable subject when there is no email.
-    return not getattr(claims, "user_id", None)
 
 
 async def resolve_mint_identity(identity_mgr: Any, user_id: Optional[str]) -> dict:
@@ -116,17 +90,19 @@ async def resolve_mint_identity(identity_mgr: Any, user_id: Optional[str]) -> di
 
 
 def identity_incomplete_error(subject: str, site: str) -> dict:
-    """The refusal for a per-user-credential call whose token carries no email.
+    """The refusal for a ``per_user_required`` call whose caller has no email.
 
-    Never ``credential_rejected``: that code tells an operator to re-seal credentials,
-    which cannot fix a caller whose identity is missing. The message names what is
-    missing, so the operator knows to look at the identity provider, not the seal.
+    Raised by the edge, which is the only side that knows the export's
+    ``credential_mode``. Never ``credential_rejected``: that code tells an operator to
+    re-seal credentials, which cannot fix a caller whose identity is missing. The
+    message names what is missing, so the operator looks at the identity provider, not
+    the seal.
     """
     return {
         "error": (
             f"{IDENTITY_INCOMPLETE}: {subject} on edge '{site}' uses per-user "
-            "credentials, which are sealed to the caller's email, and the verified "
-            "agent token carries no email. Sign in with an identity provider that "
+            "credentials, which are sealed to the caller's email, and the calling "
+            "identity has no email claim. Sign in with an identity provider that "
             "asserts one (or use a token minted for a user with an email)."
         )
     }

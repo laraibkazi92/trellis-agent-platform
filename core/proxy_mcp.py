@@ -633,8 +633,10 @@ def resolve_credentials(
     file / process env.
 
     Raises ``edge_user_secrets.MissingCredentials`` under ``per_user_required`` when
-    there is no sealed set; the caller turns that into ``missing_credentials``. Runs
-    once per session, at creation: a new value never changes a live session.
+    there is no sealed set; the caller turns that into an error result under the
+    exception's own ``code`` (``missing_credentials``, or ``identity_incomplete`` for
+    an email-less caller). Runs once per session, at creation: a new value never
+    changes a live session.
     """
     store = credentials or edge_user_secrets.CredentialStore.from_config(None)
     email = (identity or {}).get("user_email")
