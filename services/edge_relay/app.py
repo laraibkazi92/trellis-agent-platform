@@ -675,9 +675,10 @@ class CallBody(BaseModel):
     sealed: Optional[Any] = None
 
 
-# Fields a pre-v0.7.1 caller may still post. Ignored (never read) and reported once so
-# an operator can find the stale caller; a body can never assert an identity.
-_BODY_IDENTITY_FIELDS = ("user", "user_email")
+# Fields a caller may still post (v0.7.1 identity, or the run attribution the frame
+# now carries). Ignored (never read) and reported once so an operator can find the
+# stale caller; a body can never assert an identity.
+_BODY_IDENTITY_FIELDS = ("user", "user_email", "agent", "groups", "run_id", "parent_run_id")
 _BODY_IDENTITY_WARNED = False
 # Two calls can arrive on two threads: check-and-set under a lock so one rollout window
 # logs one line, not one per concurrent request.
@@ -1380,11 +1381,11 @@ async def call_site_mcp(site: str, mcp: str, body: McpCallBody) -> JSONResponse:
         audit_call("access_denied", agent=claims.agent if claims else None)
         return _error(403, code, message)
     try:
-        # Claims-derived run attribution; ``{}`` when nothing verified.
-        run_identity = protocol.validate_run_identity(**_claims_run_identity(claims))
         identity["user"], identity["user_email"] = protocol.validate_identity(
             *_claims_identity(claims)
         )
+        # Claims-derived run attribution; ``{}`` when nothing verified.
+        run_identity = protocol.validate_run_identity(**_claims_run_identity(claims))
     except ProtocolError as exc:
         audit_call("invalid_arguments")
         return _error(400, "invalid_arguments", str(exc))

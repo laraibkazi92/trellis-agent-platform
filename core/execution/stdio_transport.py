@@ -87,15 +87,6 @@ async def _close_client(client: Any) -> None:
         await close()
 
 
-def _run_identity(identity: Optional[Mapping[str, Any]]) -> Optional[RunIdentity]:
-    """The edge frame's identity as the wire model, or ``None`` for a central client.
-
-    The frame->model translation is shared with the tool runtime
-    (``RunIdentity.from_frame``): one mapping, two consumers.
-    """
-    return RunIdentity.from_frame(identity)
-
-
 class RunnerStdioTransport(ClientTransport):
     """MCP over a runner session container instead of a local subprocess."""
 
@@ -141,6 +132,10 @@ class RunnerStdioTransport(ClientTransport):
     def _current_token(self) -> Optional[str]:
         from core.agent_token import refresh
 
+        if self.identity is not None:
+            # An edge client has no token to send (and no key exists to check one):
+            # never fall through to a contextvar that could be set in this process.
+            return None
         if self.agent_token:
             return refresh(self.agent_token)
         if self._token_resolver is not None:
@@ -160,7 +155,7 @@ class RunnerStdioTransport(ClientTransport):
             session_key=self.session_key,
             env=self.env,
             agent_token=self._current_token(),
-            identity=_run_identity(self.identity),
+            identity=RunIdentity.from_frame(self.identity),
             deadline_ms=self.deadline_ms,
         )
 

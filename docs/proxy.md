@@ -103,9 +103,17 @@ still see only their read-only mounts.
 > either service. If you maintain your own edge compose file, add that variable — a runner
 > left in the central posture refuses body-supplied identity and expects a verified token
 > instead. An older edge `.env` that still lists `AGENT_TOKEN_SECRET` or
-> `ENFORCE_AGENT_TOKENS` keeps working: the runner logs one warning naming them at startup
-> and reads neither. Delete both lines. `RUNNER_TOKEN` is still required: it authenticates
-> the socket, and an unauthenticated socket can create containers.
+> `ENFORCE_AGENT_TOKENS` is harmless: the compose file passes neither to a service, so
+> nothing reads them and no warning fires. Delete both lines. `RUNNER_TOKEN` is still
+> required — and it now carries identity: whoever holds it can name any caller to this
+> runner (including another agent's output directory), so treat it as a per-host secret
+> and never share it between hosts.
+>
+> One consequence worth knowing before you upgrade: an edge call must name a verified
+> caller. The relay derives the whole identity from the token it verified, so a central
+> relay running `ENFORCE_AGENT_TOKENS=off` (or `log`, with a token it rejected) has no
+> identity to forward and the edge answers `400` instead of running the tool
+> unattributed. Edge deployments therefore assume an enforcing central relay.
 
 Prerequisites on the edge host are the same as central: Docker, plus `runsc` registered
 with it (proved with `docker run --runtime=runsc hello-world`). A dev machine without
@@ -599,28 +607,30 @@ There is no other limit mechanism: the in-process backends and the `SANDBOX_RLIM
 variables they read were removed in v0.7.1 (see
 [upgrading.md → v0.7.1](upgrading.md#v071-2026-10-26)).
 
-## Protocol v2 and compatibility
+## Protocol version and compatibility
 
-`v0.5.0` bumps the edge/relay protocol to `proto: 2`. The handshake stays strict:
+`v0.7.2` bumps the edge/relay protocol to `proto: 3`. The handshake stays strict:
 
-- The hello frame gains `caps` (`["tools"]`, `["tools", "mcp"]`, plus `lazy_catalog` when
-  `lazy_catalog: true` is set) and `mcps` (the
-  catalogs). A proto-1 hello has neither and is read as tools-only.
-- Calls carry `kind: "tool" | "mcp"` (absent means `"tool"`, so v0.4 frames are
-  unchanged) plus `mcp` for MCP calls. The frame's `user`/`user_email` are **derived from
-  the verified token's claims** at the relay; a request body cannot set them (v0.7.1).
-  Since v0.7.2 the frame carries no `agent_token` at all: identity is relay-derived and
-  the edge needs no signing key to read it (see [Edge runner](#edge-runner)).
-- **Upgrade central before edges.** A v0.5 edge dialing a v0.4 relay is refused at the
-  handshake with `CLOSE_VERSION` (close code `4001`); the edge logs one terminal
-  "version mismatch — upgrade central first" line and retries only at the maximum backoff
-  (60 s, jittered), so it never reads as a generic disconnect.
-  The reverse — a v0.4 edge against a v0.5 relay — is fully supported: its tools work
-  unchanged and MCP calls to it answer `404` ("edge does not export MCPs").
+- The hello frame carries `caps` (`["tools"]`, plus `mcp` and `lazy_catalog` when the
+  edge serves them) and `mcps` (the catalogs). Calls carry `kind: "tool" | "mcp"`
+  (absent means `"tool"`).
+- The call frame's `user`/`user_email` are **derived from the verified token's claims**
+  at the relay; a request body cannot set them (v0.7.1). Since v0.7.2 the frame also
+  carries the rest of that identity (`agent`, `groups`, `run_id`, `parent_run_id`) and
+  carries **no `agent_token`** at all — the edge needs no signing key to read it (see
+  [Edge runner](#edge-runner)).
+- **Central and edges must be upgraded together.** A `proto: 2` (v0.7.1 or older) edge
+  is refused by a v0.7.2 relay at the handshake with `CLOSE_VERSION` (close code
+  `4001`), and a v0.7.2 edge is refused by an older relay the same way. This is
+  deliberate: a v0.7.1 edge's runner still expects the token the v0.7.2 relay no longer
+  sends, so letting it connect would mean a healthy-looking tunnel where *every* call
+  fails with `403`. Recreate the edge services from the same image tag as central.
+  While a mismatched edge is refused it logs one "version mismatch" line and retries
+  only at the maximum backoff (60 s, jittered), so it never reads as a generic
+  disconnect.
 - **`lazy_catalog` needs a v0.7 relay.** The capability is opt-in; an older relay rejects
-  the unknown cap at handshake (`CLOSE_MALFORMED`), so leave `lazy_catalog: false` until
-  central is upgraded. There is no automatic downgrade-republish: flip the flag off on
-  the edge if you must roll back before upgrading central.
+  the unknown cap at handshake (`CLOSE_MALFORMED`). There is no automatic
+  downgrade-republish: flip the flag off on the edge if you must roll back.
 
 
 ## Failure semantics

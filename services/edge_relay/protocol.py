@@ -30,10 +30,13 @@ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 from core import edge_crypto
 from core.edge_keypair import fingerprint as spki_fingerprint
 
-PROTO = 2
-# A proto-1 edge is the v0.4 tools-only edge: it degrades cleanly, never gets
-# an MCP call, and the relay keeps publishing its tool catalog exactly as before.
-SUPPORTED_PROTOS = frozenset({1, 2})
+# v0.7.2 bumps the wire protocol to 3: R1 removed the agent token from the ``call``
+# frame (identity is relay-derived), so a proto-2 edge -- whose runner still expects a
+# token to verify -- would fail *every* call with a 403 while looking perfectly healthy
+# on the tunnel. Refusing the handshake is the only failure mode an operator can act
+# on. Proto 1/2 edges are not served by this relay at all: both need the token.
+PROTO = 3
+SUPPORTED_PROTOS = frozenset({3})
 SUBPROTOCOL = "trellis.edge.v1"
 
 # WebSocket close codes (4000-4999 is the application-private range).
@@ -750,9 +753,9 @@ def validate_hello(
 ) -> Tuple[int, str, List[EdgeTool], List[EdgeMcp], List[str]]:
     """Parse a hello frame, returning ``(proto, version, tools, mcps, caps)``.
 
-    ``proto`` is the peer's actual version (1 or 2), not the module default, so
-    callers can key behaviour on what the edge speaks rather than on what this
-    relay prefers.
+    ``proto`` is the peer's actual version (always 3 today, the only one this relay
+    serves), not the module default, so callers can key behaviour on what the edge
+    speaks rather than on what this relay prefers.
 
     The returned object is that five-tuple with the validated credential material on
     ``.credentials`` (``EdgeCredentials``): the edge's public key, its fingerprint,

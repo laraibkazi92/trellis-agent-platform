@@ -23,12 +23,9 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, Mapping, Optional
 
 from core.models import ToolConfig
-
-if TYPE_CHECKING:
-    from core.execution.contract import RunIdentity
 
 logger = logging.getLogger(__name__)
 
@@ -48,19 +45,6 @@ HealthCallback = Callable[[bool, Optional[str]], None]
 
 class TransientToolError(Exception):
     """A failure worth retrying (stamina owns the retry budget)."""
-
-
-def _edge_identity(identity: Optional[Mapping[str, Any]]) -> Optional["RunIdentity"]:
-    """The frame identity as the runner's ``RunIdentity`` (``None`` when absent).
-
-    The frame->model translation is shared with the MCP stdio transport
-    (``RunIdentity.from_frame``): one mapping, two consumers.
-    """
-    if not identity:
-        return None
-    from core.execution.contract import RunIdentity
-
-    return RunIdentity.from_frame(identity)
 
 
 async def _execute_in_container(
@@ -86,7 +70,7 @@ async def _execute_in_container(
     and the edge runner takes it from this authenticated request instead.
     """
     from core.execution.client import RunnerCallError, RunnerClient, RunnerUnavailable
-    from core.execution.contract import ExecRequest
+    from core.execution.contract import ExecRequest, RunIdentity
     from core.execution.spec import declared_env_keys, manifest_digest
 
     try:
@@ -98,7 +82,7 @@ async def _execute_in_container(
             manifest_digest=manifest_digest(config),
             env={k: v for k, v in env.items() if k in declared},
             agent_token=agent_token,
-            identity=_edge_identity(identity),
+            identity=RunIdentity.from_frame(identity),
             input=input_json,
             deadline_ms=max(1, int(timeout * 1000)),
         )

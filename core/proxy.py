@@ -20,10 +20,11 @@ edge-local file per export, plus per-user sets that central stores only as
 ciphertext sealed to this edge's public key (``core.edge_crypto``). Nothing here
 sends a credential value to central, and the private key never leaves this VM.
 
-Trust (v0.7.1): this process verifies **no** agent token and needs no
+Trust (v0.7.2): no process on this host verifies an agent token and none holds
 ``AGENT_TOKEN_SECRET``. The relay authenticated the caller, verified the token and
-built the frame identity from its claims; the edge trusts that identity over the
-authenticated tunnel and uses it unchanged.
+built the frame identity from its claims; this process trusts that identity over the
+authenticated tunnel and passes it on to the edge runner, which does the same over the
+``RUNNER_TOKEN``-authenticated socket.
 """
 
 from __future__ import annotations
@@ -847,8 +848,10 @@ def hello_frame(
     so the schema the relay publishes is byte-for-byte what the edge validates
     arguments against.
 
-    ``caps`` always states what this edge can serve: a proto-1 relay has no ``caps``
-    and reads the frame as tools-only, while any MCP catalog makes it ``["tools","mcp"]``.
+    ``caps`` always states what this edge can serve: ``["tools"]``, plus ``mcp`` when
+    any MCP server is exported and ``lazy_catalog`` when summaries are published. A
+    relay older than v0.7.2 reads the frame as tools-only and is refused at the
+    handshake anyway (proto 3), so the caps are informational on this side.
     MCP ``inputSchema`` payloads are carried verbatim (L6).
 
     ``lazy_catalog`` publishes summaries instead: no tool ``inputs``, a description

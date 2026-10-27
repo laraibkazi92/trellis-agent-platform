@@ -734,8 +734,11 @@ def _request_identity(
     return _verified_claims(payload)
 
 
-# Kinds that always run *as somebody*. An edge runner cannot serve one without the
-# identity the edge proxy carries; ``discovery`` is exempt (agent-free catalog read).
+# Kinds that always run *as somebody*: a one-shot run of code or a pipeline. An edge
+# runner cannot serve one without the identity the edge proxy carries. Sessions are
+# exempt along with ``discovery``: a session's container env is fully described by the
+# request (``env``), so the runner needs no identity to start it (v0.7.2 R2 may change
+# that for the output dirs).
 IDENTITY_REQUIRED_KINDS = frozenset({"tool", "console", "workflow"})
 
 

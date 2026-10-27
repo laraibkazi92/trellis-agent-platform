@@ -306,7 +306,7 @@ def test_edge_mcps_proto_and_caps_are_rendered(monkeypatch):
     html, edge = _render_edges(monkeypatch, {"plant-floor": {
         "connected": True,
         "edge_version": "0.5.0",
-        "proto": 2,
+        "proto": 3,
         "caps": ["tools", "mcp"],
         "tools": ["boiler_status"],
         "mcps": [
@@ -320,7 +320,7 @@ def test_edge_mcps_proto_and_caps_are_rendered(monkeypatch):
         {"name": "workload", "tools": 7, "transport": "stdio"},
         {"name": "inventory", "tools": 2, "transport": "sse"},
     ]
-    assert edge["proto"] == 2
+    assert edge["proto"] == 3
     assert edge["caps"] == ["tools", "mcp"]
     assert edge["tools"] == ["boiler_status"]
 
@@ -329,7 +329,7 @@ def test_edge_mcps_proto_and_caps_are_rendered(monkeypatch):
     assert "inventory" in html
     assert "stdio" in html
     assert "sse" in html
-    assert "proto 2" in html
+    assert "proto 3" in html
     assert "no MCPs exported" not in html
 
 

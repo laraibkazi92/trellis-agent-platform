@@ -1487,33 +1487,34 @@ def test_proto2_hello_registers_mcps_and_caps(monkeypatch):
         asyncio.run(_scenario())
 
 
-def test_a_proto1_hello_still_connects_as_a_tools_only_edge(monkeypatch):
-    """v0.4 edge: no caps, no mcps. It must keep working, with tools defaults."""
+@pytest.mark.parametrize("proto", [1, 2])
+def test_an_older_proto_hello_is_refused_with_4001(monkeypatch, proto):
+    """v0.7.2 refuses proto <3: those edges' runners still expect an agent token.
+
+    Such an edge would stay connected and then fail *every* call with a 403, so the
+    handshake is where it must be told to upgrade (the edge logs a version mismatch
+    and backs off to its maximum interval instead of reconnect-storming).
+    """
     monkeypatch.setattr(app_module, "resolve_token", lambda token: {"name": "site-a"})
     client = TestClient(app_module.app)
 
-    with _connect(client) as ws:
-        ws.send_json(_hello(proto=1))
-        assert ws.receive_json()["t"] == "welcome"
-        _wait_until(
-            lambda: app_module.relay.get("site-a") is not None,
-            "the site was never registered",
-        )
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with _connect(client) as ws:
+            ws.send_json(_hello(proto=proto))
+            ws.receive_text()
 
-        conn = app_module.relay.get("site-a")
-        assert conn.caps == ["tools"]
-        assert conn.mcps == {}
-        ws.close()
+    assert exc.value.code == protocol.CLOSE_VERSION
+    assert app_module.relay.get("site-a") is None
 
 
-def test_a_proto3_hello_is_refused_with_4001(monkeypatch):
+def test_a_proto4_hello_is_refused_with_4001(monkeypatch):
     """A newer edge than this relay speaks a version it cannot parse."""
     monkeypatch.setattr(app_module, "resolve_token", lambda token: {"name": "site-a"})
     client = TestClient(app_module.app)
 
     with pytest.raises(WebSocketDisconnect) as exc:
         with _connect(client) as ws:
-            ws.send_json(_hello(proto=3))
+            ws.send_json(_hello(proto=4))
             ws.receive_text()
 
     assert exc.value.code == protocol.CLOSE_VERSION

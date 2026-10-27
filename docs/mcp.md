@@ -168,9 +168,11 @@ Per tool, the relay also writes a description-only embedding under
 tools like any other.
 
 **Admin → Edges** shows, per site: the exported MCP servers with name, tool count and
-transport, the site's MCP count, and protocol badges — `proto 2` plus one badge per
-capability (`tools`, `mcp`). A v0.4 edge shows `proto 1` and `tools` only. A server the
-edge configured but dropped for size is absent from this table; the edge log says why.
+transport, the site's MCP count, and protocol badges — `proto 3` plus one badge per
+capability (`tools`, `mcp`). Only `proto 3` edges (v0.7.2) connect at all: the call
+frame stopped carrying an agent token, so an older edge is refused at the handshake.
+A server the edge configured but dropped for size is absent from this table; the edge
+log says why.
 
 The registry entry is read-only: the MCP editor renders it as edge-managed and saves/deletes
 are refused. Edit the server on the edge and `SIGHUP` the proxy.

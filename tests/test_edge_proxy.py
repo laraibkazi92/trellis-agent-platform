@@ -877,7 +877,7 @@ def test_hello_frame_with_mcp_catalogs_passes_the_relay_validator(tmp_path):
     assert [mcp["name"] for mcp in frame["mcps"]] == ["devops-cli"]
 
     proto, _version, tools, mcps, caps = protocol.validate_hello(frame)
-    assert proto == protocol.PROTO == 2
+    assert proto == protocol.PROTO == 3
     assert tools == []
     assert caps == ["tools", "mcp"]
     assert mcps[0].tools[0].input_schema == schema

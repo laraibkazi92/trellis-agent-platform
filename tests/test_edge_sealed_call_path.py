@@ -333,7 +333,7 @@ def test_handle_mcp_call_hands_the_opened_mapping_to_the_manager(edge_key):
         site = SITE
 
         async def call(
-            self, mcp, tool, args, identity, deadline_ms, *, agent_token=None, sealed=None
+            self, mcp, tool, args, identity, deadline_ms, *, sealed=None
         ):
             seen["sealed"] = sealed
             return {"content": [], "isError": False}

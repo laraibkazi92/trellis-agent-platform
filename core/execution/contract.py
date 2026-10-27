@@ -76,7 +76,7 @@ class RunIdentity(BaseModel):
     read claims before.
     """
 
-    agent: str
+    agent: str = Field(min_length=1)
     user_id: Optional[str] = None
     user_email: Optional[str] = None
     groups: list[str] = Field(default_factory=list)

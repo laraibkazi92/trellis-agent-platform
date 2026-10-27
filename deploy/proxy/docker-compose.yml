@@ -49,8 +49,8 @@ services:
       # trusts that identity over the authenticated tunnel. Since v0.7.2 no service on
       # this host holds a signing key either -- the runner below takes the identity
       # from this proxy over the shared socket (RUNNER_ROLE=edge). An
-      # AGENT_TOKEN_SECRET or ENFORCE_AGENT_TOKENS left in .env is loaded and read by
-      # nothing; the runner logs one warning naming it so the line can be deleted.
+      # AGENT_TOKEN_SECRET or ENFORCE_AGENT_TOKENS left in .env is passed to no
+      # service and read by nothing; delete both lines.
     volumes:
       # Tool suites and write targets live under the workspace. Tool containers get
       # their own read-only suite/shared mounts and, when asked for, one rw output
@@ -143,10 +143,10 @@ services:
       # trellis-proxy over the RUNNER_TOKEN-authenticated socket -- the proxy got it
       # from the relay's call frame, and the relay is the only token verifier on this
       # path. So no edge service loads a signing key: AGENT_TOKEN_SECRET and
-      # ENFORCE_AGENT_TOKENS are not set here and are never read (the runner logs one
-      # warning if they are). The role is explicit and is never inferred from whether
-      # a key happens to be present; the default is `central`, which expects a verified
-      # agent token.
+      # ENFORCE_AGENT_TOKENS are not set here and are never read (a hand-started runner
+      # that does have them logs one warning). The role is explicit and is never
+      # inferred from whether a key happens to be present; the default is `central`,
+      # which expects a verified agent token.
       RUNNER_ROLE: edge
       PYTHONDONTWRITEBYTECODE: "1"
     healthcheck:

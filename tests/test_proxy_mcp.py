@@ -1102,7 +1102,7 @@ def test_hello_frame_advertises_the_mcp_capability(tmp_path):
     assert frame["caps"] == ["tools", "mcp"]
     assert [mcp["name"] for mcp in frame["mcps"]] == ["stateful"]
     proto, _version, tools, mcps, caps = protocol.validate_hello(frame)
-    assert proto == protocol.PROTO == 2
+    assert proto == protocol.PROTO == 3
     assert tools == []
     assert caps == ["tools", "mcp"]
     assert [tool.name for tool in mcps[0].tools] == ["set_value", "get_value", "get_home"]
