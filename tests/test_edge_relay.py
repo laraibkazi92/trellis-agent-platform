@@ -1116,20 +1116,20 @@ def test_connect_publishes_the_catalog_and_records_the_disconnect(monkeypatch, e
         # disconnect that was never delivered.
         ws.close()
 
-    # The handler records the disconnect just after the socket closes; the client's
-    # context exit does not synchronise with it, and the registry write itself runs on
-    # a worker thread. Poll the in-process map first (the reliable signal), then the
-    # registry write, with a deadline that tolerates a loaded test runner.
     deadline = time.monotonic() + 5.0
     while app_module.relay.get("site-a") is not None:
         assert time.monotonic() < deadline, "the relay never released the site"
         time.sleep(0.01)
 
-    deadline = time.monotonic() + 5.0
-    while edge_registry.statuses["site-a"]["connected"] is not False:
-        assert time.monotonic() < deadline, "disconnect was never recorded"
+    # Bound the number of *reads*, not the wall clock: this read blocks on the
+    # registry lock the worker thread holds while it writes the disconnect, so a
+    # deadline measured before it can expire while the read simply waits.
+    for _ in range(500):
+        if edge_registry.statuses["site-a"]["connected"] is False:
+            break
         time.sleep(0.01)
-        time.sleep(0.01)
+    else:
+        raise AssertionError("disconnect was never recorded")
     assert app_module.relay.get("site-a") is None
 
 

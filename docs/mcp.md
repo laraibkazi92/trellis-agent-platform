@@ -25,7 +25,7 @@ The `mcp.yaml` defines how the Universal Agent Host (`core/host.py`) connects to
 - `transport`: The communication protocol. One of `stdio`, `sse`, `http`, `streamable-http`.
 - `command`: The command to execute (for `stdio`) or the connection URL (for `sse`/`http`/`streamable-http`).
 - `args` (Optional): A list of arguments to pass to the command (only applicable for `stdio`).
-- `env` (Optional): A dictionary of environment variables (for `stdio`) or HTTP headers (for `sse`/`http`/`streamable-http`).
+- `env` (Optional): A dictionary of environment variables (for `stdio`) or HTTP headers (for `sse`/`http`/`streamable-http`). The transport decides which rule the keys follow: a `stdio` `env:` key must be an environment identifier (`^[A-Za-z_][A-Za-z0-9_]*$`), while a header name must be an RFC 7230 field-name token — so `mcp-version` and `X-Api-Key` are valid headers and invalid environment variables. `db-sync` refuses the manifest for either violation, and refuses a header value containing CR, LF or NUL (header injection). `secrets`/`optional_secrets`/`variables` are environment/credential names on **every** transport.
 - `secrets` (Optional): A list of required user secrets. These will automatically appear in the UI's Secret Manager.
 - `optional_secrets` (Optional): Secrets injected when present but not required for the server to start.
 - `variables` (Optional): Non-sensitive configuration variables. Same structure as `secrets` (including contextual scoping); resolved and injected exactly like secrets, just stored as plain variables.
@@ -41,6 +41,20 @@ To keep credentials secure, you should never hardcode API keys or tokens in `mcp
 
 If an environment variable or header value contains `{SECRET_NAME}`, the framework will automatically substitute it with the user's secure value from the database.
 
+The **keys** of `env` are transport-dependent, the **values** are always interpolated:
+
+| `transport` | `env:` keys are | Validated as |
+| --- | --- | --- |
+| `stdio` | the server process's environment | `^[A-Za-z_][A-Za-z0-9_]*$` (`MY_API_KEY`) |
+| `http`, `streamable-http`, `sse` | the outgoing request's HTTP headers | RFC 7230 field-name token (`Authorization`, `X-Api-Key`, `mcp-version`) |
+
+A remote `env:` block is a header map: hyphens and mixed case are normal there, and
+`db-sync` rejects only what could not be sent — a key that is not a field-name token,
+or a value containing CR, LF or NUL. The **names** in `secrets`/`optional_secrets`/
+`variables` are different: those are credentials resolved into environment variables on
+every transport, so they must always be environment identifiers (a placeholder such as
+`{MY_API_KEY}` must therefore name a declared, valid secret).
+
 ### Example: Remote SSE Server (HTTP)
 
 ```yaml
@@ -48,8 +62,9 @@ name: my-remote-mcp
 transport: sse
 command: "https://api.example.com/v1/mcp"
 env:
-  # The framework interpolates the {MY_API_KEY} placeholder
+  # Header names: `Authorization` and a hyphenated API-version header are both fine.
   Authorization: "Bearer {MY_API_KEY}"
+  mcp-version: "v2"
 secrets:
   - "MY_API_KEY"
 ```

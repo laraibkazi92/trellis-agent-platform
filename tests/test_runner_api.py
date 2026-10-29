@@ -985,13 +985,18 @@ def test_socket_permissions_land_on_the_rebound_socket(monkeypatch, tmp_path):
     chmod/chowns, or the permissions land on the stale inode and the new socket
     stays root-owned: every app-uid caller gets EACCES while the in-container
     healthcheck (root) keeps reporting healthy.
+
+    The check is the *order* and the *file*, not two inode numbers: the mount hands
+    the freed number straight back to the next ``create`` (CI's tmpfs does), so
+    comparing them proves nothing.
     """
     import os
     from pathlib import Path
 
     path = tmp_path / "runner.sock"
     path.write_text("")  # stale socket left by the previous process
-    stale_inode = path.stat().st_ino
+    order: list[str] = []
+    rebound: list[int] = []
     fixed: list[int] = []
     release = asyncio.Event()
 
@@ -1005,17 +1010,20 @@ def test_socket_permissions_land_on_the_rebound_socket(monkeypatch, tmp_path):
             self.started = False
 
         async def serve(self):
-            # uvicorn unlinks and rebinds: the inode changes.
+            # uvicorn unlinks and rebinds: the path is a fresh file.
             if os.path.exists(self.config.uds):
                 os.unlink(self.config.uds)
             Path(self.config.uds).write_text("")
+            rebound.append(Path(self.config.uds).stat().st_ino)
             self.started = True
+            order.append("serve")
             await release.wait()
 
     monkeypatch.setattr(runner_module, "socket_path", lambda: str(path))
     monkeypatch.setattr(runner_module.uvicorn, "Config", FakeConfig)
     monkeypatch.setattr(runner_module.uvicorn, "Server", FakeServer)
     def fake_fix(target):
+        order.append("fix")
         fixed.append(Path(target).stat().st_ino)
         release.set()
 
@@ -1023,8 +1031,10 @@ def test_socket_permissions_land_on_the_rebound_socket(monkeypatch, tmp_path):
 
     asyncio.run(runner_module._serve())
 
+    # The rebind happened first, and the fix was applied to the file it created.
+    assert order == ["serve", "fix"]
+    assert fixed == rebound
     assert fixed == [path.stat().st_ino]
-    assert fixed[0] != stale_inode
 
 
 # --------------------------------------------------------------------------- #

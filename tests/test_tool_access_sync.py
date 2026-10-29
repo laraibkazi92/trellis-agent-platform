@@ -263,6 +263,124 @@ def test_a_bad_mcp_env_block_key_fails_the_sync(tmp_path, monkeypatch, capsys):
     assert "mcp 'demo'" in errors[0]
 
 
+# --------------------------------------------------------------------------- #
+# An MCP's `env:` block follows its TRANSPORT (scripts/sync_to_db.py)
+# --------------------------------------------------------------------------- #
+# Only stdio spawns a process, so only stdio's `env:` is a process environment.
+# http/streamable-http/sse hand the same mapping to the HTTP client as the request's
+# HEADER map, where `mcp-version` and `X-Api-Key` are the correct spelling -- v0.7.2
+# held every key to the env-name rule and refused those manifests outright.
+
+
+def _mcp_manifest_errors(tmp_path, monkeypatch, manifest: str) -> list[str]:
+    """Validate exactly one ``mcp.yaml`` and return the printable errors."""
+    workspace = tmp_path / "workspace"
+    mcp_dir = workspace / "mcps" / "demo"
+    mcp_dir.mkdir(parents=True)
+    (mcp_dir / "mcp.yaml").write_text(manifest)
+    monkeypatch.setattr(sync_to_db, "TOOLS_DIR", workspace / "tools")
+    monkeypatch.setattr(sync_to_db, "MCPS_DIR", workspace / "mcps")
+    return sync_to_db.validate_declared_env_names()
+
+
+@pytest.mark.parametrize("transport", ["http", "streamable-http", "sse"])
+def test_a_remote_mcp_env_block_is_a_header_map(tmp_path, monkeypatch, transport):
+    """The real shape from a Coralogix manifest: a hyphenated version header."""
+    errors = _mcp_manifest_errors(
+        tmp_path,
+        monkeypatch,
+        "name: demo\n"
+        f"transport: {transport}\n"
+        "command: https://example.invalid/mcp\n"
+        "env:\n"
+        "  Authorization: Bearer {CORALOGIX_API_KEY}\n"
+        "  mcp-version: v2\n"
+        "  X-Api-Key: literal-value\n"
+        "secrets: [CORALOGIX_API_KEY]\n",
+    )
+
+    assert errors == []
+
+
+def test_a_remote_mcp_env_block_still_needs_valid_secret_names(tmp_path, monkeypatch):
+    """Header *keys* are free; a declared secret name is still an env name."""
+    errors = _mcp_manifest_errors(
+        tmp_path,
+        monkeypatch,
+        "name: demo\n"
+        "transport: streamable-http\n"
+        "command: https://example.invalid/mcp\n"
+        "env:\n"
+        "  Authorization: Bearer {my-key}\n"
+        "secrets: [my-key]\n",
+    )
+
+    assert len(errors) == 1
+    assert "my-key" in errors[0]
+    assert "cannot be environment variables" in errors[0]
+
+
+@pytest.mark.parametrize(
+    "header_name",
+    [
+        '"my key"',        # space is not a token character
+        '"Content:Type"',  # the colon separates name from value
+        '"X-Api\\r\\nKey"',  # a quoted key with a line break echoed into the request
+        '""',              # empty field-name
+    ],
+)
+def test_a_remote_mcp_header_name_must_be_a_token(
+    tmp_path, monkeypatch, header_name
+):
+    errors = _mcp_manifest_errors(
+        tmp_path,
+        monkeypatch,
+        "name: demo\n"
+        "transport: streamable-http\n"
+        "command: https://example.invalid/mcp\n"
+        f"env:\n  {header_name}: v\n",
+    )
+
+    assert len(errors) == 1
+    assert "cannot be HTTP header names" in errors[0]
+    assert "streamable-http" in errors[0]
+
+
+def test_a_remote_mcp_header_value_may_not_carry_a_line_break(tmp_path, monkeypatch):
+    """A CRLF in a value is header injection, not a long value."""
+    errors = _mcp_manifest_errors(
+        tmp_path,
+        monkeypatch,
+        "name: demo\n"
+        "transport: sse\n"
+        "command: https://example.invalid/mcp\n"
+        "env:\n"
+        '  Authorization: "Bearer {K}\\r\\nX-Evil: 1"\n'
+        "secrets: [K]\n",
+    )
+
+    assert len(errors) == 1
+    assert "Authorization" in errors[0]
+    assert "cannot be HTTP header names" in errors[0]
+
+
+def test_a_stdio_mcp_env_block_is_still_an_environment(tmp_path, monkeypatch):
+    """stdio is the one transport that spawns a process, so its env is env."""
+    errors = _mcp_manifest_errors(
+        tmp_path,
+        monkeypatch,
+        "name: demo\n"
+        "transport: stdio\n"
+        "command: srv\n"
+        "env:\n  mcp-version: v2\n",
+    )
+
+    assert len(errors) == 1
+    assert "mcp-version" in errors[0]
+    assert "cannot be environment variables" in errors[0]
+
+
+
 def _secret_groups_yaml(key):
     """A ``secret_groups`` UI hint (one group, one option, one field)."""
     return (

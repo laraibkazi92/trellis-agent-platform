@@ -9,10 +9,42 @@ pointed at by `TRELLIS_WORKSPACE_DIR` (see `.env.example` → *Deployment Layout
 run with the default `./workspace` inside this clone, the same steps apply, but be aware
 that your content is then inside the tree you check out tags into.
 
-The current release, `v0.7.2`, is breaking for anything that runs an edge: the edge holds
-no signing key any more and speaks a new wire protocol. Read
-[its section](#v072-2026-10-27) before you upgrade. If you are coming from `v0.7.0` or
-older, read the [`v0.7.1` section](#v071-2026-10-26) as well.
+The current release, `v0.7.3`, is a one-fix patch: an **HTTP MCP manifest whose `env:`
+block names a header** (e.g. `mcp-version`) syncs again. `v0.7.2` refused it as an invalid
+environment name. Nothing else changes, and no action is needed beyond deploying the tag.
+If you are upgrading from `v0.7.1` or older, read [`v0.7.2`](#v072-2026-10-27) first — it is
+breaking for anything that runs an edge — and [`v0.7.1`](#v071-2026-10-26) if you are coming
+from `v0.7.0`.
+
+---
+
+## v0.7.3 (2026-10-29)
+
+Changes since `v0.7.2`: `db-sync` validates an MCP's `env:` block **by transport**. Only
+`stdio` spawns a process, so only `stdio`'s `env:` is a process environment; on `http`,
+`streamable-http` and `sse` the same mapping is handed to the HTTP client as the request's
+**header map** (`core/agent_factory`, `core/proxy_mcp._http_headers`). `v0.7.2` held every
+`env:` key to the env-name rule (`^[A-Za-z_][A-Za-z0-9_]*$`), so a remote manifest with a
+hyphenated header — `mcp-version: v2`, the shape a vendor's published MCP config uses —
+failed the whole sync with exit 2:
+
+```text
+REFUSING TO SYNC: invalid declared names, nothing was written.
+  ERROR: mcp 'coralogix' (.../mcp.yaml): declared name(s) mcp-version cannot be ...
+```
+
+No other manifest surface changed:
+
+- A `stdio` MCP's `env:` keys are still environment names, and are still refused otherwise.
+- `secrets`/`optional_secrets`/`variables` are environment/credential names on **every**
+  transport, so a `{PLACEHOLDER}` in a header value must still name a declared, valid secret.
+- A header name must be an RFC 7230 field-name token, and a header value may not contain CR,
+  LF or NUL (header injection). Both are refused with a message naming the transport.
+- The edge already read only `secrets`/`variables`/`secret_groups` from a manifest, so
+  central and the edge now agree about a remote `env:` block instead of disagreeing.
+
+Nothing to do on upgrade unless you had worked around this: if a v0.7.2 deployment deleted a
+hyphenated header from an HTTP `mcp.yaml` to get the sync through, put it back.
 
 ---
 
