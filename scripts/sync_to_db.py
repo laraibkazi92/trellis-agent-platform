@@ -22,7 +22,7 @@ from core.execution.contract import (
 )
 from core.execution.env import INVALID_ENV_NAME_HELP, declared_names, invalid_env_names
 from core.execution.spec import is_plain_relative
-from core.manifest_keys import _group_keys
+from core.manifest_keys import _group_keys, invalid_header_entries
 from core.models import (
     BACKGROUND_AGENT_TYPES,
     EDGE_MCP_REF_RE,
@@ -156,23 +156,48 @@ def _env_name_error(label: str, field: str, bad: list[str]) -> str:
     )
 
 
+def _header_name_error(label: str, transport: str, bad: list[str]) -> str:
+    """One printable line for a header map a remote MCP could never send."""
+    return (
+        f"{label}: env: {', '.join(bad)} cannot be HTTP header names on transport "
+        f"'{transport}' (expected a field-name token such as mcp-version or "
+        "X-Api-Key, with no CR/LF/NUL in the value); fix them, or use "
+        "transport: stdio if this really is a process environment"
+    )
+
+
 def _declared_env_name_errors(config: dict, label: str) -> list[str]:
-    """Problems with the env names a manifest declares, as printable lines.
+    """Problems with the names a manifest declares, as printable lines.
 
     A declared secret/variable name is only useful if the process can receive it as
     an environment variable. ``my-api-key`` used to sync, resolve and then vanish at
     the last mile (``core.execution.env.preamble_line`` drops it), so the tool ran
     without the credential it asked for. Reject it here, before anything is written.
+
+    The literal ``env:`` block follows the *transport*, not the other fields: on
+    ``stdio`` it is the server process's environment (so the same env-name rule
+    applies), while on ``http``/``streamable-http``/``sse`` it is the outgoing
+    request's **header map** (``core.agent_factory``, ``core/proxy_mcp._http_headers``)
+    and ``mcp-version`` or ``Authorization`` are the correct spelling there. v0.7.2
+    held every ``env:`` key to the env-name rule and refused those manifests outright.
     """
     names = []
     for field in ("secrets", "optional_secrets", "variables"):
         names.extend(declared_names(config.get(field)))
-    # An MCP's literal `env:` block is container configuration by the same rules.
-    env_block = config.get("env")
-    if isinstance(env_block, dict):
-        names.extend(str(name) for name in env_block)
 
     errors = []
+    # The env block is header configuration on a remote transport, container
+    # configuration only on stdio -- the one transport that spawns a process.
+    transport = str(config.get("transport") or "stdio").strip().lower()
+    env_block = config.get("env")
+    if transport == "stdio":
+        if isinstance(env_block, dict):
+            names.extend(str(name) for name in env_block)
+    else:
+        bad_headers = invalid_header_entries(env_block)
+        if bad_headers:
+            errors.append(_header_name_error(label, transport, bad_headers))
+
     invalid = invalid_env_names(names)
     if invalid:
         errors.append(_env_name_error(label, "declared name(s)", invalid))
@@ -702,12 +727,14 @@ def main(argv=None):
         print("\nREFUSING TO SYNC: nothing else was written to the registry.")
         return policy_status
 
-    # 0b. Manifest env names. Same reason as the policy: a declared name that is not
-    #     a valid environment name would sync and then be dropped at exec time, so the
-    #     tool would run without the credential it declared. Refuse before any write.
+    # 0b. Manifest names. Same reason as the policy: a declared name that is not a
+    #     valid environment name would sync and then be dropped at exec time, so the
+    #     tool would run without the credential it declared; an HTTP MCP's `env:` block
+    #     is a header map instead, and a header that cannot be sent fails every call.
+    #     Refuse before any write.
     env_name_errors = validate_declared_env_names()
     if env_name_errors:
-        print("\nREFUSING TO SYNC: invalid declared env names, nothing was written.")
+        print("\nREFUSING TO SYNC: invalid declared names, nothing was written.")
         for error in env_name_errors:
             print(f"  ERROR: {error}")
         return 2
