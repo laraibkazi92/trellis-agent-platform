@@ -21,8 +21,9 @@ start failing. If you are upgrading from `v0.7.2` or older, read
 
 ## v0.7.4 (2026-10-29)
 
-Three follow-ups to `v0.7.3`'s transport-aware `env:` check. All three close a hole that
-let a manifest sync and then misbehave at the first call instead of at the sync.
+Three follow-ups to `v0.7.3`'s transport-aware `env:` check, plus one fix on the delivery
+path it validates. All four close a hole that let a manifest sync and then misbehave at the
+first call instead of at the sync.
 
 **1. An undeclared `{PLACEHOLDER}` is refused.** `core.agent_factory._inject_config`
 substitutes exactly the names a manifest declares in `secrets`, `optional_secrets` and
@@ -60,6 +61,16 @@ by name:
 ```
 
 A missing `transport` is still `stdio`, as before.
+
+**4. A stdio MCP's interpolated `env:` value reaches the container.** The host filters a
+session's environment through `core.execution.spec.declared_env_keys`, which passed the
+literal `env:` block through `declared_names` — a helper that flattens a *mapping* to its
+**values** (the `{general,user,background}` form) — so the allowlist held the block's
+literals and none of its keys. `env: {POSTGRES_PASSWORD: "{PG_PASSWORD}"}` therefore
+forwarded nothing, and the container received the literal `{PG_PASSWORD}` while the
+credential sat resolved in the host. The block's keys are declared environment now, so the
+resolved value overrides the literal. Remote (http/sse) manifests were unaffected: their
+headers are built from the resolved map, not through this filter.
 
 Nothing else changes: services, ports, volumes, `.env` keys and the tool protocol are
 untouched, so the upgrade is the usual image swap.
