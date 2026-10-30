@@ -1098,10 +1098,13 @@ a change on your side, it is called out explicitly.
 Run from the engine clone:
 
 ```bash
-git fetch --tags
+git fetch --tags --force       # plain --tags keeps a re-pointed tag at its old commit
 git describe --tags            # note the tag you are on now, for rollback
 git checkout v0.4.1            # target release tag
+git rev-parse --short v0.4.1   # must match the commit named in the release notes
 docker compose pull            # fetch the multi-arch app image for that tag
+docker image inspect "${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.4.1}" \
+  --format '{{.RepoDigests}}'  # must match the digest named in the release notes
 docker compose up -d           # recreate services; nginx-gateway is built from ./gateway
 ```
 
@@ -1110,6 +1113,11 @@ Notes:
 - `docker compose pull` fetches the app image published to GHCR
   (`ghcr.io/laraibkazi92/trellis-agent-platform:vX.Y.Z`). The `nginx-gateway` service has no
   remote image — it is built locally from `./gateway` on `up`.
+- `git fetch --tags --force` is deliberate: a release tag can be re-pointed inside the same
+  version while a fix lands (v0.7.4 moved three times in one evening). Plain `--tags`
+  prints `! [rejected] … (would clobber existing tag)` and leaves the **old** commit
+  checked out, and `up -d` does not re-pull an image whose tag the host already has — the
+  `rev-parse` and `image inspect` lines are what tell you which build you are on.
 - If you build from source instead of pulling (`TRELLIS_IMAGE` unset or overridden), use
   `docker compose up -d --build`; that ignores the image default and builds locally.
 - The `db-sync` init container runs on every start and re-syncs your workspace into etcd.

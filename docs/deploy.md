@@ -70,7 +70,7 @@ docker compose up -d
 
 ### Pinning and verifying a release
 
-`TRELLIS_IMAGE` in `.env` pins a **tag** (`:v0.7.4`) because a tag stays readable in a diff. Tags are mutable, so if you need the image to be byte-identical forever, pin the **digest** published in that release's workflow summary instead:
+`TRELLIS_IMAGE` in `.env` pins a **tag** (`:v0.7.4`) because a tag stays readable in a diff. Tags are mutable — one can be re-pointed inside the same version while a fix lands — so if you need the image to be byte-identical forever, pin the **digest** published in that release's workflow summary instead:
 
 ```bash
 TRELLIS_IMAGE=ghcr.io/laraibkazi92/trellis-agent-platform@sha256:<digest>
@@ -336,11 +336,20 @@ The content repo and the `etcd-data` volume are untouched by an engine upgrade:
 
 ```bash
 cd trellis-agent-platform
-git fetch --tags
+git fetch --tags --force          # plain --tags keeps a re-pointed tag at its old commit
 git checkout v0.x.y
+git rev-parse --short v0.x.y      # must match the commit named in that release's notes
 docker compose pull
+docker image inspect "${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.x.y}" \
+  --format '{{.RepoDigests}}'     # must match the digest named in that release's notes
 docker compose up -d
 ```
+
+`--force` matters: a release tag can be re-pointed inside the same version while a fix
+lands (v0.7.4 moved three times in one evening). `git fetch --tags` then prints
+`! [rejected] … (would clobber existing tag)` and `git checkout` keeps the **old** commit
+without failing — and `docker compose up -d` alone does not re-pull an image whose tag the
+host already has. Those two checks are what tell you which build you are actually on.
 
 `db-sync` re-syncs your workspace into etcd on the way up, so newly added content in your content repo is picked up at the same time. If you build from source instead, use `docker compose up -d --build`.
 

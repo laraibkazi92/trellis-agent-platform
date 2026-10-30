@@ -49,7 +49,7 @@ from core.console_backend import RunnerConsoleBackend
 from core.execution.spec import declared_env_keys, manifest_digest
 from core.execution.stdio_transport import RunnerStdioTransport
 from core.llm_factory import build_model_settings, resolve_model
-from core.manifest_keys import all_declared, unresolved_placeholders
+from core.manifest_keys import unresolved_placeholders
 from core.mcp_schema import normalize_schema_for_provider
 from core.models import AgentConfig, MCPConfig, EDGE_MCP_WILDCARD_RE, is_agent_external, is_agent_internal
 from core.health import HealthMonitor, evaluate_health_status
@@ -648,7 +648,8 @@ def _inject_config(
     identity_mgr: IdentityManager,
     user_id: str,
     category: str,
-    is_background: bool
+    is_background: bool,
+    missing: Optional[set] = None
 ) -> Dict[str, str]:
     from core.discovery import _resolve_requirements
     env_copy = env.copy() if env else {}
@@ -662,15 +663,21 @@ def _inject_config(
     
     for req_key in req_list:
         val = resolved_data.get(req_key)
-        if val:
-            # Handle interpolation if the value is used in existing env vars (e.g. command args in env)
-            interpolated = False
-            for k, v in env_copy.items():
-                if isinstance(v, str) and f"{{{req_key}}}" in v:
-                    env_copy[k] = v.replace(f"{{{req_key}}}", str(val))
-                    interpolated = True
-            if not interpolated:
-                env_copy[req_key] = str(val)
+        if not val:
+            # Declared, and this caller has no value. The name is reported so the
+            # caller can drop the `env:` entries that asked for it; only this loop
+            # knows that "declared" here means "declared *and* unresolved".
+            if missing is not None:
+                missing.add(req_key)
+            continue
+        # Handle interpolation if the value is used in existing env vars (e.g. command args in env)
+        interpolated = False
+        for k, v in env_copy.items():
+            if isinstance(v, str) and f"{{{req_key}}}" in v:
+                env_copy[k] = v.replace(f"{{{req_key}}}", str(val))
+                interpolated = True
+        if not interpolated:
+            env_copy[req_key] = str(val)
     return env_copy
 
 async def get_external_mcp_client(mcp_name: str, user_id: str) -> FastMCPClient:
@@ -724,23 +731,21 @@ async def _open_external_mcp_client(mcp_name: str, user_id: str) -> FastMCPClien
     is_background = user_id.startswith("svc_agent_")
     
     # Inject Secrets (Scoped)
-    env = _inject_config(config.env, config.secrets, identity_mgr, user_id, "secrets", is_background)
+    missing: set = set()
+    env = _inject_config(config.env, config.secrets, identity_mgr, user_id, "secrets", is_background, missing)
 
     # Inject Optional Secrets (Scoped — silently skipped when absent, never blocks startup)
-    env = _inject_config(env, config.optional_secrets, identity_mgr, user_id, "secrets", is_background)
+    env = _inject_config(env, config.optional_secrets, identity_mgr, user_id, "secrets", is_background, missing)
 
     # Inject Variables (Scoped)
-    env = _inject_config(env, config.variables, identity_mgr, user_id, "variables", is_background)
+    env = _inject_config(env, config.variables, identity_mgr, user_id, "variables", is_background, missing)
 
-    # A declared name with no value leaves `{NAME}` in the literal `env:` block, and the
-    # server receives the braces -- a 401 whose cause is invisible in the manifest. The
-    # edge already drops such an entry; do the same here and say which key. Only the
-    # block's own keys are examined, so a resolved *value* that happens to contain
-    # braces is never touched.
-    block_keys = config.env if isinstance(config.env, dict) else {}
-    leftover = unresolved_placeholders(
-        {key: env[key] for key in block_keys if key in env}, all_declared(config)
-    )
+    # A name this caller has no value for leaves `{NAME}` in the manifest's own `env:`
+    # block, and the server would receive the braces -- a 401 whose cause is invisible
+    # in the manifest. The pairs are read from that raw block, so a resolved *value*
+    # that happens to contain braces is never reinterpreted, and an undeclared brace
+    # is left as written (a pre-v0.7.4 URL template may be working).
+    leftover = unresolved_placeholders(config.env, missing)
     for key in sorted({key for key, _name in leftover}):
         logger.warning(
             "MCP %r: dropping env: %s (no value for %s)",
