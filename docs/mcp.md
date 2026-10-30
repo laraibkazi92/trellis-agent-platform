@@ -39,21 +39,30 @@ The `mcp.yaml` defines how the Universal Agent Host (`core/host.py`) connects to
 
 To keep credentials secure, you should never hardcode API keys or tokens in `mcp.yaml`. Instead, declare them in the `secrets` list. The framework supports **Secret Interpolation** within the `env` dictionary.
 
-If an environment variable or header value contains `{SECRET_NAME}`, the framework will automatically substitute it with the user's secure value from the database.
+If an environment variable or header value contains `{SECRET_NAME}`, the framework will automatically substitute it with the user's secure value from the database — on the central host that opens the session (an [edge-hosted](#edge-hosted-mcp-servers) server's headers are built on the edge from the manifest's literal values, with no substitution).
 
-The **keys** of `env` are transport-dependent, the **values** are always interpolated:
+Only a **declared** name is substituted: a `{NAME}` that no `secrets`/`optional_secrets`/
+`variables` entry provides is left alone, so the server receives the braces. Because that
+is a silent 401 at the first call, `db-sync` refuses the manifest instead — the message
+names the `env:` key and the placeholder. The pattern is a bare braced word, so a path
+template such as `https://api.example.com/v1/{tenant}/graphql` counts as a placeholder too;
+`{ user(id: 1) }`, `{"a": 1}` and a hyphenated `{my-key}` do not.
+
+The **keys** of `env` are transport-dependent, the values are interpolated the same way on
+every transport:
 
 | `transport` | `env:` keys are | Validated as |
 | --- | --- | --- |
 | `stdio` | the server process's environment | `^[A-Za-z_][A-Za-z0-9_]*$` (`MY_API_KEY`) |
-| `http`, `streamable-http`, `sse` | the outgoing request's HTTP headers | RFC 7230 field-name token (`Authorization`, `X-Api-Key`, `mcp-version`) |
+| `http`, `streamable-http`, `sse`, `remote` | the outgoing request's HTTP headers | RFC 7230 field-name token (`Authorization`, `X-Api-Key`, `mcp-version`) |
+| anything else | — | refused: not a transport (`stdio` is the default when the field is absent) |
 
 A remote `env:` block is a header map: hyphens and mixed case are normal there, and
 `db-sync` rejects only what could not be sent — a key that is not a field-name token,
 or a value containing CR, LF or NUL. The **names** in `secrets`/`optional_secrets`/
 `variables` are different: those are credentials resolved into environment variables on
-every transport, so they must always be environment identifiers (a placeholder such as
-`{MY_API_KEY}` must therefore name a declared, valid secret).
+every transport, so they must always be environment identifiers — which is why a
+placeholder has to name a declared, valid secret.
 
 ### Example: Remote SSE Server (HTTP)
 

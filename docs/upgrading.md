@@ -9,12 +9,78 @@ pointed at by `TRELLIS_WORKSPACE_DIR` (see `.env.example` → *Deployment Layout
 run with the default `./workspace` inside this clone, the same steps apply, but be aware
 that your content is then inside the tree you check out tags into.
 
-The current release, `v0.7.3`, is a one-fix patch: an **HTTP MCP manifest whose `env:`
-block names a header** (e.g. `mcp-version`) syncs again. `v0.7.2` refused it as an invalid
-environment name. Nothing else changes, and no action is needed beyond deploying the tag.
-If you are upgrading from `v0.7.1` or older, read [`v0.7.2`](#v072-2026-10-27) first — it is
-breaking for anything that runs an edge — and [`v0.7.1`](#v071-2026-10-26) if you are coming
-from `v0.7.0`.
+The current release, `v0.7.4`, tightens the v0.7.3 manifest check in three ways: a
+`{PLACEHOLDER}` in an MCP `env:` value that names nothing declared is refused instead of
+being sent as literal text, a header name ending in a newline is refused, and an
+unrecognized `transport` falls to the strict env-name rule. No service, port, volume or
+`.env` key changes. Read [`v0.7.4`](#v074-2026-10-29) for the one manifest shape that can
+start failing. If you are upgrading from `v0.7.2` or older, read
+[`v0.7.2`](#v072-2026-10-27) first — it is breaking for anything that runs an edge.
+
+---
+
+## v0.7.4 (2026-10-29)
+
+Three follow-ups to `v0.7.3`'s transport-aware `env:` check. All three close a hole that
+let a manifest sync and then misbehave at the first call instead of at the sync.
+
+**1. An undeclared `{PLACEHOLDER}` is refused.** `core.agent_factory._inject_config`
+substitutes exactly the names a manifest declares in `secrets`, `optional_secrets` and
+`variables`, and leaves every other brace expression alone. So
+`Authorization: Bearer {CORALOGIX_APIKEY}` — one letter off — synced clean and sent the
+literal text `{CORALOGIX_APIKEY}` to the remote server: a 401 whose cause is invisible in
+the manifest. It now fails the sync:
+
+```text
+REFUSING TO SYNC: invalid declared names, nothing was written.
+  ERROR: mcp 'coralogix' (.../mcp.yaml): env: Authorization uses {CORALOGIX_APIKEY} but no
+  declared secret or variable has that name; declare it in secrets/variables or fix the
+  spelling (an undeclared placeholder is never substituted)
+```
+
+Only a token that would be a legal credential name (`[A-Za-z_][A-Za-z0-9_]*`) counts as a
+placeholder, so `{ user(id: 1) }`, `{"a": 1}` and a hyphenated `{my-key}` are left alone.
+The rule applies to `mcp.yaml` only, because no other manifest kind interpolates anything
+(a tool or workflow `env:` value is text, and is not checked).
+
+**2. A header name ending in a line break is refused.** The field-name pattern was anchored
+with `$`, which in Python also matches just before a trailing newline, so `"Auth\n"` passed
+validation and only failed later inside `httpx`. It is now anchored with `\Z`.
+
+**3. A `transport` the engine does not implement is refused.** `db-sync` reads raw YAML, so
+the field was still an arbitrary string when it was validated: `transport: http2` (a typo)
+took the permissive *header* branch, synced, and then failed inside `MCPConfig(...)` at the
+first call, inside a caught exception — silent from the operator's side. It is now refused
+by name:
+
+```text
+  ERROR: mcp 'demo' (.../mcp.yaml): transport 'http2' is not one of http,
+  remote, sse, stdio, streamable-http -- the manifest would sync and then fail to load at
+  the first call (fix the spelling, or drop the field for stdio)
+```
+
+A missing `transport` is still `stdio`, as before.
+
+Nothing else changes: services, ports, volumes, `.env` keys and the tool protocol are
+untouched, so the upgrade is the usual image swap.
+
+**What can start failing.** Only an MCP `env:` value that contains a `{NAME}` matching the
+credential-name pattern where `NAME` is not declared in that same manifest — including a
+brace that was meant literally, such as the path template in
+`X-Target: https://api.example.com/v1/{tenant}/graphql` or a `{name}` inside a message
+template. There is no escape syntax: spell the value without braces, or declare the name
+as a `variable`. Two things do *not* satisfy the check, on purpose:
+
+- a name declared on the **agent** (an MCP manifest has no inheritance), and
+- a `secret_groups` block (a `tool.yaml` field — `MCPConfig` has no such field, so it is
+  dropped when the manifest is parsed and could never resolve a header).
+
+**Two limitations this release does not change.** Interpolation happens in the central host
+process that opens the session, so an **edge-hosted** MCP's headers are built by the edge
+from the manifest's literal values and a placeholder there is not resolved. And a bucketed
+`secrets: {user: [...]}` is resolved only for the caller kind that reads that bucket, so the
+sync accepts a background-only credential reference that an interactive caller will not get.
+Both predate v0.7.4.
 
 ---
 

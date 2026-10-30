@@ -22,7 +22,12 @@ from core.execution.contract import (
 )
 from core.execution.env import INVALID_ENV_NAME_HELP, declared_names, invalid_env_names
 from core.execution.spec import is_plain_relative
-from core.manifest_keys import _group_keys, invalid_header_entries
+from core.manifest_keys import (
+    HEADER_TRANSPORTS,
+    _group_keys,
+    invalid_header_entries,
+    undeclared_placeholders,
+)
 from core.models import (
     BACKGROUND_AGENT_TYPES,
     EDGE_MCP_REF_RE,
@@ -166,7 +171,32 @@ def _header_name_error(label: str, transport: str, bad: list[str]) -> str:
     )
 
 
-def _declared_env_name_errors(config: dict, label: str) -> list[str]:
+def _placeholder_error(label: str, pairs: list[tuple[str, str]]) -> str:
+    """One printable line for ``{NAME}``s nothing will ever resolve."""
+    refs = "; ".join(f"env: {key} uses {{{name}}}" for key, name in pairs)
+    return (
+        f"{label}: {refs} but no declared secret or variable has that name; declare it "
+        "in secrets/variables or fix the spelling (an undeclared placeholder is never "
+        "substituted)"
+    )
+
+
+# Every transport the registry model accepts. ``HEADER_TRANSPORTS`` plus ``stdio`` is
+# the whole set; `tests/test_tool_access_sync.py` fails if the model's Literal grows a
+# value this does not cover.
+MCP_TRANSPORTS = HEADER_TRANSPORTS | {"stdio"}
+
+
+def _transport_error(label: str, transport: str) -> str:
+    """One printable line for a transport nothing in the engine can open."""
+    return (
+        f"{label}: transport '{transport}' is not one of "
+        f"{', '.join(sorted(MCP_TRANSPORTS))} -- the manifest would sync and then fail "
+        "to load at the first call (fix the spelling, or drop the field for stdio)"
+    )
+
+
+def _declared_env_name_errors(config: dict, label: str, kind: str) -> list[str]:
     """Problems with the names a manifest declares, as printable lines.
 
     A declared secret/variable name is only useful if the process can receive it as
@@ -180,23 +210,45 @@ def _declared_env_name_errors(config: dict, label: str) -> list[str]:
     request's **header map** (``core.agent_factory``, ``core/proxy_mcp._http_headers``)
     and ``mcp-version`` or ``Authorization`` are the correct spelling there. v0.7.2
     held every ``env:`` key to the env-name rule and refused those manifests outright.
+
+    An MCP's ``env:`` **values** are checked too (``kind == "mcp"``): ``{NAME}`` is
+    interpolated only for a declared name, so a misspelled one ships as literal text.
+    No other manifest kind has interpolation at all, so a brace expression there is
+    ordinary text and must not be judged.
     """
-    names = []
+    declared = []
     for field in ("secrets", "optional_secrets", "variables"):
-        names.extend(declared_names(config.get(field)))
+        declared.extend(declared_names(config.get(field)))
+    group_keys = _group_keys(config)
+    names = list(declared)
 
     errors = []
-    # The env block is header configuration on a remote transport, container
-    # configuration only on stdio -- the one transport that spawns a process.
     transport = str(config.get("transport") or "stdio").strip().lower()
+    if kind == "mcp" and transport not in MCP_TRANSPORTS:
+        # Nothing downstream can open this, and the raw YAML is written as-is
+        # (`sync_mcp` stores the dict; `MCPConfig(...)` is what rejects it later,
+        # inside a caught exception at call time). Report the transport only: naming
+        # the env block here would blame the headers for a misspelled field.
+        return [_transport_error(label, transport)]
+
+    # The env block is a header map on a remote transport, a container environment
+    # only on stdio -- the one transport that spawns a process. HEADER_TRANSPORTS is
+    # the list; anything else (only a value the model refuses) already returned above.
     env_block = config.get("env")
-    if transport == "stdio":
-        if isinstance(env_block, dict):
-            names.extend(str(name) for name in env_block)
-    else:
+    if transport in HEADER_TRANSPORTS:
         bad_headers = invalid_header_entries(env_block)
         if bad_headers:
             errors.append(_header_name_error(label, transport, bad_headers))
+    elif isinstance(env_block, dict):
+        names.extend(str(name) for name in env_block)
+
+    if kind == "mcp":
+        # `declared` only: `secret_groups` is a `tool.yaml` field (`core.models` has
+        # no such field on `MCPConfig`), and the raw block is dropped when the model
+        # parses the manifest -- so a group key can never resolve a header here.
+        unknown = undeclared_placeholders(env_block, declared)
+        if unknown:
+            errors.append(_placeholder_error(label, unknown))
 
     invalid = invalid_env_names(names)
     if invalid:
@@ -204,7 +256,7 @@ def _declared_env_name_errors(config: dict, label: str) -> list[str]:
     # `secret_groups` field keys are credential names too: the user types them in
     # /configuration and the tool receives them as env vars. Same flattening as the
     # edge's manifest check (`core.manifest_keys`), so the two cannot drift.
-    invalid_group_keys = invalid_env_names(_group_keys(config))
+    invalid_group_keys = invalid_env_names(group_keys)
     if invalid_group_keys:
         errors.append(
             _env_name_error(label, "secret_groups field key(s)", invalid_group_keys)
@@ -244,7 +296,9 @@ def validate_declared_env_names() -> list[str]:
                     continue
                 name = config.get("name") or manifest.parent.name
                 errors.extend(
-                    _declared_env_name_errors(config, f"{label} '{name}' ({manifest})")
+                    _declared_env_name_errors(
+                        config, f"{label} '{name}' ({manifest})", kind=label
+                    )
                 )
     return errors
 
