@@ -230,7 +230,12 @@ def _declared_env_name_errors(config: dict, label: str, kind: str) -> list[str]:
     names = list(declared)
 
     errors = []
-    transport = str(config.get("transport") or "stdio").strip().lower()
+    # The value as written: `MCPConfig.transport` is a case-sensitive Literal, so a
+    # `.lower()` here would accept `HTTP` and let the manifest fail at the first call
+    # -- exactly what this check exists to prevent. `None`/absent is stdio; an empty
+    # string is not (the model refuses it too).
+    raw_transport = config.get("transport")
+    transport = "stdio" if raw_transport is None else str(raw_transport)
     if kind == "mcp" and transport not in MCP_TRANSPORTS:
         # Nothing downstream can open this, and the raw YAML is written as-is
         # (`sync_mcp` stores the dict; `MCPConfig(...)` is what rejects it later,
@@ -619,7 +624,10 @@ def _discover_mcp_tools(config):
     if not command:
         return None
 
-    transport_type = (config.get("transport") or "stdio").lower()
+    # As written: the validation pass has already refused anything `MCPConfig` would
+    # reject, and a `.lower()` here would dial a transport the engine cannot open.
+    raw_transport = config.get("transport")
+    transport_type = "stdio" if raw_transport is None else str(raw_transport)
     if transport_type == "stdio":
         # The MCP SDK merges this env over the safe inherited defaults (PATH etc.).
         transport = StdioTransport(

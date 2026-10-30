@@ -400,6 +400,37 @@ def test_an_unknown_transport_is_refused(tmp_path, monkeypatch):
     assert "streamable-http" in errors[0]
 
 
+def test_a_transport_the_model_would_reject_is_refused_as_written(tmp_path, monkeypatch):
+    """`MCPConfig.transport` is a case-sensitive Literal; the sync must not lower-case.
+
+    `HTTP` used to pass this pass (`.lower()`) and then fail inside `MCPConfig(...)` at
+    the first call -- the exact failure the transport check exists to prevent.
+    """
+    errors = _mcp_manifest_errors(
+        tmp_path,
+        monkeypatch,
+        "name: demo\n"
+        "transport: HTTP\n"
+        "command: https://example.invalid/mcp\n"
+        "env:\n  MCP_VERSION: v2\n",
+    )
+
+    assert len(errors) == 1
+    assert "transport 'HTTP' is not one of" in errors[0]
+
+
+def test_an_empty_transport_is_refused(tmp_path, monkeypatch):
+    """An empty string is not "absent": the model refuses it, so the sync does too."""
+    errors = _mcp_manifest_errors(
+        tmp_path,
+        monkeypatch,
+        'name: demo\ntransport: ""\ncommand: node\nenv:\n  MCP_VERSION: v2\n',
+    )
+
+    assert len(errors) == 1
+    assert "transport '' is not one of" in errors[0]
+
+
 def test_a_header_name_may_not_end_with_a_line_break(tmp_path, monkeypatch):
     """``$`` also matches before a trailing newline; the field-name rule must not."""
     errors = _mcp_manifest_errors(
