@@ -663,6 +663,105 @@ def test_stdio_env_values_are_interpolated_too(tmp_path, process_env, monkeypatc
     assert "DEVOPS_PASSWORD" not in session_env
 
 
+def test_a_value_that_uses_its_own_name_keeps_that_header(tmp_path, process_env, monkeypatch):
+    """``X_API_KEY: "Bearer {X_API_KEY}"`` must not lose the header entirely.
+
+    Central substitutes in place, so the map holds ``X_API_KEY: Bearer s3cret`` and no
+    bare credential. The edge dropped both halves: the literal because the key is
+    declared, the bare name because a placeholder consumed it.
+    """
+    recorded = _RecordingTransports().install(monkeypatch)
+    entry = mcp_export(
+        tmp_path,
+        transport="http",
+        secrets=["DEVOPS_PASSWORD"],
+        env={"X_API_KEY": "Bearer {DEVOPS_PASSWORD}"},
+    )
+    store = shared_store(tmp_path, "devops-cli", DEVOPS_PASSWORD="hunter2")
+    env = proxy_mcp._server_env(
+        entry, {}, passthrough=False, token_env=None, credentials=store
+    )
+
+    proxy_mcp._transport(entry, env)
+
+    headers = recorded.calls["http"]["headers"]
+    assert headers == {"X_API_KEY": "Bearer hunter2"}
+
+
+def test_a_value_that_uses_its_own_name_reaches_the_runner_session(
+    tmp_path, process_env, monkeypatch
+):
+    """The stdio half of the same rule: the container kept no ``PGPASSWORD`` at all."""
+    recorded = _RecordingTransports().install(monkeypatch)
+    entry = mcp_export(
+        tmp_path,
+        transport="stdio",
+        secrets=["DEVOPS_PASSWORD"],
+        env={"DEVOPS_PASSWORD": "Bearer {DEVOPS_PASSWORD}"},
+    )
+    store = shared_store(tmp_path, "devops-cli", DEVOPS_PASSWORD="hunter2")
+    env = proxy_mcp._server_env(
+        entry, {}, passthrough=False, token_env=None, credentials=store
+    )
+
+    proxy_mcp._transport(entry, env)
+
+    session_env = recorded.calls["stdio"]["env"]
+    assert session_env["DEVOPS_PASSWORD"] == "Bearer hunter2"
+
+
+def test_a_literal_beside_a_real_consumer_survives_at_its_own_key(
+    tmp_path, process_env, monkeypatch
+):
+    """Central never rewrites a key it did not have to: the stale literal stays put."""
+    recorded = _RecordingTransports().install(monkeypatch)
+    entry = mcp_export(
+        tmp_path,
+        transport="http",
+        secrets=["DEVOPS_PASSWORD"],
+        env={
+            "DEVOPS_PASSWORD": "published-name",
+            "Authorization": "Bearer {DEVOPS_PASSWORD}",
+        },
+    )
+    store = shared_store(tmp_path, "devops-cli", DEVOPS_PASSWORD="hunter2")
+    env = proxy_mcp._server_env(
+        entry, {}, passthrough=False, token_env=None, credentials=store
+    )
+
+    proxy_mcp._transport(entry, env)
+
+    # `core.agent_factory._inject_config` produces exactly this map for the manifest.
+    assert recorded.calls["http"]["headers"] == {
+        "DEVOPS_PASSWORD": "published-name",
+        "Authorization": "Bearer hunter2",
+    }
+
+
+def test_an_unresolved_placeholder_is_reported_once_per_session(
+    tmp_path, process_env, monkeypatch, caplog
+):
+    """`_server_env` reports the drop; the consumers must not repeat it."""
+    recorded = _RecordingTransports().install(monkeypatch)
+    entry = mcp_export(
+        tmp_path,
+        transport="http",
+        secrets=["DEVOPS_PASSWORD"],
+        env={"Authorization": "Bearer {DEVOPS_PASSWORD}"},
+    )
+    store = shared_store(tmp_path, "devops-cli")  # nothing stored for this server
+    caplog.set_level(logging.WARNING, logger="core.proxy_mcp")
+
+    env = proxy_mcp._server_env(
+        entry, {}, passthrough=False, token_env=None, credentials=store
+    )
+    proxy_mcp._transport(entry, env)
+
+    drops = [r for r in caplog.records if "dropping env" in r.getMessage()]
+    assert len(drops) == 1
+    assert "Authorization" not in recorded.calls["http"]["headers"]
+
+
 def test_sse_headers_never_include_the_scoped_environment(tmp_path, process_env, monkeypatch):
     recorded = _RecordingTransports().install(monkeypatch)
     entry = mcp_export(tmp_path, transport="sse", secrets=["DEVOPS_PASSWORD"])

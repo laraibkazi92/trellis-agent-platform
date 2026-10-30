@@ -159,6 +159,26 @@ def undeclared_placeholders(mapping: Any, declared: Any) -> List[Tuple[str, str]
     return sorted(found)
 
 
+def unresolved_placeholders(mapping: Any, declared: Any) -> List[Tuple[str, str]]:
+    """``(env key, placeholder name)`` pairs still in braces for a *declared* name.
+
+    The complement of :func:`undeclared_placeholders`: this name should have been
+    substituted, and there was no value for it. Central used to hand the braces to the
+    server (a 401 with no cause in the manifest); the edge drops the entry and says so.
+    A pair naming something *not* declared is left to the caller -- a pre-v0.7.4
+    manifest may hold a working URL template, and only the sync gets to judge that.
+    """
+    if not isinstance(mapping, Mapping):
+        return []
+    known = {str(name) for name in declared or ()}
+    found = set()
+    for key, value in mapping.items():
+        for name in _PLACEHOLDER_RE.findall(str(value)):
+            if name in known:
+                found.add((str(key), name))
+    return sorted(found)
+
+
 def substitute_placeholders(
     value: Any, values: Mapping[str, str]
 ) -> Tuple[str, frozenset, frozenset]:

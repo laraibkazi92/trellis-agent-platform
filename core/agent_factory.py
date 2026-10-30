@@ -49,6 +49,7 @@ from core.console_backend import RunnerConsoleBackend
 from core.execution.spec import declared_env_keys, manifest_digest
 from core.execution.stdio_transport import RunnerStdioTransport
 from core.llm_factory import build_model_settings, resolve_model
+from core.manifest_keys import all_declared, unresolved_placeholders
 from core.mcp_schema import normalize_schema_for_provider
 from core.models import AgentConfig, MCPConfig, EDGE_MCP_WILDCARD_RE, is_agent_external, is_agent_internal
 from core.health import HealthMonitor, evaluate_health_status
@@ -730,6 +731,24 @@ async def _open_external_mcp_client(mcp_name: str, user_id: str) -> FastMCPClien
 
     # Inject Variables (Scoped)
     env = _inject_config(env, config.variables, identity_mgr, user_id, "variables", is_background)
+
+    # A declared name with no value leaves `{NAME}` in the literal `env:` block, and the
+    # server receives the braces -- a 401 whose cause is invisible in the manifest. The
+    # edge already drops such an entry; do the same here and say which key. Only the
+    # block's own keys are examined, so a resolved *value* that happens to contain
+    # braces is never touched.
+    block_keys = config.env if isinstance(config.env, dict) else {}
+    leftover = unresolved_placeholders(
+        {key: env[key] for key in block_keys if key in env}, all_declared(config)
+    )
+    for key in sorted({key for key, _name in leftover}):
+        logger.warning(
+            "MCP %r: dropping env: %s (no value for %s)",
+            mcp_name,
+            key,
+            ", ".join(sorted({name for k, name in leftover if k == key})),
+        )
+        env.pop(key, None)
 
     if config.transport == "stdio":
         # Pre-runner authorization: the runner proves the token but cannot decide this

@@ -9,21 +9,22 @@ pointed at by `TRELLIS_WORKSPACE_DIR` (see `.env.example` → *Deployment Layout
 run with the default `./workspace` inside this clone, the same steps apply, but be aware
 that your content is then inside the tree you check out tags into.
 
-The current release, `v0.7.4`, tightens the v0.7.3 manifest check in three ways: a
-`{PLACEHOLDER}` in an MCP `env:` value that names nothing declared is refused instead of
-being sent as literal text, a header name ending in a newline is refused, and an
-unrecognized `transport` falls to the strict env-name rule. No service, port, volume or
-`.env` key changes. Read [`v0.7.4`](#v074-2026-10-29) for the one manifest shape that can
-start failing. If you are upgrading from `v0.7.2` or older, read
-[`v0.7.2`](#v072-2026-10-27) first — it is breaking for anything that runs an edge.
+The current release, `v0.7.4`, tightens the v0.7.3 manifest check in three ways — an
+undeclared `{PLACEHOLDER}` in an MCP `env:` value is refused instead of being sent as
+literal text, a header name ending in a newline is refused, and an unrecognized `transport`
+(such as `http2`, `HTTP` or an empty string) is refused by name — and adds three fixes on
+the delivery path it validates. No service, port, volume or `.env` key changes. Read
+[`v0.7.4`](#v074-2026-10-29) for the one manifest shape that can start failing. If you are
+upgrading from `v0.7.2` or older, read [`v0.7.2`](#v072-2026-10-27) first — it is breaking
+for anything that runs an edge.
 
 ---
 
 ## v0.7.4 (2026-10-29)
 
-Three follow-ups to `v0.7.3`'s transport-aware `env:` check, plus two fixes on the delivery
-path it validates. All five close a hole that let a manifest sync and then misbehave at the
-first call instead of at the sync.
+Three follow-ups to `v0.7.3`'s transport-aware `env:` check, plus three fixes on the
+delivery path it validates. All six close a hole that let a manifest sync and then misbehave
+at the first call instead of at the sync.
 
 **1. An undeclared `{PLACEHOLDER}` is refused.** `core.agent_factory._inject_config`
 substitutes exactly the names a manifest declares in `secrets`, `optional_secrets` and
@@ -60,7 +61,9 @@ by name:
   the first call (fix the spelling, or drop the field for stdio)
 ```
 
-A missing `transport` is still `stdio`, as before.
+A missing `transport` is still `stdio`, as before. The value is compared **as written**:
+`MCPConfig.transport` is a case-sensitive `Literal`, so `HTTP` and `""` are refused here
+rather than syncing and failing to load at the first call.
 
 **4. A stdio MCP's interpolated `env:` value reaches the container.** The host filters a
 session's environment through `core.execution.spec.declared_env_keys`, which passed the
@@ -95,11 +98,23 @@ credential chain it already resolved (the caller's sealed set or the shared file
 
 - A credential a placeholder consumed is no longer also sent under its own name. Central
   has always behaved that way (`if not interpolated: env[key] = val`), so an edge-hosted
-  server now receives the same header/bare-name pair as a central one instead of both.
+  server now receives the same header/bare-name pair as a central one instead of both. A
+  value that uses its **own** name — `env: {X_API_KEY: "Bearer {X_API_KEY}"}` — keeps the
+  substituted text at that name, which is what central's in-place substitution produces;
+  the edge used to send neither the header nor the credential.
 - A placeholder that **cannot** be resolved at call time (this caller has no value for it)
   is dropped with a warning naming the key — never sent as braces, which cannot
   authenticate anywhere. The session is still created; the remote answers with its own
   error.
+
+**6. A declared name with no value is dropped, not sent as braces.** That last rule is now
+true on central too. `_inject_config` skipped a declared name it had no value for and left
+the literal `{NAME}` in the `env:` block, so an optional secret the caller had not set
+reached the remote server as `Bearer {OPT}`. Such a key is dropped with a warning naming it,
+on both sides, for an edge-hosted server and a central one alike. Only a placeholder that
+names something *declared* is dropped: an undeclared brace in a pre-v0.7.4 manifest is left
+as written, because a URL path template may be working. Only the `env:` block's own keys are
+examined, so a resolved secret whose **value** happens to contain braces is never touched.
 
 **One limitation this release does not change.** A bucketed `secrets: {user: [...]}` is
 resolved only for the caller kind that reads that bucket, so the sync accepts a
@@ -119,7 +134,7 @@ hyphenated header — `mcp-version: v2`, the shape a vendor's published MCP conf
 failed the whole sync with exit 2:
 
 ```text
-REFUSING TO SYNC: invalid declared names, nothing was written.
+REFUSING TO SYNC: invalid declared env names, nothing was written.
   ERROR: mcp 'coralogix' (.../mcp.yaml): declared name(s) mcp-version cannot be ...
 ```
 

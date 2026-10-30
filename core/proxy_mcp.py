@@ -481,26 +481,33 @@ def _session_deadline_ms(entry: McpExport) -> int:
     return (entry.session_ttl_minutes * 60 + SESSION_DEADLINE_MARGIN_S) * 1000
 
 
-def _consumed_names(block: Optional[Mapping[str, Any]], values: Mapping[str, str]) -> set:
-    """Credential names a ``{NAME}`` in ``block`` actually used."""
-    used: set = set()
-    for value in (block or {}).values():
-        used |= substitute_placeholders(value, values)[1]
-    return used
-
-
-def _session_env(entry: McpExport, env: Mapping[str, str]) -> Mapping[str, str]:
+def _session_env(
+    entry: McpExport,
+    env: Mapping[str, str],
+    *,
+    literals: Optional[Mapping[str, str]] = None,
+    consumed: Optional[set] = None,
+) -> Mapping[str, str]:
     """What a session's runner is asked to provide -- minus consumed credentials.
 
     A credential its own manifest consumed with ``{NAME}`` is already inside that
     value, so it is not sent a second time under its own name: central's
-    ``_inject_config`` does not, and neither does the header map. The common case (no
-    placeholder, or none consumed) hands the map straight through.
+    ``_inject_config`` does not, and neither does the header map. The exception is a
+    value that used its **own** name -- ``env: {PGPASSWORD: "{PGPASSWORD}"}``: there
+    the substituted text *is* that name's value, and dropping it left the container
+    without the variable entirely. ``_server_env`` carries the raw credential last
+    (the header map needs it to interpolate), so the substituted literal is re-applied
+    here. The common case hands the map straight through.
     """
-    consumed = _consumed_names(entry.config.env, env)
+    if literals is None or consumed is None:
+        literals, consumed, _ = _interpolate_env(
+            entry.config.env, env, entry.name, warn=False
+        )
     if not consumed:
         return env
-    return {key: value for key, value in env.items() if key not in consumed}
+    session = {key: value for key, value in env.items() if key not in consumed}
+    session.update({key: value for key, value in literals.items() if key in consumed})
+    return session
 
 
 def _runner_transport(
@@ -565,7 +572,9 @@ def _interpolate_env(
     block: Optional[Mapping[str, Any]],
     values: Mapping[str, str],
     name: str,
-) -> Tuple[Dict[str, str], set]:
+    *,
+    warn: bool = True,
+) -> Tuple[Dict[str, str], set, set]:
     """A manifest's literal ``env:`` values with ``{NAME}`` taken from ``values``.
 
     Central substitutes the same placeholders (``core.agent_factory._inject_config``)
@@ -575,30 +584,39 @@ def _interpolate_env(
 
     An entry any of whose placeholders has no value is dropped rather than sent with
     the braces in it: that cannot authenticate anywhere, and the drop is reported here
-    with the key and the missing names (never a value). Returns the block and the set
-    of names a placeholder consumed, which the caller must not emit twice.
+    with the key and the missing names (never a value) -- once per session, so the
+    second call site (``_transport``) passes ``warn=False``. Returns the block, the
+    names a placeholder consumed, and the keys that were dropped.
     """
     literals: Dict[str, str] = {}
     consumed: set = set()
+    dropped: set = set()
     for key, value in (block or {}).items():
         if not isinstance(key, str):
             continue
         text, used, missing = substitute_placeholders(value, values)
         consumed |= used
         if missing:
-            logger.warning(
-                "mcp '%s': dropping env: %s (no value for %s)",
-                name,
-                key,
-                ", ".join(sorted(missing)),
-            )
+            dropped.add(key)
+            if warn:
+                logger.warning(
+                    "mcp '%s': dropping env: %s (no value for %s)",
+                    name,
+                    key,
+                    ", ".join(sorted(missing)),
+                )
             continue
         literals[key] = text
-    return literals, consumed
+    return literals, consumed, dropped
 
 
 def _http_headers(
-    entry: McpExport, env: Mapping[str, str], token_env: Optional[str] = None
+    entry: McpExport,
+    env: Mapping[str, str],
+    token_env: Optional[str] = None,
+    *,
+    literals: Optional[Mapping[str, str]] = None,
+    consumed: Optional[set] = None,
 ) -> Dict[str, str]:
     """Credentials for a remote transport: only what the manifest declares.
 
@@ -618,27 +636,42 @@ def _http_headers(
     A ``{NAME}`` in a literal ``env:`` value is substituted from that same chain (a
     remote origin never got it before v0.7.4: it received ``Bearer {API_KEY}``), and a
     name a placeholder consumed is not also sent under its own name -- the same rule
-    central applies. A literal for a name the manifest does **not** declare is applied
-    as written; a stale literal must never shadow the caller's file, nor reach an
-    origin under ``per_user_required`` when the file does not define the key.
+    central applies. Two cases follow central's in-place substitution exactly: a value
+    that used its **own** name (``X_API_KEY: "Bearer {X_API_KEY}"``) keeps the
+    substituted text there, and a literal beside a real consumer of the same name
+    survives at its key. A literal for a name the manifest does **not** declare is
+    applied as written; a stale literal must never shadow the caller's file, nor reach
+    an origin under ``per_user_required`` when the file does not define the key.
     """
     reserved = edge_env.RESERVED_ENV_NAMES | {
         edge_env.DEFAULT_TOKEN_ENV,
         token_env or edge_env.DEFAULT_TOKEN_ENV,
     }
     declared = edge_env.declared_keys_for(entry.config)
-    block = {
+    if literals is None or consumed is None:
+        literals, consumed, _ = _interpolate_env(
+            entry.config.env, env, entry.name, warn=False
+        )
+    headers = {
         key: value
-        for key, value in (entry.config.env or {}).items()
-        if isinstance(key, str) and key.upper() not in reserved
+        for key, value in literals.items()
+        if key not in declared and key.upper() not in reserved
     }
-    literals, consumed = _interpolate_env(block, env, entry.name)
-    headers = {key: value for key, value in literals.items() if key not in declared}
     headers.update(
         {
             key: env[key]
             for key in sorted(declared)
             if key in env and key.upper() not in reserved and key not in consumed
+        }
+    )
+    # A declared name a placeholder consumed normally gets no header of its own -- the
+    # value that consumed it carries the credential. Unless the literal at that very
+    # name is what consumed it: then the substituted text is the value central sends.
+    headers.update(
+        {
+            key: literals[key]
+            for key in sorted(declared)
+            if key in consumed and key in literals and key.upper() not in reserved
         }
     )
     return headers
@@ -662,17 +695,25 @@ def _transport(
     claims.
     """
     Client, StreamableHttpTransport, SSETransport = _fastmcp()
+    # Once per session, for both branches: the runner env and the header map are two
+    # projections of the same substituted block. Silent -- `_server_env` already
+    # reported every drop for this session.
+    literals, consumed, _ = _interpolate_env(
+        entry.config.env, env, entry.name, warn=False
+    )
     if entry.config.transport == "stdio":
         return Client(
             _runner_transport(
                 entry,
-                _session_env(entry, env),
+                _session_env(entry, env, literals=literals, consumed=consumed),
                 kind=kind,
                 deadline_ms=deadline_ms,
                 identity=identity,
             )
         )
-    headers = _http_headers(entry, env, token_env)
+    headers = _http_headers(
+        entry, env, token_env, literals=literals, consumed=consumed
+    )
     url = entry.config.command or ""
     if entry.config.transport in ("http", "streamable-http"):
         return Client(StreamableHttpTransport(url=url, headers=headers))
@@ -763,7 +804,9 @@ def _server_env(
         env.pop(key, None)
     # A `{NAME}` in a literal value is resolved here, from the same chain the runner
     # has no way to reach (central interpolates at the same point).
-    literals, _consumed = _interpolate_env(entry.config.env, resolved, entry.name)
+    literals, _consumed, _dropped = _interpolate_env(
+        entry.config.env, resolved, entry.name
+    )
     env.update(literals)
     # Credentials win over the process env and over a literal ``env:`` (``shared``
     # mode's point, and the only source under ``per_user_required``). A placeholder

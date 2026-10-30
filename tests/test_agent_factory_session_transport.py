@@ -134,6 +134,61 @@ def test_get_external_mcp_client_builds_a_runner_session(monkeypatch):
     }
 
 
+def test_a_declared_name_with_no_value_is_dropped_instead_of_sent_as_braces(monkeypatch):
+    """`{OPT}` used to reach the remote origin. The edge drops the entry; so does central."""
+    _install(
+        monkeypatch,
+        {
+            "remote": _config(
+                name="remote",
+                transport="http",
+                command="https://mcp.example/x",
+                env={"Authorization": "Bearer {OPT}", "mcp-version": "v2"},
+                optional_secrets=["OPT"],
+            )
+        },
+    )
+    captured = {}
+
+    class FakeHttpTransport:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(agent_factory, "StreamableHttpTransport", FakeHttpTransport)
+
+    asyncio.run(agent_factory.get_external_mcp_client("remote", "user-1"))
+
+    assert captured["headers"] == {"mcp-version": "v2"}
+
+
+def test_a_declared_name_with_a_value_is_still_substituted_for_a_remote_origin(monkeypatch):
+    """The drop above must not cost a caller who does have the value."""
+    _install(
+        monkeypatch,
+        {
+            "remote": _config(
+                name="remote",
+                transport="http",
+                command="https://mcp.example/x",
+                env={"Authorization": "Bearer {OPT}"},
+                optional_secrets=["OPT"],
+            )
+        },
+        secrets={"OPT": "s3cret"},
+    )
+    captured = {}
+
+    class FakeHttpTransport:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(agent_factory, "StreamableHttpTransport", FakeHttpTransport)
+
+    asyncio.run(agent_factory.get_external_mcp_client("remote", "user-1"))
+
+    assert captured["headers"] == {"Authorization": "Bearer s3cret"}
+
+
 def test_get_external_mcp_client_does_not_name_the_background_agent_in_the_body(monkeypatch):
     """The agent name is a token claim now; the runner derives it, so the body has none."""
     _install(
