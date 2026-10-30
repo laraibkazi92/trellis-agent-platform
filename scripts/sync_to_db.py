@@ -152,10 +152,15 @@ def _warn_unresolved_edge_refs(refs, known_mcps, known_tools):
         )
 
 
+def _show(name: str) -> str:
+    """A name as one printable token: a control character must not split the error line."""
+    return name if str(name).isprintable() else repr(name)
+
+
 def _env_name_error(label: str, field: str, bad: list[str]) -> str:
     """One printable line naming the manifest, the field and the offending names."""
     return (
-        f"{label}: {field} {', '.join(bad)} cannot be environment "
+        f"{label}: {field} {', '.join(_show(name) for name in bad)} cannot be environment "
         f"variables ({INVALID_ENV_NAME_HELP}); rename them in the manifest "
         "(e.g. my-api-key -> MY_API_KEY)"
     )
@@ -164,16 +169,18 @@ def _env_name_error(label: str, field: str, bad: list[str]) -> str:
 def _header_name_error(label: str, transport: str, bad: list[str]) -> str:
     """One printable line for a header map a remote MCP could never send."""
     return (
-        f"{label}: env: {', '.join(bad)} cannot be HTTP header names on transport "
-        f"'{transport}' (expected a field-name token such as mcp-version or "
-        "X-Api-Key, with no CR/LF/NUL in the value); fix them, or use "
+        f"{label}: env: {', '.join(_show(name) for name in bad)} cannot be HTTP header "
+        f"names on transport '{transport}' (expected a field-name token such as "
+        "mcp-version or X-Api-Key, with no CR/LF/NUL in the value); fix them, or use "
         "transport: stdio if this really is a process environment"
     )
 
 
 def _placeholder_error(label: str, pairs: list[tuple[str, str]]) -> str:
     """One printable line for ``{NAME}``s nothing will ever resolve."""
-    refs = "; ".join(f"env: {key} uses {{{name}}}" for key, name in pairs)
+    refs = "; ".join(
+        f"env: {_show(key)} uses {{{name}}}" for key, name in pairs
+    )
     return (
         f"{label}: {refs} but no declared secret or variable has that name; declare it "
         "in secrets/variables or fix the spelling (an undeclared placeholder is never "

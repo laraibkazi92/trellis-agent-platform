@@ -586,6 +586,83 @@ def test_http_headers_carry_only_the_declared_credentials(tmp_path, process_env,
         assert not_declared not in env
 
 
+def test_an_edge_mcp_interpolates_a_placeholder_header(tmp_path, process_env, monkeypatch):
+    """A remote origin used to receive the literal ``Bearer {DEVOPS_PASSWORD}``.
+
+    Central substitutes it (`core.agent_factory._inject_config`) and does not also emit
+    the credential under its own name; the edge has to produce the same headers or the
+    same manifest authenticates on one side and fails on the other.
+    """
+    recorded = _RecordingTransports().install(monkeypatch)
+    entry = mcp_export(
+        tmp_path,
+        transport="http",
+        secrets=["DEVOPS_PASSWORD"],
+        env={"Authorization": "Bearer {DEVOPS_PASSWORD}", "mcp-version": "v2"},
+    )
+    store = shared_store(tmp_path, "devops-cli", DEVOPS_PASSWORD="hunter2")
+    env = proxy_mcp._server_env(
+        entry, {}, passthrough=False, token_env=None, credentials=store
+    )
+
+    proxy_mcp._transport(entry, env)
+
+    headers = recorded.calls["http"]["headers"]
+    assert headers["Authorization"] == "Bearer hunter2"
+    assert headers["mcp-version"] == "v2"
+    # Consumed by the placeholder, so not sent a second time under its own name.
+    assert "DEVOPS_PASSWORD" not in headers
+
+
+def test_a_placeholder_with_no_value_is_dropped_rather_than_sent(
+    tmp_path, process_env, monkeypatch, caplog
+):
+    """Braces cannot authenticate anywhere, so the header is dropped and reported."""
+    recorded = _RecordingTransports().install(monkeypatch)
+    entry = mcp_export(
+        tmp_path,
+        transport="http",
+        secrets=["DEVOPS_PASSWORD"],
+        env={"Authorization": "Bearer {DEVOPS_PASSWORD}"},
+    )
+    store = shared_store(tmp_path, "devops-cli")  # nothing stored for this server
+    caplog.set_level(logging.WARNING, logger="core.proxy_mcp")
+
+    env = proxy_mcp._server_env(
+        entry, {}, passthrough=False, token_env=None, credentials=store
+    )
+    proxy_mcp._transport(entry, env)
+
+    headers = recorded.calls["http"]["headers"]
+    assert "Authorization" not in headers
+    assert not any("{" in value for value in headers.values())
+    warning = " ".join(record.message for record in caplog.records)
+    assert "Authorization" in warning and "DEVOPS_PASSWORD" in warning
+
+
+def test_stdio_env_values_are_interpolated_too(tmp_path, process_env, monkeypatch):
+    """The same substitution feeds the runner request, not only the header map."""
+    recorded = _RecordingTransports().install(monkeypatch)
+    entry = mcp_export(
+        tmp_path,
+        transport="stdio",
+        secrets=["DEVOPS_PASSWORD"],
+        env={"PGPASSWORD": "{DEVOPS_PASSWORD}", "PGSSLMODE": "require"},
+    )
+    store = shared_store(tmp_path, "devops-cli", DEVOPS_PASSWORD="hunter2")
+
+    env = proxy_mcp._server_env(
+        entry, {}, passthrough=False, token_env=None, credentials=store
+    )
+    proxy_mcp._transport(entry, env)
+
+    session_env = recorded.calls["stdio"]["env"]
+    assert session_env["PGPASSWORD"] == "hunter2"
+    assert session_env["PGSSLMODE"] == "require"
+    # Consumed by the placeholder, so not repeated as its own variable.
+    assert "DEVOPS_PASSWORD" not in session_env
+
+
 def test_sse_headers_never_include_the_scoped_environment(tmp_path, process_env, monkeypatch):
     recorded = _RecordingTransports().install(monkeypatch)
     entry = mcp_export(tmp_path, transport="sse", secrets=["DEVOPS_PASSWORD"])

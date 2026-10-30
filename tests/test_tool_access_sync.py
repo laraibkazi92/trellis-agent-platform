@@ -415,6 +415,23 @@ def test_a_header_name_may_not_end_with_a_line_break(tmp_path, monkeypatch):
     assert "cannot be HTTP header names" in errors[0]
 
 
+def test_a_control_character_in_a_name_does_not_split_the_error_line(
+    tmp_path, monkeypatch
+):
+    """The offending name is quoted, so the line an operator greps stays one line."""
+    errors = _mcp_manifest_errors(
+        tmp_path,
+        monkeypatch,
+        "name: demo\n"
+        "transport: streamable-http\n"
+        "command: https://example.invalid/mcp\n"
+        'env:\n  "Auth\\n": v\n',
+    )
+
+    assert "\n" not in errors[0]
+    assert "'Auth\\n'" in errors[0]
+
+
 # --------------------------------------------------------------------------- #
 # Env values: a {PLACEHOLDER} must name something declared
 # --------------------------------------------------------------------------- #
