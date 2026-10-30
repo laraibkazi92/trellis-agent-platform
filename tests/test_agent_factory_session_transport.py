@@ -189,6 +189,41 @@ def test_a_declared_name_with_a_value_is_still_substituted_for_a_remote_origin(m
     assert captured["headers"] == {"Authorization": "Bearer s3cret"}
 
 
+def test_a_secret_value_holding_braces_is_not_reinterpreted(monkeypatch, caplog):
+    """The drop is computed from the manifest's raw block, not the substituted value.
+
+    `{OPT}` here comes from the *secret's* value, not from the manifest, so the header
+    is sent as written even though `OPT` is declared and this caller has no value for
+    it. Reading the substituted map instead would silently delete a working header.
+    """
+    _install(
+        monkeypatch,
+        {
+            "remote": _config(
+                name="remote",
+                transport="http",
+                command="https://mcp.example/x",
+                env={"X_TEMPLATE": "{TEMPLATE_SECRET}"},
+                secrets=["TEMPLATE_SECRET"],
+                optional_secrets=["OPT"],
+            )
+        },
+        secrets={"TEMPLATE_SECRET": "pre{OPT}post"},
+    )
+    captured = {}
+
+    class FakeHttpTransport:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(agent_factory, "StreamableHttpTransport", FakeHttpTransport)
+
+    asyncio.run(agent_factory.get_external_mcp_client("remote", "user-1"))
+
+    assert captured["headers"] == {"X_TEMPLATE": "pre{OPT}post"}
+    assert "dropping env" not in caplog.text
+
+
 def test_get_external_mcp_client_does_not_name_the_background_agent_in_the_body(monkeypatch):
     """The agent name is a token claim now; the runner derives it, so the body has none."""
     _install(
