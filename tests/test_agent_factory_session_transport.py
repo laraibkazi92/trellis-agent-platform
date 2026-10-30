@@ -189,6 +189,40 @@ def test_a_declared_name_with_a_value_is_still_substituted_for_a_remote_origin(m
     assert captured["headers"] == {"Authorization": "Bearer s3cret"}
 
 
+def test_a_name_bucketed_for_another_caller_is_dropped_too(monkeypatch, caplog):
+    """`_resolve_requirements` reads one bucket, so an unlooked-up name kept its braces.
+
+    `secrets: {background: [BG_KEY]}` is never requested for an interactive caller:
+    the name is neither resolved nor (before this) reported missing, so the server was
+    sent `Bearer {BG_KEY}`. A declared name this call did not supply is missing.
+    """
+    _install(
+        monkeypatch,
+        {
+            "remote": _config(
+                name="remote",
+                transport="http",
+                command="https://mcp.example/x",
+                env={"Authorization": "Bearer {BG_KEY}"},
+                secrets={"general": [], "user": [], "background": ["BG_KEY"]},
+            )
+        },
+    )
+    captured = {}
+
+    class FakeHttpTransport:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(agent_factory, "StreamableHttpTransport", FakeHttpTransport)
+    caplog.set_level("WARNING", logger=agent_factory.logger.name)
+
+    asyncio.run(agent_factory.get_external_mcp_client("remote", "user-1"))
+
+    assert captured["headers"] == {}
+    assert "Authorization" in caplog.text and "BG_KEY" in caplog.text
+
+
 def test_a_secret_value_holding_braces_is_not_reinterpreted(monkeypatch, caplog):
     """The drop is computed from the manifest's raw block, not the substituted value.
 

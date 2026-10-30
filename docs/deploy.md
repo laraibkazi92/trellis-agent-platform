@@ -70,7 +70,7 @@ docker compose up -d
 
 ### Pinning and verifying a release
 
-`TRELLIS_IMAGE` in `.env` pins a **tag** (`:v0.7.4`) because a tag stays readable in a diff. Tags are mutable — one can be re-pointed inside the same version while a fix lands — so if you need the image to be byte-identical forever, pin the **digest** published in that release's workflow summary instead:
+`TRELLIS_IMAGE` in `.env` pins a **tag** (`:v0.7.5`) because a tag stays readable in a diff. Tags are mutable, so if you need the image to be byte-identical forever, pin the **digest** published in that release's workflow summary instead:
 
 ```bash
 TRELLIS_IMAGE=ghcr.io/laraibkazi92/trellis-agent-platform@sha256:<digest>
@@ -79,7 +79,7 @@ TRELLIS_IMAGE=ghcr.io/laraibkazi92/trellis-agent-platform@sha256:<digest>
 Every release published after provenance was wired up is attested by GitHub's keyless signer, which proves the image was built by `.github/workflows/publish-images.yml` from the commit its tag points at. Verify a pulled image with the GitHub CLI (no signing key, no registry login — the attestation is stored next to the image):
 
 ```bash
-gh attestation verify oci://ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.4 \
+gh attestation verify oci://ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.5 \
   -R laraibkazi92/trellis-agent-platform
 ```
 
@@ -112,7 +112,7 @@ If the host has no access to GHCR, export the images from a connected machine an
 # connected machine
 docker compose pull
 docker save -o trellis-images.tar \
-  ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.4 \
+  ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.5 \
   ghcr.io/vectorize-io/hindsight:0.9.1-slim \
   gcr.io/etcd-development/etcd:v3.6.15 \
   redis:alpine \
@@ -126,7 +126,7 @@ docker load -i trellis-images.tar
 Alternatively push the same images to a private registry mirror and point the stack at it with `TRELLIS_IMAGE` in `.env`:
 
 ```bash
-TRELLIS_IMAGE=registry.internal.example.com/trellis-agent-platform:v0.7.4
+TRELLIS_IMAGE=registry.internal.example.com/trellis-agent-platform:v0.7.5
 ```
 
 ## Install path B: build from source
@@ -183,7 +183,7 @@ TRELLIS_HOST_WORKSPACE=/absolute/path/to/workspace   # HOST path, not /app/works
 
 ```bash
 # 1. Clone the engine at a release tag
-git clone --branch v0.7.4 https://github.com/laraibkazi92/trellis-agent-platform.git
+git clone --branch v0.7.5 https://github.com/laraibkazi92/trellis-agent-platform.git
 cd trellis-agent-platform
 
 # 2. Seed your environment file
@@ -202,7 +202,7 @@ The variables below are the ones you must touch for a first deployment. Everythi
 | `SESSION_SECRET` | Yes | Signs sessions and seeds the Fernet encryption key (`ENCRYPTION_KEY` falls back to it). |
 | `ADMIN_USERS` | Yes | Comma-separated admin identities (e.g. `ops@example.com`). |
 | `TRELLIS_WORKSPACE_DIR` | Recommended | Workspace bind-mount source. Defaults to `./workspace` inside the clone. Point it at your content repo to keep the engine pristine. |
-| `TRELLIS_IMAGE` | Optional | Pins the engine image tag or digest, e.g. `ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.4`. |
+| `TRELLIS_IMAGE` | Optional | Pins the engine image tag or digest, e.g. `ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.5`. |
 | `TRELLIS_UID` / `TRELLIS_GID` | Optional | Container uid:gid for workspace file ownership. Defaults to `1000:1000`; both must be non-zero — the runner refuses to start otherwise, because `0` is root and a root tool owns every file it writes (v0.7.2). |
 | `DEV_MODE` | No | Keep `false` for anything shared. `true` disables **all** authentication. |
 | `OIDC_GROUPS_CLAIM` | Optional | Identity-provider claim holding group membership for the tool-access group rules (default `groups`). Accepted as a list or a comma-separated string. |
@@ -345,11 +345,11 @@ docker image inspect "${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platfo
 docker compose up -d
 ```
 
-`--force` matters: a release tag can be re-pointed inside the same version while a fix
-lands (v0.7.4 moved three times in one evening). `git fetch --tags` then prints
-`! [rejected] … (would clobber existing tag)` and `git checkout` keeps the **old** commit
-without failing — and `docker compose up -d` alone does not re-pull an image whose tag the
-host already has. Those two checks are what tell you which build you are actually on.
+`--force` matters: a tag can be re-pointed to a rebuilt commit without the version
+changing. `git fetch --tags` then prints `! [rejected] … (would clobber existing tag)` and
+`git checkout` succeeds on the **old** commit without failing — and `docker compose up -d`
+alone does not re-pull an image tag the host already has. The `rev-parse` and `image
+inspect` lines are what tell you which build you are actually on.
 
 `db-sync` re-syncs your workspace into etcd on the way up, so newly added content in your content repo is picked up at the same time. If you build from source instead, use `docker compose up -d --build`.
 

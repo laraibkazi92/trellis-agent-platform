@@ -50,7 +50,7 @@ services:
   # hub and by the process that owns the agent runtime (core/tool_gate.py), never here.
   runner:
     build: *app-build
-    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.4}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.5}
     container_name: runner
     # Root only to open /var/run/docker.sock; every container it starts runs as
     # TRELLIS_UID/TRELLIS_GID from inside the spec, never as root.
@@ -107,7 +107,7 @@ services:
       # the version probe reports itself skipped. Forwarded for a deployment that does
       # mount the binary and wants the probe to check it.
       RUNSC_BIN: ${RUNSC_BIN:-}
-      RUNNER_IMAGE: ${RUNNER_IMAGE:-${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.4}}
+      RUNNER_IMAGE: ${RUNNER_IMAGE:-${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.5}}
       RUNNER_MAX_CONTAINERS: ${RUNNER_MAX_CONTAINERS:-32}
       RUNNER_MAX_CONTAINERS_PER_TOOL: ${RUNNER_MAX_CONTAINERS_PER_TOOL:-8}
       RUNNER_REAP_INTERVAL_S: ${RUNNER_REAP_INTERVAL_S:-300}
@@ -140,7 +140,7 @@ services:
   # SYNC_FORCE_PRUNE=true in .env if the wipe is intended.
   db-sync:
     build: *app-build
-    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.4}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.5}
     container_name: db-sync
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     environment:
@@ -160,7 +160,7 @@ services:
   # This is the main entry point for the agent fleet.
   host:
     build: *app-build
-    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.4}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.5}
     container_name: agent-host
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     env_file:
@@ -212,7 +212,7 @@ services:
   # Executes local polyglot tools and exposes them to the Host via SSE
   hub:
     build: *app-build
-    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.4}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.5}
     container_name: tool-hub
     # Runs as the operator uid -- the same identity that owns the bind-mounted
     # workspace. Tool processes do NOT run here (every call is a runner-managed
@@ -304,7 +304,7 @@ services:
   # published to the host: nginx fronts it at /edge (gateway/entrypoint.sh).
   edge-relay:
     build: *app-build
-    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.4}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.5}
     container_name: edge-relay
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     # Exactly ONE worker, on purpose: the site -> live connection map is in-process
@@ -358,7 +358,7 @@ services:
   # Bridges external MCP clients to the internal agent fleet via the Host's HTTP API.
   gateway:
     build: *app-build
-    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.4}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.5}
     container_name: agent-gateway
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     environment:
@@ -421,7 +421,7 @@ services:
 
   taskiq-worker:
     build: *app-build
-    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.4}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.5}
     container_name: taskiq-worker
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     # NOTE: no `env_file: .env` here on purpose. A background run resolves only the
@@ -475,7 +475,7 @@ services:
 
   taskiq-scheduler:
     build: *app-build
-    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.4}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.5}
     container_name: taskiq-scheduler
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     # NOTE: no `env_file: .env`. The scheduler only enqueues jobs (the worker runs
@@ -545,7 +545,7 @@ services:
 
   ui:
     build: *app-build
-    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.4}
+    image: ${TRELLIS_IMAGE:-ghcr.io/laraibkazi92/trellis-agent-platform:v0.7.5}
     container_name: agent-ui
     user: "${TRELLIS_UID:-1000}:${TRELLIS_GID:-1000}"
     env_file:

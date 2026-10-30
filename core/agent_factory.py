@@ -49,7 +49,7 @@ from core.console_backend import RunnerConsoleBackend
 from core.execution.spec import declared_env_keys, manifest_digest
 from core.execution.stdio_transport import RunnerStdioTransport
 from core.llm_factory import build_model_settings, resolve_model
-from core.manifest_keys import unresolved_placeholders
+from core.manifest_keys import all_declared, unresolved_placeholders
 from core.mcp_schema import normalize_schema_for_provider
 from core.models import AgentConfig, MCPConfig, EDGE_MCP_WILDCARD_RE, is_agent_external, is_agent_internal
 from core.health import HealthMonitor, evaluate_health_status
@@ -649,7 +649,7 @@ def _inject_config(
     user_id: str,
     category: str,
     is_background: bool,
-    missing: Optional[set] = None
+    supplied: Optional[set] = None
 ) -> Dict[str, str]:
     from core.discovery import _resolve_requirements
     env_copy = env.copy() if env else {}
@@ -664,12 +664,9 @@ def _inject_config(
     for req_key in req_list:
         val = resolved_data.get(req_key)
         if not val:
-            # Declared, and this caller has no value. The name is reported so the
-            # caller can drop the `env:` entries that asked for it; only this loop
-            # knows that "declared" here means "declared *and* unresolved".
-            if missing is not None:
-                missing.add(req_key)
             continue
+        if supplied is not None:
+            supplied.add(req_key)
         # Handle interpolation if the value is used in existing env vars (e.g. command args in env)
         interpolated = False
         for k, v in env_copy.items():
@@ -731,21 +728,24 @@ async def _open_external_mcp_client(mcp_name: str, user_id: str) -> FastMCPClien
     is_background = user_id.startswith("svc_agent_")
     
     # Inject Secrets (Scoped)
-    missing: set = set()
-    env = _inject_config(config.env, config.secrets, identity_mgr, user_id, "secrets", is_background, missing)
+    supplied: set = set()
+    env = _inject_config(config.env, config.secrets, identity_mgr, user_id, "secrets", is_background, supplied)
 
     # Inject Optional Secrets (Scoped — silently skipped when absent, never blocks startup)
-    env = _inject_config(env, config.optional_secrets, identity_mgr, user_id, "secrets", is_background, missing)
+    env = _inject_config(env, config.optional_secrets, identity_mgr, user_id, "secrets", is_background, supplied)
 
     # Inject Variables (Scoped)
-    env = _inject_config(env, config.variables, identity_mgr, user_id, "variables", is_background, missing)
+    env = _inject_config(env, config.variables, identity_mgr, user_id, "variables", is_background, supplied)
 
     # A name this caller has no value for leaves `{NAME}` in the manifest's own `env:`
     # block, and the server would receive the braces -- a 401 whose cause is invisible
-    # in the manifest. The pairs are read from that raw block, so a resolved *value*
-    # that happens to contain braces is never reinterpreted, and an undeclared brace
-    # is left as written (a pre-v0.7.4 URL template may be working).
-    leftover = unresolved_placeholders(config.env, missing)
+    # in the manifest. Every declared name this call did not supply counts, not only the
+    # ones it asked for: `_resolve_requirements` reads this caller's bucket alone, so a
+    # credential bucketed under `background` is never looked up for a user and would
+    # otherwise slip through as braces. The pairs come from the raw block, so a resolved
+    # *value* that happens to contain braces is never reinterpreted, and an undeclared
+    # brace is left as written (a pre-v0.7.4 URL template may be working).
+    leftover = unresolved_placeholders(config.env, all_declared(config) - supplied)
     for key in sorted({key for key, _name in leftover}):
         logger.warning(
             "MCP %r: dropping env: %s (no value for %s)",

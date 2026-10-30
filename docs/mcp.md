@@ -48,13 +48,15 @@ names the `env:` key and the placeholder. The pattern is a bare braced word, so 
 template such as `https://api.example.com/v1/{tenant}/graphql` counts as a placeholder too;
 `{ user(id: 1) }`, `{"a": 1}` and a hyphenated `{my-key}` do not.
 
-A declared name that is simply **unresolved at call time** (the caller has no value for it)
-is a different case and is not a sync error: the host and the edge both drop that `env:`
-entry and log a warning naming the key, rather than sending `Bearer {API_KEY}` to a remote
-origin. A name a placeholder consumed is not also sent under its own name — unless the value
-uses its **own** name (`X_API_KEY: "Bearer {X_API_KEY}"`), where the substituted text is that
-name's value. That is what central's in-place substitution has always produced, and it is
-what the edge produces too.
+A declared name that is simply **unresolved at call time** (the caller has no value for it,
+including a name bucketed for a different caller kind — those buckets are never read for the
+caller in front of the request) is a different case and is not a sync error: the host and the
+edge both drop that `env:` entry and log a warning naming the key, rather than sending
+`Bearer {API_KEY}` to a remote origin. A brace that arrives inside a credential's own value is
+ordinary text and is sent as written. A name a placeholder consumed is not also sent under its
+own name — unless the value uses its **own** name (`X_API_KEY: "Bearer {X_API_KEY}"`), where the
+substituted text is that name's value. That is what central's in-place substitution has always
+produced, and it is what the edge produces too.
 
 The **keys** of `env` are transport-dependent, the values are interpolated the same way on
 every transport:

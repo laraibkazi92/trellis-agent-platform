@@ -9,14 +9,52 @@ pointed at by `TRELLIS_WORKSPACE_DIR` (see `.env.example` → *Deployment Layout
 run with the default `./workspace` inside this clone, the same steps apply, but be aware
 that your content is then inside the tree you check out tags into.
 
-The current release, `v0.7.4`, tightens the v0.7.3 manifest check in three ways — an
-undeclared `{PLACEHOLDER}` in an MCP `env:` value is refused instead of being sent as
-literal text, a header name ending in a newline is refused, and an unrecognized `transport`
-(such as `http2`, `HTTP` or an empty string) is refused by name — and adds three fixes on
-the delivery path it validates. No service, port, volume or `.env` key changes. Read
-[`v0.7.4`](#v074-2026-10-29) for the one manifest shape that can start failing. If you are
-upgrading from `v0.7.2` or older, read [`v0.7.2`](#v072-2026-10-27) first — it is breaking
-for anything that runs an edge.
+The current release, `v0.7.5`, is two delivery-path follow-ups to `v0.7.4`: a credential
+bucketed for a different caller kind is dropped instead of being sent as `{NAME}`, and a
+`{PLACEHOLDER}` is only ever treated as unresolved when the manifest itself wrote it. The
+upgrade procedure also force-fetches tags and verifies the commit and image digest. No
+service, port, volume or `.env` key changes. Read [`v0.7.5`](#v075-2026-10-30) for the one
+behaviour change. If you are upgrading from `v0.7.3` or older, read
+[`v0.7.4`](#v074-2026-10-29) first — that release tightens manifest validation, and
+[`v0.7.2`](#v072-2026-10-27) before it, which is breaking for anything that runs an edge.
+
+---
+
+## v0.7.5 (2026-10-30)
+
+Two fixes on the credential-delivery path, both about what reaches a remote server when a
+placeholder cannot be filled. No service, port, volume or `.env` key changes.
+
+**1. A name bucketed for another caller kind is dropped, not sent as braces.** `secrets:` and
+`optional_secrets:` may split a credential list by caller kind:
+
+```yaml
+secrets:
+  general: []
+  user: []
+  background: [BG_KEY]
+env:
+  Authorization: Bearer {BG_KEY}
+```
+
+Only the buckets of the caller in front of the request are read, so an interactive caller
+never looks `BG_KEY` up — the name is not missing and not resolved, and the remote server was
+handed `Bearer {BG_KEY}`. Every declared name this call did **not** supply now counts as
+unresolved, exactly like one with no stored value: the entry is dropped and the warning names
+the key. Nothing is guessed from another bucket — a credential is still only ever read for the
+caller kind it is bucketed for.
+
+**2. A placeholder is only dropped when the manifest itself wrote it.** The check compares the
+manifest's raw `env:` values against the names this call supplied. A brace that arrives inside
+a credential's **value** (`TEMPLATE_SECRET = "pre{OPT}post"`) is ordinary text and is sent as
+written, and a brace that names nothing declared is left alone (a pre-`v0.7.4` URL path
+template may be working).
+
+**3. The upgrade procedure verifies what it deployed.** `git fetch --tags` refuses to move an
+existing tag (`! [rejected] … (would clobber existing tag)`) and leaves the previous commit
+checked out, and `docker compose up -d` does not re-pull an image tag the host already has. The
+standard procedure (below) now force-fetches and compares the checked-out commit and the
+image digest against the values named in that release's notes.
 
 ---
 
@@ -1113,11 +1151,11 @@ Notes:
 - `docker compose pull` fetches the app image published to GHCR
   (`ghcr.io/laraibkazi92/trellis-agent-platform:vX.Y.Z`). The `nginx-gateway` service has no
   remote image — it is built locally from `./gateway` on `up`.
-- `git fetch --tags --force` is deliberate: a release tag can be re-pointed inside the same
-  version while a fix lands (v0.7.4 moved three times in one evening). Plain `--tags`
-  prints `! [rejected] … (would clobber existing tag)` and leaves the **old** commit
-  checked out, and `up -d` does not re-pull an image whose tag the host already has — the
-  `rev-parse` and `image inspect` lines are what tell you which build you are on.
+- `git fetch --tags --force` is deliberate: a tag can be re-pointed to a rebuilt commit
+  without the version changing. Plain `--tags` prints `! [rejected] … (would clobber
+  existing tag)` and leaves the **old** commit checked out, and `up -d` does not re-pull
+  an image tag the host already has — the `rev-parse` and `image inspect` lines are what
+  tell you which build you are on.
 - If you build from source instead of pulling (`TRELLIS_IMAGE` unset or overridden), use
   `docker compose up -d --build`; that ignores the image default and builds locally.
 - The `db-sync` init container runs on every start and re-syncs your workspace into etcd.
