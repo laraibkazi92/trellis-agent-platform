@@ -170,10 +170,18 @@ class ContainerSpec:
 def declared_env_keys(config: Any) -> set[str]:
     """Every env name a manifest declares, plus the identity pair."""
     keys: set[str] = set()
-    for attr in ("secrets", "optional_secrets", "variables", "env"):
-        # MCPConfig has a literal `env:` block: those names are part of the
-        # manifest's declared environment (not caller-supplied credentials).
+    for attr in ("secrets", "optional_secrets", "variables"):
         keys |= {str(name) for name in declared_names(getattr(config, attr, None))}
+    # MCPConfig's literal `env:` block is manifest configuration: its own names are
+    # declared environment. Take its KEYS -- `declared_names` flattens a mapping to its
+    # *values* (the {general,user,background} form), which here collected the literals
+    # and dropped every key. The host filters a session's env through this set, so that
+    # misread silently discarded the resolved credential for an `env:` key whose name
+    # differs from the secret's: `env: {POSTGRES_PASSWORD: "{MY_DB_PASSWORD}"}` arrived
+    # at the container as the literal `{MY_DB_PASSWORD}`.
+    block = getattr(config, "env", None)
+    if isinstance(block, Mapping):
+        keys |= {str(name) for name in block}
     # `secret_groups` field keys are declared credentials too. Same flattening as the
     # edge's manifest check, sync and the model validator (one helper, no copies).
     keys |= set(_group_keys(config))

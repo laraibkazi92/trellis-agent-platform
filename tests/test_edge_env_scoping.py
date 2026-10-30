@@ -574,12 +574,15 @@ def test_http_headers_carry_only_the_declared_credentials(tmp_path, process_env,
         "CORALOGIX_DOMAIN": "corp.example",
         "LITERAL_HEADER": "literal-value",
     }
-    # The session env is what the runner accepts: declared keys + identity only.
+    # The session env is what the runner accepts: declared keys + identity only --
+    # and the manifest's own `env:` keys count as declared (an interpolated value under
+    # one of them has to be able to reach the container).
     assert env["TRELLIS_USER_EMAIL"] == "user-1@corp.example"
     assert env["TRELLIS_USER_ID"] == "user-1"
+    assert env["LITERAL_HEADER"] == "literal-value"
     assert "TRELLIS_EDGE_TOKEN" not in env
     # The container's tmpfs owns HOME/TMPDIR; PATH is the runner's to build.
-    for not_declared in ("HOME", "PATH", "LITERAL_HEADER"):
+    for not_declared in ("HOME", "PATH"):
         assert not_declared not in env
 
 

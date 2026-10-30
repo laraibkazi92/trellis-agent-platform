@@ -124,8 +124,14 @@ def test_get_external_mcp_client_builds_a_runner_session(monkeypatch):
     assert "user_id" not in transport.kwargs
     assert "user_email" not in transport.kwargs
     assert transport.kwargs["deadline_ms"] == 2_100_000  # 30 min idle TTL + 5 min grace
-    # Declared keys only: the literal for an undeclared key never reaches the runner.
-    assert transport.kwargs["env"] == {"DEVOPS_PASSWORD": "s3cret"}
+    # Declared keys only: the resolved credential and the manifest's own `env:` keys.
+    # The env block's keys have to be forwardable, or an interpolated value under a
+    # differently-named key (`env: {DEVOPS_PASSWORD: "{PG_PASSWORD}"}`) is filtered out
+    # and the container receives the literal braces.
+    assert transport.kwargs["env"] == {
+        "DEVOPS_PASSWORD": "s3cret",
+        "EXTRA_HEADER": "kept",
+    }
 
 
 def test_get_external_mcp_client_does_not_name_the_background_agent_in_the_body(monkeypatch):
@@ -174,7 +180,7 @@ def test_discover_external_mcps_opens_a_throwaway_discovery_session(monkeypatch)
     assert transport.kwargs["target"] == "devops-cli"
     assert transport.kwargs["deadline_ms"] == 60_000
     assert len(transport.kwargs["session_key"]) == 32
-    assert transport.kwargs["env"] == {"DEVOPS_PASSWORD": "literal"}
+    assert transport.kwargs["env"] == {"DEVOPS_PASSWORD": "literal", "EXTRA": "x"}
 
 
 def test_discovery_of_an_http_server_is_unchanged(monkeypatch):

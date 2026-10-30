@@ -255,6 +255,52 @@ def test_declared_env_passes_through(workspace):
     assert "SERVICE_URL" not in spec.env
 
 
+def test_declared_env_keys_take_the_env_block_keys_not_its_values():
+    """An `env:` mapping names its keys; `declared_names` flattens a mapping to values.
+
+    Passing the block through that helper (the {general,user,background} form) put the
+    *literals* into the allowlist and left every key out, so the host's filter dropped
+    the resolved credential for `env: {POSTGRES_PASSWORD: "{PG_PASSWORD}"}`.
+    """
+    config = MCPConfig(
+        name="pg",
+        transport="stdio",
+        command="srv",
+        env={"POSTGRES_PASSWORD": "{PG_PASSWORD}", "EXTRA_HEADER": "kept"},
+        secrets=["PG_PASSWORD"],
+    )
+
+    keys = declared_env_keys(config)
+
+    assert {"POSTGRES_PASSWORD", "EXTRA_HEADER", "PG_PASSWORD"} <= keys
+    assert "{PG_PASSWORD}" not in keys
+    assert "kept" not in keys
+
+
+def test_an_interpolated_env_value_wins_over_the_literal_in_the_container(workspace):
+    """The resolved credential reaches the process, not the `{PLACEHOLDER}` text."""
+    config = MCPConfig(
+        name="pg",
+        transport="stdio",
+        command="srv",
+        env={"POSTGRES_PASSWORD": "{PG_PASSWORD}"},
+        secrets=["PG_PASSWORD"],
+    )
+
+    spec = build_spec(
+        config,
+        kind="mcp_session",
+        suite_rel="tools/echo",
+        target="pg",
+        # What `_inject_config` resolved for this user, filtered through
+        # `declared_env_keys` the way `agent_factory` does it.
+        env={"POSTGRES_PASSWORD": "s3cret"},
+        host_workspace=str(workspace.root),
+    )
+
+    assert spec.preamble_env["POSTGRES_PASSWORD"] == "s3cret"
+
+
 def test_undeclared_env_key_is_rejected(workspace):
     with pytest.raises(InvalidRequest) as excinfo:
         build(workspace, make_config(), env={"SMUGGLED_SECRET": "x"})

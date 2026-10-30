@@ -1812,9 +1812,11 @@ def test_a_literal_mcp_env_never_overrides_a_resolved_credential(tmp_path):
     assert env["DEVOPS_PASSWORD"] == "fresh-from-the-browser"  # sealed set wins
     # Declared but absent from the set: the literal must not fill it either.
     assert "DEVOPS_URL" not in env
-    # A literal for a key the manifest does not declare never reaches the runner...
-    assert "EXTRA_HEADER" not in env
-    # ...but a remote transport still gets it as a header (headers are not env).
+    # A literal for a key the manifest's own `env:` block declares is forwarded with
+    # that literal -- the runner applies the same value from the manifest anyway, and
+    # the key has to be accepted for an interpolated value to reach the container.
+    assert env["EXTRA_HEADER"] == "kept"
+    # ...and a remote transport still gets it as a header (headers are not env).
     headers = proxy_mcp._http_headers(entry, env)
     assert headers["DEVOPS_PASSWORD"] == "fresh-from-the-browser"
     assert "DEVOPS_URL" not in headers
