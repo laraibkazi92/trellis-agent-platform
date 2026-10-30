@@ -11,9 +11,9 @@ them would mean central accepts a key the edge never exports, or the edge reads 
 central would have refused.
 
 It also holds the HTTP field-name rule for an MCP's literal ``env:`` block on a
-non-stdio transport (``invalid_header_entries``), for the same reason: the sync
-refuses such a manifest, and any downstream linter validating the same file must
-refuse exactly the same ones.
+non-stdio transport (``invalid_header_entries``) and the matching placeholder rule
+(``undeclared_placeholders``), for the same reason: the sync refuses such a manifest,
+and any downstream linter validating the same file must refuse exactly the same ones.
 
 Deliberately dependency-free: the edge imports this and must not pull the
 etcd-backed modules into its process.
@@ -95,8 +95,9 @@ def all_declared(config: Any) -> set:
 # (``core/agent_factory``, ``core/proxy_mcp._http_headers``, the sync's discovery
 # probe), so its keys follow the HTTP field-name grammar, not the env-name one:
 # ``mcp-version`` and ``X-Api-Key`` are perfectly good headers and perfectly bad
-# environment variables. RFC 7230 token.
-_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+# environment variables. RFC 7230 token -- ``\Z``, not ``$``: ``$`` also matches
+# just before a trailing newline, which would accept ``"Auth\n"``.
+_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 
 # What a header value may never carry: a line break ends the field (request
 # splitting), and NUL is not representable in an HTTP field value at all.
@@ -130,3 +131,29 @@ def invalid_header_entries(mapping: Any) -> List[str]:
         ):
             bad.add(str(key))
     return sorted(bad)
+
+
+# ``{NAME}`` in an ``env:`` value: ``core.agent_factory._inject_config`` substitutes
+# exactly the names the manifest declares and leaves every other brace expression
+# alone, so an undeclared one reaches the server as the literal text ``{TYPO}``.
+# Only a token that would be a legal credential name counts: ``{"a": 1}``,
+# ``{ user(id: 1) }`` and ``{my-key}`` are literal text, not a misspelled secret.
+_PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def undeclared_placeholders(mapping: Any, declared: Any) -> List[Tuple[str, str]]:
+    """``(env key, placeholder name)`` pairs ``declared`` does not cover, sorted.
+
+    A placeholder with no declared name is the silent half of the interpolation:
+    nothing rewrites it, no error is raised, and the remote server receives the
+    braces. The caller decides what an absent ``env:`` and an invalid name mean.
+    """
+    if not isinstance(mapping, Mapping):
+        return []
+    known = {str(name) for name in declared or ()}
+    found = set()
+    for key, value in mapping.items():
+        for name in _PLACEHOLDER_RE.findall(str(value)):
+            if name not in known:
+                found.add((str(key), name))
+    return sorted(found)

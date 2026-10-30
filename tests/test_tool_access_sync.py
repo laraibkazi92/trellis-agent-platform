@@ -380,6 +380,199 @@ def test_a_stdio_mcp_env_block_is_still_an_environment(tmp_path, monkeypatch):
     assert "cannot be environment variables" in errors[0]
 
 
+def test_an_unknown_transport_is_refused(tmp_path, monkeypatch):
+    """A typo'd transport synced and then failed inside `MCPConfig()` at call time.
+
+    The env key here is a *valid* env name on purpose: the manifest must be refused
+    for the transport, not because the key happened to look like a bad env name.
+    """
+    errors = _mcp_manifest_errors(
+        tmp_path,
+        monkeypatch,
+        "name: demo\n"
+        "transport: http2\n"
+        "command: https://example.invalid/mcp\n"
+        "env:\n  MCP_VERSION: v2\n",
+    )
+
+    assert len(errors) == 1
+    assert "transport 'http2' is not one of" in errors[0]
+    assert "streamable-http" in errors[0]
+
+
+def test_a_header_name_may_not_end_with_a_line_break(tmp_path, monkeypatch):
+    """``$`` also matches before a trailing newline; the field-name rule must not."""
+    errors = _mcp_manifest_errors(
+        tmp_path,
+        monkeypatch,
+        "name: demo\n"
+        "transport: streamable-http\n"
+        "command: https://example.invalid/mcp\n"
+        'env:\n  "Auth\\n": v\n',
+    )
+
+    assert len(errors) == 1
+    assert "cannot be HTTP header names" in errors[0]
+
+
+# --------------------------------------------------------------------------- #
+# Env values: a {PLACEHOLDER} must name something declared
+# --------------------------------------------------------------------------- #
+# ``core.agent_factory._inject_config`` substitutes exactly the names the manifest
+# declares and leaves every other brace expression alone, so a misspelled placeholder
+# shipped to the server as the literal text ``{TYPO}``: a 401 at the first call, or
+# the typo itself sent to a third party. Only the MCP path interpolates anything.
+
+
+def test_an_undeclared_placeholder_is_refused(tmp_path, monkeypatch):
+    """A header value naming a secret the manifest does not declare."""
+    errors = _mcp_manifest_errors(
+        tmp_path,
+        monkeypatch,
+        "name: demo\n"
+        "transport: streamable-http\n"
+        "command: https://example.invalid/mcp\n"
+        "env:\n"
+        "  Authorization: Bearer {CORALOGIX_APIKEY}\n"
+        "secrets: [CORALOGIX_API_KEY]\n",
+    )
+
+    assert len(errors) == 1
+    assert "Authorization" in errors[0]
+    assert "{CORALOGIX_APIKEY}" in errors[0]
+    assert "never substituted" in errors[0]
+
+
+def test_a_declared_variable_satisfies_a_placeholder(tmp_path, monkeypatch):
+    """`variables` resolve into the same map, so a URL template can use one."""
+    errors = _mcp_manifest_errors(
+        tmp_path,
+        monkeypatch,
+        "name: demo\n"
+        "transport: streamable-http\n"
+        "command: https://example.invalid/mcp\n"
+        "env:\n"
+        "  X-Tenant: acme\n"
+        "  API_URL: https://{TENANT}.example.invalid/mcp\n"
+        "variables: [TENANT]\n",
+    )
+
+    assert errors == []
+
+
+def test_a_secret_groups_block_does_not_satisfy_an_mcp_placeholder(tmp_path, monkeypatch):
+    """`secret_groups` is a tool.yaml field: MCPConfig drops it, so it cannot resolve."""
+    errors = _mcp_manifest_errors(
+        tmp_path,
+        monkeypatch,
+        "name: demo\n"
+        "transport: streamable-http\n"
+        "command: https://example.invalid/mcp\n"
+        "env:\n  Authorization: Bearer {OPT_KEY}\n"
+        "secret_groups:\n"
+        "  - label: Pick one\n"
+        "    options:\n"
+        "      - value: a\n"
+        "        fields:\n"
+        "          - key: OPT_KEY\n"
+        "            label: Key\n",
+    )
+
+    assert len(errors) == 1
+    assert "{OPT_KEY}" in errors[0]
+
+
+def test_a_tool_manifest_env_value_is_not_checked_for_placeholders(tmp_path, monkeypatch):
+    """No tool manifest interpolates anything, so braces there are ordinary text."""
+    workspace = tmp_path / "workspace"
+    tool_dir = workspace / "tools" / "demo"
+    tool_dir.mkdir(parents=True)
+    (tool_dir / "tool.yaml").write_text(
+        "name: demo\n"
+        "description: d\n"
+        "runtime: python\n"
+        "entrypoint: demo.py\n"
+        "env:\n"
+        '  GREETING: "hi {name}"\n'
+    )
+
+    monkeypatch.setattr(sync_to_db, "TOOLS_DIR", workspace / "tools")
+    monkeypatch.setattr(sync_to_db, "MCPS_DIR", workspace / "mcps")
+
+    assert sync_to_db.validate_declared_env_names() == []
+
+
+def test_an_undeclared_placeholder_in_a_stdio_env_is_refused(tmp_path, monkeypatch):
+    """Resolution ignores the transport, so the placeholder rule does too."""
+    errors = _mcp_manifest_errors(
+        tmp_path,
+        monkeypatch,
+        "name: demo\n"
+        "transport: stdio\n"
+        "command: srv\n"
+        "env:\n"
+        "  API_URL: https://example.invalid/{TENANT}\n"
+        "variables: [API_URL]\n",
+    )
+
+    assert len(errors) == 1
+    assert "API_URL" in errors[0]
+    assert "TENANT" in errors[0]
+
+
+def test_a_bare_braced_word_is_a_placeholder_even_in_a_url(tmp_path, monkeypatch):
+    """The boundary is the pattern, not the context: `{tenant}` is a placeholder.
+
+    A URL path template or a message template is therefore refused unless the name
+    is declared -- the sharp edge of this rule, documented in `docs/upgrading.md`.
+    """
+    errors = _mcp_manifest_errors(
+        tmp_path,
+        monkeypatch,
+        "name: demo\n"
+        "transport: streamable-http\n"
+        "command: https://example.invalid/mcp\n"
+        "env:\n"
+        "  X-Target: https://api.example.invalid/v1/{tenant}/graphql\n",
+    )
+
+    assert len(errors) == 1
+    assert "{tenant}" in errors[0]
+
+
+def test_the_transport_rule_covers_every_value_the_model_accepts():
+    """`MCP_TRANSPORTS` is the model's Literal, split into two rule buckets.
+
+    If `MCPConfig.transport` grows a value and one of these is not updated, the sync
+    would refuse a transport the engine supports (or stop validating a new one).
+    """
+    from typing import get_args
+
+    from core.models import MCPConfig
+
+    literal = set(get_args(MCPConfig.model_fields["transport"].annotation))
+    assert literal == sync_to_db.MCP_TRANSPORTS
+
+
+def test_literal_braces_are_not_placeholders(tmp_path, monkeypatch):
+    """Only a token that would be a legal credential name counts as a placeholder."""
+    errors = _mcp_manifest_errors(
+        tmp_path,
+        monkeypatch,
+        "name: demo\n"
+        "transport: streamable-http\n"
+        "command: https://example.invalid/mcp\n"
+        "env:\n"
+        '  X-Filter: "{ user(id: 1) }"\n'
+        '  X-Json: \'{"a": 1}\'\n'
+        '  X-Slug: "{my-key}"\n'
+        "  Authorization: Bearer {API_KEY}\n"
+        "secrets: [API_KEY]\n",
+    )
+
+    assert errors == []
+
+
 
 def _secret_groups_yaml(key):
     """A ``secret_groups`` UI hint (one group, one option, one field)."""
