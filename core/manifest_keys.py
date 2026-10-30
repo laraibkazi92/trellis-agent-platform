@@ -157,3 +157,30 @@ def undeclared_placeholders(mapping: Any, declared: Any) -> List[Tuple[str, str]
             if name not in known:
                 found.add((str(key), name))
     return sorted(found)
+
+
+def substitute_placeholders(
+    value: Any, values: Mapping[str, str]
+) -> Tuple[str, frozenset, frozenset]:
+    """``(text, used, missing)`` for one ``env:`` value.
+
+    ``used`` names the credentials the value consumed; ``missing`` the ones it asked
+    for and did not get. Both halves matter to a caller: the host must not also emit a
+    consumed name on its own (that is what ``core/agent_factory._inject_config`` does),
+    and it must not send a value still holding braces to a server. Only the
+    credential-name grammar counts as a placeholder, so literal braces in ordinary
+    text survive untouched.
+    """
+    text = str(value)
+    used, missing = set(), set()
+
+    def _replace(match: "re.Match[str]") -> str:
+        name = match.group(1)
+        if name in values and values[name] is not None:
+            used.add(name)
+            return str(values[name])
+        missing.add(name)
+        return match.group(0)
+
+    substituted = _PLACEHOLDER_RE.sub(_replace, text)
+    return substituted, frozenset(used), frozenset(missing)

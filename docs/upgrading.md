@@ -21,8 +21,8 @@ start failing. If you are upgrading from `v0.7.2` or older, read
 
 ## v0.7.4 (2026-10-29)
 
-Three follow-ups to `v0.7.3`'s transport-aware `env:` check, plus one fix on the delivery
-path it validates. All four close a hole that let a manifest sync and then misbehave at the
+Three follow-ups to `v0.7.3`'s transport-aware `env:` check, plus two fixes on the delivery
+path it validates. All five close a hole that let a manifest sync and then misbehave at the
 first call instead of at the sync.
 
 **1. An undeclared `{PLACEHOLDER}` is refused.** `core.agent_factory._inject_config`
@@ -86,12 +86,25 @@ as a `variable`. Two things do *not* satisfy the check, on purpose:
 - a `secret_groups` block (a `tool.yaml` field — `MCPConfig` has no such field, so it is
   dropped when the manifest is parsed and could never resolve a header).
 
-**Two limitations this release does not change.** Interpolation happens in the central host
-process that opens the session, so an **edge-hosted** MCP's headers are built by the edge
-from the manifest's literal values and a placeholder there is not resolved. And a bucketed
-`secrets: {user: [...]}` is resolved only for the caller kind that reads that bucket, so the
-sync accepts a background-only credential reference that an interactive caller will not get.
-Both predate v0.7.4.
+**5. An edge-hosted MCP's `env:` values are interpolated too.** The edge built its
+headers and session environment from the manifest's literal block, so
+`Authorization: Bearer {API_KEY}` went to the remote origin with the braces in it while
+central, resolving the same manifest, sent the secret. The edge now substitutes from the
+credential chain it already resolved (the caller's sealed set or the shared file, per
+`credential_mode`). Two consequences worth knowing:
+
+- A credential a placeholder consumed is no longer also sent under its own name. Central
+  has always behaved that way (`if not interpolated: env[key] = val`), so an edge-hosted
+  server now receives the same header/bare-name pair as a central one instead of both.
+- A placeholder that **cannot** be resolved at call time (this caller has no value for it)
+  is dropped with a warning naming the key — never sent as braces, which cannot
+  authenticate anywhere. The session is still created; the remote answers with its own
+  error.
+
+**One limitation this release does not change.** A bucketed `secrets: {user: [...]}` is
+resolved only for the caller kind that reads that bucket, so the sync accepts a
+background-only credential reference that an interactive caller will not get. That predates
+v0.7.4.
 
 ---
 

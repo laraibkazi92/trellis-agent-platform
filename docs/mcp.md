@@ -39,7 +39,7 @@ The `mcp.yaml` defines how the Universal Agent Host (`core/host.py`) connects to
 
 To keep credentials secure, you should never hardcode API keys or tokens in `mcp.yaml`. Instead, declare them in the `secrets` list. The framework supports **Secret Interpolation** within the `env` dictionary.
 
-If an environment variable or header value contains `{SECRET_NAME}`, the framework will automatically substitute it with the user's secure value from the database — on the central host that opens the session (an [edge-hosted](#edge-hosted-mcp-servers) server's headers are built on the edge from the manifest's literal values, with no substitution).
+If an environment variable or header value contains `{SECRET_NAME}`, the framework will automatically substitute it with the user's secure value from the database — on the central host that opens the session, and on the edge that hosts it (an [edge-hosted](#edge-hosted-mcp-servers) server builds its headers there, from the same credentials the runner session gets).
 
 Only a **declared** name is substituted: a `{NAME}` that no `secrets`/`optional_secrets`/
 `variables` entry provides is left alone, so the server receives the braces. Because that
@@ -47,6 +47,11 @@ is a silent 401 at the first call, `db-sync` refuses the manifest instead — th
 names the `env:` key and the placeholder. The pattern is a bare braced word, so a path
 template such as `https://api.example.com/v1/{tenant}/graphql` counts as a placeholder too;
 `{ user(id: 1) }`, `{"a": 1}` and a hyphenated `{my-key}` do not.
+
+A declared name that is simply **unresolved at call time** (the caller has no value for it)
+is a different case and is not a sync error: the edge drops that `env:` entry and logs a
+warning naming the key, rather than sending `Bearer {API_KEY}` to a remote origin. A name a
+placeholder consumed is not also sent under its own name — that is what the host does too.
 
 The **keys** of `env` are transport-dependent, the values are interpolated the same way on
 every transport:

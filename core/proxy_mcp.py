@@ -53,6 +53,7 @@ import yaml
 
 from core import edge_env, edge_user_secrets
 from core.execution.spec import declared_env_keys, manifest_digest
+from core.manifest_keys import substitute_placeholders
 from core.models import MCPConfig
 from core.tool_runtime import MAX_RESULT_CHARS
 from services.edge_relay import protocol
@@ -480,6 +481,28 @@ def _session_deadline_ms(entry: McpExport) -> int:
     return (entry.session_ttl_minutes * 60 + SESSION_DEADLINE_MARGIN_S) * 1000
 
 
+def _consumed_names(block: Optional[Mapping[str, Any]], values: Mapping[str, str]) -> set:
+    """Credential names a ``{NAME}`` in ``block`` actually used."""
+    used: set = set()
+    for value in (block or {}).values():
+        used |= substitute_placeholders(value, values)[1]
+    return used
+
+
+def _session_env(entry: McpExport, env: Mapping[str, str]) -> Mapping[str, str]:
+    """What a session's runner is asked to provide -- minus consumed credentials.
+
+    A credential its own manifest consumed with ``{NAME}`` is already inside that
+    value, so it is not sent a second time under its own name: central's
+    ``_inject_config`` does not, and neither does the header map. The common case (no
+    placeholder, or none consumed) hands the map straight through.
+    """
+    consumed = _consumed_names(entry.config.env, env)
+    if not consumed:
+        return env
+    return {key: value for key, value in env.items() if key not in consumed}
+
+
 def _runner_transport(
     entry: McpExport,
     env: Mapping[str, str],
@@ -538,6 +561,42 @@ def _identity_key(identity: Optional[Mapping[str, Any]]) -> str:
     return "anonymous"
 
 
+def _interpolate_env(
+    block: Optional[Mapping[str, Any]],
+    values: Mapping[str, str],
+    name: str,
+) -> Tuple[Dict[str, str], set]:
+    """A manifest's literal ``env:`` values with ``{NAME}`` taken from ``values``.
+
+    Central substitutes the same placeholders (``core.agent_factory._inject_config``)
+    and then emits a declared name on its own **only** when no placeholder consumed it.
+    The edge has to match, or one manifest authenticates through the host and sends
+    ``Bearer {API_KEY}`` from a site.
+
+    An entry any of whose placeholders has no value is dropped rather than sent with
+    the braces in it: that cannot authenticate anywhere, and the drop is reported here
+    with the key and the missing names (never a value). Returns the block and the set
+    of names a placeholder consumed, which the caller must not emit twice.
+    """
+    literals: Dict[str, str] = {}
+    consumed: set = set()
+    for key, value in (block or {}).items():
+        if not isinstance(key, str):
+            continue
+        text, used, missing = substitute_placeholders(value, values)
+        consumed |= used
+        if missing:
+            logger.warning(
+                "mcp '%s': dropping env: %s (no value for %s)",
+                name,
+                key,
+                ", ".join(sorted(missing)),
+            )
+            continue
+        literals[key] = text
+    return literals, consumed
+
+
 def _http_headers(
     entry: McpExport, env: Mapping[str, str], token_env: Optional[str] = None
 ) -> Dict[str, str]:
@@ -556,26 +615,30 @@ def _http_headers(
     renames the enrollment token would otherwise hand it to the endpoint when a
     manifest happens to declare that name.
 
-    A literal ``mcp.yaml`` ``env:`` value is applied for names the manifest does **not**
-    declare, and a resolved credential for the declared ones: a stale literal must never
-    shadow the caller's file (nor reach an origin under ``per_user_required`` when the
-    file does not define the key).
+    A ``{NAME}`` in a literal ``env:`` value is substituted from that same chain (a
+    remote origin never got it before v0.7.4: it received ``Bearer {API_KEY}``), and a
+    name a placeholder consumed is not also sent under its own name -- the same rule
+    central applies. A literal for a name the manifest does **not** declare is applied
+    as written; a stale literal must never shadow the caller's file, nor reach an
+    origin under ``per_user_required`` when the file does not define the key.
     """
     reserved = edge_env.RESERVED_ENV_NAMES | {
         edge_env.DEFAULT_TOKEN_ENV,
         token_env or edge_env.DEFAULT_TOKEN_ENV,
     }
     declared = edge_env.declared_keys_for(entry.config)
-    headers = {
-        key: str(value)
+    block = {
+        key: value
         for key, value in (entry.config.env or {}).items()
-        if isinstance(key, str) and key.upper() not in reserved and key not in declared
+        if isinstance(key, str) and key.upper() not in reserved
     }
+    literals, consumed = _interpolate_env(block, env, entry.name)
+    headers = {key: value for key, value in literals.items() if key not in declared}
     headers.update(
         {
             key: env[key]
             for key in sorted(declared)
-            if key in env and key.upper() not in reserved
+            if key in env and key.upper() not in reserved and key not in consumed
         }
     )
     return headers
@@ -603,7 +666,7 @@ def _transport(
         return Client(
             _runner_transport(
                 entry,
-                env,
+                _session_env(entry, env),
                 kind=kind,
                 deadline_ms=deadline_ms,
                 identity=identity,
@@ -663,15 +726,17 @@ def _server_env(
 ) -> Dict[str, str]:
     """Declared keys + literal ``mcp.yaml`` env + caller identity, and nothing else.
 
-    Order matters: the scoped process env first, then the manifest's literal ``env:``,
-    then the **resolved credentials last**, so a stale literal value can never shadow
+    Order matters: the scoped process env first, then the manifest's literal ``env:``
+    (with any ``{NAME}`` in a value substituted from the credentials), then the
+    **resolved credentials last**, so a stale literal value can never shadow
     a credential (which would defeat ``per_user_required`` whenever the caller's
     sealed set happens to define the key).
 
     A declared **secret** is never read from the edge process env (``passthrough``
     included). When ``sealed`` is set the per-user branch is all-or-nothing: a
     declared secret the caller's set omits is removed outright, even if a literal
-    ``env:`` carries it -- the shared file and the container never fill the gap.
+    ``env:`` carries it -- the shared file and the container never fill the gap, and a
+    placeholder that asked for it is dropped rather than sent with the braces.
     Declared ``variables`` are still the edge's own configuration.
 
     The result is intersected with the manifest's declared keys: the runner rejects
@@ -696,16 +761,15 @@ def _server_env(
     # value is dropped before they run.
     for key in declared_secrets:
         env.pop(key, None)
-    env.update(
-        {
-            key: str(value)
-            for key, value in (entry.config.env or {}).items()
-            if isinstance(key, str)
-        }
-    )
+    # A `{NAME}` in a literal value is resolved here, from the same chain the runner
+    # has no way to reach (central interpolates at the same point).
+    literals, _consumed = _interpolate_env(entry.config.env, resolved, entry.name)
+    env.update(literals)
     # Credentials win over the process env and over a literal ``env:`` (``shared``
-    # mode's point, and the only source under ``per_user_required``).
-    env.update(resolved)
+    # mode's point, and the only source under ``per_user_required``). A placeholder
+    # that consumed one still leaves it here: ``_transport`` decides what the runner
+    # is told, and the header map needs the whole credential chain to interpolate.
+    env.update({key: str(value) for key, value in resolved.items()})
     if sealed is not None:
         # All-or-nothing: a declared secret the caller's set omits must not survive
         # from a literal ``env:`` either.
