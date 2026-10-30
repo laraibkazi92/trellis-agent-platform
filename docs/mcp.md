@@ -49,9 +49,12 @@ template such as `https://api.example.com/v1/{tenant}/graphql` counts as a place
 `{ user(id: 1) }`, `{"a": 1}` and a hyphenated `{my-key}` do not.
 
 A declared name that is simply **unresolved at call time** (the caller has no value for it)
-is a different case and is not a sync error: the edge drops that `env:` entry and logs a
-warning naming the key, rather than sending `Bearer {API_KEY}` to a remote origin. A name a
-placeholder consumed is not also sent under its own name — that is what the host does too.
+is a different case and is not a sync error: the host and the edge both drop that `env:`
+entry and log a warning naming the key, rather than sending `Bearer {API_KEY}` to a remote
+origin. A name a placeholder consumed is not also sent under its own name — unless the value
+uses its **own** name (`X_API_KEY: "Bearer {X_API_KEY}"`), where the substituted text is that
+name's value. That is what central's in-place substitution has always produced, and it is
+what the edge produces too.
 
 The **keys** of `env` are transport-dependent, the values are interpolated the same way on
 every transport:
